@@ -63,6 +63,8 @@
 // the shipped optimizer (this defect was present in release too, so a debug-only witness
 // would have been half a witness).
 
+#include <stdarg.h>
+
 int i_seed = 9;   // mutable global -> opaque load (anti-fold)
 
 int sum9(int a, int b, int c, int d, int e, int f, int g, int h, int i, ...) {

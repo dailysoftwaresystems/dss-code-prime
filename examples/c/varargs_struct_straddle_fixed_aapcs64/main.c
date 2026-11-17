@@ -22,6 +22,8 @@
 // Runs under qemu-aarch64 (the arm64-Linux CI leg + local build-wsl). The release arm
 // re-witnesses under the shipped pipeline with Inlining ON (FC7-C3 lesson).
 
+#include <stdarg.h>
+
 struct H3 { double a; double b; double c; };
 
 double hx = 10.0;   // mutable globals → opaque loads (anti-fold)

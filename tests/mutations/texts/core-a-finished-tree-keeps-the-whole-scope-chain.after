@@ -1,0 +1,1 @@
+            [&](ParseDiagnostic& d) { (void)compaction; (void)d; });

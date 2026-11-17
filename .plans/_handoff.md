@@ -937,6 +937,52 @@ round's close; each checkpoint's commit message says what was and was not run on
     windows-x86_64-debug and windows-x86_64-release (MSVC 19.52). The pre-fold repo-guard on the lane's tree passed.
   - Balance: 690 open against 620 at `71648598`. Fold order now: L2b2 → f26d → f26e (a convention an attribute names
     is EMITTED, ledger 607) → 3f → 3g → 3h → L2b4 → L2b3 → H6d → H7.
+- **Checkpoint 46 (2026-11-16) = the library lane's fold L2b2**, the binder sketch's homes and the parse regression's
+  fix:
+  - Every asker of a type name reads the binder sketch's one home. The finish() type-name oracle is RETIRED
+    (D-PP-FC2-ORACLE-RETIRE closed): a type name reaches a C parse from the file's own text, the preprocessor's
+    splice, or the seeded shipped typedef names.
+  - The variadic surface's names are visible exactly where the references' headers make them visible. A va_list
+    record is recognized by its record's name.
+  - A type name in a value position is refused at the name: the new code `S_TypeNameInValuePosition` (0xE0B0).
+  - An empty declaration that declares nothing is a WARNING where the language says so.
+  - The descriptor cache derives each descriptor's surface once per (bytes, inputs) per thread (rulings 602, (i),
+    630). D-FFI-THE-SHIPPED-SURFACE-CHECK-RE-DERIVES-THE-CORPUS-IN-EVERY-UNIT was disclosed and closed in the fold.
+    ✔MEASURED: the check alone 79.4 → 4.2 ms, a unit's finish 53–102 → 4.1 ms, and
+    `test_fc3_width_semantics_shuffled` clears (77.54 s; it was a TIMEOUT at 873 s).
+  - THE PARSE REGRESSION, this fold's own and never on main, is fixed: an optional specifier prefix had made a name-led
+    rule (×1.87 probes on sqlite3.c).
+    - The fix: the grammar split; the triage hoist `hoistRefutesTheCandidate_`, whose static half is in the schema;
+      the grammar-token view; and the scope chain's memory rule.
+    - ✔MEASURED: probes 51,948 on sqlite3.c (96,316 at checkpoint 43) and 8,117 on shell.c (20,288). The parse's
+      per-thread cycles, B A B A: −15.2% and −21.9%. The sqlite image is PRE == POST on windows and linux.
+  - D-PARSE-A-PARENTHESISED-CHAIN-COSTS-PARSE-WORK-EXPONENTIAL-IN-ITS-DEPTH closes for EXACTLY its title.
+    `sizeof_type_name` past a BINDING speculation ceiling still costs ~C²; that is the new 🔵 DISCLOSED
+    D-PARSE-AN-OVER-DEEP-INPUT-IS-REFUSED-IN-TIME-LINEAR-IN-ITS-DEPTH, the FIRST item of lm's next fold L2b4.
+  - New 🔵 DISCLOSED rows, each HEAD's debt:
+    - D-PARSE-AN-OVER-DEEP-INPUT-IS-REFUSED-IN-TIME-LINEAR-IN-ITS-DEPTH (P2, L2b4);
+    - D-FFI-A-CACHED-DESCRIPTOR-IS-FREED-UNDER-ITS-READER-BY-A-NESTED-LOOKUP (P1, a use after free when a nested
+      lookup erases an entry its caller holds; L2b4, second item);
+    - D-MIR-A-FIXTURE-LOWERS-WITH-A-HAND-COPY-OF-THE-PIPELINES-MIR-CONFIG-AND-TABLES (P1, L2b4);
+    - D-DIAG-A-DIAGNOSTIC-QUOTES-ITS-OPERAND-WHOLE (P2, cs's f26d).
+  - Rows: closed 3, opened 5 (created 0, disclosed 5), so the REAL net is +2. Three rows are amended and not closed;
+    phase B of lm's brief owes them.
+  - Arms: 114 new, 187 changed (143 of those in `cases` only), 3 retired; 1784 arms. Main has not swept them.
+  - ✔MEASURED by the lane on the final bytes, the whole suite on four legs:
+    - windows-x86_64-release (MSVC 19.52) 2994/2997, windows-x86_64-debug (GNU 13.2) 2994/2997,
+      macos-arm64-debug 2968/2972, linux-x86_64-debug 2969/2972;
+    - every red is HEAD's (known defects (13) and (14) below) but two: a stale build of the lane's own and a timeout
+      under the load of three legs, both re-run green;
+    - the repo-guard label on the lane's tree passed 26 of 26 on both Windows legs.
+  - Main's own: the arm registry was SETTLED. The lane's copy is main's plus only its own arms, with no change of
+    main's lost: 1483 same, 187 changed, 114 added, 3 retired, 0 reverted.
+  - Balance: 692 open against 620 at `71648598` (29 closed; 101 opened, of which 4 created and 97 disclosed;
+    counted −25, REAL net +72); 692 against 690 at HEAD. `check-anchor-arms` names 76 claims that do not hold, all
+    owed to the fold's sweep.
+  - Fold order now: f26d → f26e → H6c2 → 3f → 3g → 3h → L2b4 → L2b3 → H6d → H7 → H7b1 → H7b2 → H7c. H7's plan is
+    of record at v3g after four design-audit passes (ledgers 713–725). The support routines are split into H7b1
+    (the platform-floor homes, the Mach-O stack probe and the fixture), H7b2 (the binding, the atomics arbiter and
+    binary128) and H7c (the bodies).
 - **★ KNOWN DEFECTS ON THIS TREE — each a MERGE BLOCKER of this PR's own making, each in a lane's hands:**
   (1) `orphan_tests_guard` — FIXED by checkpoint 16;
   (2) the valid ELF link refused since checkpoint 12 — LINKS AGAIN since checkpoint 18 (above);
@@ -997,6 +1043,25 @@ round's close; each checkpoint's commit message says what was and was not run on
   - 17 of the checkpoint's 250 arms do not read `passed` on macos-arm64-debug.
   - The row D-C-A-BLOCK-SCOPE-FUNCTION-DECLARATION-HIDES-NOTHING-IN-ITS-BLOCK is REOPENED: one of its nine arms is
     violated.
+  (14) IN MAIN SINCE CHECKPOINTS 44 AND 45, ✔MEASURED by their five-leg suites and arm sweeps (ledgers 616, 618, 628,
+  629, 676), each routed to a lane:
+  - `program/test_entry_envp_run` is red on both Windows legs and both Linux legs. It is a STALE TEST of 3e's, which
+    xa restates in 3f.
+  - `examples/corpus-lints` (`ExamplesCorpusLint.LoaderSearchPathValueIsTheResolvedLibraryDirectories`) is red on
+    macos-arm64 and both Linux legs. H6c's examples runner no longer resolves `a/sub/..` to `a` on POSIX. It is a
+    MERGE BLOCKER of hm's H6c2.
+  - Checkpoint 44's Mac sweep left 12 arms violated and 2 survived, all routed.
+  - Checkpoint 45's sweeps: on macos-arm64-debug, 8 violated and 1 survived; on windows-x86_64-debug, 11 violated.
+    - Every one is hm's, for H6c2, except three site arms of xa's in `dss_program_test_every_unit`.
+    - xa re-declares those three only after H6c2 folds, because their reds rest on hm's one-loop home.
+  (15) THE BASE's, ✔MEASURED by xa: DSS's OUTPUT FOR ONE TARGET DEPENDS ON THE HOST TOOLCHAIN THAT BUILT DSS.
+  - The pre-L2b2 sqlite images built for one target differed between windows and linux.
+  - One cause is mem2reg's phi order, walked over an `unordered_set`. A sorted walk in xa's tree makes windows ==
+    linux.
+  - The Mac (AppleClang) differs further, through C++'s unspecified argument-evaluation order: 84 sites, most of
+    them in `hir_to_mir.cpp`'s limb emitters.
+  - It closes in xa's 3f: the sorted walk, every argument-order site, the guard `check-evaluation-order` with no
+    allow-list, and a host-equality step across windows, linux and the Mac at the round close.
 - **FOUND THIS ROUND, NOT YET IN MAIN — the BASE's debt each lane found while closing rows and is closing in its next
   fold** (each ✔MEASURED against the references; the lane's fold names its rows). IN MAIN SINCE CHECKPOINT 32 (the
   link lane's 3c): the 32-bit relocation range, arm64 `.long main`, the g++ `inline` variable kept as two objects, the

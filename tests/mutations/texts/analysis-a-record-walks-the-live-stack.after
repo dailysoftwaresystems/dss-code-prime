@@ -1,0 +1,1 @@
+    LiveScope const innermost = *liveScopes_.rbegin();

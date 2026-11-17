@@ -2054,7 +2054,7 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
                     result = fail(ConstEvalFailure::NotAConstantExpression, node2);
                     break;
                 }
-            } else if (!result.value.has_value()) {
+            } else if (DiscardedOperandSequence::endsAt(result)) {
                 work.pop_back();            // a discarded operand that did not fold is the result
                 break;
             }

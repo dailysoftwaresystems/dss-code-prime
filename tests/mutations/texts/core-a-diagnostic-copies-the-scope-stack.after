@@ -1,0 +1,1 @@
+    std::vector<ScopeKind> copy; for (ScopeEntry const e : scopes_) copy.push_back(e.kind); return ScopeTrail{std::span<ScopeKind const>{copy}}; (void)ScopeTrail::at(scopeChain_, scopes_.back().node,

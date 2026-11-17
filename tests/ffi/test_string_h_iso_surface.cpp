@@ -44,6 +44,7 @@
 #include "ffi/shipped_lib_descriptor.hpp"
 #include "link/object_format_schema.hpp"
 #include "repo_root.hpp"
+#include "validation_va_list_binding.hpp"   // the descriptor word a validation read binds (c82)
 
 #include <gtest/gtest.h>
 
@@ -148,7 +149,8 @@ void readStringH(Pair const& p, StringH& out) {
     DiagnosticReporter rep;
     out.desc = readShippedLibDescriptor(*cfg / "shippedLibs" / "string.json", out.interner, out.typeReg,
                                         rep, (*formatR)->dataModel(), std::string_view{p.arch},
-                                        out.kind, {}, nullptr, &facts);
+                                        out.kind,
+                                        dss::test_support::validationVaListBinding(out.interner), nullptr, &facts);
     ASSERT_TRUE(out.desc.has_value());
     ASSERT_FALSE(rep.hasErrors()) << (rep.all().empty() ? std::string{} : rep.all().front().actual);
 }

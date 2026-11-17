@@ -46,6 +46,7 @@
 #include "mir/lowering/hir_to_mir.hpp"
 #include "mir/mir.hpp"
 #include "mir/mir_opcode.hpp"
+#include "program/model_to_hir.hpp"   // lowerModelToHir — the pipeline's gates
 #include "shipped_schema_or_throw.hpp"
 
 #include <gtest/gtest.h>
@@ -104,8 +105,15 @@ struct Lowered {
                                            *format, nullptr);
     SemanticModel model = std::move(analysis.model);
     DiagnosticReporter hirReporter;
-    auto hir = lowerToHir(model, hirReporter);
+    ModelLoweredToHir lowered = lowerModelToHir(model, *format, hirReporter);   // the pipeline's gates
+    auto hir = std::move(lowered.hir);
     DiagnosticReporter mirReporter;
+    if (!lowered.lowersToMir) {   // the build stops here, and so does the fixture: MIR never entered
+        HirToMirResult notEntered;
+        notEntered.ok = false;
+        return Lowered{target, format, std::move(model), std::move(hir), std::move(hirReporter),
+                       std::move(notEntered), std::move(mirReporter)};
+    }
     MirLoweringConfig mirCfg = languageMirLoweringConfig(*schema);
     mirCfg.symbolIdSpace = MirSymbolIdSpace::endingAt(
         static_cast<std::uint32_t>(model.symbols().size()));

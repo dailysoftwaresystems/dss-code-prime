@@ -30,6 +30,7 @@
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
 #include "mutate_target_schema.hpp"
+#include "program/model_to_hir.hpp"   // lowerModelToHir — the pipeline's gates
 #include "synthetic_fn.hpp"
 
 #include <gtest/gtest.h>
@@ -44,6 +45,7 @@
 #include <stdexcept>
 #include <variant>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -73,9 +75,41 @@ struct Lowered {
     builder.addInMemory(std::move(src), "<mem>");
     auto cu    = std::make_shared<CompilationUnit>(std::move(builder).finish());
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
+    // The target's ELF document: the format the unit is built for (x86_64 unless a custom
+    // target says otherwise).
+    std::string_view const arch = customTarget != nullptr ? customTarget->name() : "x86_64";
+    char const* const formatName = arch == "x86_64" ? "elf64-x86_64-linux-exec"
+                                   : arch == "arm64" ? "elf64-aarch64-linux-exec"
+                                                     : nullptr;
+    // A miss THROWS (`no_abort_in_tests_guard`): GoogleTest reports it as a failure of the one test.
+    if (formatName == nullptr) {
+        throw std::runtime_error("lowerCToLir: no ELF document for target '" + std::string{arch} + "'");
+    }
+    auto const format = ObjectFormatSchema::loadShipped(formatName);
+    if (!format) {
+        throw std::runtime_error(std::string{"lowerCToLir: ObjectFormatSchema::loadShipped("} + formatName
+                                 + ") failed");
+    }
     DiagnosticReporter hirReporter;
-    auto hir = lowerToHir(model, hirReporter);
+    ModelLoweredToHir lowered = lowerModelToHir(model, **format, hirReporter);   // the pipeline's gates
+    auto hir = std::move(lowered.hir);
     DiagnosticReporter mirReporter;
+    if (!lowered.lowersToMir) {   // the build stops here, and so does the fixture: MIR and LIR never entered
+        HirToMirResult mir;
+        mir.ok = false;
+        MirToLirResult lir;
+        lir.ok = false;
+        return Lowered{
+            .model       = std::move(model),
+            .hir         = std::move(hir),
+            .hirReporter = std::move(hirReporter),
+            .mir         = std::move(mir),
+            .mirReporter = std::move(mirReporter),
+            .target      = std::move(customTarget),
+            .lirReporter = DiagnosticReporter{},
+            .lir         = std::move(lir),
+        };
+    }
     // The language's policy through the pipeline's ONE assembly (`languageMirLoweringConfig`).
     MirLoweringConfig mirCfg = languageMirLoweringConfig(**loaded);
     mirCfg.symbolIdSpace = MirSymbolIdSpace::endingAt(   // the unit's name table, as the driver states it
@@ -7764,10 +7798,15 @@ TEST(MirToLir, LongDoubleComplexArithmeticLowersOnX87Axis) {
         << "the DECLARATION tier must accept long double _Complex on the x87 axis: "
         << (model.diagnostics().all().empty()
                 ? "" : model.diagnostics().all()[0].actual);
+    auto const format = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-exec");
+    ASSERT_TRUE(format.has_value());
     DiagnosticReporter hirReporter;
-    auto hir = lowerToHir(model, hirReporter);
+    ModelLoweredToHir lowered = lowerModelToHir(model, **format, hirReporter);   // the pipeline's gates
+    auto const& hir = lowered.hir;
+    ASSERT_NE(hir, nullptr);
     ASSERT_TRUE(hir->ok)
         << (hirReporter.all().empty() ? "" : hirReporter.all()[0].actual);
+    ASSERT_TRUE(lowered.lowersToMir) << "the pipeline's gates pass the clean unit on to MIR";
     DiagnosticReporter mirReporter;
     MirLoweringConfig mirCfg = languageMirLoweringConfig(**loaded);   // the pipeline's assembly
     mirCfg.symbolIdSpace = MirSymbolIdSpace::endingAt(   // the unit's name table, as the driver states it

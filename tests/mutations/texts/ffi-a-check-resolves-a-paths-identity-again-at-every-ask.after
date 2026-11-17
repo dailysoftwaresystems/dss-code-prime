@@ -1,0 +1,1 @@
+    auto key = resolvedDescriptorPathKey(path);   // the arm: the scope answers no identity

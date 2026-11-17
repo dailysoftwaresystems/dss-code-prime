@@ -2067,7 +2067,7 @@ evalImpl(NodeId                              expr,
                     if (seq.refused()) {
                         result = fail(ConstEvalFailure::NotAConstantExpression, node);
                     } else {
-                        if (seq.discards() && lhs.value.has_value() && rhs.value.has_value()
+                        if (seq.reportsTheForm(lhs.value.has_value() && rhs.value.has_value())
                             && notTheAskedExpression == 0 && env.noteConstantForm) {
                             env.noteConstantForm(ConstantForm::CommaOperator, node);
                         }

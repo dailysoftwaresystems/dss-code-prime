@@ -25,6 +25,8 @@
 // reason to say it is not exercised here. Runs natively on the x86_64-Linux CI
 // leg.
 
+#include <stdarg.h>
+
 int sum(int n, ...) {
     va_list ap;
     va_start(ap, n);

@@ -23,6 +23,7 @@
 #include "scratch_dir.hpp"
 
 #include "shipped_schema_or_throw.hpp"   // the ONE load-or-fail-this-test helper
+#include "driver_diagnostics_listener.hpp"   // AskedDriverCodes
 
 #include <gtest/gtest.h>
 
@@ -163,6 +164,7 @@ TEST(HirLoweringMultiLang, MultiSchemaCtorAndDeclOrderFollowsTreeOrder) {
 }
 
 TEST(HirLoweringMultiLang, UnknownExtensionIsLoudInMultiLanguageCu) {
+    dss::test_support::AskedDriverCodes const asked{dss::DiagnosticCode::D_UnknownFileExtension};   // the unrouted extension IS the subject
     // In a multi-language CU, an addFile whose extension matches NO registered
     // language fails loud (D_UnknownFileExtension) and adds no tree — never
     // silently parses under the primary grammar.

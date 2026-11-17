@@ -1557,15 +1557,19 @@ TEST(HirLoweringC, StructDeclarationLowersToTypeDecl) {
 // C 6.7p2 — a top-level declaration with NEITHER a named declarator NOR a tag
 // (`int ;`) declares nothing. This became grammar-parseable when the init-
 // declarator-list was made OPTIONAL (to admit the bare `struct P {…};` form,
-// D-CSUBSET-STRUCT-BODY-VARDECL-POSITION). The HIR lowering must FAIL LOUD with
+// D-CSUBSET-STRUCT-BODY-VARDECL-POSITION). The HIR lowering reports it ONCE with
 // S_DeclarationDeclaresNothing — and must NOT crash: the prior code drove
 // `findCompositeSpecifierIn`'s `tree.rule()` over a leaf token (the `int`),
-// tripping the `Internal`-node assertion. RED-ON-DISABLE on BOTH halves: revert
-// the `findCompositeSpecifierIn` Internal guard → this test CRASHES; drop the
-// `emitH(S_DeclarationDeclaresNothing)` → `res->ok` stays true and the count is 0.
+// tripping the `Internal`-node assertion.
+// ★ P69 L2b2 (lane `lm`): RE-AIMED on the references' answer — a WARNING, and the
+// declaration lowers to nothing. ✔MEASURED 2026-11-05 (probe l2b2e): gcc 13.3.0 ("useless
+// type name in empty declaration"), clang 18.1.3 and Apple clang ("declaration does not
+// declare anything") warn and cl accepts in silence; this pin asked for a failing lowering.
+// RED-ON-DISABLE: revert the Internal guard → this test CRASHES; drop the report → the
+// count is 0.
 // (The sibling `StructDeclarationLowersToTypeDecl` above proves the diagnostic
 // does NOT false-fire on a real bare tag-declaring def.)
-TEST(HirLoweringC, TopLevelDeclaresNothingFailsLoudNoCrash) {
+TEST(HirLoweringC, TopLevelDeclaresNothingWarnsNoCrash) {
     SemanticModel model = analyzeC("int ;\nint main(void) { return 0; }\n");
     // The constraint violation is HIR-tier: parse + semantic accept `int ;`.
     ASSERT_FALSE(model.hasErrors())
@@ -1573,10 +1577,14 @@ TEST(HirLoweringC, TopLevelDeclaresNothingFailsLoudNoCrash) {
               ? "" : model.diagnostics().all()[0].actual);
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
-    EXPECT_FALSE(res->ok)
-        << "`int ;` declares nothing — lowering must fail loud, not accept";
+    EXPECT_TRUE(res->ok)
+        << "`int ;` declares nothing — a warning, and the lowering goes on";
     EXPECT_EQ(countCode(r, DiagnosticCode::S_DeclarationDeclaresNothing), 1u)
         << "exactly one S_DeclarationDeclaresNothing for the empty `int ;` decl";
+    for (auto const& d : r.all())
+        if (d.code == DiagnosticCode::S_DeclarationDeclaresNothing)
+            EXPECT_EQ(d.severity, DiagnosticSeverity::Warning)
+                << "C diagnoses an empty declaration as a warning (semantics.declarators.emptyDeclarationWarns)";
 }
 
 // C23 6.7.2.5 (D-CSUBSET-TYPEOF): a bare `typeof(x);` — a typeof type-specifier
@@ -1584,8 +1592,9 @@ TEST(HirLoweringC, TopLevelDeclaresNothingFailsLoudNoCrash) {
 // a type-specifier (not a struct/union/enum composite), so the "declares nothing"
 // path fires at HIR lowering (S_DeclarationDeclaresNothing) and must NOT crash on
 // the typeof subtree. Semantic + parse accept it (x is a declared global); the
-// constraint is HIR-tier.
-TEST(HirLoweringC, BareTypeofDeclaresNothingFailsLoud) {
+// constraint is HIR-tier. ★ P69 L2b2 (lane `lm`): RE-AIMED with the class, a WARNING
+// (`int;`'s answer, MEASURED; this typeof head's is INFERRED from the class, unmeasured).
+TEST(HirLoweringC, BareTypeofDeclaresNothingWarns) {
     SemanticModel model = analyzeC(
         "int x;\ntypeof(x);\nint main(void) { return 0; }\n");
     ASSERT_FALSE(model.hasErrors())
@@ -1593,10 +1602,14 @@ TEST(HirLoweringC, BareTypeofDeclaresNothingFailsLoud) {
               ? "" : model.diagnostics().all()[0].actual);
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
-    EXPECT_FALSE(res->ok)
-        << "`typeof(x);` declares nothing — lowering must fail loud, not accept";
+    EXPECT_TRUE(res->ok)
+        << "`typeof(x);` declares nothing — a warning, and the lowering goes on";
     EXPECT_EQ(countCode(r, DiagnosticCode::S_DeclarationDeclaresNothing), 1u)
         << "exactly one S_DeclarationDeclaresNothing for the bare `typeof(x);` decl";
+    for (auto const& d : r.all())
+        if (d.code == DiagnosticCode::S_DeclarationDeclaresNothing)
+            EXPECT_EQ(d.severity, DiagnosticSeverity::Warning)
+                << "C diagnoses an empty declaration as a warning (semantics.declarators.emptyDeclarationWarns)";
 }
 
 // c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: a body-PRESENT specifier WITH a
@@ -1626,7 +1639,7 @@ TEST(HirLoweringC, StructDefinitionWithObjectLowersClean) {
 // emit NOTHING and must NOT fail loud (it is NOT a declares-nothing constraint
 // violation). RED-on-disable: drop the `findForwardCompositeSpecifierIn` no-op arm
 // and the bare forward decl re-emits S_DeclarationDeclaresNothing (res->ok false).
-// Contrast TopLevelDeclaresNothingFailsLoudNoCrash (`int ;`, NO tag → still loud).
+// Contrast TopLevelDeclaresNothingWarnsNoCrash (`int ;`, NO tag → still loud).
 TEST(HirLoweringC, TopLevelForwardStructDeclLowersToNothing) {
     SemanticModel model = analyzeC(
         "struct S;\nint main(void) { return 0; }\n");
@@ -1642,7 +1655,7 @@ TEST(HirLoweringC, TopLevelForwardStructDeclLowersToNothing) {
 
 // c35: the LOCAL twin — a bare `struct S;` as a block STATEMENT is a (block-scoped)
 // forward declaration; lowers to nothing, no fail-loud. Contrast
-// LocalDeclaresNothingFailsLoud (`int;`, NO tag → still loud).
+// LocalDeclaresNothingWarns (`int;`, NO tag → still reported).
 TEST(HirLoweringC, LocalForwardStructDeclLowersToNothing) {
     SemanticModel model = analyzeC(
         "int main(void){ struct S; return 0; }\n");
@@ -8714,23 +8727,30 @@ TEST(HirLoweringC, LocalStructDefineAndDeclareAndRefLowerClean) {
 }
 
 // c28: a NON-defining no-declarator LOCAL (`int;`) declares nothing (C 6.7p2).
-// Mirroring the top-level `int ;` (TopLevelDeclaresNothingFailsLoudNoCrash), the
+// Mirroring the top-level `int ;` (TopLevelDeclaresNothingWarnsLoudNoCrash), the
 // front end (parse + semantic) ACCEPTS it, and the HIR lowering FAILS LOUD with
 // S_DeclarationDeclaresNothing — the local twin of the top-level no-object path
 // (lowerVarLikeInto: an empty list-mode declarator carrier with NO composite
 // specifier in the head). Must NOT crash and must NOT silently accept.
 // RED-on-disable: drop the lowerVarLikeInto declares-nothing guard → res->ok
 // stays true and the count is 0 (a silent accept).
-TEST(HirLoweringC, LocalDeclaresNothingFailsLoud) {
+// ★ P69 L2b2 (lane `lm`): RE-AIMED on the references' answer, a WARNING (probe l2b2e,
+// MEASURED 2026-11-05 — gcc, clang and Apple clang warn, cl accepts in silence).
+TEST(HirLoweringC, LocalDeclaresNothingWarns) {
     SemanticModel model = analyzeC("int main(void){ int; return 0; }\n");
     ASSERT_FALSE(model.hasErrors())
         << "parse + semantic accept `int;` — the constraint is HIR-tier";
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
-    EXPECT_FALSE(res->ok)
-        << "`int;` (no declarator, no tag) declares nothing — lowering must fail loud";
+    EXPECT_TRUE(res->ok)
+        << "`int;` (no declarator, no tag) declares nothing — a warning, and the lowering "
+           "goes on";
     EXPECT_EQ(countCode(r, DiagnosticCode::S_DeclarationDeclaresNothing), 1u)
         << "exactly one S_DeclarationDeclaresNothing for the empty local `int;`";
+    for (auto const& d : r.all())
+        if (d.code == DiagnosticCode::S_DeclarationDeclaresNothing)
+            EXPECT_EQ(d.severity, DiagnosticSeverity::Warning)
+                << "C diagnoses an empty declaration as a warning (semantics.declarators.emptyDeclarationWarns)";
 }
 
 // c89 (D-CSUBSET-SIZEOF-VALUE-OPERAND-TYPE): the VALUE-form sizeof operand is
@@ -11777,9 +11797,14 @@ TEST(HirLoweringC, SubscriptOfTwoPointersIsRefusedNotResolved) {
     SemanticModel model = analyzeC(
         "static int d[4];\n"
         "int main(void) { int *p = d; int *q = d; return p[q]; }\n");
-    ASSERT_FALSE(model.hasErrors())
-        << (model.diagnostics().all().empty()
-              ? "" : model.diagnostics().all()[0].actual);
+    // ★ P69 L2b2 (lane `lm`): THE SEMANTIC TIER REFUSES IT NOW, where every reference
+    // does. The constraint has one home (`subscriptConstraintOf`, type_rules.hpp), and the
+    // analyzer asks it at the subscript, so the model carries the one refusal; this pin
+    // asserted a CLEAN model while only the lowering asked. The lowering still asks the
+    // same home, and still refuses rather than aborting.
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_SubscriptOperandsNotPointerAndInteger), 1u)
+        << "the semantic tier refuses `p[q]` once, at the subscript";
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
     ASSERT_TRUE(res != nullptr);
@@ -11791,9 +11816,14 @@ TEST(HirLoweringC, SubscriptOfTwoPointersIsRefusedNotResolved) {
 TEST(HirLoweringC, SubscriptOfTwoIntegersIsRefusedNamingTheConstruct) {
     SemanticModel model = analyzeC(
         "int main(void) { int a = 1, b = 2; return a[b]; }\n");
-    ASSERT_FALSE(model.hasErrors())
-        << (model.diagnostics().all().empty()
-              ? "" : model.diagnostics().all()[0].actual);
+    // ★ P69 L2b2 (lane `lm`): THE SEMANTIC TIER REFUSES IT NOW, where every reference
+    // does. The constraint has one home (`subscriptConstraintOf`, type_rules.hpp), and the
+    // analyzer asks it at the subscript, so the model carries the one refusal; this pin
+    // asserted a CLEAN model while only the lowering asked. The lowering still asks the
+    // same home, and still refuses rather than aborting.
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_SubscriptOperandsNotPointerAndInteger), 1u)
+        << "the semantic tier refuses `a[b]` once, at the subscript";
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
     ASSERT_TRUE(res != nullptr);
@@ -13625,6 +13655,60 @@ TEST(HirLoweringC, ADllimportDeclarationLowersToAnImportNotToStorage) {
             EXPECT_NE(res->hir.kind(s), HirKind::VarDecl)
                 << c.what << ": an import inside a body is no local";
     }
+}
+
+// ── F1': AN UNRESOLVED TYPE IN EVERY POSITION f05 HOLDS IT ───────────────────────
+// The sibling of AnUnresolvedDeclaredTypeFailsLoudInsteadOfAbortingTheCompiler,
+// one TEST per position so the `[ RUN ]` line names a position that aborts.
+// `va_list` with no header in scope is the program's own unknown name: the
+// semantic tier reports S_UnknownType and leaves the type InvalidType — a state
+// no later fix can make valid, so these fixtures cannot rot. The pipeline never
+// lowers such a model (`lowerModelToHir` stops at the model's error); what this
+// tier owes a caller that does is a RETURN from `lowerToHir`, never an abort.
+// ✔MEASURED 2026-11-13 (macos-arm64-debug, host run 20261113-211922-9a805016):
+// every position returns. The abort MirLoweringC.ArrayRvalueValueReadDecaysNeverLoads's
+// old source hit (`dss::substrate fatal: TypeInterner::get: TypeId out of range`,
+// host run 20261105-194136-d2e3e46a) was MIR's, entered on such a model by a
+// fixture past the pipeline's gate.
+namespace {
+void expectLoweringReturns(char const* src) {
+    SemanticModel model = analyzeC(src);
+    ASSERT_GE(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 1u)
+        << "the fixture's precondition: `va_list` with no header is unknown";
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);   // must RETURN, not abort
+    ASSERT_TRUE(res != nullptr);
+}
+}  // namespace
+
+TEST(HirLoweringCUnresolvedType, AParameterOfAnUnresolvedTypeIsLoweredWithoutAborting) {
+    expectLoweringReturns("void take(va_list ap) { }\n");
+}
+
+TEST(HirLoweringCUnresolvedType, AMemberOfAnUnresolvedTypeIsLoweredWithoutAborting) {
+    expectLoweringReturns("struct S { int pad; va_list ap; };\n"
+                          "int f(struct S *s) { return s->pad; }\n");
+}
+
+TEST(HirLoweringCUnresolvedType, AGlobalOfAnUnresolvedTypeIsLoweredWithoutAborting) {
+    expectLoweringReturns("va_list gv;\n");
+}
+
+TEST(HirLoweringCUnresolvedType, AnUnresolvedGlobalAsAnArgumentIsLoweredWithoutAborting) {
+    expectLoweringReturns("void take(va_list ap);\n"
+                          "va_list gv;\n"
+                          "void f(void) { take(gv); }\n");
+}
+
+TEST(HirLoweringCUnresolvedType, AnUnresolvedMemberAsAnArgumentIsLoweredWithoutAborting) {
+    expectLoweringReturns("void take(va_list ap);\n"
+                          "struct S { int pad; va_list ap; };\n"
+                          "void f(struct S *s) { take(s->ap); }\n");
+}
+
+TEST(HirLoweringCUnresolvedType, AnUnresolvedPointeeAsAnArgumentIsLoweredWithoutAborting) {
+    expectLoweringReturns("void take(va_list ap);\n"
+                          "void f(va_list *pp) { take(*pp); }\n");
 }
 
 // ★ P69 (lane `cs`, fold f26b): AN ATTRIBUTE MAY LEAD A BLOCK-SCOPE `extern`

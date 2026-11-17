@@ -300,7 +300,14 @@ struct ConstEvalResult {
 //                     sequence, before any operand folds;
 //   * `isDiscarded(i)` — operand `i` is discarded: it must FOLD (all references refuse `(y, 42)`
 //                     for a non-constant `y`, ✔MEASURED P69 L2), and the first that does not is
-//                     the sequence's result; the last operand's fold is the value.
+//                     the sequence's result (`endsAt`); the last operand's fold is the value;
+//   * `reportsTheForm(folded)` — an evaluated sequence REPORTS the form it used once: it discards
+//                     an operand, the position admits that, and every operand folded (C 6.6p3's
+//                     constraint asks for the diagnostic; the references warn).
+// ★ P69 L2b2 (lane `lm`, the L2b1 review's K1): the result half and the warning are the rule's too.
+// The HIR tier's sequence frame decided "a discarded operand that did not fold is the result" by
+// its own test, and the CST tier's comma gated its note by its own expression; both ask the rule
+// now (`endsAt`, `reportsTheForm`), so an edit of the rule moves every tier together.
 struct DiscardedOperandSequence {
     std::size_t   operandCount = 0;
     ConstantForms admitted{};
@@ -312,11 +319,19 @@ struct DiscardedOperandSequence {
     [[nodiscard]] constexpr bool isDiscarded(std::size_t i) const noexcept {
         return i + 1 < operandCount;
     }
-    // The sequence's result after a DISCARDED operand's fold: that fold when it failed, else the
-    // fold of what follows it.
+    // A DISCARDED operand's fold ENDS the sequence when it failed: it is the sequence's result.
+    [[nodiscard]] static constexpr bool endsAt(ConstEvalResult const& discardedFold) noexcept {
+        return !discardedFold.value.has_value();
+    }
+    // The sequence's result after a DISCARDED operand's fold: that fold when it ends the
+    // sequence, else the fold of what follows it.
     [[nodiscard]] static ConstEvalResult afterDiscarded(ConstEvalResult discarded,
                                                         ConstEvalResult rest) {
-        return discarded.value.has_value() ? std::move(rest) : std::move(discarded);
+        return endsAt(discarded) ? std::move(discarded) : std::move(rest);
+    }
+    // Whether the evaluated sequence reports the form: `everyOperandFolded` is the evaluator's.
+    [[nodiscard]] constexpr bool reportsTheForm(bool everyOperandFolded) const noexcept {
+        return discards() && !refused() && everyOperandFolded;
     }
 };
 

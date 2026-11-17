@@ -1,0 +1,1 @@
+    for (ParseDiagnostic const& d : unaskedErrors(unit)) {

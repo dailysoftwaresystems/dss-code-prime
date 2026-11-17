@@ -24,6 +24,8 @@
  * under-bump flips sumTwoHfa off 38; a dropped ByReference deref flips sumLarge.
  * Mach-O-arm64; macos-latest CI leg is the runtime witness.
  */
+#include <stdarg.h>
+
 typedef struct { double a; double b; }        PairD;
 typedef struct { int    a; int    b; }        Pair;
 typedef struct { long   a; long   b; long c; } Big;

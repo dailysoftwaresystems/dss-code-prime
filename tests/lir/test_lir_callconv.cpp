@@ -1616,10 +1616,10 @@ TEST(LirCallconv, VlaVariadicFunctionAddressesItsVaAreasOffTheFramePointer) {
         auto bundle = lowerThroughRewrite(
             "int f(int n, ...) {\n"
             "  int a[n];\n"
-            "  va_list ap;\n"
-            "  va_start(ap, n);\n"
-            "  a[0] = va_arg(ap, int);\n"
-            "  va_end(ap);\n"
+            "  __builtin_va_list ap;\n"
+            "  __builtin_va_start(ap, n);\n"
+            "  a[0] = __builtin_va_arg(ap, int);\n"
+            "  __builtin_va_end(ap);\n"
             "  return a[0];\n"
             "}\n",
             pair.conventionIndex, pair.arch);
@@ -2943,9 +2943,9 @@ TEST(LirCallconvAbi, Win64VariadicCalleeHomeBaseCongruenceNoShadow) {
     // vaRegSaveAreaSize == 0 (Win64 has no callee-local register-save zone).
     auto bundle = lowerThroughRewrite(
         "int sum(int n, ...) {\n"
-        "    va_list ap; va_start(ap, n);\n"
-        "    int t = va_arg(ap, int);\n"
-        "    va_end(ap);\n"
+        "    __builtin_va_list ap; __builtin_va_start(ap, n);\n"
+        "    int t = __builtin_va_arg(ap, int);\n"
+        "    __builtin_va_end(ap);\n"
         "    return t;\n"
         "}\n",
         /*ccIndex=*/1);
@@ -5226,11 +5226,11 @@ TEST(LirCallconvAbi,
 TEST(LirCallconvVariadic, VaStartFunctionPrologueSpillsArgRegsIntoSaveArea) {
     auto bundle = lowerThroughRewrite(
         "int sum(int n, ...) {\n"
-        "  va_list ap;\n"
-        "  va_start(ap, n);\n"
+        "  __builtin_va_list ap;\n"
+        "  __builtin_va_start(ap, n);\n"
         "  int t = 0;\n"
-        "  for (int i = 0; i < n; i = i + 1) { t = t + va_arg(ap, int); }\n"
-        "  va_end(ap);\n"
+        "  for (int i = 0; i < n; i = i + 1) { t = t + __builtin_va_arg(ap, int); }\n"
+        "  __builtin_va_end(ap);\n"
         "  return t;\n"
         "}\n");
     ASSERT_TRUE(bundle.lowered.lir.ok) << "c → LIR failed";
@@ -5396,9 +5396,9 @@ TEST(LirCallconvAbiFC12c, SysVAndWin64VaListUnchanged) {
 TEST(LirCallconvVariadicFC12c, Aapcs64VariadicCalleeReservesAndSpillsSaveArea) {
     auto bundle = lowerThroughRewrite(
         "int sum(int n, ...) {\n"
-        "    va_list ap; va_start(ap, n);\n"
-        "    int t = va_arg(ap, int);\n"
-        "    va_end(ap);\n"
+        "    __builtin_va_list ap; __builtin_va_start(ap, n);\n"
+        "    int t = __builtin_va_arg(ap, int);\n"
+        "    __builtin_va_end(ap);\n"
         "    return t;\n"
         "}\n",
         /*ccIndex=*/0, /*targetName=*/"arm64");
@@ -5488,10 +5488,10 @@ TEST(LirCallconvVariadicFC12c, Aapcs64VariadicStructReturnPrologueScratchAvoidsX
     auto bundle = lowerThroughRewrite(
         "typedef struct { long a; long b; long c; } Big;\n"
         "Big make(int n, ...) {\n"
-        "    va_list ap; va_start(ap, n);\n"
+        "    __builtin_va_list ap; __builtin_va_start(ap, n);\n"
         "    long s = 0;\n"
-        "    for (int i = 0; i < n; i = i + 1) { s = s + va_arg(ap, long); }\n"
-        "    va_end(ap);\n"
+        "    for (int i = 0; i < n; i = i + 1) { s = s + __builtin_va_arg(ap, long); }\n"
+        "    __builtin_va_end(ap);\n"
         "    Big r; r.a = s; r.b = n; r.c = s + n; return r;\n"
         "}\n",
         /*ccIndex=*/0, /*targetName=*/"arm64");
@@ -5645,9 +5645,9 @@ TEST(LirCallconvVariadicFC12c, AppleForcesVarargToStackAapcs64KeepsInReg) {
 TEST(LirCallconvVariadicFC12c, AppleVaStartOverflowBaseCongruence) {
     auto bundle = lowerThroughRewrite(
         "int sum(int n, ...) {\n"
-        "    va_list ap; va_start(ap, n);\n"
-        "    int t = va_arg(ap, int);\n"
-        "    va_end(ap);\n"
+        "    __builtin_va_list ap; __builtin_va_start(ap, n);\n"
+        "    int t = __builtin_va_arg(ap, int);\n"
+        "    __builtin_va_end(ap);\n"
         "    return t;\n"
         "}\n",
         /*ccIndex=*/1, /*targetName=*/"arm64");
@@ -5701,9 +5701,9 @@ TEST(LirCallconvVariadicFC12c, AppleVaStartOverflowBaseCongruence) {
 TEST(LirCallconvVariadicFC12deferral4, SysVVaStartFixedStackOverflowBaseCongruence) {
     auto bundle = lowerThroughRewrite(
         "int pick(int a, int b, int c, int d, int e, int f, int g, ...) {\n"
-        "    va_list ap; va_start(ap, g);\n"
-        "    int v = va_arg(ap, int);\n"
-        "    va_end(ap);\n"
+        "    __builtin_va_list ap; __builtin_va_start(ap, g);\n"
+        "    int v = __builtin_va_arg(ap, int);\n"
+        "    __builtin_va_end(ap);\n"
         "    return a + g + v;\n"
         "}\n",
         /*ccIndex=*/0, /*targetName=*/"x86_64");
@@ -5752,9 +5752,9 @@ TEST(LirCallconvVariadicFC12deferral4, Aapcs64VaStartFixedStackOverflowBaseCongr
     auto bundle = lowerThroughRewrite(
         "int pick(int a, int b, int c, int d, int e, int f, int g, int h, int i,"
         " ...) {\n"
-        "    va_list ap; va_start(ap, i);\n"
-        "    int v = va_arg(ap, int);\n"
-        "    va_end(ap);\n"
+        "    __builtin_va_list ap; __builtin_va_start(ap, i);\n"
+        "    int v = __builtin_va_arg(ap, int);\n"
+        "    __builtin_va_end(ap);\n"
         "    return a + i + v;\n"
         "}\n",
         /*ccIndex=*/0, /*targetName=*/"arm64");
@@ -5907,9 +5907,9 @@ TEST(LirCallconvLargeFrameImm12, Aapcs64NinthFixedParamLoadUsesScaledLoadU) {
         " ...) {\n"
         "    long pad[40];\n"             // FOLD 1: 320B local -> frame > 255
         "    pad[0] = i;\n"
-        "    va_list ap; va_start(ap, i);\n"
-        "    int v = va_arg(ap, int);\n"
-        "    va_end(ap);\n"
+        "    __builtin_va_list ap; __builtin_va_start(ap, i);\n"
+        "    int v = __builtin_va_arg(ap, int);\n"
+        "    __builtin_va_end(ap);\n"
         "    return a + b + c + d + e + f + g + h + i + v;\n"
         "}\n",
         /*ccIndex=*/0, /*targetName=*/"arm64");

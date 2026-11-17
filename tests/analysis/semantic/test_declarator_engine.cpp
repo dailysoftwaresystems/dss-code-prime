@@ -36,6 +36,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -435,6 +436,112 @@ TEST(DeclaratorWalk, NonDeclaratorShapeYieldsNothing) {
     std::vector<NodeId> out;
     collectDeclarators(tree, stray, f.dc, out);
     EXPECT_TRUE(out.empty());
+}
+
+// ── P69 L2b2 (lane `lm`, the L2b1 review's V1): THE ARRAY BOUNDS A DECLARATOR WRITES ──
+// `declaratorOwnArraySuffixes` over every declarator form × {a named declarator, an abstract one}:
+// plain, under pointer layers, through a group, an array of pointers, a function returning a
+// pointer to an array (the RESULT's bound is the declarator's), a function pointer whose PARAMETER
+// holds a bound (none: the parameters' bounds are theirs), and two levels of that. Each form names
+// its own array suffixes in source order; a function suffix's parameter bound is never among them.
+// RED-ON-DISABLE: a direct declarator's group not followed (the forms whose bounds sit inside a
+// group lose them); a direct declarator's children taken left to right onto the work stack (every
+// form of two bounds reads them right to left). The walk follows only a direct declarator's group
+// and array suffixes, so it enters a function suffix by no path; the parameter rows are what a walk
+// that entered every child (the shape of the walks it replaces) would get wrong.
+TEST(DeclaratorWalk, ADeclaratorWritesItsOwnArrayBoundsAndNoParametersBound) {
+    struct Built {
+        NodeId              root;
+        std::vector<NodeId> expected;
+    };
+    // `named` ⇒ the innermost direct declarator holds a name token; else it is the abstract twin.
+    using Build = std::function<Built(WalkFixture&, RuleId innermost, bool named)>;
+    auto const asuf = [](WalkFixture& f) {
+        return f.node(f.rAsuf, {f.tok(f.tokOther), f.tok(f.tokOther, 1), f.tok(f.tokOther)});
+    };
+    auto const player = [](WalkFixture& f) { return f.node(f.rPlayer, {f.tok(f.tokStar)}); };
+    auto const group = [](WalkFixture& f, NodeId dtor) {
+        return f.node(f.rGroup, {f.tok(f.tokOther), dtor, f.tok(f.tokOther)});
+    };
+    // A function suffix whose one parameter is `p[c]`: the bound the walk must never return.
+    auto const fsufWithABound = [asuf](WalkFixture& f, NodeId& paramBound) {
+        paramBound = asuf(f);
+        NodeId const param =
+            f.node(f.rDtor, {f.node(f.rDirect, {f.tok(f.tokName, 2), paramBound})});
+        return f.node(f.rFsuf, {f.tok(f.tokOther), param, f.tok(f.tokOther)});
+    };
+    auto const base = [](WalkFixture& f, RuleId innermost, bool named, std::vector<NodeId> tail) {
+        std::vector<NodeId> kids;
+        if (named) kids.push_back(f.tok(f.tokName, 0));
+        kids.insert(kids.end(), tail.begin(), tail.end());
+        return f.node(innermost, std::move(kids));
+    };
+    struct Form {
+        char const* what;
+        Build       build;
+    };
+    Form const forms[] = {
+        {"plain, `x[a]`", [&](WalkFixture& f, RuleId in, bool named) {
+             NodeId const a = asuf(f);
+             return Built{f.node(f.rDtor, {base(f, in, named, {a})}), {a}};
+         }},
+        {"under pointer layers, `*x[a][b]`", [&](WalkFixture& f, RuleId in, bool named) {
+             NodeId const a = asuf(f);
+             NodeId const b = asuf(f);
+             return Built{f.node(f.rDtor, {player(f), base(f, in, named, {a, b})}), {a, b}};
+         }},
+        {"through a group, `(*x)[a]`", [&](WalkFixture& f, RuleId in, bool named) {
+             NodeId const a = asuf(f);
+             NodeId const inner = f.node(f.rDtor, {player(f), base(f, in, named, {})});
+             return Built{f.node(f.rDtor, {f.node(f.rDirect, {group(f, inner), a})}), {a}};
+         }},
+        {"an array of pointers to arrays, `(*x[a])[b]`", [&](WalkFixture& f, RuleId in, bool named) {
+             NodeId const a = asuf(f);
+             NodeId const b = asuf(f);
+             NodeId const inner = f.node(f.rDtor, {player(f), base(f, in, named, {a})});
+             return Built{f.node(f.rDtor, {f.node(f.rDirect, {group(f, inner), b})}), {a, b}};
+         }},
+        {"a function returning a pointer to an array, `(*f(p[c]))[b]`",
+         [&](WalkFixture& f, RuleId in, bool named) {
+             NodeId c;
+             NodeId const fs = fsufWithABound(f, c);
+             NodeId const b = asuf(f);
+             NodeId const inner = f.node(f.rDtor, {player(f), base(f, in, named, {fs})});
+             return Built{f.node(f.rDtor, {f.node(f.rDirect, {group(f, inner), b})}), {b}};
+         }},
+        {"a function pointer whose parameter holds a bound, `(*fp)(p[c])`",
+         [&](WalkFixture& f, RuleId in, bool named) {
+             NodeId c;
+             NodeId const fs = fsufWithABound(f, c);
+             NodeId const inner = f.node(f.rDtor, {player(f), base(f, in, named, {})});
+             return Built{f.node(f.rDtor, {f.node(f.rDirect, {group(f, inner), fs})}), {}};
+         }},
+        {"two levels, `(*(*f(p[c]))[b])[d]`", [&](WalkFixture& f, RuleId in, bool named) {
+             NodeId c;
+             NodeId const fs = fsufWithABound(f, c);
+             NodeId const b = asuf(f);
+             NodeId const d = asuf(f);
+             NodeId const innermost = f.node(f.rDtor, {player(f), base(f, in, named, {fs})});
+             NodeId const middle =
+                 f.node(f.rDtor, {player(f), f.node(f.rDirect, {group(f, innermost), b})});
+             return Built{f.node(f.rDtor, {f.node(f.rDirect, {group(f, middle), d})}), {b, d}};
+         }},
+    };
+    for (Form const& form : forms) {
+        for (bool const named : {true, false}) {
+            WalkFixture f{"x"};
+            RuleId const abstractDirect = f.rb.internRule("w_adirect");
+            f.dc.directAbstractRule = abstractDirect;
+            Built const built = form.build(f, named ? f.rDirect : abstractDirect, named);
+            Tree const tree   = std::move(f.rb).finish(built.root);
+            std::vector<NodeId> got;
+            declaratorOwnArraySuffixes(tree, built.root, f.dc, got);
+            std::vector<std::uint32_t> gotIds, wantIds;
+            for (NodeId n : got) gotIds.push_back(n.v);
+            for (NodeId n : built.expected) wantIds.push_back(n.v);
+            EXPECT_EQ(gotIds, wantIds) << form.what << (named ? ", named" : ", abstract");
+        }
+    }
 }
 
 // ── M3: the inversion engine (full parse + analyze pipeline) ────────────

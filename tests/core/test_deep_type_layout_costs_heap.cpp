@@ -30,7 +30,9 @@
 #include "hir/hir.hpp"
 #include "hir/hir_literal_pool.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
+#include "link/object_format_schema.hpp"
 #include "mir/lowering/hir_to_mir.hpp"
+#include "program/model_to_hir.hpp"   // lowerModelToHir — the pipeline's gates
 #include "mir/mir.hpp"
 #include "mir/mir_text.hpp"
 #include "tokenizer/token_stream.hpp"
@@ -108,8 +110,9 @@ constexpr std::size_t kOrdinaryThreadReserveBytes = std::size_t{1} * 1024 * 1024
 // large and input-INDEPENDENT (`bounded_stack.hpp` says why), so it must not
 // be what a bounded stage pays for.
 struct ShippedSchemas {
-    std::shared_ptr<GrammarSchema const> schema;
-    std::shared_ptr<TargetSchema const>  target;
+    std::shared_ptr<GrammarSchema const>      schema;
+    std::shared_ptr<TargetSchema const>       target;
+    std::shared_ptr<ObjectFormatSchema const> format;   // the unit is built for ELF x86_64
 };
 [[nodiscard]] ShippedSchemas const& shipped() {
     static ShippedSchemas const loadedOnce = [] {
@@ -117,7 +120,9 @@ struct ShippedSchemas {
         if (!loaded) throw std::runtime_error{"loadShipped(c) failed"};
         auto t = TargetSchema::loadShipped("x86_64");
         if (!t) throw std::runtime_error{"loadShipped(x86_64) failed"};
-        return ShippedSchemas{.schema = *loaded, .target = *t};
+        auto f = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-exec");
+        if (!f) throw std::runtime_error{"loadShipped(elf64-x86_64-linux-exec) failed"};
+        return ShippedSchemas{.schema = *loaded, .target = *t, .format = *f};
     }();
     return loadedOnce;
 }
@@ -150,7 +155,17 @@ struct ShippedSchemas {
         throw std::runtime_error{"deep-nest fixture did not analyze cleanly"};
 
     DiagnosticReporter hirReporter;
-    auto hir = lowerToHir(model, hirReporter);
+    ModelLoweredToHir lowered = lowerModelToHir(model, *shipped().format, hirReporter);   // the pipeline's gates
+    auto hir = std::move(lowered.hir);
+    if (!lowered.lowersToMir) {   // the build stops here, and so does the fixture: MIR never entered
+        HirToMirResult notEntered;
+        notEntered.ok = false;
+        return Lowered{.schema = std::move(schema),
+                       .target = std::move(target),
+                       .model  = std::move(model),
+                       .hir    = std::move(hir),
+                       .mir    = std::move(notEntered)};
+    }
 
     DiagnosticReporter mirReporter;
     MirLoweringConfig mirCfg = languageMirLoweringConfig(*schema);   // the pipeline's assembly

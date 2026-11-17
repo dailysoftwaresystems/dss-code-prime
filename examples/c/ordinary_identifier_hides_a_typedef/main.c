@@ -72,6 +72,20 @@ static int (*(*s1d(int S1))(int))(int) { return (S1) - 1 ? 0 : s1d2; }
 static void s1sig(int x) { (void)x; }
 static void (*s1e(int S1, void (*fn)(int)))(int) { return (S1) - 1 ? 0 : fn; }
 
+/* 29-32 (P69 L2b2): the same definitions with their tokens written by MACROS — the returned list
+ * from a macro BODY and the own list from its argument (29), the returned list's parameter named in
+ * the body (30), the own list from a second macro defined after the first (31), two levels of
+ * returned function pointers from one body (32). Which lists a declarator holds is decided by the
+ * order of the PARSE, never by the source offsets a macro gives its tokens. */
+#define S2_RET(d) int (*d)(int)
+#define S2_RETU(d) int (*d)(int u)
+#define S2_RET2(d) int (*(*d)(int))(int)
+#define S2_OWN (int S1)
+static S2_RET(s2a(int S1)) { return (S1) - 1 ? 0 : s1h; }
+static S2_RETU(s2b(int S1)) { return (S1) - 1 ? 0 : s1h; }
+static S2_RET(s2c S2_OWN) { return (S1) - 1 ? 0 : s1h; }
+static S2_RET2(s2d(int S1)) { return (S1) - 1 ? 0 : s1d2; }
+
 int main(void) {
     { A1 x = 40; struct A1 s = { 2 }; if ((A1)(x) + s.a != 42) return 1; }
     { B1 x = 40; struct B1 s = { 2 }; if ((B1)(x) + s.a != 42) return 2; }
@@ -109,5 +123,9 @@ int main(void) {
     if (s1c(1) != s1v) return 26;
     if (s1d(1) != s1d2 || s1d(1)(0)(42) != 42) return 27;
     if (s1e(1, s1sig) != s1sig) return 28;
+    if (s2a(1) != s1h || s2a(1)(42) != 42) return 29;
+    if (s2b(1) != s1h || s2b(1)(42) != 42) return 30;
+    if (s2c(1) != s1h || s2c(1)(42) != 42) return 31;
+    if (s2d(1) != s1d2 || s2d(1)(0)(42) != 42) return 32;
     return 42;
 }

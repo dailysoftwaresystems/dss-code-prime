@@ -39,6 +39,7 @@
 #include "run_binary.hpp"               // runBinary (behavioral exit-code proof)
 #include "scratch_dir.hpp"
 #include "unc_spelling.hpp"             // the ONE multi-separator-root fixture
+#include "driver_diagnostics_listener.hpp"   // AskedDriverCodes
 
 #include <gtest/gtest.h>
 
@@ -1559,6 +1560,7 @@ TEST(CompileProjectIntegration, UnsupportedProfileRejectedBeforeCompile) {
 // control flowed past enforcement to delegation (1 source → the
 // single-CU `compileFiles` route).
 TEST(CompileProjectIntegration, SupportedProfileProceedsPastGate) {
+    dss::test_support::AskedDriverCodes const asked{dss::DiagnosticCode::D_FileNotFound};   // the absent source is the downstream failure past the gate
     dss::test_support::ScratchDir scratch{
         dss::test_support::Location::Temp, "program"};
     auto path = writeProjectFile(scratch.path(), R"({
@@ -1657,6 +1659,7 @@ TEST(EnforceArtifactProfileFormatShipped, ExecServesCliRejectsLib) {
 // compile (which then fails downstream on the missing source — NOT via a
 // profile gate). Proves the format gate accepts + control flowed past it.
 TEST(CompileProjectIntegration, CliProfilePassesFormatGate) {
+    dss::test_support::AskedDriverCodes const asked{dss::DiagnosticCode::D_FileNotFound};   // the absent source is the downstream failure past the gate
     dss::test_support::ScratchDir scratch{
         dss::test_support::Location::Temp, "program"};
     auto path = writeProjectFile(scratch.path(), R"({
@@ -1942,6 +1945,7 @@ int runMatrixCell(std::string_view language, std::string_view profile,
 // gate). Proves toy flows THROUGH compileProject (toy had never been
 // driven through it before AP4).
 TEST(ArtifactProfileMatrix, ToyCliPassesBothGatesThenFailsDownstream) {
+    dss::test_support::AskedDriverCodes const asked{dss::DiagnosticCode::D_FileNotFound};   // the absent source is the downstream failure the cell asserts
     DiagnosticReporter rep;
     int const rc = runMatrixCell("toy", "cli", kExecTarget, rep);
     EXPECT_NE(rc, 0) << "absent source must fail the build downstream";

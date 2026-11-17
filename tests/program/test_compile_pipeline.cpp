@@ -45,6 +45,7 @@
 #include "program/program.hpp"
 #include "scratch_dir.hpp"
 #include "link_facts.hpp"   // ordinaryLinkFormat (P69: mergeCuMirs reads the link's document)
+#include "driver_diagnostics_listener.hpp"   // AskedDriverCodes
 
 #include <gtest/gtest.h>
 
@@ -244,8 +245,7 @@ TEST(Program_CompileFiles, EmptyDeclOnlyTuEmitsValidEmptyObject) {
 // tokenize / expand, D-PERF-1-PREPROCESSOR), which run for ANY C compile. (Phases a
 // trivial source legitimately skips — the STANDALONE tokenize [c
 // preprocesses, so its tokenize is the preprocess-tokenize sub-phase],
-// reparse [no ambiguous cast], synthesize-ffi [no externs] — are
-// deliberately un-asserted.)
+// synthesize-ffi [no externs] — are deliberately un-asserted.)
 TEST(Program_CompileFiles, PhaseTimersRecordEveryPipelinePhase) {
     using dss::substrate::CompilePhase;
     using dss::substrate::PhaseTimers;
@@ -1984,6 +1984,7 @@ TEST(Program_CompileFiles, UnknownFormatNameReturnsNonZero) {
 }
 
 TEST(Program_CompileFiles, NonExistentSourceFileReturnsNonZero) {
+    dss::test_support::AskedDriverCodes const asked{dss::DiagnosticCode::D_FileNotFound};   // the missing source IS the subject
     // pr-test-analyzer FOLD-NOW: a source file path that doesn't
     // exist is the archetype silent-failure-hunter case for the
     // post-fold CU-diagnostic drain. `UnitBuilder::addFile` emits
@@ -3279,6 +3280,8 @@ namespace {
     ScratchDir sysDir{Location::InsideRepo, "model3-libresolve"};
     std::ofstream(sysDir.path() / "stdio.json", std::ios::binary) << descJson;
     UnitBuilder builder{grammar, DiagnosticBudget::libraryDefault()};
+    dss::test_support::AskedDriverCodes const clearedDirs{dss::DiagnosticCode::C_UnbackedPredefinedMacro};   // no shipped dirs: the language's predefines are unbacked
+    builder.clearSystemDirs();   // the test's own system dirs, not the shipped ones
     builder.addSystemDir(sysDir.path());
     builder.addInMemory("#include <stdio.h>\nint main() { puts(\"hi\"); return 0; }\n",
                         "main.c");
@@ -3313,6 +3316,8 @@ namespace {
     ScratchDir sysDir{Location::InsideRepo, "model3-libresolve"};
     std::ofstream(sysDir.path() / "stdio.json", std::ios::binary) << descJson;
     UnitBuilder builder{grammar, DiagnosticBudget::libraryDefault()};
+    dss::test_support::AskedDriverCodes const clearedDirs{dss::DiagnosticCode::C_UnbackedPredefinedMacro};   // no shipped dirs: the language's predefines are unbacked
+    builder.clearSystemDirs();   // the test's own system dirs, not the shipped ones
     builder.addSystemDir(sysDir.path());
     builder.addInMemory(R"(#include <stdio.h>
 int main() { puts("hi"); return 0; }
@@ -4226,8 +4231,7 @@ TEST(Program_CuParallelism, FrontHalfActuallyRunsConcurrently) {
         substrate::CompilePhase::Preprocess,      substrate::CompilePhase::PreprocessSplice,
         substrate::CompilePhase::PreprocessTokenize, substrate::CompilePhase::PreprocessExpand,
         substrate::CompilePhase::Tokenize,        substrate::CompilePhase::Parse,
-        substrate::CompilePhase::Reparse,         substrate::CompilePhase::ResolveImports,
-        substrate::CompilePhase::Semantic,
+        substrate::CompilePhase::ResolveImports,  substrate::CompilePhase::Semantic,
     };
     bool anyFrontOverlap = false;
     for (substrate::CompilePhase const p : kFront) {

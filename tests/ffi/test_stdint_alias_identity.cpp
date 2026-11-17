@@ -61,6 +61,7 @@
 #include "ffi/shipped_lib_descriptor.hpp"
 #include "repo_root.hpp"
 #include "scratch_dir.hpp"
+#include "validation_va_list_binding.hpp"   // the descriptor word a validation read binds (c82)
 
 #include <nlohmann/json.hpp>
 
@@ -139,7 +140,7 @@ private:
     void add(fs::path const& p, std::string_view arch, ObjectFormatKind fmt,
              DataModel model) {
         auto d = readShippedLibDescriptor(p, interner_, typeReg_, reporter_, model,
-                                          arch, fmt);
+                                          arch, fmt, dss::test_support::validationVaListBinding(interner_));
         if (!d) { ok_ = false; return; }
         descs_.push_back(std::move(*d));
     }
@@ -612,7 +613,8 @@ TEST(StdintAliasIdentity, DeletingTheFormatKeysRestoresTheAmbiguityTheRowRemoved
     DiagnosticReporter rep;
     auto const desc = readShippedLibDescriptor(stdintJson, interner, typeReg, rep,
                                                DataModel::Lp64, std::string_view{"arm64"},
-                                               ObjectFormatKind::MachO);
+                                               ObjectFormatKind::MachO,
+                                               dss::test_support::validationVaListBinding(interner));
     EXPECT_TRUE(rep.hasErrors())
         << "with the format keys gone, two LP64 arms match on Darwin and the read "
            "must be REFUSED — a clean read means the ambiguity is being resolved "

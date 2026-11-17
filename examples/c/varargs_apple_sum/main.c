@@ -20,6 +20,8 @@
 // leg (no qemu for Mach-O). SkippedCrossHost on a non-macOS host — expected, NOT a
 // failure.
 
+#include <stdarg.h>
+
 int sum(int n, ...) {
     va_list ap;
     va_start(ap, n);

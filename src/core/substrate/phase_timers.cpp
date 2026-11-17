@@ -125,7 +125,6 @@ std::string_view compilePhaseName(CompilePhase p) noexcept {
         case CompilePhase::PreprocessExpand:   return "preprocess-expand";
         case CompilePhase::Tokenize:       return "tokenize";
         case CompilePhase::Parse:          return "parse";
-        case CompilePhase::Reparse:        return "reparse";
         case CompilePhase::ResolveImports: return "resolve-imports";
         case CompilePhase::Semantic:       return "semantic";
         case CompilePhase::LowerHir:       return "lower-hir";

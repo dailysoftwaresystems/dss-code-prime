@@ -1,0 +1,4 @@
+                        d.code     = DiagnosticCode::S_TypeNameInValuePosition;
+                        d.severity = DiagnosticSeverity::Error;
+                        d.buffer   = tree.source().id();
+                        d.span     = tree.span(tree.parent(node));

@@ -656,6 +656,12 @@ dss_add_test(NAME program/test_release_hidden_definitions
 dss_add_test(NAME program/test_compiled_symbol_alias_object
              SOURCES test_compiled_symbol_alias_object.cpp)
 
+# P69 L2b2 (lane `lm`, ruling 575): the pipeline's gates from the analysis to HIR→MIR
+# (`lowerModelToHir`) — a model with an error is never lowered, a HIR that reported an error
+# never goes on to MIR, and a clean one is settled for its format first.
+dss_add_test(NAME program/test_model_to_hir
+             SOURCES test_model_to_hir.cpp)
+
 # P69 (lane `cs`, fold f26b; D-LK-OBJECT-STV-PROTECTED-DROPPED): a visibility the target's format cannot write is
 # written as the format document's `visibilityWrittenAs` states, settled once per unit and warned
 # (`H_VisibilityWrittenAsAnother`) — the shipped documents' statements, the loader's refusals, a unit settled to a

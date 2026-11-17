@@ -1,15 +1,16 @@
 {
-  "$comment": "Neutral shipped <stdarg.h> (C89 7.15). `va_list` + `va_start`/`va_arg`/`va_end`/`va_copy` are ALREADY BUILT IN: the c grammar declares the variadic rules, so the semantic phase injects the `va_list` builtin type (target-specific: __va_list_tag[1] on SysV, char* on Win64/Apple-arm64, __va_list on AAPCS64 — selected by VaListStrategy) and the parser lowers the va_* operations directly. So this descriptor exists to make `#include <stdarg.h>` RESOLVE (the angle-include resolver maps the header stem to <stem>.json; a missing descriptor fires F_ShippedHeaderNotFound), and to make the five names MACROS once it is included, as C 7.16 says they are — code tests `#ifdef va_copy` (or `__va_copy`) before choosing how to copy a list. P69 (lane `cs`, D-C-STDARG-VA-COPY-MISSING): ✔MEASURED 2026-09-30 (the lane's probe pp2): after `#include <stdarg.h>`, gcc 13.3.0 and clang 18.1.3 (both modes) define all five, MSVC 19.51 the four without `__va_copy`, and none of the three defines any without the include. Each macro expands to the keyword of its own name (`__va_copy` to `va_copy`); a macro is never re-expanded inside its own expansion (C 6.10.3.4p2), so the expansion reaches the grammar as the keyword. The `va_list` typedef is documentary — the builtin of the same name WINS (README: 'A builtin type of the same name wins'), so this alias is shadowed and never affects codegen; ptr<void> is a placeholder shape only.",
+  "$comment": "Neutral shipped <stdarg.h> (C89 7.15, C23 7.16). The c grammar's always-visible spellings of the list type and its operations are gcc and clang's builtins — `__builtin_va_list` (`semantics.variadic`.vaListTypeNames: the semantic phase binds it to the target's list type, selected by VaListStrategy — __va_list_tag[1] on SysV, char* on Win64 / Apple arm64, __va_list on AAPCS64) and the keywords `__builtin_va_start`, `__builtin_va_arg`, `__builtin_va_end`, `__builtin_va_copy`, which the parser lowers directly. The plain names are THIS header's, as C 7.1.3 reserves them only when it is included (P69 L2b2, lane `lm`, MEASURED: with no header every reference compiles a program's own `va_list`, `va_start`, `va_arg`, `va_end`, `va_copy`, `__va_copy`). So this descriptor exists to make `#include <stdarg.h>` RESOLVE (the angle-include resolver maps the header stem to <stem>.json; a missing descriptor fires F_ShippedHeaderNotFound), and to make the five names MACROS once it is included, as C 7.16 says they are — code tests `#ifdef va_copy` (or `__va_copy`) before choosing how to copy a list. P69 (lane `cs`, D-C-STDARG-VA-COPY-MISSING): ✔MEASURED 2026-09-30 (the lane's probe pp2): after `#include <stdarg.h>`, gcc 13.3.0 and clang 18.1.3 (both modes) define all five, MSVC 19.51 the four without `__va_copy`, and none of the three defines any without the include. Each macro expands to its builtin keyword (`va_copy` and `__va_copy` both to `__builtin_va_copy`), which no macro shadows, so the expansion reaches the grammar as the keyword. The typedefs `va_list` and `__gnuc_va_list` (the spelling glibc, Apple and MinGW-w64 headers declare beside it) name the descriptor word `va_list` — the list type the semantic tier builds for the active strategy — so each is the very TypeId `__builtin_va_list` is, never a stand-in shape (P69 L2b2, lane `lm`: MEASURED 2026-11-05, probes l2b2h — `__gnuc_va_list` is visible after <stdarg.h> on glibc gcc 13.3.0 and clang 18.1.3, Apple clang and MinGW-w64 gcc, not cl; the union admits it on every format).",
   "header": "stdarg.h",
   "standard": "c89",
   "typedefs": [
-    { "name": "va_list", "type": "ptr<void>" }
+    { "name": "va_list",        "type": "va_list" },
+    { "name": "__gnuc_va_list", "type": "va_list" }
   ],
   "macros": [
-    { "name": "va_start",  "params": [], "variadic": true, "replacement": "va_start(__VA_ARGS__)" },
-    { "name": "va_arg",    "params": ["ap", "T"],          "replacement": "va_arg(ap, T)" },
-    { "name": "va_end",    "params": ["ap"],               "replacement": "va_end(ap)" },
-    { "name": "va_copy",   "params": ["dest", "src"],      "replacement": "va_copy(dest, src)" },
-    { "name": "__va_copy", "params": ["dest", "src"],      "replacement": "va_copy(dest, src)" }
+    { "name": "va_start",  "params": [], "variadic": true, "replacement": "__builtin_va_start(__VA_ARGS__)" },
+    { "name": "va_arg",    "params": ["ap", "T"],          "replacement": "__builtin_va_arg(ap, T)" },
+    { "name": "va_end",    "params": ["ap"],               "replacement": "__builtin_va_end(ap)" },
+    { "name": "va_copy",   "params": ["dest", "src"],      "replacement": "__builtin_va_copy(dest, src)" },
+    { "name": "__va_copy", "params": ["dest", "src"],      "replacement": "__builtin_va_copy(dest, src)" }
   ]
 }

@@ -224,7 +224,7 @@ std::size_t checkOneTarget(fs::path const& root, GrammarSchema const& sch,
     // the read fails loud. Any consistent stand-in works here — the checker only
     // compares TypeIds, and the SAME id is bound for every descriptor.
     std::array<NamedTypeBinding, 1> const named{
-        NamedTypeBinding{"va_list",
+        NamedTypeBinding{dss::ffi::kVaListDescriptorTypeName,
                          interner.pointer(interner.primitive(TypeKind::Void))}};
 
     Vocabulary const vocab = vocabularyFor(sch, ax.dm, ax.ldf);

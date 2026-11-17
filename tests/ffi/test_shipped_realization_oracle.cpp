@@ -151,7 +151,7 @@ using dss::ffi_test::FixtureRoleResolver;
     // descriptor is silently absent — the shape that once made `abort` link and
     // `putchar` not. Any consistent stand-in works; nothing here reads the id.
     std::array<NamedTypeBinding, 1> const named{
-        NamedTypeBinding{"va_list",
+        NamedTypeBinding{dss::ffi::kVaListDescriptorTypeName,
                          interner.pointer(interner.primitive(TypeKind::Void))}};
     FixtureRoleResolver const roles{fmt};
     auto const realized = realizeShippedExternSymbols(

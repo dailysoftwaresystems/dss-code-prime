@@ -8,5 +8,10 @@
     "source": "test_support/pch_stub.cpp",
     "site": "CMakeLists.txt",
     "reason": "NOT a test. A translation unit that exists only so add_library(dss_test_pch STATIC ...) in the tests-root CMakeLists.txt has something to compile, which is what lets target_precompile_headers PRODUCE the one shared test PCH every dss_add_test target consumes via REUSE_FROM. It contains no assertions and defines no symbol worth running."
+  },
+  {
+    "source": "test_support/driver_diagnostics_listener.cpp",
+    "site": "CMakeLists.txt",
+    "reason": "NOT a gtest suite. It is the one source of add_library(dss_test_driver_diagnostics OBJECT ...) in the tests-root CMakeLists.txt, which dss_add_test links into EVERY test binary and the examples runner links too: its static initializer registers the observer that fails a test whose unit was finished with a driver Error the test did not ask for. Its own pin is test_support/test_driver_diagnostics_listener.cpp, registered with dss_add_test; registering this file the same way would make the observer a test of its own, which it is not."
   }
 ]

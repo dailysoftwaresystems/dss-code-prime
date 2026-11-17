@@ -1,0 +1,1 @@
+    pushBinding_(entryFor_(std::move(name)), 0, /*isType=*/false);

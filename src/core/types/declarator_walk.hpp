@@ -7,6 +7,8 @@
 #include "core/types/tree_node.hpp"
 
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 // FC4 c1 (M2): the ONE declarator name-extraction walk, shared by BOTH the
@@ -58,6 +60,15 @@ template <class View>
         if (v.kind(c) == NodeKind::Internal && v.rule(c) == rule) return c;
     }
     return {};
+}
+
+// The one answer of a descent that reached ANOTHER name than the one its caller climbed from
+// (P69 L2b2): the declarator nest is not a shape the walk knows, and the process stops loud, the
+// walk's name first, as `substrate::failOnCyclicWalk` does.
+[[noreturn]] inline void failOnAnotherName(char const* walk) {
+    std::fprintf(stderr, "dss::declarator walk fatal: %s: the descent from the outermost declarator "
+                         "reached another name than the one its climb started from\n", walk);
+    std::abort();
 }
 
 } // namespace declarator_walk_detail
@@ -678,7 +689,13 @@ template <class View>
             }
         }
         if (name.valid()) {
-            if (expectedName.valid() && name.v != expectedName.v) return {};
+            // P69 L2b2 (lane `lm`, the L2b1 review's F1): the climb started from `expectedName`, so
+            // the descent from the top it found reaches that name, or the nest is not the shape the
+            // walk knows — stopped by name, never answered "no derivation" (every tier would read
+            // the name's type as the head's: a function as an object, a definition's own list lost).
+            if (expectedName.valid() && name.v != expectedName.v) {
+                declarator_walk_detail::failOnAnotherName("innermostDerivationOf");
+            }
             levels.push_back(Level{declarator, cur, name});
             break;
         }
@@ -781,6 +798,81 @@ declaratorFnSuffixNode(Tree const& tree, NodeId nameNode,
     NodeId const der = innermostNameDerivation(tree, nameNode, dc);
     if (!der.valid() || tree.kind(der) != NodeKind::Internal) return {};
     return isFnSuffixRule(tree.rule(der), dc) ? der : NodeId{};
+}
+
+// ── ★ P69 L2b2 (lane `lm`, the L2b1 review's V1): THE ARRAY BOUNDS A DECLARATOR WRITES ─────────
+// The array suffixes of `start`'s own declarator nest, in source order: through its pointer
+// layers, its direct (and abstract direct) declarators, its parenthesis groups and every suffix a
+// level carries — so the RESULT side of a function declarator, a suffix written after the group
+// that holds the function's name (`int (*f(int n))[m]`: `[m]`), is the declarator's — and never
+// into a function suffix: its parameters' bounds are the PARAMETERS' (C 6.7.6.3), evaluated where
+// the function is entered, never where its declarator or a type name holding it is (`int (*)(int
+// m, int (*)[m])` writes no bound; gcc 13.3.0 and clang 18.1.3 build `_Generic(0, int (*)(int m,
+// int (*)[m]): 1, default: 42)` and run it to 42, ✔MEASURED 2026-11-04, probe-reference-cc runs
+// 20261104-205440-634751cd / 20261104-205545-97ec04c3). An array suffix's own subtree is its bound
+// (one expression) and is not entered. `start` is a declarator, a per-slot wrapper, a direct or an
+// abstract direct declarator; anything else writes none.
+// "Variably modified" asks three questions, each with ONE home, none a copy of another: whether a
+// TYPE is variably modified (`TypeInterner::isVariablyModified`); which bounds a DECLARATOR or a
+// type name writes and so evaluates (this walk); and a VLA OBJECT's storage and stride (the array
+// spine, `typeContainsVla` / `isVlaArray`). Iterative: a work stack bounded by the tree it walks.
+template <class View>
+void declaratorOwnArraySuffixes(View const& v, NodeId start, DeclaratorConfig const& dc,
+                                std::vector<NodeId>& out) {
+    auto const isDirect = [&dc](RuleId r) noexcept {
+        return r == dc.directRule
+            || (dc.directAbstractRule.has_value() && r == *dc.directAbstractRule);
+    };
+    auto const isArraySuffix = [&dc](RuleId r) noexcept {
+        return r == dc.arraySuffixRule
+            || (dc.arrayStarSuffixRule.has_value() && r == *dc.arrayStarSuffixRule);
+    };
+    std::vector<NodeId> stack{start};
+    for (substrate::WalkSteps steps{v.nodeCount(), "declaratorOwnArraySuffixes' walk"};
+         !stack.empty(); steps.step()) {
+        NodeId const cur = stack.back();
+        stack.pop_back();
+        if (!cur.valid() || v.kind(cur) != NodeKind::Internal) continue;
+        RuleId const r = v.rule(cur);
+        if (isDeclaratorSlotWrapper(r, dc)) {
+            stack.push_back(declarator_walk_detail::firstChildOfRule(v, cur, dc.declaratorRule));
+            continue;
+        }
+        if (r == dc.groupRule) {
+            stack.push_back(declarator_walk_detail::firstChildOfRule(v, cur, dc.declaratorRule));
+            continue;
+        }
+        if (r == dc.declaratorRule) {   // its pointer layers write no bound; its direct does
+            for (NodeId c : v.children(cur)) {
+                if (v.isVisible(c) && v.kind(c) == NodeKind::Internal && isDirect(v.rule(c))) {
+                    stack.push_back(c);
+                    break;
+                }
+            }
+            continue;
+        }
+        if (isDirect(r)) {
+            // Its group (the nest's next level, written first) and its array suffixes, in source
+            // order: pushed in reverse, so they pop left to right. Only those two: a function
+            // suffix's parameters' bounds are theirs, and a decoration (an attribute run, an asm
+            // label) writes none — so neither is ever entered, by construction.
+            auto const kids = v.children(cur);
+            for (std::size_t i = kids.size(); i-- > 0;) {
+                NodeId const c = kids[i];
+                if (!v.isVisible(c) || v.kind(c) != NodeKind::Internal) continue;
+                RuleId const cr = v.rule(c);
+                if (isArraySuffix(cr) || cr == dc.groupRule) stack.push_back(c);
+            }
+            continue;
+        }
+        if (isArraySuffix(r)) out.push_back(cur);
+    }
+}
+
+// The same walk over a frozen `Tree`.
+inline void declaratorOwnArraySuffixes(Tree const& tree, NodeId start, DeclaratorConfig const& dc,
+                                       std::vector<NodeId>& out) {
+    declaratorOwnArraySuffixes(TreeDeclaratorView{tree}, start, dc, out);
 }
 
 } // namespace dss

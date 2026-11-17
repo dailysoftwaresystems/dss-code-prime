@@ -303,19 +303,14 @@ readCHeaderFromText(std::string_view      text,
     // `long double`. A header now reads here the way it reads in the build.
     //
     // The language's SYSTEM include directories come with it, as they do for
-    // every channel that builds a unit (`applySystemDirs`): without them
+    // every unit (`UnitBuilder` takes its language's at construction): without them
     // `__has_include(<h>)` answers "no" for every shipped header whatever the
     // pair's case rule says, and every predefined macro's surface claim is
     // unbacked.
     UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
-    applySystemDirs(builder, **loaded);
     applyTargetFormatPair(builder, pair.target, pair.format);
     builder.addInMemory(std::string{text}, std::string{headerPathLabel});
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
-    SemanticModel model =
-        analyzeForTargetFormat(cu, DiagnosticBudget::libraryDefault(), pair.target,
-                               pair.format, pair.callingConvention)
-            .model;
 
     // ★★★ THE HEADER'S BUFFERS MUST TRAVEL WITH ITS DIAGNOSTICS, OR THE
     // DIAGNOSTICS CANNOT BE RENDERED. `cu` is a CompilationUnit the driver never
@@ -341,6 +336,33 @@ readCHeaderFromText(std::string_view      text,
     for (auto const& b : cu->auxiliaryBuffers()) {
         if (b) reporter.sourceBuffers().add(b);
     }
+
+    // ★★★ THE UNIT'S OWN VERDICT FIRST, AS THE BUILD READS IT. The build fails a
+    // unit on its driver stream or any tree's stream and analyses only the units
+    // that survive (`runCusToTargets`). This reader used to analyse at once and
+    // forward only the analysis's diagnostics, so a header whose `#include`
+    // resolved nowhere (F_ShippedHeaderNotFound) or whose parser recovered past a
+    // syntax error (P_*) was read as the declarations that happened to survive —
+    // an import surface smaller than the header, with no diagnostic and no error.
+    // The streams and the verdict come from their one home.
+    bool const unitFailed =
+        cu->forEachOwnDiagnosticStream([&reporter](DiagnosticReporter const& stream) {
+            reporter.sourceBuffers().addAll(stream.sourceBuffers());
+            for (auto const& d : stream.all()) reporter.report(d);
+        });
+    if (unitFailed) {
+        return std::unexpected(emitWithFirstReportedCause(
+            HeaderReadErrorKind::HeaderParseFailed,
+            std::string{"c frontend rejected header '"}
+                + std::string{headerPathLabel} + "' — see preceding diagnostics.",
+            diagsSince(reporter, errStart),
+            reporter));
+    }
+
+    SemanticModel model =
+        analyzeForTargetFormat(cu, DiagnosticBudget::libraryDefault(), pair.target,
+                               pair.format, pair.callingConvention)
+            .model;
     for (auto const& d : model.diagnostics().all()) {
         reporter.report(d);
     }

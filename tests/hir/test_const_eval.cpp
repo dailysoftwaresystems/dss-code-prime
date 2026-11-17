@@ -2938,8 +2938,13 @@ TEST(ConstEvalAddress, ASequenceDiscardingNothingNeedsNoForm) {
 // it over the operand counts a sequence can have and both admissions; then a discarded operand
 // that does not fold is the sequence's result, through this tier's SeqExpr (`(y, 42)` with `y` no
 // constant: every reference refuses it).
-// RED-ON-DISABLE: `refused()` ignoring the admission, `discards()` counting the value alone, or
-// `afterDiscarded` keeping the value past a failed discarded operand.
+// P69 L2b2 (lane `lm`, the L2b1 review's K1): and the rule's result half and its warning — `endsAt`
+// (a discarded operand that did not fold ends the sequence), which this tier's sequence frame now
+// asks, and `reportsTheForm`, which the CST tier's comma asks — then a discarded operand at every
+// position of a longer sequence, through this tier.
+// RED-ON-DISABLE: `refused()` ignoring the admission, `discards()` counting the value alone,
+// `isDiscarded()` taking a discarded operand for the value, `endsAt` never ending the sequence, or
+// `reportsTheForm` never reporting it.
 TEST(ConstEvalSequence, TheCommasOneRuleDecidesEveryPartOfASequence) {
     ConstantForms comma;
     comma.admit(ConstantForm::CommaOperator);
@@ -2973,11 +2978,40 @@ TEST(ConstEvalSequence, TheCommasOneRuleDecidesEveryPartOfASequence) {
         << "a folded discarded operand hands on what follows it";
     EXPECT_FALSE(DiscardedOperandSequence::afterDiscarded(notFolded, folded).value.has_value())
         << "a discarded operand that did not fold is the sequence's result";
-    // Through the tier: a discarded operand that is no constant refuses the whole sequence.
-    AddrRig r;
-    std::array<HirNodeId, 1> one{r.builder.makeExprStmt(r.ref(kSymLocal, r.intT()))};
-    HirNodeId const e = r.builder.makeSeqExpr(one, r.litInt(42, r.intT()), r.intT());
-    expectRefused(evalAddr(r, e, allForms()));
+    EXPECT_TRUE(DiscardedOperandSequence::endsAt(notFolded)) << "a failed discarded fold ends it";
+    EXPECT_FALSE(DiscardedOperandSequence::endsAt(folded)) << "a folded discarded operand does not";
+    for (Row const& r : rows) {
+        DiscardedOperandSequence const seq{.operandCount = r.operands, .admitted = r.admitted};
+        for (bool const everyOperandFolded : {false, true}) {
+            EXPECT_EQ(seq.reportsTheForm(everyOperandFolded),
+                      r.discards && !r.refused && everyOperandFolded)
+                << r.operands << " operands, comma "
+                << (r.admitted.admits(ConstantForm::CommaOperator) ? "admitted" : "not admitted")
+                << (everyOperandFolded ? ", every operand folded" : ", an operand did not fold");
+        }
+    }
+    // Through the tier: a discarded operand that is no constant refuses the whole sequence, at the
+    // first position and at a later one; three constants fold to the last.
+    {
+        AddrRig r;
+        std::array<HirNodeId, 1> one{r.builder.makeExprStmt(r.ref(kSymLocal, r.intT()))};
+        HirNodeId const e = r.builder.makeSeqExpr(one, r.litInt(42, r.intT()), r.intT());
+        expectRefused(evalAddr(r, e, allForms()));
+    }
+    {
+        AddrRig r;
+        std::array<HirNodeId, 2> two{r.builder.makeExprStmt(r.litInt(1, r.intT())),
+                                     r.builder.makeExprStmt(r.ref(kSymLocal, r.intT()))};
+        HirNodeId const e = r.builder.makeSeqExpr(two, r.litInt(42, r.intT()), r.intT());
+        expectRefused(evalAddr(r, e, allForms()));
+    }
+    {
+        AddrRig r;
+        std::array<HirNodeId, 2> two{r.builder.makeExprStmt(r.litInt(1, r.intT())),
+                                     r.builder.makeExprStmt(r.litInt(2, r.intT()))};
+        HirNodeId const e = r.builder.makeSeqExpr(two, r.litInt(42, r.intT()), r.intT());
+        expectInt(evalAddr(r, e, allForms()), 42);
+    }
 }
 
 // [[D-CE-CAST-OF-AN-UNSIGNED-CONSTANT-ABOVE-INT64-DOES-NOT-FOLD]], one width up: a

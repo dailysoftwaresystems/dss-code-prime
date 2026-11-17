@@ -396,7 +396,7 @@ TEST(ShippedLibraryRole, TheRealizationOracleResolvesRolesThroughTheResolver) {
     TypeInterner interner{CompilationUnitId{1}};
     TypeRegistry typeReg;
     std::array<NamedTypeBinding, 1> const named{
-        NamedTypeBinding{"va_list",
+        NamedTypeBinding{dss::ffi::kVaListDescriptorTypeName,
                          interner.pointer(interner.primitive(TypeKind::Void))}};
     std::array<std::string, 1> const names{"puts"};
 

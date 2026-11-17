@@ -218,7 +218,7 @@ struct ReadContext {
     TypeInterner interner{CompilationUnitId{1}};
     TypeRegistry typeReg;
     std::array<NamedTypeBinding, 1> named{
-        NamedTypeBinding{"va_list",
+        NamedTypeBinding{dss::ffi::kVaListDescriptorTypeName,
                          interner.pointer(interner.primitive(TypeKind::Void))}};
 };
 

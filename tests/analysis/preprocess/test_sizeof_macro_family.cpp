@@ -297,7 +297,6 @@ TEST(SizeofMacroFamily, EveryMemberEqualsSizeofItsTypeOnEveryRealPair) {
             SCOPED_TRACE(targetName + ":" + formatName);
 
             UnitBuilder builder{grammar, DiagnosticBudget::libraryDefault()};
-            applySystemDirs(builder, *grammar);
             applyTargetFormatPair(builder, target, format);
             builder.addInMemory(familyProbe(realizesLongDouble), "family.c");
             auto const cu = std::make_shared<CompilationUnit const>(

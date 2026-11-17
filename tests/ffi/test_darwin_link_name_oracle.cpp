@@ -96,6 +96,7 @@
 // `test_pe_crt_costate_binding.cpp` idiom). The real-tree arms were also
 // exercised by mutation — see this cycle's report.
 
+#include "core/types/aggregate_layout.hpp"   // vaListTypes
 #include "analysis/compilation_unit/compilation_unit.hpp"   // predefinedTypeFactsFor — the pair's own facts
 #include "core/types/data_model.hpp"
 #include "core/types/diagnostic_reporter.hpp"
@@ -110,6 +111,7 @@
 #include "link/object_format_schema.hpp"
 #include "repo_root.hpp"
 #include "scratch_dir.hpp"
+#include "validation_va_list_binding.hpp"   // the descriptor word a validation read binds (c82)
 
 #include <nlohmann/json.hpp>
 
@@ -320,25 +322,6 @@ struct DescriptorFn {
     return out;
 }
 
-// c82 (D-FFI-DESCRIPTOR-VA-LIST-TYPE): the SysV `va_list` named-type binding
-// PRODUCTION threads into every shipped-descriptor read — `stdio.json`'s
-// `vfprintf` spells `va_list`, and without the binding that signature does not
-// decode and the WHOLE descriptor read fails. ✔MEASURED here: omitting it turned
-// stdio.json's 37 Mach-O functions into "failed to read", i.e. this census would
-// have skipped the largest descriptor in the corpus. Same mint as the analyzer's
-// SysVRegisterSave arm; the caller keeps the storage alive across the read.
-[[nodiscard]] std::array<NamedTypeBinding, 1>
-sysvVaListBinding(TypeInterner& interner) {
-    TypeId const voidPtr =
-        interner.pointer(interner.primitive(TypeKind::Void));
-    std::array<TypeId, 4> tagFields{
-        interner.primitive(TypeKind::U32), interner.primitive(TypeKind::U32),
-        voidPtr, voidPtr};
-    TypeId const vaListTy =
-        interner.array(interner.structType("__va_list_tag", tagFields), 1);
-    return {NamedTypeBinding{"va_list", vaListTy}};
-}
-
 // The `linkName` the REAL READER resolves for one descriptor on one arch. Keyed
 // per (descriptor, arch) and cached, because a descriptor read is not free and
 // the census walks 288 rows twice.
@@ -368,7 +351,12 @@ readLinkNames(fs::path const& descriptor, std::string_view arch) {
     TypeInterner       interner{CompilationUnitId{1}};
     TypeRegistry       typeReg;
     DiagnosticReporter rep;
-    auto const namedTypes = sysvVaListBinding(interner);
+    // c82: the descriptor word `va_list` resolves only through the read's binding —
+    // stdio.json's `vfprintf` spells it, and without the binding that signature does
+    // not decode and the WHOLE descriptor read fails. ✔MEASURED here: omitting it
+    // turned stdio.json's 37 Mach-O functions into "failed to read", i.e. this census
+    // would have skipped the largest descriptor in the corpus.
+    auto const namedTypes = dss::test_support::validationVaListBinding(interner);
     auto const facts      = machoPairFacts(arch);
     if (!facts.has_value()) return out;
     auto const desc = readShippedLibDescriptor(descriptor, interner, typeReg, rep,

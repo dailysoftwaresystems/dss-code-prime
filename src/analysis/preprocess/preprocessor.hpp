@@ -114,9 +114,8 @@ struct DSS_EXPORT PreprocessResult {
     // The preprocessed tokens (directives removed, macros expanded),
     // Eof-terminated, all referencing `synthBuffer`. A `TokenStream` for the
     // parser is built from a COPY of this via `TokenStream::fromTokens` -- the
-    // vector is retained (not moved into a one-shot stream) so the FC2
-    // type-name oracle's one-shot REPARSE can rebuild an identical stream
-    // without re-running the whole preprocess.
+    // vector is retained (not moved into a one-shot stream) for the
+    // compilation unit's parse sidecar, whose input-closure digest reads it.
     std::vector<Token> tokens;
 
     // synth-offset -> origin map for diagnostic remapping.
@@ -170,15 +169,14 @@ struct DSS_EXPORT PreprocessResult {
     // -- every angle `#include <h>` (or quote->angle fallback) the SynthBuilder
     // SPLICED whose splice offset the AUTHORITATIVE macro pass did NOT prove dead,
     // each expanded to its TRANSITIVE `includes` closure and DEDUPED by weakly-
-    // canonical path. This set EQUALS the finish() oracle's `shippedLibDescriptors`
-    // (built by the import resolver from the SAME authoritatively-live includes),
+    // canonical path. This set EQUALS the import resolver's `shippedLibDescriptors`
+    // (built from the SAME authoritatively-live includes),
     // never a superset. EMIT-ONLY -- it changes no preprocess behavior; it surfaces
     // which descriptors' SEMANTICALLY-injected typedef surfaces are in scope so
     // `parseAndAdd_` can SEED their typedef NAMES into the binder sketch's global
-    // scope BEFORE the FIRST parse. A shipped-typedef cast `(size_t)(expr)` then
-    // commits as a CAST on parse 1 (no AmbiguousTypeNameCandidate -> no full-file
-    // oracle reparse in UnitBuilder::finish), and because the set is oracle-aligned
-    // the seed resolves EXACTLY what the reparse would, never a name it would not.
+    // scope BEFORE the parse. A shipped-typedef cast `(size_t)(expr)` then
+    // commits as a CAST, and because the set is the live one the seed names
+    // exactly the live descriptors' typedefs, never a dead branch's.
     // Empty for a TU that resolves no live system descriptor (every non-C language,
     // any C TU with only quote includes, and a descriptor reached ONLY through a
     // dead `#if 0` branch).

@@ -105,6 +105,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <format>
+#include <functional>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -325,12 +327,16 @@ struct Case {
                          false, DiagnosticCode::P_MissingRequiredChild);
     add("empty-init",    "int main(void){ int z = ; return z; }",
                          false, DiagnosticCode::P_NoAlternativeMatched);
-    // ⚠ `P_NoAlternativeMatched`, and it USED to be `P_UnexpectedToken`. The
-    // `P_UnexpectedToken` that followed was the second voice of the same
-    // structural error, and `recoverAt`'s cascade shield now holds it. The
-    // code below was READ off the parser after that change, not carried over.
+    // ⚠ `P_UnexpectedToken` again (P69 L2b2): `(int` COMMITS the cast's type reading,
+    // so the site's failure is that reading's own — "expected ')'" at `x`, where every
+    // reference puts it: ✔MEASURED (probe-reference-cc, probes l2b2g8) gcc 13.3.0
+    // "expected ')' before 'x'" at 1:37 and clang 18.1.3 "expected ')'" at 1:38 (linux
+    // host run 20261114-001352-62942e04), cl 19.52 C2146 "missing ')' before identifier
+    // 'x'" (windows run 20261114-001356-80061235); DSS at `x` (compile-and-keep
+    // l2b2g7-dss-1). Before batch B the value reading `( int` was replayed and refused at
+    // `int` (P_NoAlternativeMatched), a position no reference names.
     add("unclosed-cast", "int main(void){ int x=0; return (int x; }",
-                         false, DiagnosticCode::P_NoAlternativeMatched);
+                         false, DiagnosticCode::P_UnexpectedToken);
     add("garbage-tail",  "int main(void){ int x=0; return (int)x @@@; }",
                          false, DiagnosticCode::P_UnexpectedToken);
 
@@ -498,6 +504,60 @@ TEST(ParserSpeculationRefusalCost, RefusalWorkIsLinearInTheDepthCeiling) {
         << deep.tokenAccessCount << " accesses at ceiling " << kDeep
         << " against " << shallow.tokenAccessCount << " at " << kShallow
         << " (ratio " << ratio << ")";
+}
+
+// ── (A') THE SAME, WITH BOTH CEILINGS BINDING AS SHIPPED ─────────────────────
+//
+// P69 L2b2 (lane `lm`): the case above lifts the expression ceiling, and so it
+// stayed green while the shipped one broke. Shipped, the expression ceiling sits
+// one level above the speculation ceiling (c.lang.json: 16384 / 16383) and a cast
+// is one expression level: past the speculation ceiling, a REPLAY at depth 0 that
+// descends into the cast reading goes one level deeper with every failure and meets
+// the EXPRESSION ceiling again, so a refusal that replayed the committed cast cost a
+// speculation of the rest of the chain per level — ✔MEASURED, l2b2A-6
+// (macos-arm64-debug): the bounded-stack pin and the corpus file
+// speculation_depth_ceiling.c TIMED OUT. A failure that met a ceiling is no
+// committed type reading's (`failedAsItsCommittedTypeReading`), and the refusal is
+// linear again. Here the two ceilings keep the shipped DISTANCE, read off the
+// document, at 128 and at 1024 (8x): linear ~8x, quadratic ~64x, the bound 24.
+TEST(ParserSpeculationRefusalCost, RefusalWorkIsLinearWithBothCeilingsAsShipped) {
+    auto schema = cSchema();
+    ASSERT_NE(schema, nullptr);
+    ParserConfig const shipped = shippedCConfig(*schema);
+    ASSERT_GT(shipped.maxExpressionDepth, shipped.maxSpeculationDepth)
+        << "the shipped expression ceiling sits above the speculation ceiling";
+    std::size_t const distance = shipped.maxExpressionDepth - shipped.maxSpeculationDepth;
+
+    constexpr std::size_t kShallow = 128;
+    constexpr std::size_t kDeep    = 1024;   // 8x
+    static_assert(kDeep == kShallow * 8, "the ratio bound below assumes 8x");
+
+    auto refuseAt = [&](std::size_t ceiling) -> ParseResult {
+        ParserConfig cfg = shippedCConfig(*schema);
+        cfg.maxSpeculationDepth = ceiling;
+        cfg.maxExpressionDepth  = ceiling + distance;
+        return parseCFull(schema, castChain(ceiling + 1), std::move(cfg));
+    };
+    ParseResult shallow = refuseAt(kShallow);
+    ParseResult deep    = refuseAt(kDeep);
+    ASSERT_GT(shallow.tokenAccessCount, 0u);
+    ASSERT_GT(deep.tokenAccessCount, 0u);
+    // Both arms REFUSED, by the speculation ceiling, once — as the bounded-stack pin
+    // asks of the shipped pair. (EXPECT, not ASSERT: a replay that descends level by
+    // level re-reports the ceiling AND costs the quadratic, and both are said.)
+    EXPECT_EQ(countCode(shallow.tree, DiagnosticCode::P_MaxSpeculationDepth), 1u)
+        << "the refusal past both ceilings at the shipped distance reports the "
+           "speculation ceiling once; codes=[" << allCodes(shallow.tree) << "]";
+    EXPECT_EQ(countCode(deep.tree, DiagnosticCode::P_MaxSpeculationDepth), 1u)
+        << "the refusal past both ceilings at the shipped distance reports the "
+           "speculation ceiling once; codes=[" << allCodes(deep.tree) << "]";
+    const double ratio = static_cast<double>(deep.tokenAccessCount)
+                       / static_cast<double>(shallow.tokenAccessCount);
+    EXPECT_LT(ratio, 24.0)
+        << "the refusal past both ceilings at the shipped distance must cost token work "
+           "LINEAR in the ceiling: measured "
+        << deep.tokenAccessCount << " accesses at ceiling " << kDeep << " against "
+        << shallow.tokenAccessCount << " at " << kShallow << " (ratio " << ratio << ")";
 }
 
 // ── REFUSING IS NOT ASYMPTOTICALLY WORSE THAN ACCEPTING ─────────────────────
@@ -877,9 +937,13 @@ TEST(ParserSpeculationRefusalCost, SpeculativeParsesAreIdenticalAndPrintTheirRen
 // and the deep-nesting pins' parenthesised constant positions: nested
 // `__builtin_expect`, `__builtin_choose_expr` and `_Generic` in an enumerator's or an
 // array bound's parentheses, and statement expressions in an `if` condition.
-// RED-ON-DISABLE: the memo never consulted → the doubling stop; the base asked only
-// at the close → `cast_call`'s span; the operand's triage left to the close →
-// `undeclared_call`'s span.
+// RED-ON-DISABLE: the base asked only at the close → `cast_call`'s span; the operand's
+// triage left to the close → `undeclared_call`'s span.
+// ★ P69 L2b2 (lane `lm`): the failed-probe memo never consulted is NO LONGER red here.
+// ✔MEASURED (check-mutations runs 20261116-213402-d2ea60b0 and 20261116-223042-65df8e82):
+// every chain stays linear without it, x0.96 to x1.17 of the control, because the triage
+// refutes each probe these chains fail within a token of where it opened. That record's
+// pin is `ANestOfLateFailingProbesCostsWorkLinearInItsDepth`, at the end of this file.
 TEST(ParserSpeculationRefusalCost, EveryParenthesisedChainCostsWorkLinearInItsDepth) {
     auto schema = cSchema();
     ASSERT_NE(schema, nullptr);
@@ -980,7 +1044,15 @@ TEST(ParserSpeculationRefusalCost, EveryParenthesisedChainCostsWorkLinearInItsDe
 // QUADRATIC chain (the undeclared call with the triage asked late, the lane's sweep run
 // 20261022-004607-013a8640) doubles at 1.77x, 2.07x, 2.42x, 2.81x, 3.19x, 3.51x — under 6x it ran to
 // 128 levels past (7.1 million accesses) and past the sweep's time limit; under 3x it stops at 64 past.
-// An exponential reading ends in this red at 16 levels past, not in hours. RED-ON-DISABLE: a ceiling refutation never answered from the memo → the doubling stop.
+// An exponential reading ends in this red at 16 levels past, not in hours.
+// ★ P69 L2b2 (lane `lm`): a ceiling refutation never answered from the memo is NO LONGER red here.
+// ✔MEASURED (check-mutations run 20261116-223042-65df8e82): without it `sizeof_type_name` costs x232 at
+// 2 levels past the ceiling and x244 at 256 past, while every other chain is unmoved. That cost is in the
+// ROOM below the ceiling and flat in the levels past it, and this pin reads only growth in the levels past.
+// It cannot read the room on c's chains: ✔MEASURED on the bytes (l2b2-post-it4 and -it5, TEMPORARY climbs),
+// `sizeof_type_name` past a binding ceiling C costs probes ~C² (14 / 58 / 242 / 994 / 4034 at C = 4 … 64).
+// That record's pin is `ANestOfLateFailingProbesCostsWorkLinearInTheRoomBelowABindingCeiling`, at the end
+// of this file.
 TEST(ParserSpeculationRefusalCost, AChainPastTheSpeculationCeilingCostsWorkLinearInItsDepth) {
     auto schema = cSchema();
     ASSERT_NE(schema, nullptr);
@@ -1232,7 +1304,8 @@ TEST(ParserSpeculationRefusalCost, AReplayedNestedFailureKeysItsProbeByTheSketch
 // pin's assertion.
 //
 // THE PINS: 4000 levels against 500 must cost each counter, and the token stream, under three times
-// the linear 8× (the file's margin).
+// the linear 8× (the file's margin) — each nest CLIMBED to 4000 a doubling at a time (`climbNest`), so a
+// super-linear reading stops at the first doubling over 3x.
 namespace {
 
 struct NestReading {
@@ -1263,6 +1336,86 @@ constexpr int kNestDeep    = 4000;
     return static_cast<double>(deep) / static_cast<double>(std::max<std::uint64_t>(shallow, 1));
 }
 
+// ★ P69 L2b2 (lane `lm`): EVERY NEST IS CLIMBED, NEVER JUMPED. A pin reads its nest at every depth of
+// `kNestLadder`, 8 up to 4000 levels, and stops at the first step that multiplies a counter — the token
+// accesses, the builder's scope work, the sketch's work — by more than x3 a doubling: linear is ~2x a
+// doubling and quadratic ~4x, so a super-linear reading ends in that red at a cheap rung, never in a parse
+// that does not end.
+// ✔MEASURED, the lane's sweep (check-mutations run 20261104-221811-0f5259b1, host run
+// 20261104-221853-eeba3aef, macos-arm64-debug): with the triage's base asked only at a probe's close, the
+// fixed pair 500 / 4000 of EveryNestingOfProbesCostsTheSketchWorkLinearInItsDepth ran past ten times the
+// unmutated runner and was stopped — no verdict at all. The stop's message carries the pin's own
+// explanation (`why`), so a regression says the same thing whichever check meets it first. Each pin's own
+// assertion is unchanged: 4000 levels against 500 under three times the linear 8x.
+// ✔MEASURED, the first climbed run (`dssharness test` run 20261104-224950-106f4caa, macos-arm64-debug): the
+// climb read what the fixed pair never asserted — every nest that probes per level doubled the BUILDER'S
+// scope work x3.14–x3.53 at 125 → 250 levels, because the builder copied its whole scope stack into every
+// diagnostic and a refuted alternative raises some at every level. A diagnostic holds an O(1) handle now
+// (scope_trail.hpp); those nests pin it, on the counter a copy is counted in.
+// ✔MEASURED, the lane's sweep 2 (check-mutations run 20261104-233251-c50bb496, host run
+// 20261104-233323-c75f4cad, macos-arm64-debug): a climb that STARTED at 125 levels did not contain the
+// triage arm either — EveryNestingOfProbes ran 5 minutes inside its climb and was stopped, so a rung at or
+// below the first stop already cost minutes under that mutation. So the climb starts at 8 levels: a
+// super-linear cost is read where a rung is cheap, and every rung is printed as it is read, so a run that is
+// stopped still says how far each nest got.
+constexpr int    kNestLadder[] = {8, 16, 32, 64, 125, 250, 500, 1000, 2000, 4000};
+// A step may multiply a counter by at most 1.5 times the depth's own ratio — x3 for a doubling — linear being
+// ~x1 that ratio and quadratic ~x2 (x4 for a doubling).
+constexpr double kNestStepMargin = 1.5;
+
+struct NestLadder {
+    bool        complete = false;   // false: a step stopped the climb, and said so
+    NestReading shallow{};          // at kNestShallow
+    NestReading deep{};             // at kNestDeep
+};
+
+[[nodiscard]] NestLadder climbNest(std::shared_ptr<GrammarSchema const> const& schema,
+                                   std::function<std::string(int)> const& src, std::string const& name,
+                                   std::string const& why) {
+    static_assert(kNestLadder[std::size(kNestLadder) - 1] == kNestDeep, "the climb ends at the deep reading");
+    NestLadder  out;
+    NestReading last{};
+    int         lastDepth = 0;
+    bool        sawShallow = false;
+    for (int const d : kNestLadder) {
+        NestReading const r = readNest(schema, src(d), d);
+        std::printf("%s: %d levels: tokens %llu, builder scope work %llu, sketch work %llu\n", name.c_str(), d,
+                    static_cast<unsigned long long>(r.tokens), static_cast<unsigned long long>(r.scope),
+                    static_cast<unsigned long long>(r.sketch));
+        std::fflush(stdout);   // a run stopped mid-climb still shows the rungs it read
+        if (lastDepth != 0) {
+            struct Counter {
+                char const*   what;
+                std::uint64_t before;
+                std::uint64_t now;
+            };
+            double const allowed = kNestStepMargin * static_cast<double>(d) / static_cast<double>(lastDepth);
+            for (Counter const c : {Counter{"token accesses", last.tokens, r.tokens},
+                                    Counter{"builder scope work", last.scope, r.scope},
+                                    Counter{"sketch work", last.sketch, r.sketch}}) {
+                if (c.before == 0) continue;
+                double const step = nestRatio(c.now, c.before);
+                if (step > allowed) {
+                    ADD_FAILURE() << name << ": the " << c.what << " grew super-linearly - x" << step << " from "
+                                  << lastDepth << " to " << d << " levels (" << c.before << " -> " << c.now
+                                  << "), over x" << allowed << "; the climb stops here: " << why;
+                    return out;
+                }
+            }
+        }
+        if (d == kNestShallow) {
+            out.shallow = r;
+            sawShallow  = true;
+        }
+        if (d == kNestDeep) out.deep = r;
+        last      = r;
+        lastDepth = d;
+    }
+    if (!sawShallow) ADD_FAILURE() << name << ": the climb never read the shallow depth " << kNestShallow;
+    out.complete = sawShallow;
+    return out;
+}
+
 }  // namespace
 
 // RED-ON-DISABLE: a token's scope check that reads the scope stack again — each entry it reads
@@ -1290,8 +1443,10 @@ TEST(ParserSpeculationRefusalCost, NestedBracketsCostTheBuilderScopeWorkLinearIn
     };
     double const linear = static_cast<double>(kNestDeep) / static_cast<double>(kNestShallow);
     for (Shape const& s : shapes) {
-        NestReading const shallow = readNest(schema, s.src(kNestShallow), kNestShallow);
-        NestReading const deep    = readNest(schema, s.src(kNestDeep), kNestDeep);
+        NestLadder const ladder = climbNest(schema, s.src, s.name, "a token's scope check reads the nesting");
+        if (!ladder.complete) continue;
+        NestReading const& shallow = ladder.shallow;
+        NestReading const& deep    = ladder.deep;
         double const scope  = nestRatio(deep.scope, shallow.scope);
         double const tokens = nestRatio(deep.tokens, shallow.tokens);
         std::printf("%s: %d levels scope work %llu tokens %llu; %d levels scope work %llu tokens "
@@ -1319,8 +1474,11 @@ TEST(ParserSpeculationRefusalCost, AProbeAtEveryNestedLevelCostsTheSketchWorkLin
         return "typedef int T;\nint f(void) { int v = " + repeatText("({ (T)(1); ", d) + "5"
              + repeatText("; })", d) + "; return v; }\n";
     };
-    NestReading const shallow = readNest(schema, src(kNestShallow), kNestShallow);
-    NestReading const deep    = readNest(schema, src(kNestDeep), kNestDeep);
+    NestLadder const ladder =
+        climbNest(schema, src, "a probe per level", "a probe's snapshot reads the nesting");
+    if (!ladder.complete) return;
+    NestReading const& shallow = ladder.shallow;
+    NestReading const& deep    = ladder.deep;
     double const linear = static_cast<double>(kNestDeep) / static_cast<double>(kNestShallow);
     double const sketch = nestRatio(deep.sketch, shallow.sketch);
     double const tokens = nestRatio(deep.tokens, shallow.tokens);
@@ -1348,10 +1506,10 @@ TEST(ParserSpeculationRefusalCost, AProbeAtEveryNestedLevelCostsTheSketchWorkLin
 // name and probes a typedef at every level made the lookup of `T` at level k pass k dead `a`s —
 // Θ(D²) — and in LENGTH every late lookup of an early typedef walked every parameter and local of
 // every earlier function. And re-binding a definition's own parameters at its body scanned the
-// bindings from the first one of the file, uncounted: Θ(definitions × bindings). A lookup walks its
-// NAME's chain now (a per-name index, dead heads moved past once), and the re-bind starts where
-// the list's scope opened, counted. THE PINS: as above, 4000 against 500 under three times the
-// linear 8x, on the sketch's counter and the token stream.
+// bindings from the first one of the file, uncounted: Θ(definitions × bindings). A lookup reads its
+// NAME's head now (a per-name chain of live bindings, P69 L2b2), and the re-bind reads its list's own
+// bindings, counted. THE PINS: as above, 4000 against 500 under three times the linear 8x, on the
+// sketch's counter and the token stream.
 
 // RED-ON-DISABLE: a lookup that scans every binding again — each one it passes counted.
 TEST(ParserSpeculationRefusalCost, ADeclarationAndAProbeAtEveryNestedLevelCostTheSketchWorkLinearInTheDepth) {
@@ -1361,8 +1519,11 @@ TEST(ParserSpeculationRefusalCost, ADeclarationAndAProbeAtEveryNestedLevelCostTh
         return "typedef int T;\nint f(void) { int v = " + repeatText("({ int a = 1; (void)(T)(a); ", d)
              + "5" + repeatText("; })", d) + "; return v; }\n";
     };
-    NestReading const shallow = readNest(schema, src(kNestShallow), kNestShallow);
-    NestReading const deep    = readNest(schema, src(kNestDeep), kNestDeep);
+    NestLadder const ladder = climbNest(schema, src, "a declaration and a probe per level",
+                                        "a lookup passes the bindings of the levels outside it");
+    if (!ladder.complete) return;
+    NestReading const& shallow = ladder.shallow;
+    NestReading const& deep    = ladder.deep;
     double const linear = static_cast<double>(kNestDeep) / static_cast<double>(kNestShallow);
     double const sketch = nestRatio(deep.sketch, shallow.sketch);
     double const tokens = nestRatio(deep.tokens, shallow.tokens);
@@ -1383,13 +1544,12 @@ TEST(ParserSpeculationRefusalCost, ADeclarationAndAProbeAtEveryNestedLevelCostTh
 
 // Four files of N definitions: alone (each one's parameters re-bound at its body), then N late
 // lookups of the early typedef `T`, then the same with every definition's parameter named `T` (so
-// T's own chain holds 2N dead bindings before the typedef), then the same chain before a file-scope
-// VARIABLE `T`, used late in parentheses — every `(T)` a cast probe the sketch refutes (`T` is a
-// value), so every lookup of it runs inside a probe that rolls back.
-// RED-ON-DISABLE: the re-bind scanning from the file's first binding (the first shape); a lookup
-// scanning every binding (the last three); a lookup that never moves a dead head (the last two); a
-// rollback that revives the dead bindings a lookup inside the probe moved past, though they died
-// before the probe began (the last).
+// 2N bindings of T die before the typedef's lookups), then the same before a file-scope VARIABLE
+// `T`, used late in parentheses — every `(T)` a cast probe the sketch refutes (`T` is a value), so
+// every lookup of it runs inside a probe that rolls back.
+// RED-ON-DISABLE: the re-bind scanning the binding store (the first shape); a lookup scanning the
+// binding store (the last three) — each counted, the store being read through its counted accessor
+// (P69 L2b2).
 TEST(ParserSpeculationRefusalCost, AFileOfDefinitionsCostsTheSketchWorkLinearInItsLength) {
     auto schema = cSchema();
     ASSERT_NE(schema, nullptr);
@@ -1422,8 +1582,12 @@ TEST(ParserSpeculationRefusalCost, AFileOfDefinitionsCostsTheSketchWorkLinearInI
     };
     double const linear = static_cast<double>(kNestDeep) / static_cast<double>(kNestShallow);
     for (Shape const& s : shapes) {
-        NestReading const shallow = readNest(schema, src(s, kNestShallow), kNestShallow);
-        NestReading const deep    = readNest(schema, src(s, kNestDeep), kNestDeep);
+        NestLadder const ladder =
+            climbNest(schema, [&](int n) { return src(s, n); }, s.name,
+                      "the sketch's work grows with the bindings recorded before it");
+        if (!ladder.complete) continue;
+        NestReading const& shallow = ladder.shallow;
+        NestReading const& deep    = ladder.deep;
         double const sketch = nestRatio(deep.sketch, shallow.sketch);
         double const tokens = nestRatio(deep.tokens, shallow.tokens);
         std::printf("%s: %d definitions sketch work %llu tokens %llu; %d definitions sketch work "
@@ -1442,36 +1606,29 @@ TEST(ParserSpeculationRefusalCost, AFileOfDefinitionsCostsTheSketchWorkLinearInI
     }
 }
 
-// THE SKETCH ITSELF, no parser between: a dead binding is walked once, whatever the probes do. Each
-// part first records N bindings of `T` NESTED (each while the one before is live, so no push can
-// pass another), above a typedef `T`.
-// (a) All N die before any probe; then N lookups of the typedef, each inside a snapshot that is
-// restored (a probe the triage refutes): the first lookup passes them for good — no restore can
-// bring them back. (b) One snapshot live throughout (a probe still open): the N die inside it, then
-// N lookups — a restore COULD bring those back, so the first lookup moves the head past them under
-// the journal, and the others start at the typedef. (c) All N die before any probe; then N probes
-// that each declare `T` in a block of their own, close it, look `T` up and roll back: the push that
-// declares it passes the N first, so the head it journals — the one the rollback restores — is
-// already past them. A parse reaches (b) and (c) at these sizes only through more probe budget than
-// a probe has, so they are asked here.
-// RED-ON-DISABLE: a pass made under the journal, or none (a, c); a lookup that never moves its head
-// past the dead bindings it walked (b); a push that links to its name's head unpassed (c) — each
-// makes every lookup walk all N.
+// THE SKETCH ITSELF, no parser between (P69 L2b1's three nestings; the product below takes every
+// one). Each part first records N bindings of `T` NESTED, above a typedef `T`. (a) All N die before
+// any probe; then N lookups of the typedef, each inside a snapshot that is restored. (b) One snapshot
+// live throughout: the N die inside it, then N lookups. (c) All N die before any probe; then N probes
+// that each declare `T` in a block of their own, close it, look `T` up and roll back. L2b1's chains
+// held dead bindings, passed by a lookup under or outside the journal; since P69 L2b2 a close unlinks
+// its bindings and a lookup reads its name's head, so no part walks a dead binding at all.
+// RED-ON-DISABLE: a lookup that walks its name's chain or the binding store again (each binding it
+// reads counted) makes every lookup cost N.
 TEST(ParserSpeculationRefusalCost, ALookupWalksADeadBindingOnceAcrossAProbeOrInsideIt) {
     auto schema = cSchema();
     ASSERT_NE(schema, nullptr);
-    SourceSpan const at = SourceSpan::empty(0);
     auto nestOfT = [&](BinderSketch& sk, int n) {
         for (int k = 0; k < n; ++k) {
             sk.openScope(RuleId{});
-            sk.record("T", /*isType=*/false, at);
+            sk.record("T", /*isType=*/false);
         }
         for (int k = 0; k < n; ++k) (void)sk.closeScope();
     };
     enum class Part { DiedBeforeTheProbes, DiedInsideTheProbe, DeclaredAgainInEachProbe };
     auto run = [&](Part part, int n) -> std::uint64_t {
         BinderSketch sk(*schema);
-        sk.record("T", /*isType=*/true, at);
+        sk.record("T", /*isType=*/true);
         std::optional<BinderSketch::Snapshot> open;
         if (part == Part::DiedInsideTheProbe) open.emplace(sk.snapshot());
         nestOfT(sk, n);
@@ -1484,7 +1641,7 @@ TEST(ParserSpeculationRefusalCost, ALookupWalksADeadBindingOnceAcrossAProbeOrIns
             BinderSketch::Snapshot s = sk.snapshot();
             if (part == Part::DeclaredAgainInEachProbe) {
                 sk.openScope(RuleId{});
-                sk.record("T", /*isType=*/false, at);
+                sk.record("T", /*isType=*/false);
                 (void)sk.closeScope();
             }
             EXPECT_EQ(sk.lookup("T"), BinderSketch::NameKind::Type) << "a dead binding answered";
@@ -1530,8 +1687,11 @@ TEST(ParserSpeculationRefusalCost, ANestThatDeclaresANameCostsItsLateRefutedProb
         return "int T;\nint g(int x) { " + repeatText("{ int T = 0; ", n) + repeatText("} ", n)
              + "return " + repeatText("(T) + ", n) + "x; }\n";
     };
-    NestReading const shallow = readNest(schema, src(kNestShallow), kNestShallow);
-    NestReading const deep    = readNest(schema, src(kNestDeep), kNestDeep);
+    NestLadder const ladder = climbNest(schema, src, "a nest declaring T, then late refuted probes of T",
+                                        "a lookup walks the dead bindings again");
+    if (!ladder.complete) return;
+    NestReading const& shallow = ladder.shallow;
+    NestReading const& deep    = ladder.deep;
     double const linear = static_cast<double>(kNestDeep) / static_cast<double>(kNestShallow);
     double const sketch = nestRatio(deep.sketch, shallow.sketch);
     double const tokens = nestRatio(deep.tokens, shallow.tokens);
@@ -1548,4 +1708,422 @@ TEST(ParserSpeculationRefusalCost, ANestThatDeclaresANameCostsItsLateRefutedProb
         << kNestDeep << " nested declarations and late probes cost the binder sketch x" << sketch
         << " the work of " << kNestShallow << " (linear x" << linear
         << "): a lookup walks the dead bindings again";
+}
+
+// ── P69 L2b2 (lane `lm`, the L2b1 review's W1 and P1, the design audit's condition 1): THE SKETCH'S
+// WORK IS LINEAR FOR EVERY NESTING OF LIVE SNAPSHOTS ──
+//
+// The pins above each took ONE nesting of snapshots: none, one live probe with no probe inside it, or
+// probes with none outside them. The sketch passed a dead binding for good only when it died before
+// the OUTERMOST live snapshot; one that died after it, and before an inner probe, was passed under the
+// journal, so every inner probe that rolled back put it back and the next lookup walked it again —
+// N bindings of `T` dying under a live probe, then N lookups each in a probe that rolls back, cost
+// Θ(N²). A name's chain holds LIVE bindings only now (a scope's close unlinks its own), so a lookup
+// reads its name's head and there is nothing to walk past.
+//
+// THE PRODUCT, asked of the sketch itself: live snapshots {0, 1, 2, 3} × where the N bindings die
+// {before the outermost, after each level's snapshot} × where the N lookups run {each in a probe that
+// rolls back, each in a probe that commits, after every snapshot is released} × the dying binding's
+// placement {its own block, a type floated past a declarator-dominator, an enumeration constant lifted
+// past a composite body}. Every live snapshot is rolled back at the end, innermost first, so the replay
+// is counted with the rest. And the design audit's row: D nested probes, each binding and closing a
+// scope and looking the name up, then all rolled back. THE PIN: 4000 against 500 under three times the
+// linear 8x on `workCount()`, whole (construction to the last rollback); every lookup answers the
+// binding outside the dead ones.
+// RED-ON-DISABLE: a close that does not unlink its bindings (a lookup reads a dead head: the structural
+// check aborts); a lookup that walks its chain past dead bindings again; a restore that does not
+// rewind the binding store (a wrong answer after the rollback).
+TEST(ParserSpeculationRefusalCost, TheSketchsWorkIsLinearForEveryNestingOfLiveSnapshots) {
+    auto schema = cSchema();
+    ASSERT_NE(schema, nullptr);
+    RuleId const block     = schema->rules().find("block");
+    RuleId const dominator = schema->rules().find("topLevelDecl");
+    RuleId const composite = schema->rules().find("enumSpec");
+    ASSERT_TRUE(block.valid() && dominator.valid() && composite.valid());
+    enum class Placement { OwnBlock, FloatedPastADominator, LiftedPastAComposite };
+    enum class Lookups { EachInAProbeRolledBack, EachInAProbeCommitted, AfterEverySnapshotReleased };
+    struct Cell {
+        int       live;     // live snapshots around the lookups
+        int       diesAt;   // 0: before the outermost; j: after the j-th snapshot
+        Lookups   lookups;
+        Placement placement;
+    };
+    // The binding outside the dead ones answers every lookup: of the kind the dead ones are not.
+    auto outerKind = [](Placement p) {
+        return p == Placement::FloatedPastADominator ? BinderSketch::NameKind::Value
+                                                     : BinderSketch::NameKind::Type;
+    };
+    auto run = [&](Cell const& c, int n) -> std::uint64_t {
+        BinderSketch sk(*schema);
+        sk.record("T", outerKind(c.placement) == BinderSketch::NameKind::Type);
+        std::vector<BinderSketch::Snapshot> live;
+        live.reserve(4);
+        auto nestDying = [&] {   // N bindings of `T`, each while the one before is live; then all die
+            int scopes = 0;
+            for (int k = 0; k < n; ++k) {
+                sk.openScope(block);
+                ++scopes;
+                switch (c.placement) {
+                case Placement::OwnBlock:
+                    sk.record("T", /*isType=*/false);
+                    break;
+                case Placement::FloatedPastADominator:
+                    sk.openScope(dominator);
+                    ++scopes;
+                    sk.record("T", /*isType=*/true);   // a type floats to the block
+                    break;
+                case Placement::LiftedPastAComposite:
+                    sk.openScope(composite);
+                    ++scopes;
+                    sk.record("T", /*isType=*/false, /*liftToEnclosingScope=*/true);
+                    break;
+                }
+            }
+            for (int k = 0; k < scopes; ++k) (void)sk.closeScope();
+        };
+        for (int level = 0; level <= c.live; ++level) {
+            if (c.diesAt == level) nestDying();
+            if (level < c.live) live.push_back(sk.snapshot());
+        }
+        if (c.lookups == Lookups::AfterEverySnapshotReleased) {
+            while (!live.empty()) live.pop_back();   // every live probe committed
+        }
+        for (int k = 0; k < n; ++k) {
+            if (c.lookups == Lookups::AfterEverySnapshotReleased) {
+                EXPECT_EQ(sk.lookup("T"), outerKind(c.placement)) << "a dead binding answered";
+                continue;
+            }
+            BinderSketch::Snapshot probe = sk.snapshot();
+            EXPECT_EQ(sk.lookup("T"), outerKind(c.placement)) << "a dead binding answered";
+            if (c.lookups == Lookups::EachInAProbeRolledBack) sk.restore(std::move(probe));
+        }
+        while (!live.empty()) {   // the live probes roll back, innermost first
+            sk.restore(std::move(live.back()));
+            live.pop_back();
+            EXPECT_EQ(sk.lookup("T"), outerKind(c.placement)) << "after a rollback";
+        }
+        return sk.workCount();
+    };
+    std::vector<Cell> cells;
+    for (int live = 0; live <= 3; ++live)
+        for (int diesAt = 0; diesAt <= live; ++diesAt)
+            for (Lookups l : {Lookups::EachInAProbeRolledBack, Lookups::EachInAProbeCommitted,
+                              Lookups::AfterEverySnapshotReleased})
+                for (Placement p : {Placement::OwnBlock, Placement::FloatedPastADominator,
+                                    Placement::LiftedPastAComposite})
+                    cells.push_back(Cell{live, diesAt, l, p});
+    char const* const lookupsName[] = {"each in a probe rolled back", "each in a probe committed",
+                                       "after every snapshot released"};
+    char const* const placementName[] = {"its own block", "floated past a dominator",
+                                         "lifted past a composite"};
+    double const linear = static_cast<double>(kNestDeep) / static_cast<double>(kNestShallow);
+    for (Cell const& c : cells) {
+        std::string const name = std::format(
+            "{} live snapshot(s), the bindings die {}, lookups {}, placed in {}", c.live,
+            c.diesAt == 0 ? std::string{"before the outermost"}
+                          : std::format("after snapshot {}", c.diesAt),
+            lookupsName[static_cast<int>(c.lookups)], placementName[static_cast<int>(c.placement)]);
+        std::uint64_t const shallow = run(c, kNestShallow);
+        std::uint64_t const deep    = run(c, kNestDeep);
+        double const ratio = nestRatio(deep, shallow);
+        std::printf("%s: %d sketch work %llu; %d sketch work %llu; x%.2f (linear x%.0f)\n",
+                    name.c_str(), kNestShallow, static_cast<unsigned long long>(shallow), kNestDeep,
+                    static_cast<unsigned long long>(deep), ratio, linear);
+        ASSERT_GE(shallow, static_cast<std::uint64_t>(kNestShallow))
+            << name << ": the sketch counted nothing: this pin reads nothing";
+        EXPECT_LT(ratio, 3.0 * linear)
+            << name << ": " << kNestDeep << " cost the binder sketch x" << ratio << " the work of "
+            << kNestShallow << " (linear x" << linear << ")";
+    }
+    // The design audit's condition 1: D nested probes, each binding `T` in a block of its own, closing
+    // it and looking `T` up, then all rolled back — the replay of each level's records counted.
+    auto nestOfProbes = [&](int d) -> std::uint64_t {
+        BinderSketch sk(*schema);
+        sk.record("T", /*isType=*/true);
+        std::vector<BinderSketch::Snapshot> live;
+        live.reserve(static_cast<std::size_t>(d));
+        for (int k = 0; k < d; ++k) {
+            live.push_back(sk.snapshot());
+            sk.openScope(block);
+            sk.record("T", /*isType=*/false);
+            EXPECT_EQ(sk.lookup("T"), BinderSketch::NameKind::Value) << "the block's own binding";
+            (void)sk.closeScope();
+            EXPECT_EQ(sk.lookup("T"), BinderSketch::NameKind::Type) << "a dead binding answered";
+        }
+        while (!live.empty()) {
+            sk.restore(std::move(live.back()));
+            live.pop_back();
+            EXPECT_EQ(sk.lookup("T"), BinderSketch::NameKind::Type) << "after a rollback";
+        }
+        return sk.workCount();
+    };
+    std::uint64_t const shallow = nestOfProbes(kNestShallow);
+    std::uint64_t const deep    = nestOfProbes(kNestDeep);
+    double const ratio = nestRatio(deep, shallow);
+    std::printf("D nested probes each binding and closing a scope, then rolled back: %d sketch work "
+                "%llu; %d sketch work %llu; x%.2f (linear x%.0f)\n",
+                kNestShallow, static_cast<unsigned long long>(shallow), kNestDeep,
+                static_cast<unsigned long long>(deep), ratio, linear);
+    ASSERT_GE(shallow, static_cast<std::uint64_t>(kNestShallow)) << "this row counted nothing";
+    EXPECT_LT(ratio, 3.0 * linear)
+        << kNestDeep << " nested probes cost the binder sketch x" << ratio << " the work of "
+        << kNestShallow << " (linear x" << linear << "): a rollback or a lookup reads the nesting";
+}
+
+// The parses that reach the product above — the review's W1 shapes (MEASURED valid: gcc 13.3.0 and
+// clang 18.1.3 build and run each to 42, and cl 19.51 the ISO one) — then P1's nest of declarations in
+// initializers (the close-time record's shape), a nest of composite bodies each lifting an
+// enumeration constant (the placement walk's shape), and a nest of array bounds in type names, each
+// with a prototype scope that kills a `T` and a refuted `(T)` probe (a probe inside a probe inside a
+// declarator).
+// RED-ON-DISABLE: a pass of a dead binding undone by an inner rollback (the cast, statement-
+// expression and bound nests); the close-time record scanning the bindings after its name again (the
+// initializers); a lift that walks the live stack (the composite nest).
+TEST(ParserSpeculationRefusalCost, EveryNestingOfProbesCostsTheSketchWorkLinearInItsDepth) {
+    auto schema = cSchema();
+    ASSERT_NE(schema, nullptr);
+    struct Shape {
+        char const* name;
+        std::string (*src)(int);
+    };
+    Shape const shapes[] = {
+        {"ISO nested casts, a prototype scope and a refuted probe per level", [](int d) {
+             return "typedef int S;\nint T;\nint f(void) { return "
+                  + repeatText("(S)(sizeof(void (*)(int T)) + (T) + ", d) + "0" + repeatText(")", d)
+                  + "; }\n";
+         }},
+        {"GNU nested casts of statement expressions, a block-scope T and a refuted probe per level",
+         [](int d) {
+             return "typedef int S;\nint T;\nint f(void) { return "
+                  + repeatText("(S)({ { int T = 0; (void)T; } (T) + 1 + ", d) + "0"
+                  + repeatText("; })", d) + "; }\n";
+         }},
+        {"declarations in nested initializers", [](int d) {
+             return "int f(void) { int v0 = " + repeatText("({ int v = ", d) + "5"
+                  + repeatText("; v; })", d) + "; return v0; }\n";
+         }},
+        {"nested composite bodies, an enumeration constant per level", [](int d) {
+             std::string o = "struct S0 { ";
+             for (int k = 1; k < d; ++k) {
+                 o += "enum { E" + std::to_string(k) + " = 1 } e" + std::to_string(k) + "; struct S"
+                    + std::to_string(k) + " { ";
+             }
+             o += "int z; ";
+             for (int k = d - 1; k >= 1; --k) o += "} s" + std::to_string(k) + "; ";
+             return o + "};\n";
+         }},
+        {"nested array bounds in type names, a prototype scope and a refuted probe per level",
+         [](int d) {
+             return "int T;\nint f(void) { return (int)"
+                  + repeatText("sizeof(int (*)[sizeof(void (*)(int T)) + (T) + ", d) + "1"
+                  + repeatText("])", d) + "; }\n";
+         }},
+    };
+    double const linear = static_cast<double>(kNestDeep) / static_cast<double>(kNestShallow);
+    for (Shape const& s : shapes) {
+        NestLadder const ladder =
+            climbNest(schema, s.src, s.name, "the nest's work grows with its depth");
+        if (!ladder.complete) continue;
+        NestReading const& shallow = ladder.shallow;
+        NestReading const& deep    = ladder.deep;
+        double const sketch = nestRatio(deep.sketch, shallow.sketch);
+        double const tokens = nestRatio(deep.tokens, shallow.tokens);
+        std::printf("%s: %d levels sketch work %llu tokens %llu; %d levels sketch work %llu tokens "
+                    "%llu; sketch x%.2f, tokens x%.2f (linear x%.0f)\n",
+                    s.name, kNestShallow, static_cast<unsigned long long>(shallow.sketch),
+                    static_cast<unsigned long long>(shallow.tokens), kNestDeep,
+                    static_cast<unsigned long long>(deep.sketch),
+                    static_cast<unsigned long long>(deep.tokens), sketch, tokens, linear);
+        ASSERT_GE(shallow.sketch, static_cast<std::uint64_t>(kNestShallow))
+            << s.name << ": the nest asked the sketch nothing per level: this pin reads nothing";
+        EXPECT_LT(tokens, 3.0 * linear) << s.name << ": the token work is super-linear";
+        EXPECT_LT(sketch, 3.0 * linear)
+            << s.name << ": " << kNestDeep << " levels cost the binder sketch x" << sketch
+            << " the work of " << kNestShallow << " (linear x" << linear << ")";
+    }
+}
+
+// ── P69 L2b2 (lane `lm`, the fold's third sweep): A NEST OF LATE-FAILING PROBES COSTS WORK LINEAR IN ITS
+// DEPTH, AND IN THE ROOM BELOW A BINDING CEILING ──
+//
+// The parser keeps two records of a failed probe, and each answers a later try that would fail the same
+// way: a failure that met no ceiling (`failedProbes_`, wherever the room it used is left) and a failure a
+// ceiling refuted (`ceilingRefuted_`, under the exact room it started with). The chains above no longer
+// show either record. ✔MEASURED (check-mutations run 20261116-223042-65df8e82, macos-arm64-debug, against
+// that run's own control):
+//   * with the failure record never answered, every chain those two pins print costs x0.96 to x1.17 of the
+//     control (paren_call at 256 levels: 14937 -> 17497), and stays linear. The type-name triage refutes each
+//     probe that would fail within a token of where it opened, so a retry costs O(1);
+//   * with the ceiling record never answered, `sizeof_type_name` costs x232 (34900 -> 8086725 at 2 levels
+//     past a ceiling of 16), and the same x244 at 256 past. So a pin that doubles only the levels past the
+//     ceiling reads no growth.
+// What the records answer is a probe that fails LATE, after a nest, and costs that whole nest each time it is
+// tried again. So these pins parse one, in a synthetic grammar with no type-name triage at all (rule names
+// non-shipped; shipped grammars untouched):
+//   nest   := nA | nB | nZ | Identifier     (speculative)
+//   nA     := ( nestA )                      fails at the innermost `x )`, always
+//   nestA  := nA | nA2 | nZ | idBang         (speculative)
+//   nA2    := ( nestA ) !
+//   nZ     := ( !                            fails at its second token, always
+//   idBang := Identifier !
+//   nB     := ( nest )
+// on `( ( … ( x ) … ) ) ;`. At every level `nA` and `nA2` each run `nestA` at the next level, and fail only at
+// its `x )`. Without the records, `nestA` at a level costs twice `nestA` at the next: work exponential in the
+// depth, or in the room below a binding ceiling. With them, each rule runs once at each level.
+//   * `nZ`: the last candidate a token admits is descended directly and opens no probe. `nZ` takes that place
+//     at every `(`, so every candidate that recurses is probed. Without it the success path nested no probes,
+//     and a nest past its ceiling parsed clean (✔MEASURED, l2b2-post-it4).
+//   * a recovery scan of 1 token (`maxSyncScanTokens`): a refuted probe's last candidate fails where its
+//     recovery scans toward the next `)` — up to the whole nest below it, capped by the scan (shipped 64).
+//     That scan is the recovery's work, not a record's. ✔MEASURED (l2b2-post-it5, a TEMPORARY climb): at the
+//     shipped scan the nest's steps were x2.31, x2.48, x2.74, x3.07 to 64 levels, then x2.69 and x2.26 past
+//     the cap; at a scan of 1 they were x2.06 down to x2.00.
+// ✔MEASURED on the bytes (l2b2-post-it5, windows-x86_64-release): the depth climb 219 / 451 / 915 / 1843 /
+// 3699 / 7411 / 14835 token accesses at 4 … 256 levels (x2.06 to x2.00), the probes opened 3d - 1; the ceiling
+// climb 345 / 621 / 1173 / 2277 / 4485 / 8901 at ceilings 4 … 128 (x1.80 to x1.98), each refused by
+// P_MaxSpeculationDepth.
+// THE PINS, on `tokenAccessCount` (deterministic, host-independent): each nest is climbed a doubling at a
+// time — the depth with no ceiling binding (4 to 256 levels), then the ceiling with the nest 4 levels past it
+// (4 to 128). A doubling over x3 stops the climb. Linear is ~x2 a doubling, so an exponential reading ends in
+// that red at its first doubling, never in a parse that does not end. The whole climb must also cost under
+// three times the linear ratio of its ends.
+// RED-ON-DISABLE: a failure that met no ceiling never answered from its record → the first pin's stop; a
+// ceiling refutation never answered from its record → the second's. Each pin is the other arm's neighbour:
+// the first meets no ceiling, and in the second every failure meets one.
+namespace {
+
+[[nodiscard]] std::string lateFailSchema() {
+    return R"JSON({
+  "dssSchemaVersion": 4,
+  "language": { "name": "LateFailSynth", "version": "0.0.1", "fileExtensions": [".lfsyn"] },
+  "tokens": {
+    " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\n": [{ "kind": "Newline",    "flags": ["EmptySpace"] }],
+    ";":  [{ "kind": "Semi" }],
+    "!":  [{ "kind": "Bang" }],
+    "(":  [{ "kind": "ParenOpen" }],
+    ")":  [{ "kind": "ParenClose" }]
+  },
+  "syncTokens": [ "Semi" ],
+  "shapes": {
+    "root":   { "sequence": [ "nest", "Semi" ] },
+    "nest":   { "alt": [ "nA", "nB", "nZ", "Identifier" ], "speculative": true, "lookahead": 32 },
+    "nA":     { "sequence": [ "ParenOpen", "nestA", "ParenClose" ] },
+    "nestA":  { "alt": [ "nA", "nA2", "nZ", "idBang" ], "speculative": true, "lookahead": 32 },
+    "nA2":    { "sequence": [ "ParenOpen", "nestA", "ParenClose", "Bang" ] },
+    "nZ":     { "sequence": [ "ParenOpen", "Bang" ] },
+    "idBang": { "sequence": [ "Identifier", "Bang" ] },
+    "nB":     { "sequence": [ "ParenOpen", "nest", "ParenClose" ] }
+  }
+})JSON";
+}
+
+[[nodiscard]] std::string lateFailNest(int depth) {
+    auto const n = static_cast<std::size_t>(depth);
+    return std::string(n, '(') + "x" + std::string(n, ')') + ";\n";
+}
+
+// The speculation ceiling given, and a token budget that never binds: 32 * 4096 tokens a probe, where no
+// probe here charges more than the source's 2 * 260 + 2. The grammar has no `expr` rule, so the expression
+// ceiling is never asked. A recovery scans 1 token (the comment above).
+[[nodiscard]] ParserConfig lateFailRoom(std::size_t speculationCeiling) {
+    ParserConfig cfg;
+    cfg.maxSpeculationDepth     = speculationCeiling;
+    cfg.speculationBudgetFactor = 4096;
+    cfg.maxSyncScanTokens       = 1;
+    return cfg;
+}
+
+[[nodiscard]] ParseResult parseLateFail(std::string source, ParserConfig cfg) {
+    auto loaded = GrammarSchema::loadFromText(lateFailSchema(), "<late-fail-synth>");
+    if (!loaded) {
+        // Thrown, never abort(): GoogleTest reports a throw as a failure of this ONE test.
+        throw std::runtime_error(
+            "the synthetic late-fail schema failed to load: " +
+            (loaded.error().empty() ? std::string{"<no diagnostics>"}
+                                    : std::string{loaded.error()[0].message}));
+    }
+    std::shared_ptr<GrammarSchema const> schema = *loaded;
+    auto src = SourceBuffer::fromString(std::move(source), "<late-fail-src>");
+    Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
+    auto [stream, lexDiags] = std::move(tk).tokenize();
+    Parser p{std::move(src), std::move(schema), std::move(stream),
+             DiagnosticBudget::libraryDefault(), std::move(cfg), std::move(lexDiags)};
+    return std::move(p).parse();
+}
+
+}  // namespace
+
+TEST(ParserSpeculationRefusalCost, ANestOfLateFailingProbesCostsWorkLinearInItsDepth) {
+    constexpr int    kShallow = 4;
+    constexpr int    kDeep    = 256;
+    constexpr double kStep    = 3.0;   // a doubling of the depth, at most (the comment above)
+    std::uint64_t first = 0;
+    std::uint64_t last  = 0;
+    for (int d = kShallow; d <= kDeep; d *= 2) {
+        // No ceiling binds: the probes nest one a level, at most 257 deep here, under a ceiling of 4096.
+        ParseResult const r = parseLateFail(lateFailNest(d), lateFailRoom(4096));
+        ASSERT_FALSE(r.tree.diagnostics().hasErrors())
+            << d << " levels must parse clean; codes=[" << allCodes(r.tree) << "]";
+        EXPECT_TRUE(treeHasRule(r.tree, "nB")) << d << " levels: the nest is read as `nB` at every level";
+        for (char const* failed : {"nA", "nA2", "nZ", "idBang"})
+            EXPECT_FALSE(treeHasRule(r.tree, failed))
+                << d << " levels: `" << failed << "` fails at the innermost token and is never taken";
+        std::printf("LATE-FAIL a nest of %d levels: %llu token accesses, %llu probes opened\n", d,
+                    static_cast<unsigned long long>(r.tokenAccessCount),
+                    static_cast<unsigned long long>(r.speculationProbeCount));
+        std::fflush(stdout);
+        if (last != 0) {
+            double const step =
+                static_cast<double>(r.tokenAccessCount) / static_cast<double>(last);
+            ASSERT_LT(step, kStep) << "a nest of late-failing probes: doubling its depth to " << d
+                                   << " multiplied the work by " << step << " (" << last << " -> "
+                                   << r.tokenAccessCount << ")";
+        } else {
+            first = r.tokenAccessCount;
+        }
+        last = r.tokenAccessCount;
+    }
+    double const linear = static_cast<double>(kDeep) / static_cast<double>(kShallow);
+    double const span   = static_cast<double>(last) / static_cast<double>(first);
+    EXPECT_LT(span, 3.0 * linear) << "a nest of late-failing probes: " << kDeep << " levels cost " << span
+                                  << "x the work of " << kShallow << " (" << first << " -> " << last
+                                  << "); linear is ~" << linear << "x";
+}
+
+TEST(ParserSpeculationRefusalCost, ANestOfLateFailingProbesCostsWorkLinearInTheRoomBelowABindingCeiling) {
+    constexpr int    kLowest  = 4;
+    constexpr int    kHighest = 128;
+    constexpr int    kPast    = 4;     // the nest's levels past its ceiling
+    constexpr double kStep    = 3.0;   // a doubling of the ceiling, at most (the comment above)
+    std::uint64_t first = 0;
+    std::uint64_t last  = 0;
+    for (int c = kLowest; c <= kHighest; c *= 2) {
+        ParseResult const r =
+            parseLateFail(lateFailNest(c + kPast), lateFailRoom(static_cast<std::size_t>(c)));
+        // Past its ceiling the nest is refused, and by the ceiling's own name: so every failure here met it.
+        ASSERT_GE(countCode(r.tree, DiagnosticCode::P_MaxSpeculationDepth), 1u)
+            << "a nest " << kPast << " levels past a ceiling of " << c
+            << " is refused by the ceiling's own name; codes=[" << allCodes(r.tree) << "]";
+        std::printf("LATE-FAIL a nest %d levels past a ceiling of %d: %llu token accesses, %llu probes "
+                    "opened, %s\n",
+                    kPast, c, static_cast<unsigned long long>(r.tokenAccessCount),
+                    static_cast<unsigned long long>(r.speculationProbeCount), allCodes(r.tree).c_str());
+        std::fflush(stdout);
+        if (last != 0) {
+            double const step =
+                static_cast<double>(r.tokenAccessCount) / static_cast<double>(last);
+            ASSERT_LT(step, kStep)
+                << "a nest of late-failing probes past a binding ceiling: doubling the ceiling to " << c
+                << " multiplied the work by " << step << " (" << last << " -> " << r.tokenAccessCount << ")";
+        } else {
+            first = r.tokenAccessCount;
+        }
+        last = r.tokenAccessCount;
+    }
+    double const linear = static_cast<double>(kHighest + kPast) / static_cast<double>(kLowest + kPast);
+    double const span   = static_cast<double>(last) / static_cast<double>(first);
+    EXPECT_LT(span, 3.0 * linear) << "a nest of late-failing probes past a binding ceiling: a ceiling of "
+                                  << kHighest << " costs " << span << "x the work of " << kLowest << " ("
+                                  << first << " -> " << last << "); linear is ~" << linear << "x";
 }

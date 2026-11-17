@@ -1,0 +1,2 @@
+      "sequence": [ "identDeclHead", "EndStatement" ],
+      "commitRequiresTypeName": { "rule": "identDeclHead", "polarity": "requireKnownType" }

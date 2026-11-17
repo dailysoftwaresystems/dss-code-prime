@@ -1,1 +1,1 @@
-        return std::move(rest);
+        return (void)discardedFold, false;

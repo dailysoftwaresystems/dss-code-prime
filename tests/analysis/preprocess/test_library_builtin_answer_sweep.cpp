@@ -133,7 +133,6 @@ void appendErrors(DiagnosticReporter const& rep, std::string_view tier, std::str
 
     DiagnosticBudget const budget = sweepBudget(builtins.functions.size());
     UnitBuilder builder{cLanguage(), budget};
-    applySystemDirs(builder, *cLanguage());
     applyTargetFormatPair(builder, target, format);
     builder.addInMemory(std::move(source), "sweep.c");
     auto const cu = std::make_shared<CompilationUnit const>(std::move(builder).finish());

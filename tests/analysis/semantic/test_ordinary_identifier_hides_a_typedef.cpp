@@ -67,8 +67,8 @@ TEST(OrdinaryIdentifierHidesATypedef, InATypeNamePositionAnOrdinaryIdentifierNam
          "typedef int T;\nint main(void) { int T = 1; "
          "return _Generic(0, T: 1, default: 42) + T - 1; }\n", true},
         {"an object, before `va_arg`'s type",
-         "typedef int T;\nint f(int n, ...) { int T = 0; va_list ap; va_start(ap, n); "
-         "int r = va_arg(ap, T); va_end(ap); return r + T; }\n", true},
+         "typedef int T;\nint f(int n, ...) { int T = 0; __builtin_va_list ap; __builtin_va_start(ap, n); "
+         "int r = __builtin_va_arg(ap, T); __builtin_va_end(ap); return r + T; }\n", true},
         {"a parameter, in the body",
          "typedef int T;\nint f(int T) { return _Generic(0, T: 1, default: 2) + T; }\n",
          true},
@@ -202,4 +202,60 @@ TEST(OrdinaryIdentifierHidesATypedef, ADefinitionsOwnParameterSurvivesTheListsOf
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_TRUE(hasCode(model.diagnostics(), DiagnosticCode::S_NotCallable)) << "the signal shape";
+}
+
+// ── P69 L2b2 (lane `lm`, the L2b1 review's D1): WHICH LISTS A DECLARATOR HOLDS IS DECIDED BY PARSE
+// ORDER, WHEREVER ITS TOKENS WERE WRITTEN ──
+// The sketch told a declarator's own lists from the ones before it by SOURCE OFFSET: a list that
+// starts at or after the declarator was its own. A macro's tokens carry the `#define` line's offsets,
+// so when the returned type's list comes from a macro BODY and the definition's own list from the
+// argument (or from a macro defined after it), the order of the offsets is not the order of the
+// parse, and the definition's own parameters were dropped before its body. ✔MEASURED 2026-11-04
+// (probe-reference-cc runs 20261104-203758-d1e7cc01 / -203837-b02a79f2 / -203919-276a91e3 and
+// 20261104-203955-8bf4072e: gcc 13.3.0, clang 18.1.3 and cl 19.51 build every form below with
+// `(T) - 1` in the body and run it to 42; DSS's dsscp at checkpoint 38 refused the four forms
+// S_UnknownType, leg run 20261104-204404-5ece0c4a). THE UNIVERSE: the token origin {the returned
+// list from a macro body and the own list from its argument; the returned list's parameter named
+// in the body; the own list from a second macro defined after the first; two levels of returned
+// function pointers from one body; the whole declarator from one body, the own list's name an
+// argument; the declarator's name pasted (`##`)} × {a definition (its body sees its own parameter:
+// `(T)(x)` calls the int and is refused S_NotCallable), a declaration (its list dies: `(T)(x)` after
+// it is a cast)}.
+TEST(OrdinaryIdentifierHidesATypedef, ADefinitionsOwnParameterSurvivesWhereverItsTokensWereWritten) {
+    struct Form { char const* what; char const* macros; char const* declarator; char const* ret; };
+    // `declarator` declares g with `int T, int x` as its own parameters, through `macros`.
+    Form const forms[] = {
+        {"the returned list from a macro body, the own list from its argument",
+         "#define RET_FNPTR(d) int (*d)(int)\n", "RET_FNPTR(g(int T, int x))", "h"},
+        {"the returned list's parameter named in the macro body",
+         "#define RET_FNPTR(d) int (*d)(int U)\n", "RET_FNPTR(g(int T, int x))", "h"},
+        {"the own list from a second macro defined after the first",
+         "#define RET_FNPTR(d) int (*d)(int)\n#define OWN (int T, int x)\n", "RET_FNPTR(g OWN)", "h"},
+        {"two levels of returned function pointers from one macro body",
+         "#define RET2(d) int (*(*d)(int))(int)\n", "RET2(g(int T, int x))", "h2"},
+        {"the whole declarator from one macro body, the own parameter's name an argument",
+         "#define DECL(n, p) int (*n(int p, int x))(int)\n", "DECL(g, T)", "h"},
+        {"the declarator's name pasted",
+         "#define RET_FNPTR(d) int (*d)(int)\n#define NAME(a, b) a##b\n",
+         "RET_FNPTR(NAME(g, 0)(int T, int x))", "h"},
+    };
+    char const* const helpers =
+        "typedef int T;\nstatic int h(int t) { return t; }\n"
+        "static int (*h2(int u))(int) { (void)u; return h; }\n";
+    for (Form const& f : forms) {
+        std::string const head = std::string{helpers} + f.macros + "static " + f.declarator;
+        std::string const def = head + " { int y = (T)(x); (void)y; return " + f.ret + "; }\n";
+        std::string const dcl = head + ";\nint main(void) { int x = 42; return (T)(x); }\n";
+        for (auto const& [src, refused, form] :
+             {std::tuple{def, true, "definition"}, std::tuple{dcl, false, "declaration"}}) {
+            auto cu = buildShippedUnit("c", {src});
+            assertNoBuilderErrors(*cu);
+            auto model = analyze(cu, DiagnosticBudget::libraryDefault());
+            EXPECT_EQ(hasCode(model.diagnostics(), DiagnosticCode::S_NotCallable), refused)
+                << form << ", " << f.what << "\n" << src;
+            EXPECT_FALSE(hasCode(model.diagnostics(), DiagnosticCode::S_UnknownType))
+                << form << ", " << f.what << ": T read as the typedef where it is the parameter\n"
+                << src;
+        }
+    }
 }

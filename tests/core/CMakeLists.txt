@@ -36,6 +36,10 @@ target_link_libraries(dss_core_test_header_name_matching PRIVATE nlohmann_json::
 dss_add_test(NAME core/test_include_path_rooted_resolution
              SOURCES test_include_path_rooted_resolution.cpp)
 dss_add_test(NAME core/test_grammar_schema      SOURCES test_grammar_schema.cpp)
+# P69 L2b2: `semantics.variadic.vaListTypeNames` is required, non-empty and names
+# each spelling once; the shipped c document binds `__builtin_va_list` only.
+dss_add_test(NAME core/test_va_list_type_names_block
+             SOURCES test_va_list_type_names_block.cpp)
 # Plan 15 CFI slice (D-UNWIND-NO-EH-FRAME-ANY-LANGUAGE-ON-ELF-OR-MACHO): the
 # shared PC-keyed unwind representation -- per-PC state, the remember/restore
 # stack, and the malformed-stream refusals every format writer relies on.
@@ -65,6 +69,9 @@ dss_add_test(NAME core/test_number_decode       SOURCES test_number_decode.cpp)
 dss_add_test(NAME core/test_bit_int_value       SOURCES test_bit_int_value.cpp)
 dss_add_test(NAME core/test_wide_float_value    SOURCES test_wide_float_value.cpp)
 dss_add_test(NAME core/test_tree_builder        SOURCES test_tree_builder.cpp)
+# P69 L2b2 (lane `lm`): the scope chain holds what can be read, not every scope ever pushed. Its own
+# binary: a defective drop makes the serial check abort, so its cases assert sizes first. See its header.
+dss_add_test(NAME core/test_scope_chain_marks   SOURCES test_scope_chain_marks.cpp)
 dss_add_test(NAME core/test_tree_cursor         SOURCES test_tree_cursor.cpp)
 dss_add_test(NAME core/test_tree_node           SOURCES test_tree_node.cpp)
 dss_add_test(NAME core/test_tree                SOURCES test_tree.cpp)

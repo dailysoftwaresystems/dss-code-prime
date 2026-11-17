@@ -42,8 +42,10 @@
 #include "hir/hir_inline_asm.hpp"
 #include "hir/hir_node.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
+#include "link/object_format_schema.hpp"
 #include "mir/lowering/hir_to_mir.hpp"
 #include "mir/mir.hpp"
+#include "program/model_to_hir.hpp"   // lowerModelToHir — the pipeline's gates
 #include "mir/mir_asm_descriptor.hpp"
 #include "mir/mir_opcode.hpp"
 #include "mutate_target_schema.hpp"
@@ -110,8 +112,23 @@ struct Lowered {
                               DataModel::Lp64, std::nullopt, std::nullopt,
                               std::nullopt, std::nullopt,
                               LongDoubleFormat::None, out.target.get()));
-    out.hir = lowerToHir(*out.model, out.hirReporter);
-    if (out.hir == nullptr) return out;
+    // The target's ELF document: the format the unit is built for.
+    std::string_view const arch = out.target != nullptr ? out.target->name() : std::string_view{};
+    char const* const formatName = arch == "x86_64" ? "elf64-x86_64-linux-exec"
+                                   : arch == "arm64" ? "elf64-aarch64-linux-exec"
+                                                     : nullptr;
+    if (formatName == nullptr) {
+        ADD_FAILURE() << "no ELF document for target '" << arch << "'";
+        return out;
+    }
+    auto const format = ObjectFormatSchema::loadShipped(formatName);
+    if (!format) {
+        ADD_FAILURE() << "ObjectFormatSchema::loadShipped(" << formatName << ") failed";
+        return out;
+    }
+    ModelLoweredToHir lowered = lowerModelToHir(*out.model, **format, out.hirReporter);   // the pipeline's gates
+    out.hir = std::move(lowered.hir);
+    if (!lowered.lowersToMir) return out;   // the build stops here, and so does the fixture: MIR never entered
 
     MirLoweringConfig cfg = languageMirLoweringConfig(**loaded);   // the pipeline's assembly
     cfg.symbolIdSpace = MirSymbolIdSpace::endingAt(   // the unit's name table, as the driver states it
@@ -388,16 +405,26 @@ TEST(MirInlineAsmImmediate, TheFormIsReadFromTheTargetNotFromTheLetterSpelling) 
 // also worked against the SHIPPED target, the mutation was not what made the
 // previous test pass and the pair would be measuring the letter's absence
 // rather than the form's presence.
+// P69 L2b2 (ruling 575): neither shipped target declares `K`, so the ANALYSIS refuses the operand
+// by its letter (S_InlineAsmConstraintLetterUndeclared, the target's letter list read with the
+// target in scope) and the pipeline's gates stop the unit before MIR; MIR's own "resolved to
+// nothing" is the backstop for a model that never reaches it. ✔MEASURED 2026-11-13 through the
+// CLI (compile-and-keep, macos-arm64-debug, x86_64:elf64-x86_64-linux-exec, probe l2b2g6 g6h):
+// `error[S_InlineAsmConstraintLetterUndeclared]` "… uses constraint letter 'K' …" at the operand.
 TEST(MirInlineAsmImmediate, AnUndeclaredLetterIsStillRefusedOnTheShippedTarget) {
     for (char const* arch : {kX86, kArm}) {
         SCOPED_TRACE(arch);
         auto const l = lowerWith(shipped(arch),
                                  wrap(R"(__asm__("nop %1" : "+r"(r) : "K"(5));)"));
-        ASSERT_FALSE(l.mirReporter.all().empty())
-            << "an undeclared constraint letter was accepted";
-        EXPECT_NE(l.firstMirDiagnostic().find("resolved to nothing"),
-                  std::string::npos)
-            << l.firstMirDiagnostic();
+        ASSERT_TRUE(l.model.has_value());
+        bool named = false;
+        for (auto const& d : l.model->diagnostics().all()) {
+            named = named
+                    || (d.code == DiagnosticCode::S_InlineAsmConstraintLetterUndeclared
+                        && d.actual.find("letter 'K'") != std::string::npos);
+        }
+        EXPECT_TRUE(named) << "an undeclared constraint letter was accepted";
+        EXPECT_TRUE(l.mirReporter.all().empty()) << "MIR is never entered";
     }
 }
 

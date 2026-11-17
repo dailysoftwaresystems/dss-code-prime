@@ -608,9 +608,9 @@ int dumpPredefinedMacros(CliArgs const& args, std::ostream& out,
         // same reason the collision arm below prints nothing partial.
         //
         // The search path is the LANGUAGE's own `semantics.shippedLibDirs`,
-        // resolved by `resolveSystemDirs` — the SAME call the compile path makes
-        // (through `applySystemDirs`), so the dump reads the same corpus the
-        // compile would.
+        // resolved by `resolveSystemDirs` — the SAME call every unit the compile
+        // path builds makes at construction (`UnitBuilder`), so the dump reads the
+        // same corpus the compile would.
         //
         // ⚠ THIS USED TO BE A PRIVATE COPY OF THAT WALK, and "the same
         // resolution" was a claim in a comment rather than a shared call —

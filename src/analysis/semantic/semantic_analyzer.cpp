@@ -23705,6 +23705,50 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         }
     }
 
+    // ── THE SUBSCRIPT CONSTRAINT, AT EVERY SUBSCRIPT (P69 L2b2, lane `lm`) ─────────────
+    // C 6.5.3.2p1 is judged HERE, at the subscript's own node, wherever it stands — the
+    // statement expression's shape above: the refusal lived in the lowering alone, which
+    // meets only a subscript it LOWERS, so an unevaluated one (`sizeof(s[0])`,
+    // `__typeof__(i[0])`, a `_Generic` controlling expression) was judged by no tier.
+    // ✔MEASURED 2026-11-05: gcc 13.3.0, clang 18.1.3, cl 19.51 and Apple clang refuse a
+    // struct and an int subscripted inside `sizeof` and `__typeof__` at the subscript,
+    // where DSS gave an internal refusal later. The law and its words are the lowering's
+    // too (`subscriptConstraintOf`), so a subscript both tiers judge is one diagnostic.
+    // The operands are the postfix node's first two non-token children, as the typer's
+    // own Postfix frame reads them.
+    if (k == NodeKind::Internal) {
+        auto const& hc = tree.schema().hirLowering();
+        if (hc.postfixExprRule.valid() && tree.rule(node).v == hc.postfixExprRule.v) {
+            std::string_view target;
+            NodeId baseN{}, subscriptN{};
+            for (NodeId c : visibleChildren(tree, node)) {
+                if (tree.kind(c) == NodeKind::Token) {
+                    if (target.empty()) {
+                        for (auto const& e : hc.postfixOps)
+                            if (e.token.v == tree.tokenKind(c).v) { target = e.target; break; }
+                    }
+                    continue;
+                }
+                if (!baseN.valid()) baseN = c;
+                else if (!subscriptN.valid()) subscriptN = c;
+            }
+            if (target == "Index" && baseN.valid() && subscriptN.valid()) {
+                auto const verdict = subscriptConstraintOf(
+                    s.lattice.interner(), subtreeType(s, tree, baseN, here),
+                    subtreeType(s, tree, subscriptN, here));
+                if (!verdict.refusal.empty()) {
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::S_SubscriptOperandsNotPointerAndInteger;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.buffer   = tree.source().id();
+                    d.span     = tree.span(node);
+                    d.actual   = std::string{verdict.refusal};
+                    s.reporter.report(std::move(d));
+                }
+            }
+        }
+    }
+
     // C23 §6.5 (D-CSUBSET-NULLPTR): the fail-loud operator gate. `nullptr`
     // (TypeKind::NullptrT) is a null pointer constant, NOT an arithmetic value;
     // under the HIR lowering it becomes the integer-0 null constant, so WITHOUT this
@@ -24223,6 +24267,33 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                                              resolved.node, *call);
                         }
                     }
+                    // ★ P69 L2b2 (lane `lm`): A TYPE NAME IS NO VALUE. An identifier that is a
+                    // primary expression must designate an object or a function (C 6.5.2p2);
+                    // the ordinary namespace also holds TYPE symbols (a typedef name, a
+                    // language builtin type such as `__builtin_va_list`), and this arm bound
+                    // one as a VALUE of its type. ✔MEASURED 2026-11-05 (probes l2b2t, the
+                    // positions return / operand / initializer / call argument / cast
+                    // operand): gcc 13.3.0, clang 18.1.3, cl 19.51 and Apple clang refuse each
+                    // at the name; DSS refused the typedef by an internal lowering refusal and
+                    // COMPILED the builtin as a value. The use stays unbound and is no
+                    // undeclared name — it is declared, as a type.
+                    bool typeNameRefused = false;
+                    if (found.valid() && lookupNs == SymbolNamespace::Ordinary
+                        && s.symbols.at(found).kind == DeclarationKind::Type) {
+                        ParseDiagnostic d;
+                        d.code     = DiagnosticCode::S_TypeNameInValuePosition;
+                        d.severity = DiagnosticSeverity::Error;
+                        d.buffer   = tree.source().id();
+                        d.span     = tree.span(resolved.node);
+                        d.actual   = std::format(
+                            "'{}' names a type, and an expression is required here: an "
+                            "identifier that is a primary expression designates an object or a "
+                            "function (C 6.5.2p2)",
+                            resolved.name);
+                        s.reporter.report(std::move(d));
+                        found           = SymbolId{};
+                        typeNameRefused = true;
+                    }
                     if (found.valid()) {
                         s.nodeToSymbol.set(resolved.node, found);
                         s.usesBySymbol[found.v].push_back(resolved.node);
@@ -24298,7 +24369,8 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         // them and run 42 — and `struct Z *p = (struct Z *)&x;`
                         // compiled, because the DECLARATION minted the tag first.
                         bool hard = ref.hardParents.empty() && !ref.isTagReference
-                                    && !libraryBuiltinRefused;   // P69: already reported
+                                    && !libraryBuiltinRefused   // P69: already reported
+                                    && !typeNameRefused;        // P69 L2b2: so is this
                         if (!hard && !ref.isTagReference) {
                             NodeId refParent = tree.parent(node);
                             if (refParent.valid()
@@ -24569,7 +24641,8 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         // stamp the node `void`. ALL THREE check the `ap` operand is a va_list. The
         // SHAPE of a va_list is STRATEGY-dependent (matching the injected type):
         //   * SysVRegisterSave (or nullopt): Array<__va_list_tag> or Ptr<__va_list_tag>
-        //     (array-decay makes both shapes legitimate).
+        //     (array-decay makes both shapes legitimate) — the strategy's OWN record,
+        //     compared by identity (`vaListTypes`), so a user's `struct __va_list_tag` is none.
         //   * HomogeneousPointer (Win64 + Apple arm64): `char*` = Ptr<I8> (the injected
         //     `va_list`).
         //   * Aapcs64DualCursor (AAPCS64 ARM64-ELF): the `__va_list` STRUCT directly
@@ -24583,6 +24656,11 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             bool const aapcs64VaList =
                 s.vaListStrategy.has_value()
                 && *s.vaListStrategy == VaListStrategy::Aapcs64DualCursor;
+            // The strategy's record, by IDENTITY (the one builder) — never by its spelling: a
+            // user may declare a `struct __va_list_tag` / `struct __va_list` of their own.
+            TypeId const vaRecord =
+                vaListTypes(s.vaListStrategy.value_or(VaListStrategy::SysVRegisterSave), in)
+                    .record;
             // True iff `ty` is a va_list for the active strategy.
             auto isVaList = [&](TypeId ty) -> bool {
                 if (!ty.valid()) return false;
@@ -24600,15 +24678,14 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 if (aapcs64VaList) {
                     // AAPCS64: `va_list` IS the `__va_list` struct (no decay). The ap
                     // operand is the struct lvalue; its address is the cursor base.
-                    return k == TypeKind::Struct && in.name(ty) == "__va_list";
+                    return k == TypeKind::Struct && ty == vaRecord;
                 }
                 // SysV family: Array<__va_list_tag> or Ptr<__va_list_tag>.
                 if (k != TypeKind::Array && k != TypeKind::Ptr) return false;
                 auto const ops = in.operands(ty);
                 if (ops.empty()) return false;
                 TypeId const inner = ops[0];
-                return inner.valid() && in.kind(inner) == TypeKind::Struct
-                    && in.name(inner) == "__va_list_tag";
+                return inner.valid() && inner == vaRecord;
             };
             // Emit S_TypeMismatch at `apNode` when its type is not a va_list.
             auto checkAp = [&](NodeId apNode) {
@@ -31755,160 +31832,42 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         }
         // FC12a-core (D-FC12A-VARIADIC-CALLEE) + FC12b (D-FC12B-WIN64-VARIADIC-CALLEE):
         // inject the `va_list` type iff this language declares a va_arg surface
-        // (config-driven: `vaArgRule` valid). The CONCRETE va_list TYPE is selected
-        // by the active CC's `vaListStrategy` (BLOCKER-2: threaded into analyze() so
-        // sizeof(va_list) is right per ABI — a wrong size mis-sizes the `ap` local
-        // and corrupts the stack). Switch on the closed strategy (never cc.name /
-        // arch / format), with a fail-loud default for an un-realized ABI:
-        //   * SysVRegisterSave (or ABSENT — direct-API/back-compat) → `__va_list_tag`
-        //     {u32,u32,void*,void*} + `va_list = __va_list_tag[1]` (24B). The C ABI
-        //     definition; it array-decays to `__va_list_tag*` when passed to
-        //     va_start/va_arg/va_end. The per-field BYTE OFFSETS at codegen come from
-        //     the target's `vaListLayout`; this struct only makes the type resolvable
-        //     by name + sizes `ap`.
-        //   * HomogeneousPointer (Win64 + Apple arm64) → `va_list = char*` (a pointer
-        //     to I8). NO __va_list_tag struct: sizeof(va_list)==8 sizes `ap` as one
-        //     pointer.
-        //   * Aapcs64DualCursor (AAPCS64 ARM64-ELF, FC12c) → `va_list = __va_list`, a
-        //     typedef to the 5-field STRUCT DIRECTLY (NOT an array like SysV, NOT a
-        //     pointer like Win64): {void* __stack; void* __gr_top; void* __vr_top;
-        //     int __gr_offs; int __vr_offs;} (32B). The va_start/va_arg/va_end ap
-        //     operand is this struct lvalue; its ADDRESS is the dual-cursor base.
+        // (config-driven: `vaArgRule` valid). The CONCRETE list TYPE is selected by the
+        // active CC's `vaListStrategy` (BLOCKER-2: threaded into analyze() so
+        // sizeof(va_list) is right per ABI — a wrong size mis-sizes the `ap` local and
+        // corrupts the stack), absent meaning SysVRegisterSave (direct-API/back-compat),
+        // and BUILT by the one builder every tier reads (`vaListTypes`,
+        // aggregate_layout.hpp): SysV an array of one `__va_list_tag` (24B, it decays to
+        // a pointer to the record when passed), Win64 and Apple arm64 `char *` (8B), AAPCS64
+        // the 32B `__va_list` record itself. The per-field BYTE OFFSETS at codegen come from
+        // the target's `vaListLayout`; the type only makes `ap` sized and recognizable.
+        // P69 L2b2 (lane `lm`): each spelling of `semantics.variadic.vaListTypeNames` is
+        // bound to that list type — the SAME TypeId under every spelling, so a typedef chain
+        // through any of them stays identity-equal (`__builtin_va_list` is the one the Darwin
+        // SDK reaches va_list through, D-CSUBSET-BUILTIN-VA-LIST-TYPE-NAME). The strategy's
+        // RECORD is bound under NO name, in neither namespace, because no reference binds it
+        // (MEASURED 2026-11-04 on gcc 13.3.0 and clang 18.1.3 for x86-64 and aarch64, cl and
+        // Apple clang: `sizeof(__va_list_tag)` and `sizeof(__va_list)` are undeclared,
+        // `sizeof(struct __va_list_tag)` and `sizeof(struct __va_list)` an incomplete tag of
+        // the user's own) — so a user's own `struct __va_list_tag` or `int __va_list` is
+        // theirs, and is no list (`isVaList` compares the record by identity).
         // A language without the surface injects nothing — no leak, no pollution.
         if (sch->semantics().vaArgRule.valid()) {
-            auto& in = s.lattice.interner();
-            VaListStrategy const strat =
-                vaListStrategy.value_or(VaListStrategy::SysVRegisterSave);
-            if (strat == VaListStrategy::Aapcs64DualCursor) {
-                // AAPCS64 §B.4: `va_list = __va_list` (the struct directly). The five
-                // members in declaration order — pointers first (8B each), then the two
-                // i32 cursors (4+4) — give a 32B struct under natural alignment, exactly
-                // the AAPCS64 `__va_list` layout. `va_list` typedefs DIRECTLY to this
-                // struct (no array decay): the va_start/va_arg/va_end ap operand IS the
-                // struct lvalue and its address is the dual-cursor base.
-                TypeId const voidPtr = in.pointer(in.primitive(TypeKind::Void));
-                TypeId const i32     = in.primitive(TypeKind::I32);
-                std::array<TypeId, 5> vaFields{
-                    voidPtr,   // __stack
-                    voidPtr,   // __gr_top
-                    voidPtr,   // __vr_top
-                    i32,       // __gr_offs
-                    i32,       // __vr_offs
-                };
-                TypeId const vaStructTy = in.structType("__va_list", vaFields);
-                SymbolRecord structRec;
-                structRec.name  = "__va_list";
-                structRec.scope = builtinScope;
-                structRec.tree  = InvalidTree;
-                structRec.kind  = DeclarationKind::Type;
-                structRec.type  = vaStructTy;
-                SymbolId const structId = s.symbols.mint(structRec);
-                s.scopes.injectBinding(builtinScope, "__va_list", structId);
-
-                SymbolRecord vaRec;
-                vaRec.name  = "va_list";
-                vaRec.scope = builtinScope;
-                vaRec.tree  = InvalidTree;
-                vaRec.kind  = DeclarationKind::Type;
-                vaRec.type  = vaStructTy;   // typedef to the struct DIRECTLY
-                SymbolId const vaId = s.symbols.mint(vaRec);
-                s.scopes.injectBinding(builtinScope, "va_list", vaId);
-                // D-CSUBSET-BUILTIN-VA-LIST-TYPE-NAME: `__builtin_va_list` is the
-                // COMPILER-PROVIDED spelling of the SAME type — the Darwin SDK
-                // reaches va_list only through `typedef __builtin_va_list
-                // __darwin_va_list;` (<sys/_types/_va_list.h>), so no descriptor
-                // can supply the name. Bind the IDENTICAL TypeId (never a
-                // re-derived twin): a typedef chain through either name stays
-                // identity-equal per calling convention. Mirrored in ALL THREE
-                // strategy branches of this if/else chain.
-                SymbolRecord builtinVaRec;
-                builtinVaRec.name  = "__builtin_va_list";
-                builtinVaRec.scope = builtinScope;
-                builtinVaRec.tree  = InvalidTree;
-                builtinVaRec.kind  = DeclarationKind::Type;
-                builtinVaRec.type  = vaStructTy;   // the SAME TypeId as `va_list`
-                SymbolId const builtinVaId = s.symbols.mint(builtinVaRec);
-                s.scopes.injectBinding(builtinScope, "__builtin_va_list",
-                                       builtinVaId);
-                vaListBuiltinType = vaStructTy;   // c82: descriptor alias
-                s.vaListType      = vaStructTy;   // c82: adjustment exclusion
-            } else if (strat == VaListStrategy::HomogeneousPointer) {
-                // Win64: `va_list` is a plain `char*` (pointer to I8) — sizeof 8.
-                TypeId const charPtr = in.pointer(in.primitive(TypeKind::I8));
-                SymbolRecord vaRec;
-                vaRec.name  = "va_list";
-                vaRec.scope = builtinScope;
-                vaRec.tree  = InvalidTree;
-                vaRec.kind  = DeclarationKind::Type;
-                vaRec.type  = charPtr;
-                SymbolId const vaId = s.symbols.mint(vaRec);
-                s.scopes.injectBinding(builtinScope, "va_list", vaId);
-                // D-CSUBSET-BUILTIN-VA-LIST-TYPE-NAME: the `__builtin_va_list`
-                // alias — the SAME TypeId as `va_list` (see the Aapcs64 branch).
-                SymbolRecord builtinVaRec;
-                builtinVaRec.name  = "__builtin_va_list";
-                builtinVaRec.scope = builtinScope;
-                builtinVaRec.tree  = InvalidTree;
-                builtinVaRec.kind  = DeclarationKind::Type;
-                builtinVaRec.type  = charPtr;      // the SAME TypeId as `va_list`
-                SymbolId const builtinVaId = s.symbols.mint(builtinVaRec);
-                s.scopes.injectBinding(builtinScope, "__builtin_va_list",
-                                       builtinVaId);
-                vaListBuiltinType = charPtr;      // c82: descriptor alias
-                s.vaListType      = charPtr;      // c82: adjustment exclusion
-            } else {
-                // SysVRegisterSave (or absent): __va_list_tag[1].
-                TypeId const voidPtr = in.pointer(in.primitive(TypeKind::Void));
-                std::array<TypeId, 4> tagFields{
-                    in.primitive(TypeKind::U32),  // gp_offset
-                    in.primitive(TypeKind::U32),  // fp_offset
-                    voidPtr,                      // overflow_arg_area
-                    voidPtr,                      // reg_save_area
-                };
-                TypeId const tagTy = in.structType("__va_list_tag", tagFields);
-                SymbolRecord tagRec;
-                tagRec.name  = "__va_list_tag";
-                tagRec.scope = builtinScope;
-                tagRec.tree  = InvalidTree;
-                tagRec.kind  = DeclarationKind::Type;
-                tagRec.type  = tagTy;
-                SymbolId const tagId = s.symbols.mint(tagRec);
-                // MF-4 (C 6.2.3): builtins-as-`DeclarationKind::Type` —
-                // `__va_list_tag` here and shipped-descriptor typedefs — are
-                // injected into the ORDINARY namespace (the default param). A
-                // `struct __va_list_tag` reference therefore will NOT resolve
-                // them (the tag-namespace lookup misses → S_UnknownType). That
-                // is an INTENTIONAL fail-loud boundary, not a tag-namespace
-                // bug: these are synthesized typedef-NAMES, not C tags, and no
-                // c source spells `struct __va_list_tag` (the type is
-                // reached only through the `va_list` typedef alias). If a real
-                // tagged builtin is ever needed, bind it with
-                // SymbolNamespace::Tag instead.
-                s.scopes.injectBinding(builtinScope, "__va_list_tag", tagId);
-
-                TypeId const vaListTy = in.array(tagTy, 1);
-                SymbolRecord vaRec;
-                vaRec.name  = "va_list";
-                vaRec.scope = builtinScope;
-                vaRec.tree  = InvalidTree;
-                vaRec.kind  = DeclarationKind::Type;
-                vaRec.type  = vaListTy;
-                SymbolId const vaId = s.symbols.mint(vaRec);
-                s.scopes.injectBinding(builtinScope, "va_list", vaId);
-                // D-CSUBSET-BUILTIN-VA-LIST-TYPE-NAME: the `__builtin_va_list`
-                // alias — the SAME TypeId as `va_list` (see the Aapcs64 branch).
-                SymbolRecord builtinVaRec;
-                builtinVaRec.name  = "__builtin_va_list";
-                builtinVaRec.scope = builtinScope;
-                builtinVaRec.tree  = InvalidTree;
-                builtinVaRec.kind  = DeclarationKind::Type;
-                builtinVaRec.type  = vaListTy;     // the SAME TypeId as `va_list`
-                SymbolId const builtinVaId = s.symbols.mint(builtinVaRec);
-                s.scopes.injectBinding(builtinScope, "__builtin_va_list",
-                                       builtinVaId);
-                vaListBuiltinType = vaListTy;     // c82: descriptor alias
-                s.vaListType      = vaListTy;     // c82: adjustment exclusion
+            TypeId const listTy =
+                vaListTypes(vaListStrategy.value_or(VaListStrategy::SysVRegisterSave),
+                            s.lattice.interner()).list;
+            for (std::string const& spelling : sch->semantics().vaListTypeNames) {
+                SymbolRecord rec;
+                rec.name  = spelling;
+                rec.scope = builtinScope;
+                rec.tree  = InvalidTree;
+                rec.kind  = DeclarationKind::Type;
+                rec.type  = listTy;
+                SymbolId const id = s.symbols.mint(rec);
+                s.scopes.injectBinding(builtinScope, spelling, id);
             }
+            vaListBuiltinType = listTy;   // c82: descriptor alias
+            s.vaListType      = listTy;   // c82: adjustment exclusion
         }
     }
 
@@ -32369,7 +32328,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             std::span<NamedTypeBinding const> namedTypes{};
             if (vaListBuiltinType.has_value()) {
                 namedTypeStorage[0] =
-                    NamedTypeBinding{"va_list", *vaListBuiltinType};
+                    NamedTypeBinding{ffi::kVaListDescriptorTypeName, *vaListBuiltinType};
                 namedTypes = std::span<NamedTypeBinding const>{
                     namedTypeStorage.data(), 1};
             }
@@ -33652,7 +33611,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         std::array<NamedTypeBinding, 1> namedTypeStorage{};
         std::span<NamedTypeBinding const> namedTypes{};
         if (vaListBuiltinType.has_value()) {
-            namedTypeStorage[0] = NamedTypeBinding{"va_list", *vaListBuiltinType};
+            namedTypeStorage[0] = NamedTypeBinding{ffi::kVaListDescriptorTypeName, *vaListBuiltinType};
             namedTypes = std::span<NamedTypeBinding const>{namedTypeStorage.data(), 1};
         }
         std::optional<std::string_view> const activeTargetView =
@@ -33807,7 +33766,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             std::span<NamedTypeBinding const> namedTypes{};
             if (vaListBuiltinType.has_value()) {
                 namedTypeStorage[0] =
-                    NamedTypeBinding{"va_list", *vaListBuiltinType};
+                    NamedTypeBinding{ffi::kVaListDescriptorTypeName, *vaListBuiltinType};
                 namedTypes = std::span<NamedTypeBinding const>{
                     namedTypeStorage.data(), 1};
             }
@@ -34214,7 +34173,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 std::array<NamedTypeBinding, 1> namedTypeStorage{};
                 std::span<NamedTypeBinding const> namedTypes{};
                 if (vaListBuiltinType.has_value()) {
-                    namedTypeStorage[0] = NamedTypeBinding{"va_list", *vaListBuiltinType};
+                    namedTypeStorage[0] = NamedTypeBinding{ffi::kVaListDescriptorTypeName, *vaListBuiltinType};
                     namedTypes = std::span<NamedTypeBinding const>{namedTypeStorage.data(), 1};
                 }
                 std::optional<std::string_view> const activeTargetView =

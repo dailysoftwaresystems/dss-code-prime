@@ -195,7 +195,6 @@ extern int dss_rl_wide "msv" L"crt.dll";
 @min-stdc 0
 @families gnu,msvc
 @expect-ref reject
-@acknowledged-gap DSS reserves va_start / va_arg / va_end as GRAMMAR KEYWORDS (/keywords VaStartKeyword, VaArgKeyword, VaEndKeyword; /shapes vaStartExpr, vaArgExpr, vaEndExpr) and injects __builtin_va_list unconditionally, so this compiles with NO <stdarg.h> at all. gcc/clang spell the primitives __builtin_va_start/__builtin_va_arg/__builtin_va_end; the unprefixed names are <stdarg.h> MACROS in every reference implementation. Note vaArgExpr also puts a TYPE-NAME in an expression argument position, which no reference grammar has outside a macro expansion.
 @why Header-less: `va_start` is undeclared and `va_arg(ap, int)` is `expected expression before 'int'` on gcc/clang; MSVC likewise.
 @code
 int dss_va_probe(int n, ...) { __builtin_va_list ap; int v; va_start(ap, n); v = va_arg(ap, int); va_end(ap); return v; }

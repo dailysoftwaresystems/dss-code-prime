@@ -41,6 +41,8 @@
 // flips the total off 39. Runs on the Windows host's differential ctest.
 
 // Mutable global seeds — their runtime loads are opaque to ConstFold/Mem2Reg.
+#include <stdarg.h>
+
 int    g_iseed = 2;
 double g_dseed = 1.0;
 

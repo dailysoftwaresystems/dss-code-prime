@@ -27,7 +27,7 @@
 #include "link/format/object_symbol_names.hpp"  // hasExternalLinkage -- the ONE static-resolution predicate (armap + static pull)
 #include "hir/attributes/ffi_metadata.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
-#include "hir/attributes/visibility_written_as.hpp"   // settleVisibilitiesWrittenAs (P69 fold f26b)
+#include "program/model_to_hir.hpp"   // lowerModelToHir — the gates from the analysis to HIR→MIR
 #include "link/format/ar.hpp"  // writeArArchive (D-LK-STATIC-ARCHIVE-WRITER, c163)
 #include "link/format/coff_object_reader.hpp"  // c170: COFF .obj member reader (static-pull dispatch)
 #include "link/format/elf_object_reader.hpp"  // c165: readRelocatableObject (static-pull member parse)
@@ -1143,22 +1143,14 @@ static std::optional<CuHirModule> buildCuHirImpl(
         return std::nullopt;
     }
 
-    // 2. CST → HIR.
-    auto const hirEntry = reporter.errorCount();
-    phase.emplace(substrate::CompilePhase::LowerHir);
-    auto hir = lowerToHir(model, reporter);
-    phase.reset();
-    if (!hir || !hir->ok || !tierClean(reporter, hirEntry)) {
+    // 2. CST → HIR behind the pipeline's two gates, and the HIR settled for the
+    //    format — `lowerModelToHir` (program/model_to_hir.hpp), the one place they
+    //    are decided, which every fixture that lowers source to MIR shares.
+    ModelLoweredToHir lowered = lowerModelToHir(model, format, reporter);
+    if (!lowered.lowersToMir) {
         return std::nullopt;
     }
-    // P69 fold f26b: a visibility this format cannot write becomes the one its
-    // document states, before any tier reads it, and the program is told.
-    settleVisibilitiesWrittenAs(*hir, format, format.name(),
-                                [&](SymbolId s) {
-                                    SymbolRecord const* r = model.recordFor(s);
-                                    return r != nullptr ? r->name : std::string{};
-                                },
-                                reporter);
+    auto hir = std::move(lowered.hir);
 
     // Both products of the front half. (The resolved CC's `vaListLayout` rode here
     // for the retired <stdio.h> synth pass alone — P69 — and the MIR lowering
@@ -3171,28 +3163,15 @@ realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
             && abi->cc->vaListLayout.has_value()) {
             strat = abi->cc->vaListLayout->strategy;
         }
-        auto& in = lattice.interner();
-        TypeId vaListTy;
-        if (strat == VaListStrategy::HomogeneousPointer) {
-            vaListTy = in.pointer(in.primitive(TypeKind::I8));   // Win64: char*
-        } else if (strat == VaListStrategy::Aapcs64DualCursor) {
-            TypeId const voidPtr = in.pointer(in.primitive(TypeKind::Void));
-            std::array<TypeId, 5> f{voidPtr, voidPtr, voidPtr,
-                                    in.primitive(TypeKind::I32),
-                                    in.primitive(TypeKind::I32)};
-            vaListTy = in.structType("__va_list", f);
-        } else {
-            // SysVRegisterSave, and the nullopt default: a cc with no
-            // `vaListLayout` has no variadic-callee surface at all, so the
-            // SysV-family shape is inert there — the identical fallback the
-            // semantic injector takes.
-            TypeId const voidPtr = in.pointer(in.primitive(TypeKind::Void));
-            std::array<TypeId, 4> f{in.primitive(TypeKind::U32),
-                                    in.primitive(TypeKind::U32), voidPtr,
-                                    voidPtr};
-            vaListTy = in.array(in.structType("__va_list_tag", f), 1);
-        }
-        namedTypeStorage[0] = NamedTypeBinding{"va_list", vaListTy};
+        // The ONE builder the semantic injector reads too (`vaListTypes`), with the
+        // identical nullopt default: a cc with no `vaListLayout` has no variadic-callee
+        // surface at all, so the SysV-family shape is inert there. Bound under the
+        // descriptor vocabulary's own spelling (`ffi::kVaListDescriptorTypeName`).
+        TypeId const vaListTy =
+            vaListTypes(strat.value_or(VaListStrategy::SysVRegisterSave),
+                        lattice.interner()).list;
+        namedTypeStorage[0] =
+            NamedTypeBinding{ffi::kVaListDescriptorTypeName, vaListTy};
         namedTypes = std::span<NamedTypeBinding const>{namedTypeStorage.data(),
                                                        1};
     }

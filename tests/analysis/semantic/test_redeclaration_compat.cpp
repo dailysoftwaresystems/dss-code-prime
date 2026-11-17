@@ -68,15 +68,6 @@ compat(TypeInterner const& in, TypeId a, TypeId b,
 
 // ── e2e tier: the real `c` schema + the REAL shipped-lib descriptor corpus ───
 
-[[nodiscard]] fs::path shippedLibsDir() {
-    fs::path const dir = dss::test::configRoot() / "shippedLibs";
-    std::error_code ec;
-    if (!fs::is_directory(dir, ec))
-        throw std::runtime_error("shipped-lib descriptor directory missing: "
-                                 + dir.string());
-    return dir;
-}
-
 // Analyze `src` the way the production driver does for one (format, dataModel):
 // the real descriptor corpus on the system include path and the format active, so
 // the goal-2 suppression + the platform-realization pass both run for real. The
@@ -87,7 +78,6 @@ compat(TypeInterner const& in, TypeId a, TypeId b,
                                                DataModel dataModel) {
     auto schema = loadShippedSchema("c");
     UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
-    builder.addSystemDir(shippedLibsDir());
     builder.setActiveFormat(format);
     builder.addInMemory(std::move(src), "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());

@@ -77,6 +77,10 @@ namespace dss::sem_test {
         || hasCode(r, DiagnosticCode::S_IntegerPointerConversion);
 }
 
+// ★ P69 L2b2 (lane `lm`): the unit has its language's system dirs BY CONSTRUCTION, as every
+// unit the driver builds does (`UnitBuilder`), so an angle `#include` of a shipped header
+// resolves and one of no header fails on its F_ShippedHeaderNotFound — a DRIVER diagnostic
+// the test fails on unless it asks for it (`test_support/driver_diagnostics_listener.hpp`).
 [[nodiscard]] inline std::shared_ptr<CompilationUnit const>
 buildShippedUnit(std::string_view langName,
                  std::initializer_list<std::string> sources) {
@@ -109,6 +113,23 @@ inline void assertNoBuilderErrors(CompilationUnit const& cu) {
             }
         }
     }
+}
+
+// ★ P69 L2b2 (lane `lm`): THE TEXT A DIAGNOSTIC'S SPAN COVERS, READ FROM THE BUFFER THE SPAN
+// NAMES — the driver's registry: every tree's own source plus the unit's auxiliary
+// (preprocessor ORIGIN) buffers. A preprocessed tree's `source()` is the SYNTHESIZED buffer,
+// and a diagnostic is remapped onto its origin, so slicing `source()` with it reads one
+// buffer's offsets in another (✔MEASURED 2026-11-05, the Mac leg: "M" where a pin expected
+// `z`). A span that names no buffer of the unit is a failure, never an empty match.
+[[nodiscard]] inline std::string spanTextOf(CompilationUnit const& cu, ParseDiagnostic const& d) {
+    for (auto const& tree : cu.trees()) {
+        if (tree.source().id() == d.buffer) return std::string{tree.source().slice(d.span)};
+    }
+    for (auto const& b : cu.auxiliaryBuffers()) {
+        if (b && b->id() == d.buffer) return std::string{b->slice(d.span)};
+    }
+    ADD_FAILURE() << "the diagnostic's span names no buffer of the unit";
+    return {};
 }
 
 } // namespace dss::sem_test

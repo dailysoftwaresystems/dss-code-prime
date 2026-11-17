@@ -1,1 +1,2 @@
-                return RecordedFailure{it->second.candidate, it->second.hit, keyedBySketch};
+                return RecordedFailure{it->second.refusal, it->second.hit, keyedBySketch,
+                                       /*committedTypeReading=*/false};

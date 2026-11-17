@@ -44,14 +44,6 @@ namespace {
                    AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
 }
 
-[[nodiscard]] fs::path shippedLibsDir() {
-    fs::path const dir = dss::test::configRoot() / "shippedLibs";
-    std::error_code ec;
-    if (!fs::is_directory(dir, ec))
-        throw std::runtime_error("shipped-lib descriptor directory missing: " + dir.string());
-    return dir;
-}
-
 // A PLATFORM in play (the format active, the real descriptor corpus on the system include
 // path) — what a library builtin needs to bind: the shape `test_redeclaration_compat.cpp`'s
 // `analyzeWithShipped` uses.
@@ -62,7 +54,6 @@ namespace {
                                       DiagnosticBudget budget = DiagnosticBudget::libraryDefault()) {
     auto schema = loadShippedSchema("c");
     UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
-    builder.addSystemDir(shippedLibsDir());
     builder.setActiveFormat(format);
     builder.addInMemory(std::move(src), "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());

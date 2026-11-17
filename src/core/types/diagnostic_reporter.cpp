@@ -817,9 +817,11 @@ void appendExpectedActual(std::string& out, ParseDiagnostic const& d) {
 void appendScopeStack(std::string& out, ParseDiagnostic const& d) {
     if (d.scopeStack.empty()) return;
     out += "scope: ";
-    for (std::size_t i = 0; i < d.scopeStack.size(); ++i) {
+    // The trail's kinds are read here, at rendering, never at capture (scope_trail.hpp).
+    std::vector<ScopeKind> const kinds = d.scopeStack.kinds();
+    for (std::size_t i = 0; i < kinds.size(); ++i) {
         if (i > 0) out += " > ";
-        out += scopeName(d.scopeStack[i]);
+        out += scopeName(kinds[i]);
     }
     out += '\n';
 }

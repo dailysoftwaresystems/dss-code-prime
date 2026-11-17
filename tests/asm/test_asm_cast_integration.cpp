@@ -31,8 +31,10 @@
 #include "lir/lir_regalloc.hpp"
 #include "lir/lir_rewrite.hpp"
 #include "lir/lowering/mir_to_lir.hpp"
+#include "link/object_format_schema.hpp"
 #include "mir/lowering/hir_to_mir.hpp"
 #include "mir/mir.hpp"
+#include "program/model_to_hir.hpp"   // lowerModelToHir — the pipeline's gates
 
 #include <gtest/gtest.h>
 
@@ -90,11 +92,16 @@ TEST(CastIntegration, SourceLevelFloatToIntCastEncodesCvttsdsi) {
         << (model.diagnostics().all().empty()
                 ? "" : model.diagnostics().all()[0].actual);
 
+    auto const format = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-exec");
+    ASSERT_TRUE(format.has_value());
     DiagnosticReporter hirReporter;
-    auto hir = lowerToHir(model, hirReporter);
+    ModelLoweredToHir lowered = lowerModelToHir(model, **format, hirReporter);   // the pipeline's gates
+    auto const& hir = lowered.hir;
+    ASSERT_NE(hir, nullptr);
     ASSERT_TRUE(hir->ok);
     EXPECT_EQ(hirReporter.errorCount(), 0u);
     if (hirReporter.errorCount() != 0u) dumpDiagnostics(hirReporter);
+    ASSERT_TRUE(lowered.lowersToMir) << "the pipeline's gates pass the clean unit on to MIR";
 
     DiagnosticReporter mirReporter;
     // The language's policy through the pipeline's ONE assembly, and the mutability map the

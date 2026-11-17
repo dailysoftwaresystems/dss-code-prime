@@ -1,7 +1,8 @@
 #include "analysis/compilation_unit/compilation_unit.hpp"
 
 #include "analysis/compilation_unit/import_resolver.hpp"
-#include "ffi/shipped_lib_descriptor.hpp"   // readShippedLibTypedefNames (c43 follow-up: the cast-vs-call oracle)
+#include "analysis/compilation_unit/unit_finished_observer.hpp"   // finish() notifies every observer
+#include "ffi/shipped_lib_descriptor.hpp"   // readShippedLibTypedefNames (the first parse's typedef seed)
 #include "analysis/preprocess/preprocessor.hpp"
 #include "analysis/syntactic/parser.hpp"
 #include "core/crypto/sha256.hpp"            // the ONE content digest — `inputDigest()`
@@ -82,8 +83,13 @@ void reportDriver(DiagnosticReporter& rep,
 // This is THE single chokepoint that makes all three config-driven — every real
 // parse in this file routes through it. AGNOSTIC: reads the schema's own values;
 // no language/target/format branch.
-[[nodiscard]] ParserConfig parserConfigFor(GrammarSchema const& schema) {
+// P69 L2b2 (lane `lm`): `hoistTriageBaseAsk` is the builder's, never the schema's: it is on
+// for every compile, and only the identity witness turns it off
+// (`UnitBuilder::setTriageBaseHoistForTheIdentityWitness`), to prove the hoisted base ask
+// decides nothing the opened probe would not.
+[[nodiscard]] ParserConfig parserConfigFor(GrammarSchema const& schema, bool hoistTriageBaseAsk) {
     ParserConfig cfg;
+    cfg.hoistTriageBaseAsk = hoistTriageBaseAsk;
     if (auto cap = schema.maxExpressionDepth()) {
         cfg.maxExpressionDepth = *cap;
     }
@@ -112,7 +118,6 @@ CompilationUnit::CompilationUnit(PrivateTag,
                                  DiagnosticReporter                   driverDiagnostics,
                                  std::vector<CrossTreeRef>            crossRefs,
                                  std::vector<ShippedDescriptorRef>    shippedLibDescriptors,
-                                 std::uint32_t                        typeNameReparseCount,
                                  std::vector<std::shared_ptr<SourceBuffer>> auxiliaryBuffers,
                                  std::vector<std::unordered_map<std::uint32_t, std::uint32_t>>
                                      pragmaPackMaps,
@@ -120,19 +125,20 @@ CompilationUnit::CompilationUnit(PrivateTag,
                                      pragmaNoOptimizeSets,
                                  std::vector<PreprocessedPositionMap>
                                      preprocessedPositionMaps,
-                                 std::string                          inputDigest)
+                                 std::string                          inputDigest,
+                                 std::uint64_t                        speculationProbeCount)
     : id_(id)
     , schema_(std::move(schema))
     , trees_(std::move(trees))
     , driverDiagnostics_(std::move(driverDiagnostics))
     , crossRefs_(std::move(crossRefs))
     , shippedLibDescriptors_(std::move(shippedLibDescriptors))
-    , typeNameReparseCount_(typeNameReparseCount)
     , auxiliaryBuffers_(std::move(auxiliaryBuffers))
     , pragmaPackMaps_(std::move(pragmaPackMaps))
     , pragmaNoOptimizeSets_(std::move(pragmaNoOptimizeSets))
     , preprocessedPositionMaps_(std::move(preprocessedPositionMaps))
-    , inputDigest_(std::move(inputDigest)) {}
+    , inputDigest_(std::move(inputDigest))
+    , speculationProbeCount_(speculationProbeCount) {}
 
 CompilationUnit::~CompilationUnit()                                            = default;
 CompilationUnit::CompilationUnit(CompilationUnit&&) noexcept                   = default;
@@ -142,6 +148,17 @@ CompilationUnit& CompilationUnit::operator=(CompilationUnit&&) noexcept        =
 CompilationUnitId             CompilationUnit::id()                const noexcept { return id_; }
 std::span<Tree const>         CompilationUnit::trees()             const noexcept { return trees_; }
 DiagnosticReporter const&     CompilationUnit::driverDiagnostics() const noexcept { return driverDiagnostics_; }
+
+bool CompilationUnit::forEachOwnDiagnosticStream(
+    std::function<void(DiagnosticReporter const&)> const& sink) const {
+    bool failed = driverDiagnostics_.hasErrors();
+    sink(driverDiagnostics_);
+    for (Tree const& tree : trees_) {
+        if (tree.diagnostics().hasErrors()) failed = true;
+        sink(tree.diagnostics());
+    }
+    return failed;
+}
 std::span<CrossTreeRef const> CompilationUnit::crossRefs()         const noexcept { return crossRefs_; }
 std::span<ShippedDescriptorRef const>
 CompilationUnit::shippedLibDescriptors() const noexcept { return shippedLibDescriptors_; }
@@ -149,6 +166,8 @@ std::span<std::shared_ptr<SourceBuffer> const>
 CompilationUnit::auxiliaryBuffers() const noexcept { return auxiliaryBuffers_; }
 std::string_view
 CompilationUnit::inputDigest() const noexcept { return inputDigest_; }
+std::uint64_t
+CompilationUnit::speculationProbeCount() const noexcept { return speculationProbeCount_; }
 
 std::unordered_map<std::uint32_t, std::uint32_t> const&
 CompilationUnit::pragmaPackFor(std::size_t treeIndex) const noexcept {
@@ -295,6 +314,25 @@ UnitBuilder::UnitBuilder(std::shared_ptr<GrammarSchema const> schema,
         cuFatal("UnitBuilder: schema is null");
     }
     schemas_.push_back(schema_);   // primary is also the sole registry entry
+    adoptSystemDirs_(LanguageSystemDirs{*schema_});
+}
+
+UnitBuilder::UnitBuilder(std::shared_ptr<GrammarSchema const> schema,
+                         DiagnosticBudget                     budget,
+                         LanguageSystemDirs const&            systemDirs)
+    : id_(CompilationUnit::nextId())
+    , schema_(std::move(schema))
+    , budget_(budget)
+    , driverDiagnostics_(budget.withoutDedup().asConfig()) {
+    if (!schema_) {
+        cuFatal("UnitBuilder: schema is null");
+    }
+    if (systemDirs.grammar() != schema_.get()) {
+        cuFatal("UnitBuilder: the system dirs it was handed were resolved for another "
+                "language than the unit's own");
+    }
+    schemas_.push_back(schema_);   // primary is also the sole registry entry
+    adoptSystemDirs_(systemDirs);
 }
 
 UnitBuilder::UnitBuilder(std::vector<std::shared_ptr<GrammarSchema const>> schemas,
@@ -310,6 +348,23 @@ UnitBuilder::UnitBuilder(std::vector<std::shared_ptr<GrammarSchema const>> schem
     }
     schema_  = schemas.front();    // primary = first registered
     schemas_ = std::move(schemas);
+    for (auto const& s : schemas_) adoptLanguage_(*s);   // every language, not the primary alone
+}
+
+LanguageSystemDirs::LanguageSystemDirs(GrammarSchema const& grammar)
+    : grammar_(&grammar), dirs_(resolveSystemDirs(grammar)) {}
+
+void UnitBuilder::adoptSystemDirs_(LanguageSystemDirs const& dirs) {
+    if (systemDirsCleared_) return;   // the caller named a unit without its languages' dirs
+    for (std::filesystem::path const& dir : dirs.dirs()) {
+        if (std::find(systemDirs_.begin(), systemDirs_.end(), dir) == systemDirs_.end()) {
+            systemDirs_.push_back(dir);
+        }
+    }
+}
+
+void UnitBuilder::adoptLanguage_(GrammarSchema const& grammar) {
+    adoptSystemDirs_(LanguageSystemDirs{grammar});
 }
 
 void UnitBuilder::registerSchema(std::shared_ptr<GrammarSchema const> schema) {
@@ -319,6 +374,7 @@ void UnitBuilder::registerSchema(std::shared_ptr<GrammarSchema const> schema) {
     if (!schema) {
         cuFatal("UnitBuilder::registerSchema: schema is null");
     }
+    adoptLanguage_(*schema);   // a registered language brings its system dirs
     schemas_.push_back(std::move(schema));
 }
 
@@ -332,13 +388,17 @@ void UnitBuilder::addTree(Tree&& tree) {
     }
     trees_.push_back(std::move(tree));
     // FC2: keep the parse-sidecar vector index-parallel by construction.
-    // An externally-built tree has no parse sidecar (empty candidates,
-    // no source/schema handle) — it is never oracle-reparsed.
+    // An externally-built tree keeps an EMPTY parse sidecar.
     sidecars_.emplace_back();
 }
 
 TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
                                 std::shared_ptr<GrammarSchema const> schema) {
+    // ONE SNAPSHOT OF THE SHIPPED CORPUS FOR THIS PARSE (P69 L2b2, ruling 602): the
+    // preprocessor's readers and closure walks and the name seed read each descriptor
+    // once and resolve each path once; the next operation reads again, so a builder kept
+    // alive sees a descriptor rewritten between two of its operations.
+    ffi::ShippedDescriptorReadScope const oneSnapshot;
     // Keep the registry the authoritative set of EVERY schema used in this CU
     // (an explicit-schema addInMemory may name a schema never registered): so
     // finish()'s per-schema import resolution covers this tree, and so a later
@@ -348,7 +408,10 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
         for (auto const& s : schemas_) {
             if (s->schemaId() == schema->schemaId()) { known = true; break; }
         }
-        if (!known) schemas_.push_back(schema);
+        if (!known) {
+            schemas_.push_back(schema);
+            adoptLanguage_(*schema);   // the language brings its system dirs
+        }
     }
     // Empty translation unit is valid (consistent with "empty CU is valid"):
     // note it as Info but still parse + add the (empty) tree. Lives here so
@@ -410,15 +473,16 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
         // [[D-PP-REMAP-ORIGIN-OFFSET-UNVALIDATED]]: the DIAGNOSTIC-shaped
         // twin. It carries the same position rewrite `remap` does, plus the
         // `expanded from macro 'X'` note a product-token subject needs — so
-        // the two tiers that hand whole diagnostics through (this parse and
-        // the FC2 oracle reparse below) use it, while every POSITION-only
+        // the tier that hands whole diagnostics through (this parse) uses
+        // it, while every POSITION-only
         // consumer (the LSP map, the descriptor refs, the post-parse tiers)
         // keeps `remap`. Both are derived from the SAME line map.
         auto diagRemap = pp.makeDiagnosticRemap();
         std::shared_ptr<SourceBuffer> synth = pp.synthBuffer;
         // The parser consumes a stream built from a COPY of the preprocessed
-        // tokens; the vector is retained in the sidecar for the FC2 oracle
-        // reparse. The synthesized buffer is the parse source.
+        // tokens; the vector is retained in the sidecar, where the unit's
+        // input-closure digest reads it (`inputDigest`). The synthesized
+        // buffer is the parse source.
         // FC13 gate (D-PP-FATAL-HALTS-PARSE): a FATAL preprocessor backstop
         // (the >256 macro-expansion-nesting guard or the include-nesting
         // guard) TRUNCATES the synthesized stream at the failure point.
@@ -457,33 +521,31 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
         phase.emplace(substrate::CompilePhase::Parse);
         // D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION: seed the binder sketch's global
         // scope with the LIVE shipped-descriptor typedef NAMES (`size_t` from
-        // <stddef.h>, the stdint widths, …) BEFORE the FIRST parse. Those
-        // typedefs are injected SEMANTICALLY (post-parse), so without this the
-        // includer parsed `(size_t)(expr)` as a CALL and recorded an
-        // AmbiguousTypeNameCandidate -> UnitBuilder::finish() re-tokenized and
-        // re-parsed the WHOLE TU (~0.75s/TU on the SQLite amalgamation) just to
-        // learn the name is a type. Seeding it up front commits the cast on parse
-        // 1 (parser.cpp NameKind::Type) -> no candidate -> no reparse. This reuses
-        // the EXACT channel the finish() oracle reparse already uses
-        // (ParserConfig::seedGlobalTypeNames -> BinderSketch::seedGlobalType); the
-        // reparse is RETAINED as the residual net for in-buffer FORWARD references
-        // (a typedef used before its own definition in the synthesized buffer),
-        // which no descriptor seed can cover. Interner-free NAME harvest over the
+        // <stddef.h>, the stdint widths, …) BEFORE the parse. Those typedefs are
+        // injected SEMANTICALLY (post-parse), so without the seed the parse would
+        // not know `size_t` as a type name and would read `(size_t)(expr)` as a
+        // CALL; seeded, the cast commits (parser.cpp NameKind::Type). It is the
+        // ONE channel by which a name the source does not declare reaches the
+        // parse as a type (ParserConfig::seedGlobalTypeNames ->
+        // BinderSketch::seedGlobalType): a name only ANOTHER translation unit
+        // declares is no type name here (C 6.2.1 — gcc 13.3.0, clang 18.1.3 and
+        // cl refuse it, P69 L2b2), and a use before its own typedef is none either
+        // (C 6.2.1p7). Interner-free NAME harvest over the
         // descriptors the preprocessor actually resolved (parent + transitive
         // `includes` closure), deduped by name. A scratch reporter: a malformed
         // descriptor is reported ONCE by the semantic read, never here.
-        // ORACLE-ALIGNED (D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION): `pp.resolvedShippedDescriptors` is now the
+        // LIVE ONLY (D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION): `pp.resolvedShippedDescriptors` is the
         // AUTHORITATIVELY-LIVE descriptor set (the preprocessor drops a splice whose
-        // offset falls in an `#if 0` dead range), EQUAL to the finish() oracle's
-        // `shippedLibDescriptors`. So seeding resolves EXACTLY the names the finish()
-        // reparse would -- never a superset, never a name from a dead-branch include.
+        // offset falls in an `#if 0` dead range), EQUAL to the import resolver's
+        // `shippedLibDescriptors` -- never a superset, never a name from a dead-branch include.
         // ONE-DIRECTIONAL (P0016): a real in-source binding still SHADOWS a seed
         // (`lookup` scans bindings newest-first; seeds precede every parse-time
         // record), so seeding only ever turns Unknown -> Type, never overrides a
         // Value -- it resolves MORE names, never suppresses a diagnostic.
-        ParserConfig cfg = parserConfigFor(*schema);
+        ParserConfig cfg = parserConfigFor(*schema, hoistTriageBaseAsk_);
         {
             std::unordered_set<std::string> seen;
+            std::unordered_set<std::string> seenValues;
             for (std::filesystem::path const& desc :
                  pp.resolvedShippedDescriptors) {
                 DiagnosticReporter scratch{budget_.withoutDedup().asConfig()};
@@ -495,11 +557,24 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
                         }
                     }
                 }
+                // P69 L2b2 (ruling 516): and its VALUE names — the functions, objects and
+                // constants the semantic read binds — so a name the sketch does not know is
+                // one nothing declares. The format the analyzer gates them by, when the unit
+                // has one; every format's otherwise (a superset: a name the sketch knows is
+                // never called undeclared).
+                if (auto names = ffi::readShippedLibValueNames(desc, activeFormat_, scratch)) {
+                    for (auto& n : *names) {
+                        if (seenValues.insert(n).second) {
+                            cfg.seedGlobalValueNames.push_back(std::move(n));
+                        }
+                    }
+                }
             }
         }
         Parser p{synth, schema, std::move(stream), budget_, std::move(cfg),
                  std::move(pp.diagnostics)};
         ParseResult result = std::move(p).parse();
+        speculationProbes_ += result.speculationProbeCount;
         phase.reset();
         // Remap the produced tree's diagnostics off the synth buffer onto the
         // origin file(s) before ingest, so a header-origin (and post-splice
@@ -514,14 +589,8 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
         }
         addTree(std::move(result.tree));
         auto& sidecar           = sidecars_.back();
-        sidecar.candidates      = std::move(result.typeNameCandidates);
-        sidecar.globalTypeNames = std::move(result.globalTypeNames);
-        sidecar.globalTypeBindings = std::move(result.globalTypeBindings);
-        sidecar.source          = std::move(synth);
-        sidecar.schema          = std::move(schema);
         sidecar.ppTokens        = std::move(pp.tokens);
         sidecar.ppRemap         = std::move(remap);
-        sidecar.ppDiagRemap     = std::move(diagRemap);
         // [[D-PP-SEMANTIC-DIAGNOSTIC-POSITION-UNREMAPPED]]: record the SYNTH
         // buffer so the finished CU can answer "is this position in synthesized
         // coordinates" for EVERY later tier — the parse tier is simply the only
@@ -538,7 +607,7 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
             if (!seg.origin) { remapCoversEverySegment = false; break; }
         }
         if (remapCoversEverySegment) {
-            sidecar.ppSynthBuffer = sidecar.source->id();
+            sidecar.ppSynthBuffer = synth->id();
             // D-LSP-POSITIONS-RESOLVED-IN-SYNTHESIZED-PREPROCESSOR-COORDINATES:
             // carry the MAP and the MAIN ORIGIN under the SAME condition as the
             // synth id, so all three are recorded together or not at all. A
@@ -576,20 +645,12 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
     Tokenizer tk{src, schema, budget_};
     auto [stream, lexDiags] = std::move(tk).tokenize();
     phase.emplace(substrate::CompilePhase::Parse);
-    Parser p{src, schema, std::move(stream), budget_, parserConfigFor(*schema),
+    Parser p{src, schema, std::move(stream), budget_, parserConfigFor(*schema, hoistTriageBaseAsk_),
              std::move(lexDiags)};
     ParseResult result = std::move(p).parse();
+    speculationProbes_ += result.speculationProbeCount;
     phase.reset();
     addTree(std::move(result.tree));
-    // FC2: fill the sidecar addTree just pushed — the parse's ambiguous
-    // type-name candidates + exported global type names (the finish()-time
-    // oracle's inputs) and the handles a one-shot reparse needs.
-    auto& sidecar           = sidecars_.back();
-    sidecar.candidates      = std::move(result.typeNameCandidates);
-    sidecar.globalTypeNames = std::move(result.globalTypeNames);
-    sidecar.globalTypeBindings = std::move(result.globalTypeBindings);
-    sidecar.source          = std::move(src);
-    sidecar.schema          = std::move(schema);
     return trees_.back().id();
 }
 
@@ -657,13 +718,12 @@ void UnitBuilder::addSystemDir(std::filesystem::path dir) {
     systemDirs_.push_back(std::move(dir));
 }
 
-// See the header. The WALK is `resolveSystemDirs`
-// (`core/types/config_path_walk.hpp`); this is only the binding onto a builder,
-// and it is a named function rather than an open-coded loop so that every
-// channel that builds a CU — driver, editor, and anything after them — is
-// visibly asking the SAME question.
-void applySystemDirs(UnitBuilder& builder, GrammarSchema const& grammar) {
-    for (auto const& d : resolveSystemDirs(grammar)) builder.addSystemDir(d);
+void UnitBuilder::clearSystemDirs() {
+    if (finished_) {
+        cuFatal("UnitBuilder::clearSystemDirs called after finish()");
+    }
+    systemDirs_.clear();
+    systemDirsCleared_ = true;
 }
 
 void UnitBuilder::setActiveFormat(ObjectFormatKind fmt) {
@@ -816,6 +876,17 @@ void UnitBuilder::setCharIsUnsigned(std::optional<bool> charIsUnsigned) {
         cuFatal("UnitBuilder::setCharIsUnsigned called after finish()");
     }
     charIsUnsigned_ = charIsUnsigned;
+}
+
+void UnitBuilder::setTriageBaseHoistForTheIdentityWitness(bool hoist) {
+    if (finished_) {
+        cuFatal("UnitBuilder::setTriageBaseHoistForTheIdentityWitness called after finish()");
+    }
+    if (!trees_.empty()) {
+        cuFatal("UnitBuilder::setTriageBaseHoistForTheIdentityWitness called after a tree was "
+                "added: every tree of one unit is parsed under one setting");
+    }
+    hoistTriageBaseAsk_ = hoist;
 }
 
 void UnitBuilder::setUserDefines(std::vector<std::string> defines) {
@@ -994,6 +1065,10 @@ CompilationUnit UnitBuilder::finish() && {
     if (finished_) {
         cuFatal("UnitBuilder::finish() called twice");
     }
+    // ONE SNAPSHOT OF THE SHIPPED CORPUS FOR THIS FINISH (P69 L2b2, ruling 602): the
+    // predefined-macro check, the import resolution and the parses it follows into read
+    // each descriptor once and resolve each path once.
+    ffi::ShippedDescriptorReadScope const oneSnapshot;
 
     validatePredefinedMacroIdentity_();
 
@@ -1049,196 +1124,6 @@ CompilationUnit UnitBuilder::finish() && {
         }
     }
 
-    // ── FC2 type-name oracle + conditional reparse ────────────────────────
-    //
-    // Premise: an `#include`d header's typedefs are invisible to the
-    // INCLUDER's parse (each file parses alone; trees merge post-parse via
-    // crossRefs), so `(MyT)-x` with MyT from a header froze as the value
-    // reading and recorded an AmbiguousTypeNameCandidate. Here — after the
-    // resolvers loaded every include target, while `trees_` is still
-    // mutable — the oracle resolves each candidate against the UNION of
-    // every tree's exported global TYPE names (each parse's binder sketch
-    // already harvested its own; nested includes are covered because the
-    // union spans ALL trees in the CU). A tree with ≥1 resolved candidate
-    // is re-tokenized + re-parsed ONCE with the resolved names seeded into
-    // the binder sketch's global scope, and REPLACED in place. The second
-    // parse's diagnostics replace the first's wholesale (the Tree owns its
-    // diagnostic stream — no double-report). Candidates the oracle cannot
-    // resolve keep the value reading (semantic diagnoses misuse — fail
-    // loud, correct C behavior). Single round by design: candidates that
-    // EMERGE on a reparse are not re-processed.
-    //
-    // Languages with no binder declarations record no candidates → this
-    // whole block is a no-op scan (zero cost, zero behavior).
-    std::uint32_t typeNameReparseCount = 0;
-    {
-        bool anyCandidates = false;
-        for (auto const& sc : sidecars_) {
-            if (!sc.candidates.empty()) { anyCandidates = true; break; }
-        }
-        if (anyCandidates) {
-            std::unordered_set<std::string> oracle;
-            for (auto const& sc : sidecars_) {
-                for (auto const& n : sc.globalTypeNames) oracle.insert(n);
-            }
-            // D-CSUBSET-SHIPPED-TYPEDEF-CAST-PARSE: a SHIPPED header's typedefs
-            // (`size_t` from <stddef.h>, `ptrdiff_t`, the stdint widths, …) are
-            // injected SEMANTICALLY (post-parse), so they appear in NO tree's
-            // `globalTypeNames` — the includer parsed `(size_t)(expr)` as a CALL
-            // and recorded an AmbiguousTypeNameCandidate. Harvest each resolved
-            // shipped descriptor's typedef NAMES into the oracle so the reparse
-            // below seeds them as parse-time type names and COMMITS the cast (then
-            // c43's offsetof fold applies → sqlite's `keyinfoSpace[offsetof(...)]`
-            // dim is constant, S001C clears). Interner-free (names only); a scratch
-            // reporter so a malformed descriptor is reported ONCE by the semantic
-            // read (readShippedLibDescriptor), never double-reported here.
-            for (auto const& ref : shippedLibDescriptors) {
-                DiagnosticReporter scratch{budget_.withoutDedup().asConfig()};
-                if (auto names = ffi::readShippedLibTypedefNames(ref.path, scratch)) {
-                    for (auto& n : *names) oracle.insert(std::move(n));
-                }
-            }
-            // `sidecars_` is index-parallel to `trees_` by construction
-            // (addTree appends both) — fatal if that invariant ever broke.
-            if (sidecars_.size() != trees_.size()) {
-                cuFatal("UnitBuilder::finish: parse-sidecar vector out of "
-                        "sync with trees");
-            }
-            for (std::size_t i = 0; i < trees_.size(); ++i) {
-                auto& sc = sidecars_[i];
-                if (sc.candidates.empty()) continue;
-                // D-CSUBSET-FN-TYPE-TYPEDEF-PAREN-NAME: a typedef name is not
-                // in scope within its OWN declarator (C 6.2.1p7). The oracle
-                // seeds a name as a GLOBAL (position-independent) type for the
-                // whole reparse, so seeding a typedef's OWN name would make its
-                // own parenthesized-name declarator (`typedef int (F);`) reparse
-                // as an abstract function-suffix param (F a param TYPE) instead
-                // of the parenthesized declarator that NAMES F — S0017. A
-                // candidate's span IS its self-defining occurrence exactly when
-                // it equals one of THIS tree's own global-TYPE binding spans (a
-                // byte range uniquely identifies one token in the buffer, so
-                // span equality ⇒ same token ⇒ the definition site). A genuine
-                // cross-file / in-buffer-FORWARD use has a DISTINCT span from
-                // the definition (BothDirectionsResolveInlineInOneBuffer), and a
-                // cross-file typedef's binding lives in ANOTHER tree — neither
-                // is excluded here.
-                auto spanKey = [](SourceSpan s) {
-                    return (static_cast<std::uint64_t>(s.start()) << 32)
-                           | s.end();
-                };
-                std::unordered_set<std::uint64_t> ownBindingSpans;
-                ownBindingSpans.reserve(sc.globalTypeBindings.size());
-                for (auto const& [name, span] : sc.globalTypeBindings) {
-                    (void)name;
-                    ownBindingSpans.insert(spanKey(span));
-                }
-                std::vector<std::string>        seeds;
-                std::unordered_set<std::string> seen;
-                for (auto const& cand : sc.candidates) {
-                    if (!oracle.contains(cand.name)) continue;
-                    if (ownBindingSpans.contains(spanKey(cand.span))) {
-                        continue;   // self-defining occurrence — C 6.2.1p7
-                    }
-                    if (seen.insert(cand.name).second) {
-                        seeds.push_back(cand.name);
-                    }
-                }
-                if (seeds.empty()) continue;   // unresolved → value reading stands
-                if (!sc.source || !sc.schema) {
-                    // Candidates exist but the tree was injected via the
-                    // raw addTree path (no source/schema handle) — we
-                    // cannot reparse what we did not parse. Unreachable
-                    // for builder-parsed trees; fail loud over silently
-                    // dropping a resolvable cross-file type.
-                    cuFatal("UnitBuilder::finish: type-name candidates on "
-                            "a tree with no reparse handles");
-                }
-                // Same config-driven cap as the first parse — the reparse
-                // re-walks the SAME (possibly deep) tree, so it must admit the
-                // identical nesting depth or a clean first parse would fail the
-                // oracle reparse.
-                ParserConfig cfg = parserConfigFor(*sc.schema);
-                cfg.seedGlobalTypeNames = std::move(seeds);
-                // Build the reparse result. When this tree was preprocessed
-                // (FC13), `sc.source` is the synthesized buffer and
-                // re-tokenizing it would lose macro expansion + leave
-                // directives in -- so rebuild an identical stream from the
-                // retained preprocessed tokens, reparse with the type-name
-                // seed, and re-apply the line-map remap so the reparsed tree's
-                // diagnostics still attribute to the origin header/main file.
-                // c97: the oracle reparse accumulates into its OWN phase
-                // (Reparse, not Parse) so the ~2x front-end multiplier is
-                // visible in the --time breakdown.
-                substrate::PhaseTimers::Scope reparsePhase{
-                    substrate::CompilePhase::Reparse};
-                ParseResult result = [&] {
-                    if (!sc.ppTokens.empty()) {
-                        TokenStream stream =
-                            TokenStream::fromTokens(sc.ppTokens);
-                        Parser p{sc.source, sc.schema, std::move(stream),
-                                 budget_, std::move(cfg), nullptr};
-                        ParseResult r = std::move(p).parse();
-                        if (sc.ppDiagRemap) {
-                            r.tree.remapDiagnostics(sc.ppDiagRemap);
-                        }
-                        return r;
-                    }
-                    Tokenizer tk{sc.source, sc.schema, budget_};
-                    auto [stream, lexDiags] = std::move(tk).tokenize();
-                    Parser p{sc.source, sc.schema, std::move(stream),
-                             budget_, std::move(cfg), std::move(lexDiags)};
-                    return std::move(p).parse();
-                }();
-                trees_[i]          = std::move(result.tree);
-                sc.candidates      = std::move(result.typeNameCandidates);
-                sc.globalTypeNames = std::move(result.globalTypeNames);
-                sc.globalTypeBindings = std::move(result.globalTypeBindings);
-                ++typeNameReparseCount;
-            }
-            if (typeNameReparseCount > 0) {
-                // A reparsed tree carries a NEW TreeId (and fresh NodeIds),
-                // so every crossRefs edge built above is potentially stale.
-                // Re-run the resolvers over the FINAL tree set into fresh
-                // outputs. The first pass's driver diagnostics + descriptor
-                // paths remain authoritative (they are path-keyed, not
-                // tree-id-keyed); the re-resolve writes into scratch sinks
-                // so nothing double-reports. Inputs are identical (every
-                // include target is already loaded; loadAndAdd_ dedups by
-                // canonical path), so the edge SET is the same — only the
-                // ids are refreshed.
-                crossRefs.clear();
-                DiagnosticReporter scratchDiags{budget_.withoutDedup().asConfig()};
-                std::vector<ShippedDescriptorRef> scratchDescriptors;
-                ResolutionContext recontext{
-                    trees_,
-                    scratchDiags,
-                    includeDirs_,
-                    systemDirs_,
-                    headerNameMatching_,
-                    headerSearch_,   // identical inputs, the same view of the tree
-                    activeFormat_,   // identical inputs to the first pass
-                    [this](std::filesystem::path const& path, bool& ok,
-                           std::shared_ptr<GrammarSchema const> schema) {
-                        return loadAndAdd_(path, ok, std::move(schema));
-                    },
-                    crossRefs,
-                    scratchDescriptors,
-                };
-                resolvedSchemaIds.clear();
-                // c97: the post-reparse re-resolve accumulates into the same
-                // resolve-imports phase (its `runs` count shows the 2nd pass).
-                substrate::PhaseTimers::Scope reresolvePhase{
-                    substrate::CompilePhase::ResolveImports};
-                for (auto const& schema : schemas_) {
-                    if (!resolvedSchemaIds.insert(schema->schemaId().v).second) {
-                        continue;
-                    }
-                    chooseResolver(schema)->resolve(recontext);
-                }
-            }
-        }
-    }
-
     // c105 (D-PP-USER-DEFINE fold): remap every shipped-descriptor ref's
     // carried `#include` span/buffer from SYNTH coordinates onto its ORIGIN
     // file, exactly as tree diagnostics are remapped. Pre-c105 this was
@@ -1261,7 +1146,7 @@ CompilationUnit UnitBuilder::finish() && {
     // remaps to the FINISHED CU, so they outlive this builder.
     //
     // Everything above this line is the builder's own use of them — the parse
-    // tier's `remapDiagnostics`, the FC2 oracle reparse, the descriptor refs.
+    // tier's `remapDiagnostics` and the descriptor refs.
     // Every tier BELOW (semantic, HIR, MIR, LIR, the assembly engine, the
     // linker) re-derives its positions from the SAME trees and therefore re-mints
     // the same synthesized coordinates; until now it had nothing to convert them
@@ -1412,7 +1297,7 @@ CompilationUnit UnitBuilder::finish() && {
     std::string const inputDigest = crypto::sha256Hex(doc);
 
     finished_ = true;
-    return CompilationUnit{
+    CompilationUnit unit{
         CompilationUnit::PrivateTag{},
         id_,
         std::move(schema_),
@@ -1420,13 +1305,17 @@ CompilationUnit UnitBuilder::finish() && {
         std::move(driverDiagnostics_),
         std::move(crossRefs),
         std::move(shippedLibDescriptors),
-        typeNameReparseCount,
         std::move(auxiliaryBuffers_),
         std::move(pragmaPackMaps),
         std::move(pragmaNoOptimizeSets),
         std::move(preprocessedPositionMaps),
         inputDigest,
+        speculationProbes_,
     };
+    // Every unit any builder finishes is heard by every registered observer — the one
+    // place a consumer sees them all, whoever built it (unit_finished_observer.hpp).
+    UnitFinishedObservers::notify(unit);
+    return unit;
 }
 
 } // namespace dss

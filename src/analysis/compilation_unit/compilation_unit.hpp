@@ -15,7 +15,6 @@
 // Locked decisions L1-L6 + deferrals D1-D8 live in
 // `.plans/08-compilation-unit-plan - tbd.md` §2.5.
 
-#include "analysis/syntactic/binder_sketch.hpp"   // AmbiguousTypeNameCandidate (FC2 sidecar)
 #include "core/export.hpp"
 #include "core/types/diagnostic_budget.hpp"
 #include "core/types/diagnostic_reporter.hpp"
@@ -103,14 +102,14 @@ struct DSS_EXPORT PreprocessedPositionMap {
     //
     // ★ THIS COSTS NOTHING AND IT IS WHY THE CLOSURE WAS NEVER ENOUGH.
     // `makeRemap()` ALREADY copies the whole `LineMap` into the closure (its
-    // own note says so: the FC2 oracle reparse re-invokes it long after the
-    // `PreprocessResult` dies, so a pointer would dangle). So the segments were
+    // own note says so: the closure outlives the `PreprocessResult` it came
+    // from, so a pointer would dangle). So the segments were
     // always here — sealed inside a `std::function` that exposes exactly ONE
     // direction. Carrying the map openly makes BOTH directions derivable from
     // one owner that cannot drift, instead of inviting a second table.
     //
     // ⚠ The closure is NOT deleted and must not be: `Tree::remapDiagnostics`
-    // and the FC2 oracle reparse take a closure-shaped adapter. It is DERIVED
+    // and the descriptor refs take a closure-shaped adapter. It is DERIVED
     // from this same map (`PreprocessResult::makeRemap`), so there stays
     // exactly one implementation of the forward direction.
     LineMap map;
@@ -146,7 +145,6 @@ public:
                     DiagnosticReporter                   driverDiagnostics,
                     std::vector<CrossTreeRef>            crossRefs,
                     std::vector<ShippedDescriptorRef>    shippedLibDescriptors,
-                    std::uint32_t                        typeNameReparseCount = 0,
                     std::vector<std::shared_ptr<SourceBuffer>> auxiliaryBuffers = {},
                     // TF-C82: index-parallel to `trees` — see `pragmaPackFor`.
                     std::vector<std::unordered_map<std::uint32_t, std::uint32_t>>
@@ -164,7 +162,9 @@ public:
                     // `inputDigest()`. Empty only for a CU built by a path that
                     // predates this parameter, which `inputDigest()` reports as
                     // "not computed" rather than as a value.
-                    std::string inputDigest = {});
+                    std::string inputDigest = {},
+                    // The probes every parse of the unit opened. See `speculationProbeCount()`.
+                    std::uint64_t speculationProbeCount = 0);
 
     ~CompilationUnit();  // out-of-line; mirrors Tree's discipline.
 
@@ -230,6 +230,23 @@ public:
     // ...). Empty in CU1 — the first D_* codes land in CU2.
     [[nodiscard]] DiagnosticReporter const&      driverDiagnostics() const noexcept;
 
+    // ★★★ THE UNIT'S OWN VERDICT — ONE HOME FOR EVERY CHANNEL THAT FINISHES A UNIT.
+    // A unit carries its own diagnostics in more than one stream: the driver's
+    // (`driverDiagnostics()`: an `#include` no directory resolves, a missing file)
+    // and each tree's (its lexer's and parser's, an error the parser recovered
+    // from included). This calls `sink` with each of them in the order the tiers
+    // ran — the driver's, then every tree's — and returns whether ANY carried an
+    // Error: the unit's own answer, before any analysis runs on it.
+    // Every channel that finishes a unit reads its streams through here — the
+    // build's drain, the FFI header reader, the editor. A channel that read only
+    // the analysis's diagnostics, or only the first tree's, took a header that
+    // resolved nowhere, or a parse its parser recovered from, for the declarations
+    // that survived. The sink says only WHERE a stream goes (a reporter with its
+    // buffers, a caller's reporter, the editor's raw list) — never WHICH streams
+    // a unit has.
+    [[nodiscard]] bool forEachOwnDiagnosticStream(
+        std::function<void(DiagnosticReporter const&)> const& sink) const;
+
     // Always returns an empty span in CU1-CU3. CU4's ImportResolver is the
     // only producer (D4); the accessor + struct ship now so CU3's semantic-
     // phase contract sees the consumption shape from day one (L5).
@@ -254,15 +271,6 @@ public:
     // does not collide with builder-produced ids — same posture as
     // `TreeBuilder::nextTreeId()`.
     [[nodiscard]] static CompilationUnitId nextId() noexcept;
-
-    // FC2 observability: how many trees the type-name oracle REPARSED
-    // during finish() (cross-file ambiguous-cast resolution). 0 when no
-    // tree recorded a resolvable AmbiguousTypeNameCandidate — the pin
-    // that the reparse pass costs nothing on candidate-free builds.
-    // Pure observability, NOT a behavior knob.
-    [[nodiscard]] std::uint32_t typeNameReparseCount() const noexcept {
-        return typeNameReparseCount_;
-    }
 
     // FC13: auxiliary source buffers that diagnostics may reference but which
     // are NOT a parsed tree's `source()` -- the C preprocessor's origin
@@ -360,6 +368,13 @@ public:
     // — and a key builder must treat empty as a REFUSAL, never as "no inputs".
     // Empty is detectable; wrong is not.
     [[nodiscard]] std::string_view inputDigest() const noexcept;
+
+    // P69 L2b2 (lane `lm`): the speculation probes every parse of this unit opened
+    // (`ParseResult::speculationProbeCount`, summed). A count of parser work, never a
+    // fact about the program: the identity witness reads it to prove its switch reached
+    // the parser (`UnitBuilder::setTriageBaseHoistForTheIdentityWitness`). Zero for a
+    // unit built by a path that predates it.
+    [[nodiscard]] std::uint64_t speculationProbeCount() const noexcept;
 
     // ★★ TF-C82 (D-PP-PRAGMA-REGISTRY): tree `treeIndex`'s `#pragma pack` stamps —
     // synth byte offset of a token -> the MAXIMUM MEMBER ALIGNMENT (bytes) the
@@ -473,7 +488,6 @@ private:
     DiagnosticReporter                   driverDiagnostics_;
     std::vector<CrossTreeRef>            crossRefs_;
     std::vector<ShippedDescriptorRef>    shippedLibDescriptors_;  // FF11 neutral-JSON descriptor refs (path+span+buffer)
-    std::uint32_t                        typeNameReparseCount_ = 0;  // FC2 oracle observability
     std::vector<std::shared_ptr<SourceBuffer>> auxiliaryBuffers_;    // FC13 PP origin buffers (header/main) for diagnostic rendering
     // TF-C82: index-parallel to `trees_` (the builder emits one entry per tree,
     // so alignment is by construction, not by convention).
@@ -486,12 +500,54 @@ private:
     std::vector<PreprocessedPositionMap> preprocessedPositionMaps_;
     // 64 lowercase hex, or EMPTY meaning NOT COMPUTED — see `inputDigest()`.
     std::string                          inputDigest_;
+    // See `speculationProbeCount()`.
+    std::uint64_t                        speculationProbeCount_ = 0;
+};
+
+// ★★★ ONE LANGUAGE'S SYSTEM INCLUDE DIRECTORIES — `resolveSystemDirs(grammar)`
+// (`core/types/config_path_walk.hpp`, which owns the walk) taken ONCE, remembering
+// which language it answered for. A `UnitBuilder` takes its primary language's
+// dirs itself at construction; this type exists for the one caller that resolves
+// them ahead of many units — the driver's multi-TU build, once per build key,
+// because the walk reads the environment and probes ancestor directories — and a
+// builder handed dirs resolved for ANOTHER language refuses them loud.
+class DSS_EXPORT LanguageSystemDirs {
+public:
+    explicit LanguageSystemDirs(GrammarSchema const& grammar);
+
+    [[nodiscard]] GrammarSchema const*                   grammar() const noexcept { return grammar_; }
+    [[nodiscard]] std::span<std::filesystem::path const> dirs() const noexcept { return dirs_; }
+
+private:
+    GrammarSchema const*               grammar_;
+    std::vector<std::filesystem::path> dirs_;
 };
 
 // Single-use builder for CompilationUnit. Non-copyable + non-movable, same
 // posture as Parser/TreeBuilder: the only legitimate consumption is
 // `std::move(builder).finish()`. CU1's mutator surface is just addTree;
 // CU2 adds addFile / addInMemory.
+//
+// ★★★ A UNIT HAS ITS LANGUAGES' SYSTEM INCLUDE DIRECTORIES BY CONSTRUCTION
+// (P69 L2b2, ruling 570). Every language the unit compiles brings its dirs
+// (`LanguageSystemDirs`) when it joins the unit — at a constructor, at
+// `registerSchema`, and at an explicit-schema `addInMemory` — before the caller
+// can add anything for it: the angle form's `/usr/include` analogue,
+// `semantics.shippedLibDirs`. Each dir is held once, in joining order, and the
+// dirs are the UNIT's, not a tree's: the shipped descriptors are language-neutral
+// (one directory, `shippedLibs`, which only c declares today). ✔MEASURED
+// 2026-11-13 (Mac): a mixed unit whose c tree was not the primary took only the
+// primary's dirs, none, and failed C_UnbackedPredefinedMacro. It used to be a call every
+// channel had to remember after constructing (`applySystemDirs`, now deleted):
+// the driver, the editor and the FFI header reader each made it, and a unit
+// built without it is one the build REFUSES — every predefined macro whose
+// `requires` claim names a shipped header is unbacked (C_UnbackedPredefinedMacro,
+// an unsuppressable Error, about eleven per C unit), and every angle include
+// misses. ✔MEASURED 2026-11-13 (Mac, host run 20261113-202529-993afa48): 222
+// test constructions in 83 files, 21 of them making the call, and 3676 failing
+// cases on that one code once a test fails on a driver error it did not ask
+// for. A caller whose SUBJECT is a unit with no system dirs, or with other
+// ones, says so — `clearSystemDirs()`, then `addSystemDir` — with its reason.
 class DSS_EXPORT UnitBuilder {
 public:
     // Single-language builder: the one schema is the CU's primary (the
@@ -511,9 +567,17 @@ public:
 
     // Multi-language builder (HR11/CU5): `schemas` is the registry `addFile`
     // routes against by file extension; `schemas[0]` is the CU's primary. Must
-    // be non-empty.
+    // be non-empty. Every schema brings its language's system dirs, in order.
     UnitBuilder(std::vector<std::shared_ptr<GrammarSchema const>> schemas,
                 DiagnosticBudget                                   budget);
+
+    // The single-language builder with its system dirs resolved AHEAD (see
+    // `LanguageSystemDirs`): the same unit as the two-argument form, for a caller
+    // that builds many units of one language. Dirs resolved for another language
+    // than `schema` abort loud.
+    UnitBuilder(std::shared_ptr<GrammarSchema const> schema,
+                DiagnosticBudget                     budget,
+                LanguageSystemDirs const&            systemDirs);
 
     // Register an additional source language so `addFile` can route a path to it
     // by matching the extension against each registered schema's
@@ -521,8 +585,8 @@ public:
     // that both claim one extension makes every such file fail loud naming
     // both, never silently pick the first
     // (D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET). NOT required for the explicit-schema
-    // `addInMemory` overload — that auto-registers its schema at parse. Aborts
-    // after finish().
+    // `addInMemory` overload — that auto-registers its schema at parse. Either way
+    // the language brings its system dirs. Aborts after finish().
     void registerSchema(std::shared_ptr<GrammarSchema const> schema);
 
     ~UnitBuilder();  // out-of-line: an inline (implicit) dtor is not emitted
@@ -573,11 +637,17 @@ public:
 
     // FF11: declare a SYSTEM include directory (absolute) the import
     // resolver searches for the ANGLE form `#include <h>` (distinct from
-    // `addIncludeDir`, the quote form's search). The analogue of C's
-    // /usr/include; the production driver resolves the language's
-    // `semantics.shippedLibDirs` config strings to absolute dirs and
-    // calls this per dir. Aborts if called after finish().
+    // `addIncludeDir`, the quote form's search), AFTER the ones the unit already
+    // has — its language's own, taken at construction. Aborts if called after
+    // finish().
     void addSystemDir(std::filesystem::path dir);
+
+    // Drop every system dir the unit has, its languages' included, and take none
+    // from a language that joins it later. For a caller whose SUBJECT is a unit
+    // with no system dirs, or with only its own (then `addSystemDir`): it says so
+    // here, with its reason, because the unit the build makes always has its
+    // languages'. Aborts if called after finish().
+    void clearSystemDirs();
 
     // c9 (Phase-2): declare the active compile target's object-format so the
     // preprocessor's `__has_include(<h>)` (and the descriptor macro-splice) report
@@ -628,6 +698,15 @@ public:
     // 0-127 is the same integer either way and folds unchanged, while a high
     // byte refuses loud. Aborts if called after finish().
     void setCharIsUnsigned(std::optional<bool> charIsUnsigned);
+
+    // P69 L2b2 (lane `lm`): THE IDENTITY WITNESS'S SWITCH, and nothing else's. The parser
+    // asks the type-name triage's base BEFORE it opens a probe whose type child would be
+    // refused by that ask (`ParserConfig::hoistTriageBaseAsk`); this turns that hoist off
+    // for every parse of this unit, so the witness can compare the unit's trees and
+    // diagnostics with it on and off. Read from no language document and no CLI flag;
+    // its one caller is the witness test (a repo-guard scan pins that). Aborts if called
+    // after finish() or after a tree was added.
+    void setTriageBaseHoistForTheIdentityWitness(bool hoist);
 
     // c105 (D-PP-USER-DEFINE): declare the CLI `--define NAME[=VALUE]` entries
     // (verbatim). Each lowers to a `#define` line in the preprocessor's
@@ -720,41 +799,18 @@ private:
     [[nodiscard]] std::vector<std::shared_ptr<GrammarSchema const>>
     schemasForPath_(std::filesystem::path const& path) const;
 
-    // FC2: per-tree parse sidecar, index-parallel to `trees_` (alignment
-    // is by construction: addTree appends an EMPTY sidecar; parseAndAdd_
-    // then fills the back one). Carries each parse's ambiguous type-name
-    // candidates + exported global type names (the oracle's inputs) and
-    // the source/schema handles a one-shot reparse needs. An externally
-    // built tree pushed via addTree keeps the empty sidecar — it is
-    // never reparsed (no candidates, no source handle).
+    // Per-tree parse sidecar, index-parallel to `trees_` (alignment is by
+    // construction: addTree appends an EMPTY sidecar; parseAndAdd_ then
+    // fills the back one). An externally built tree pushed via addTree
+    // keeps the empty sidecar.
     struct TreeParseSidecar {
-        std::vector<AmbiguousTypeNameCandidate> candidates;
-        std::vector<std::string>                globalTypeNames;
-        // The tree's own global TYPE bindings with their name-token spans —
-        // the oracle's self-definition guard
-        // (D-CSUBSET-FN-TYPE-TYPEDEF-PAREN-NAME):
-        // a candidate whose (name, span) matches one of THIS tree's
-        // bindings is a typedef's own defining occurrence (C 6.2.1p7) and is
-        // not seeded for that tree's reparse.
-        std::vector<std::pair<std::string, SourceSpan>> globalTypeBindings;
-        std::shared_ptr<SourceBuffer>           source;   // null for addTree trees
-        std::shared_ptr<GrammarSchema const>    schema;   // null for addTree trees
-        // FC13: when the file went through the C preprocessor, `source` is the
-        // SYNTHESIZED buffer and these carry the preprocessed token stream
-        // (Eof-terminated) + the line-map remap closure. The FC2 type-name
-        // oracle's one-shot reparse rebuilds an identical TokenStream from
-        // `ppTokens` (instead of re-tokenizing raw `source`, which would lose
-        // macro expansion) and re-applies `ppRemap` to the reparsed tree's
-        // diagnostics. Empty/null when the file was not preprocessed.
+        // FC13: when the file went through the C preprocessor, these carry
+        // the preprocessed token stream (Eof-terminated), which the unit's
+        // input-closure digest reads (`inputDigest`), and the line-map remap
+        // closure the descriptor refs and the finished unit's position maps
+        // take. Empty/null when the file was not preprocessed.
         std::vector<Token>                              ppTokens;
         std::function<void(BufferId&, SourceSpan&)>     ppRemap;
-        // [[D-PP-REMAP-ORIGIN-OFFSET-UNVALIDATED]]: the DIAGNOSTIC-shaped
-        // twin of `ppRemap`, used by the two sites that hand whole
-        // diagnostics through (the parse above and the FC2 oracle reparse).
-        // It adds the `expanded from macro 'X'` note for a diagnostic whose
-        // subject is a macro-expansion PRODUCT token; `ppRemap` stays for
-        // every POSITION-only consumer, and both come from the same map.
-        std::function<void(ParseDiagnostic&)>           ppDiagRemap;
         // The SYNTHESIZED buffer's id, recorded ONLY when the preprocessor
         // produced a line map that can actually move a position off it (a
         // non-empty map with at least one real origin). Invalid otherwise —
@@ -810,6 +866,10 @@ private:
     // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the active (target x format)'s
     // plain-`char` sign, relayed to `preprocess()` for the `#if` fold.
     std::optional<bool>                  charIsUnsigned_{};
+    // P69 L2b2: the identity witness's switch (`setTriageBaseHoistForTheIdentityWitness`),
+    // and the probes this unit's parses opened (`CompilationUnit::speculationProbeCount`).
+    bool                                 hoistTriageBaseAsk_ = true;
+    std::uint64_t                        speculationProbes_  = 0;
     std::vector<std::string>             userDefines_;  // c105: --define NAME[=VALUE]
     std::vector<PredefinedMacroDef>      targetPredefinedMacros_;  // TF-C74: per-arch identity predefines
     std::vector<PredefinedMacroDef>      formatPredefinedMacros_;  // TF-C97: per-format data-model predefines
@@ -821,29 +881,13 @@ private:
     // rendering (a remapped header/main diagnostic resolves to a real buffer).
     std::vector<std::shared_ptr<SourceBuffer>> auxiliaryBuffers_;
     bool                                 finished_ = false;
-};
+    // `clearSystemDirs()` was called: no language adopts its dirs after it.
+    bool                                 systemDirsCleared_ = false;
 
-// Declare `grammar`'s SYSTEM include directories on `builder` — one
-// `builder.addSystemDir` per entry of `resolveSystemDirs(grammar)`
-// (`core/types/config_path_walk.hpp`, which owns the walk).
-//
-// ★★ THE PAIRING HAS ONE OWNER TOO, AND THAT IS THE POINT —
-// D-LSP-HAS-NO-SYSTEM-INCLUDE-DIRS-AND-DROPS-THE-CU-DRIVER-DIAGNOSTICS. This
-// used to live at `dss` namespace scope inside `program/program.cpp` behind a
-// bare forward declaration, so the LSP — which builds a `UnitBuilder` for every
-// open document — had no way to reach it and simply did not declare any system
-// dir. An editor whose CU is built differently from the compiler's is an editor
-// that answers a different question than the one the user is asking.
-//
-// It is HERE rather than beside `resolveSystemDirs` because it is the half that
-// needs a `UnitBuilder`, and `core` must not depend on `analysis`. Everything
-// that does NOT need a builder — the driver's multi-TU path, which hoists the
-// walk out of a per-file loop, and `dump_predefined_macros`, which has no
-// builder at all — calls `resolveSystemDirs` directly.
-//
-// ⚠ CALL IT BEFORE `finish()`, like every other `UnitBuilder` mutator: it
-// forwards to `addSystemDir`, which aborts after `finish()`.
-DSS_EXPORT void applySystemDirs(UnitBuilder& builder, GrammarSchema const& grammar);
+    // The one place a language's system dirs join the unit.
+    void adoptSystemDirs_(LanguageSystemDirs const& dirs);
+    void adoptLanguage_(GrammarSchema const& grammar);
+};
 
 class TargetSchema;         // core/types/target_schema.hpp
 class ObjectFormatSchema;   // link/object_format_schema.hpp

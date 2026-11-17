@@ -127,7 +127,6 @@ struct Settled {
 // The unit compiled to MIR for `tc`'s format: each definition's visibility as MIR states it, and the warnings.
 [[nodiscard]] Settled settle(Toolchain const& tc) {
     UnitBuilder builder{tc.grammar, DiagnosticBudget::libraryDefault()};
-    dss::applySystemDirs(builder, *tc.grammar);
     builder.addInMemory(kUnit, "visibility.c");
     CompilationUnit    cu = std::move(builder).finish();
     DiagnosticReporter rep;
@@ -346,7 +345,6 @@ TEST(VisibilityWrittenAs, AnAliasIsSettledToItsDocumentAndToldOnce) {
         auto const tc = toolchain("x86_64", *format);
         ASSERT_TRUE(tc.has_value());
         UnitBuilder builder{tc->grammar, DiagnosticBudget::libraryDefault()};
-        dss::applySystemDirs(builder, *tc->grammar);
         builder.addInMemory(kAliases, "aliases.c");
         CompilationUnit    cu = std::move(builder).finish();
         DiagnosticReporter rep;

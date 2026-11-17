@@ -291,7 +291,6 @@ std::optional<Toolchain> loadToolchain(char const* targetName, char const* forma
 
 CompilationUnit unitOf(Toolchain const& tc, std::string source, std::string label) {
     UnitBuilder builder{tc.grammar, DiagnosticBudget::libraryDefault()};
-    dss::applySystemDirs(builder, *tc.grammar);
     builder.addInMemory(std::move(source), std::move(label));
     return std::move(builder).finish();
 }

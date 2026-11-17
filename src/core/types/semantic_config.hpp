@@ -1054,6 +1054,14 @@ struct DSS_EXPORT DeclaratorConfig {
     // scope's bindings are seen from its start, the language's names order-free (a language
     // whose declarations may follow their uses: the toy language, the synthetic grammars).
     bool          scopeBeginsAfterDeclarator = false;
+    // ★ P69 L2b2 (lane `lm`): `emptyDeclarationWarns` — a declaration with NO declarator that
+    // declares no tag and no enumeration constant (`int;`, `T;`, `const T;`, `struct { int a; };`)
+    // declares nothing (C 6.7p2), and the language diagnoses that as a WARNING rather than an
+    // error; either way it lowers to nothing. ✔MEASURED 2026-11-05 (probes l2b2e, l2b2i): gcc
+    // 13.3.0, clang 18.1.3 and Apple clang warn and cl accepts in silence, at file and block scope
+    // and as a for-init. Off (the default) ⇒ an error. An ABSTRACT declarator (`int *;`) is no
+    // empty declaration: every reference refuses it, and `requireNamedDeclarators` keeps it one.
+    bool          emptyDeclarationWarns = false;
 };
 
 // VLA C4c (D-CSUBSET-VLA-PARAM-STAR): is rule `r` a FUNCTION suffix — either the
@@ -4270,6 +4278,12 @@ struct DSS_EXPORT SemanticConfig {
     RuleId        vaCopyRule{};       std::string vaCopyRuleName;
     std::uint32_t vaCopyDestinationChild = 0;
     std::uint32_t vaCopySourceChild      = 0;
+    // P69 L2b2 (lane `lm`): the spellings the source names the va_list TYPE by with no declaration
+    // of its own (`semantics.variadic.vaListTypeNames`). The analyzer binds each, in its builtin
+    // scope, to the active strategy's list type (`vaListTypes`); the parser's binder sketch knows
+    // each as a type name before the parse. Required, non-empty and distinct with `variadic`. The
+    // strategy's RECORD has no spelling here: no reference binds it by any name.
+    std::vector<std::string> vaListTypeNames;
     // C11/C23 6.7.10 (D-CSUBSET-STATIC-ASSERT): the `_Static_assert`/`static_assert`
     // static-assertion DECLARATION rule. When Pass 2 visits a node of this rule it
     // const-evaluates the FIRST meaningful child (the condition — the `assignmentExpr`

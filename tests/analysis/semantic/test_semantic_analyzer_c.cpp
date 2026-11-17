@@ -20,6 +20,7 @@
 #include "link/object_format_schema.hpp"
 #include "repo_root.hpp"
 #include "scratch_dir.hpp"
+#include "driver_diagnostics_listener.hpp"   // AskedDriverCodes
 
 #include <gtest/gtest.h>
 
@@ -49,9 +50,11 @@ TEST(SemanticAnalyzerC, FunctionLocalIntDeclTypedAsI32) {
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
-    // main (function) + x (variable) + the 3 FC12a-core builtin TYPES
-    // (`__va_list_tag` + `va_list` + the `__builtin_va_list` alias,
-    // D-CSUBSET-BUILTIN-VA-LIST-TYPE-NAME) injected into every c CU's builtin
+    // main (function) + x (variable) + the 1 FC12a-core builtin TYPE name
+    // (`__builtin_va_list`, `semantics.variadic.vaListTypeNames`,
+    // D-CSUBSET-BUILTIN-VA-LIST-TYPE-NAME; the strategy's record `__va_list_tag` is bound
+    // under no name since P69 L2b2 — no reference binds it — and `va_list` is <stdarg.h>'s
+    // typedef since P69 L2b2, no builtin) injected into every c CU's builtin
     // scope (D-FC12A-VARIADIC-CALLEE — gated on the schema declaring `vaArgRule`) + the
     // 6 intrinsic builtin FUNCTIONS (SE6 builtinFunctions, minted into the same
     // CU-wide builtins scope): TF-C95 `__sync_synchronize` (D-CSUBSET-ATOMIC-FENCE)
@@ -104,8 +107,12 @@ TEST(SemanticAnalyzerC, FunctionLocalIntDeclTypedAsI32) {
     // inf/huge_val/nan and their f/l twins, ffs/parity and their l/ll twins, popcountl/clzl/ctzl,
     // alloca, object_size, the three generic and eighteen typed checked-arithmetic builtins and
     // the three `_p` predicates).
-    ASSERT_EQ(model.symbols().size() - 1, 156u)
-        << "main + x + __va_list_tag + va_list + __builtin_va_list + __umulh + "
+    // P69 L2b2 (lane `lm`): - `va_list` — the c grammar's one builtin spelling of the
+    // list type is `__builtin_va_list`; `va_list` is <stdarg.h>'s typedef, and with no
+    // header it is the program's own name (✔MEASURED, probes l2b2v c01/c04: gcc,
+    // clang, cl and Apple clang compile a program's own `va_list` with no header).
+    ASSERT_EQ(model.symbols().size() - 1, 154u)
+        << "main + x + __builtin_va_list + __umulh + "
            "_InterlockedCompareExchange + _InterlockedCompareExchange64 + "
            "_ReadWriteBarrier + __sync_synchronize + __builtin_unreachable + "
            "_exception_code + _exception_info + the 6 __builtin bit-count "
@@ -3838,7 +3845,7 @@ TEST(SemanticAnalyzerC, BadFieldSizeofArrayDimensionRejected) {
 // dimension.
 TEST(SemanticAnalyzerC, SizeofVaListIs24UnderSysV) {
     auto cu = buildShippedUnit("c", {
-        "int a[sizeof(va_list)];\n",
+        "int a[sizeof(__builtin_va_list)];\n",
     });
     assertNoBuilderErrors(*cu);
     // SysVRegisterSave (the default/absent strategy): va_list = __va_list_tag[1].
@@ -3847,6 +3854,9 @@ TEST(SemanticAnalyzerC, SizeofVaListIs24UnderSysV) {
                          VaListStrategy::SysVRegisterSave);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NonConstantArrayLength), 0u);
+    EXPECT_FALSE(model.hasErrors())
+        << "the program is accepted, as on every reference: "
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
     auto const& ti = model.lattice().interner();
     SymbolRecord const* aRec = nullptr;
     for (std::size_t i = 1; i < model.symbols().size(); ++i)
@@ -3861,7 +3871,7 @@ TEST(SemanticAnalyzerC, SizeofVaListIs24UnderSysV) {
 
 TEST(SemanticAnalyzerC, SizeofVaListIs8UnderWin64) {
     auto cu = buildShippedUnit("c", {
-        "int a[sizeof(va_list)];\n",
+        "int a[sizeof(__builtin_va_list)];\n",
     });
     assertNoBuilderErrors(*cu);
     // HomogeneousPointer (Win64): va_list = char* (one pointer = 8B).
@@ -3870,6 +3880,9 @@ TEST(SemanticAnalyzerC, SizeofVaListIs8UnderWin64) {
                          VaListStrategy::HomogeneousPointer);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NonConstantArrayLength), 0u);
+    EXPECT_FALSE(model.hasErrors())
+        << "the program is accepted, as on every reference: "
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
     auto const& ti = model.lattice().interner();
     SymbolRecord const* aRec = nullptr;
     for (std::size_t i = 1; i < model.symbols().size(); ++i)
@@ -3890,7 +3903,7 @@ TEST(SemanticAnalyzerC, SizeofVaListIs8UnderWin64) {
 // the FC12b fail-loud, or injecting a pointer/array shape, flips the dimension off 32.
 TEST(SemanticAnalyzerC, SizeofVaListIs32UnderAapcs64) {
     auto cu = buildShippedUnit("c", {
-        "int a[sizeof(va_list)];\n",
+        "int a[sizeof(__builtin_va_list)];\n",
     });
     assertNoBuilderErrors(*cu);
     // Aapcs64DualCursor: va_list = __va_list (the 5-field struct, 32B).
@@ -3902,6 +3915,9 @@ TEST(SemanticAnalyzerC, SizeofVaListIs32UnderAapcs64) {
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_VariadicCalleeUnsupported), 0u)
         << "AAPCS64 va_list is realized in FC12c — no fail-loud at injection";
+    EXPECT_FALSE(model.hasErrors())
+        << "the program is accepted, as on every reference: "
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
     auto const& ti = model.lattice().interner();
     SymbolRecord const* aRec = nullptr;
     for (std::size_t i = 1; i < model.symbols().size(); ++i)
@@ -3919,8 +3935,8 @@ TEST(SemanticAnalyzerC, SizeofVaListIs32UnderAapcs64) {
 // `vaArgRule` gates the injection; the body NAMES + USES va_list/va_start/va_arg.
 TEST(SemanticAnalyzerC, Aapcs64VariadicCalleeAnalyzesClean) {
     auto cu = buildShippedUnit("c", {
-        "int f(int n, ...) { va_list ap; va_start(ap, n);"
-        " int t = va_arg(ap, int); va_end(ap); return t; }\n",
+        "int f(int n, ...) { __builtin_va_list ap; __builtin_va_start(ap, n);"
+        " int t = __builtin_va_arg(ap, int); __builtin_va_end(ap); return t; }\n",
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
@@ -3931,6 +3947,9 @@ TEST(SemanticAnalyzerC, Aapcs64VariadicCalleeAnalyzesClean) {
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 0u)
         << "the __va_list struct ap operand must pass isVaList for AAPCS64";
+    EXPECT_FALSE(model.hasErrors())
+        << "the program is accepted, as on every reference: "
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
 }
 
 // D-CSUBSET-BUILTIN-VA-LIST-TYPE-NAME (sqlite os_unix.c/mem1.c/test1.c, always via
@@ -3959,6 +3978,9 @@ TEST(SemanticAnalyzerC, SizeofBuiltinVaListMatchesVaListUnderSysV) {
                         DiagnosticCode::S_NonConstantArrayLength), 0u);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_UnknownType), 0u);
+    EXPECT_FALSE(model.hasErrors())
+        << "the program is accepted, as on every reference: "
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
     auto const& ti = model.lattice().interner();
     SymbolRecord const* aRec = nullptr;
     for (std::size_t i = 1; i < model.symbols().size(); ++i)
@@ -3984,6 +4006,9 @@ TEST(SemanticAnalyzerC, SizeofBuiltinVaListMatchesVaListUnderWin64) {
                         DiagnosticCode::S_NonConstantArrayLength), 0u);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_UnknownType), 0u);
+    EXPECT_FALSE(model.hasErrors())
+        << "the program is accepted, as on every reference: "
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
     auto const& ti = model.lattice().interner();
     SymbolRecord const* aRec = nullptr;
     for (std::size_t i = 1; i < model.symbols().size(); ++i)
@@ -4009,6 +4034,9 @@ TEST(SemanticAnalyzerC, SizeofBuiltinVaListMatchesVaListUnderAapcs64) {
                         DiagnosticCode::S_NonConstantArrayLength), 0u);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_UnknownType), 0u);
+    EXPECT_FALSE(model.hasErrors())
+        << "the program is accepted, as on every reference: "
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
     auto const& ti = model.lattice().interner();
     SymbolRecord const* aRec = nullptr;
     for (std::size_t i = 1; i < model.symbols().size(); ++i)
@@ -4021,54 +4049,182 @@ TEST(SemanticAnalyzerC, SizeofBuiltinVaListMatchesVaListUnderAapcs64) {
         << "sizeof(__builtin_va_list) under AAPCS64 = sizeof(va_list) = 32";
 }
 
+// ── P69 L2b2 (lane `lm`, rulings 520 / 523): the list type's NAMES, the strategy's RECORD ────
+//
+// MEASURED 2026-11-04 on gcc 13.3.0 and clang 18.1.3 (x86-64 SysV and aarch64 AAPCS64), cl and
+// Apple clang (probes l2b2b b01-b03/b12-b16, l2b2v v01-v12): `__builtin_va_list` takes sizeof,
+// _Alignof, a cast and a compound literal on every gcc/clang cell; NO reference binds the
+// strategy's record in either namespace (`sizeof(__va_list_tag)` / `sizeof(__va_list)`
+// undeclared, `sizeof(struct …)` an incomplete user tag); a user's own record, object or typedef
+// of that name is theirs; and a user record of the builtin's very LAYOUT is refused as a
+// va_arg operand ("first argument to 'va_arg' not of type 'va_list'").
+namespace {
+[[nodiscard]] SemanticModel analyzeUnderStrategy(std::string src, VaListStrategy strat) {
+    auto cu = buildShippedUnit("c", {std::move(src)});
+    return analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
+                   AggregateLayoutParams{ScalarAlignmentRule::Natural, 16}, strat);
+}
+constexpr VaListStrategy kEveryVaListStrategy[] = {VaListStrategy::SysVRegisterSave,
+                                                   VaListStrategy::HomogeneousPointer,
+                                                   VaListStrategy::Aapcs64DualCursor};
+}  // namespace
+
+// Ruling 520: the builtin list type's spelling is a TYPE name before the parse (the sketch seeds
+// `semantics.variadic.vaListTypeNames`), so each guarded type position takes the type reading.
+TEST(SemanticAnalyzerC, TheBuiltinListTypeNameTakesEveryTypePosition) {
+    for (VaListStrategy const strat : kEveryVaListStrategy) {
+        auto model = analyzeUnderStrategy(
+            "int f(void) {\n"
+            "  int s = (int)sizeof(__builtin_va_list) + (int)_Alignof(__builtin_va_list);\n"
+            "  void *p = (__builtin_va_list *)0;\n"
+            "  void *q = (__builtin_va_list *){ 0 };\n"
+            "  return s + (p != q);\n"
+            "}\n",
+            strat);
+        EXPECT_FALSE(model.hasErrors())
+            << vaListStrategyName(strat) << ": "
+            << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+    }
+}
+
+// Ruling 523 (3): the strategy's record is bound under NO name — the bare spelling is undeclared
+// and `struct NAME` is an incomplete tag of the program's own, never the builtin's record.
+TEST(SemanticAnalyzerC, TheStrategysRecordIsNoSourceName) {
+    struct Cell { VaListStrategy strat; char const* name; };
+    for (Cell const c : {Cell{VaListStrategy::SysVRegisterSave, "__va_list_tag"},
+                         Cell{VaListStrategy::Aapcs64DualCursor, "__va_list"}}) {
+        auto bare = analyzeUnderStrategy(
+            std::string{"int f(void) { return (int)sizeof("} + c.name + "); }\n", c.strat);
+        EXPECT_TRUE(hasCode(bare.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier))
+            << c.name << " must be undeclared, as on every reference";
+        auto tag = analyzeUnderStrategy(
+            std::string{"int g(void) { return (int)sizeof(struct "} + c.name + "); }\n", c.strat);
+        EXPECT_TRUE(tag.hasErrors())
+            << "struct " << c.name << " is an incomplete tag of the program's own";
+    }
+}
+
+// Ruling 523 (3), the positive direction: a user's own record, object or typedef of the record's
+// name is THEIRS under every strategy.
+TEST(SemanticAnalyzerC, AUsersOwnSameNamedRecordIsTheirs) {
+    for (VaListStrategy const strat : kEveryVaListStrategy) {
+        for (char const* src : {
+                 "struct __va_list_tag { int x; };\n"
+                 "int main(void) { struct __va_list_tag t = { 42 }; return t.x - 42; }\n",
+                 "struct __va_list { int x; };\n"
+                 "int main(void) { struct __va_list t = { 42 }; return t.x - 42; }\n",
+                 "int __va_list_tag;\n"
+                 "int main(void) { __va_list_tag = 42; return __va_list_tag - 42; }\n",
+                 "int __va_list = 42;\n"
+                 "int main(void) { return __va_list - 42; }\n",
+                 "typedef int __va_list_tag;\n"
+                 "int main(void) { __va_list_tag x = 42; return x - 42; }\n",
+             }) {
+            auto model = analyzeUnderStrategy(src, strat);
+            EXPECT_FALSE(model.hasErrors()) << vaListStrategyName(strat) << ":\n" << src;
+        }
+    }
+}
+
+// Ruling 523 (4): a record of the builtin's very LAYOUT under the builtin's very NAME is still the
+// user's — recognized by IDENTITY, it is no list, and a va_arg over it is refused; the builtin
+// list beside it is accepted.
+TEST(SemanticAnalyzerC, AUsersSameLayoutRecordIsNoVaList) {
+    struct Cell { VaListStrategy strat; char const* src; };
+    for (Cell const c : {
+             Cell{VaListStrategy::SysVRegisterSave,
+                  "struct __va_list_tag { unsigned a, b; void *c, *d; };\n"
+                  "int f(struct __va_list_tag *p) { return __builtin_va_arg(p, int); }\n"},
+             Cell{VaListStrategy::Aapcs64DualCursor,
+                  "struct __va_list { void *a, *b, *c; int d, e; };\n"
+                  "int f(struct __va_list p) { return __builtin_va_arg(p, int); }\n"},
+         }) {
+        auto model = analyzeUnderStrategy(c.src, c.strat);
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
+            << vaListStrategyName(c.strat) << ": a user's record is no va_list\n" << c.src;
+    }
+    for (VaListStrategy const strat : kEveryVaListStrategy) {
+        auto model = analyzeUnderStrategy(
+            "int f(int n, ...) { __builtin_va_list ap; __builtin_va_start(ap, n);\n"
+            "  int r = __builtin_va_arg(ap, int); __builtin_va_end(ap); return r; }\n",
+            strat);
+        EXPECT_FALSE(model.hasErrors()) << vaListStrategyName(strat) << ": the builtin list";
+    }
+}
+
 // D-CSUBSET-BUILTIN-VA-LIST-TYPE-NAME: the contract is TypeId IDENTITY, not a size
-// coincidence — the injected `__builtin_va_list` SymbolRecord carries the SAME
-// TypeId variable as `va_list` in every strategy branch. Identity is what makes a
-// typedef chain through either name interchangeable (typedef resolution returns the
-// aliased symbol's `.type` verbatim) and what routes a `__builtin_va_list`-typed
-// param through the c82 va_list param-adjustment exclusion (a pure `TypeId ==`
-// compare) and the va_arg isVaList shape check.
+// coincidence. P69 L2b2 (lane `lm`): the c grammar binds ONE builtin spelling of the
+// list type, `__builtin_va_list` (`semantics.variadic.vaListTypeNames`), and `va_list`
+// is <stdarg.h>'s typedef, which names that very type through the descriptor word — so
+// an object declared through either name carries the SAME TypeId in every strategy
+// branch. Identity is what makes a typedef chain through either name interchangeable
+// (typedef resolution returns the aliased symbol's `.type` verbatim) and what routes a
+// `__builtin_va_list`-typed param through the c82 va_list param-adjustment exclusion (a
+// pure `TypeId ==` compare) and the va_arg isVaList shape check. With NO header the
+// builtin scope binds no `va_list` at all: ✔MEASURED (probes l2b2v c01/c04), gcc 13.3.0,
+// clang 18.1.3, cl and Apple clang compile a program's own `va_list` with no header and
+// refuse the plain name as the list's.
 TEST(SemanticAnalyzerC, BuiltinVaListTypeIdIsIdenticalToVaListPerStrategy) {
     for (auto const strat : {VaListStrategy::SysVRegisterSave,
                              VaListStrategy::HomogeneousPointer,
                              VaListStrategy::Aapcs64DualCursor}) {
+        // The SUBJECT is <stdarg.h>'s typedef, which the unit reaches through the system dirs
+        // every unit has (`UnitBuilder`); `va_list` without the header is the program's own
+        // unknown name (P69 L2b2).
         auto cu = buildShippedUnit("c", {
+            "#include <stdarg.h>\n"
+            "va_list a;\n"
+            "__builtin_va_list b;\n"
             "int main(void) { return 0; }\n",
         });
         assertNoBuilderErrors(*cu);
+        ASSERT_FALSE(cu->driverDiagnostics().hasErrors())
+            << "<stdarg.h> resolves on the shipped system dirs";
         auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
                              AggregateLayoutParams{ScalarAlignmentRule::Natural, 16},
                              strat);
-        // The builtin scope holds exactly one record per name in this plain TU.
-        SymbolRecord const* vaRec      = nullptr;
+        EXPECT_FALSE(model.hasErrors()) << "strategy " << static_cast<int>(strat);
+        SymbolRecord const* aRec       = nullptr;
+        SymbolRecord const* bRec       = nullptr;
         SymbolRecord const* builtinRec = nullptr;
         for (std::size_t i = 1; i < model.symbols().size(); ++i) {
-            if (model.symbols()[i].name == "va_list")
-                vaRec = &model.symbols()[i];
+            if (model.symbols()[i].name == "a") aRec = &model.symbols()[i];
+            if (model.symbols()[i].name == "b") bRec = &model.symbols()[i];
             if (model.symbols()[i].name == "__builtin_va_list")
                 builtinRec = &model.symbols()[i];
         }
-        ASSERT_NE(vaRec, nullptr);
         ASSERT_NE(builtinRec, nullptr)
             << "__builtin_va_list must be injected under strategy "
             << static_cast<int>(strat);
         EXPECT_EQ(builtinRec->kind, DeclarationKind::Type);
-        ASSERT_TRUE(vaRec->type.valid());
-        ASSERT_TRUE(builtinRec->type.valid());
-        EXPECT_EQ(builtinRec->type.v, vaRec->type.v)
+        ASSERT_NE(aRec, nullptr);
+        ASSERT_NE(bRec, nullptr);
+        ASSERT_TRUE(aRec->type.valid());
+        ASSERT_TRUE(bRec->type.valid());
+        EXPECT_EQ(aRec->type.v, bRec->type.v)
             << "ONE TypeId under both names (strategy "
             << static_cast<int>(strat) << ")";
+        EXPECT_EQ(bRec->type.v, builtinRec->type.v)
+            << "the builtin's own type (strategy " << static_cast<int>(strat) << ")";
     }
+    auto cu = buildShippedUnit("c", {"int main(void) { return 0; }\n"});
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
+    std::size_t plain = 0;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "va_list") ++plain;
+    EXPECT_EQ(plain, 0u)
+        << "with no header `va_list` is the program's own name — no builtin binds it";
 }
 
 // ★ THE DARWIN CHAIN — the REAL sqlite shape: the SDK typedefs
-// `__builtin_va_list` -> `__darwin_va_list` -> `va_list`, where the LAST typedef
-// REDECLARES the name `va_list` that is already bound in the builtin scope. The
-// file-scope typedef legally SHADOWS the builtin-scope binding (bind() collides
-// same-scope only; the tree root is a CHILD of the builtin scope) with the SAME
-// TypeId, so `va_list v;` resolves through the user chain to the identical
-// per-strategy type and sizeof(v) folds to the strategy's pin.
-TEST(SemanticAnalyzerC, DarwinVaListTypedefChainShadowsBuiltinPerStrategy) {
+// `__builtin_va_list` -> `__darwin_va_list` -> `va_list`. P69 L2b2 (lane `lm`): no
+// builtin binds `va_list` any more (the c grammar's one builtin spelling is
+// `__builtin_va_list`), so the LAST typedef is an ordinary file-scope declaration of the
+// name — no header is included here, exactly as the SDK's own <sys/_types/_va_list.h>
+// declares it — and `va_list v;` resolves through the chain to the builtin's
+// per-strategy type, so sizeof(v) folds to the strategy's pin.
+TEST(SemanticAnalyzerC, DarwinVaListTypedefChainResolvesToTheBuiltinPerStrategy) {
     struct Row { VaListStrategy strat; int size; };
     for (auto const& row : {Row{VaListStrategy::SysVRegisterSave, 24},
                             Row{VaListStrategy::HomogeneousPointer, 8},
@@ -4089,7 +4245,7 @@ TEST(SemanticAnalyzerC, DarwinVaListTypedefChainShadowsBuiltinPerStrategy) {
             << static_cast<int>(row.strat) << ")";
         EXPECT_EQ(countCode(model.diagnostics(),
                             DiagnosticCode::S_RedeclaredSymbol), 0u)
-            << "the user `va_list` typedef shadows the builtin binding, never "
+            << "the user `va_list` typedef declares the name once, never "
                "collides";
         EXPECT_EQ(countCode(model.diagnostics(),
                             DiagnosticCode::S_NonConstantArrayLength), 0u);
@@ -4117,7 +4273,7 @@ TEST(SemanticAnalyzerC, BuiltinVaListTypedefParamRoundTripsThroughVaArg) {
                              VaListStrategy::Aapcs64DualCursor}) {
         auto cu = buildShippedUnit("c", {
             "typedef __builtin_va_list my_va;\n"
-            "int f(int n, my_va ap) { return va_arg(ap, int); }\n",
+            "int f(int n, my_va ap) { return __builtin_va_arg(ap, int); }\n",
         });
         assertNoBuilderErrors(*cu);
         auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
@@ -4181,9 +4337,10 @@ TEST(SemanticAnalyzerC, NestedBlocksShadowWithoutRedecl) {
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u)
         << "different blocks → different scopes → no shadow redecl";
-    // main (function) + two distinct `x` symbols (one per block scope) + the 3
-    // FC12a-core builtin TYPES (__va_list_tag + va_list + the __builtin_va_list
-    // alias, D-CSUBSET-BUILTIN-VA-LIST-TYPE-NAME) + the 5 intrinsic
+    // main (function) + two distinct `x` symbols (one per block scope) + the 1
+    // FC12a-core builtin TYPE (__builtin_va_list, D-CSUBSET-BUILTIN-VA-LIST-TYPE-NAME;
+    // since P69 L2b2 the strategy's record is bound under no name and `va_list` is
+    // <stdarg.h>'s typedef, no builtin — 2 fewer than the 3 this pin counted) + the 5 intrinsic
     // builtins (c103 __umulh + c104 _InterlockedCompareExchange + c113
     // _ReadWriteBarrier + TF-C95 __sync_synchronize (D-CSUBSET-ATOMIC-FENCE) + c115
     // _exception_code + _exception_info) + the 6
@@ -4210,7 +4367,7 @@ TEST(SemanticAnalyzerC, NestedBlocksShadowWithoutRedecl) {
     // inf/huge_val/nan and their f/l twins, ffs/parity and their l/ll twins, popcountl/clzl/ctzl,
     // alloca, object_size, the three generic and eighteen typed checked-arithmetic builtins and
     // the three `_p` predicates).
-    EXPECT_EQ(model.symbols().size() - 1, 157u);
+    EXPECT_EQ(model.symbols().size() - 1, 155u);
 }
 
 // ★★ P69 (lane `cs`, fold f26c — D-C-A-NAME-USED-BEFORE-ITS-DECLARATION-BINDS-THE-LATER-ONE): A USE
@@ -4229,9 +4386,10 @@ TEST(SemanticAnalyzerC, AUseBeforeItsDeclarationInTheSameBlockIsUndeclared) {
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 1u);
 
-    // main (function) + x (variable) + the 3 FC12a-core builtin TYPES
-    // (__va_list_tag + va_list + the __builtin_va_list alias,
-    // D-CSUBSET-BUILTIN-VA-LIST-TYPE-NAME) + the 6 intrinsic builtins (c103 __umulh +
+    // main (function) + x (variable) + the 1 FC12a-core builtin TYPE
+    // (__builtin_va_list, D-CSUBSET-BUILTIN-VA-LIST-TYPE-NAME; since P69 L2b2 the
+    // strategy's record is bound under no name and `va_list` is <stdarg.h>'s typedef, no
+    // builtin — 2 fewer than the 3 this pin counted) + the 6 intrinsic builtins (c103 __umulh +
     // c104 _InterlockedCompareExchange + c113 _ReadWriteBarrier + TF-C95
     // __sync_synchronize (D-CSUBSET-ATOMIC-FENCE) + c115
     // _exception_code + _exception_info) + the 6 FC17.9(b) bit-count builtins
@@ -4260,7 +4418,7 @@ TEST(SemanticAnalyzerC, AUseBeforeItsDeclarationInTheSameBlockIsUndeclared) {
     // inf/huge_val/nan and their f/l twins, ffs/parity and their l/ll twins, popcountl/clzl/ctzl,
     // alloca, object_size, the three generic and eighteen typed checked-arithmetic builtins and
     // the three `_p` predicates).
-    ASSERT_EQ(model.symbols().size() - 1, 156u);
+    ASSERT_EQ(model.symbols().size() - 1, 154u);
     SymbolId xSym{};
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "x") xSym = SymbolId{static_cast<std::uint32_t>(i)};
@@ -5544,6 +5702,8 @@ buildAngleDescriptorUnit(ScratchDir const& sysDir,
     std::ofstream(sysDir.path() / descName, std::ios::binary) << descJson;
     auto schema = loadShippedSchema("c");
     UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
+    dss::test_support::AskedDriverCodes const clearedDirs{dss::DiagnosticCode::C_UnbackedPredefinedMacro};   // no shipped dirs: the language's predefines are unbacked
+    builder.clearSystemDirs();   // the test's own system dirs, not the shipped ones
     builder.addSystemDir(sysDir.path());
     builder.addInMemory(mainSrc, "main.c");
     return std::make_shared<CompilationUnit>(std::move(builder).finish());
@@ -5948,6 +6108,8 @@ TEST(SemanticAnalyzerC, FF11MultipleDescriptorsEachSymbolInjectedOnce) {
 
     auto schema = loadShippedSchema("c");
     UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
+    dss::test_support::AskedDriverCodes const clearedDirs{dss::DiagnosticCode::C_UnbackedPredefinedMacro};   // no shipped dirs: the language's predefines are unbacked
+    builder.clearSystemDirs();   // the test's own system dirs, not the shipped ones
     builder.addSystemDir(sysDir.path());
     // <dup.h> is included TWICE (bracketing the others); each of dup,s0..s3 is
     // called so all five must resolve, and dup must be minted only once.
@@ -6035,18 +6197,26 @@ TEST(SemanticAnalyzerC, TypedefNameInCastPositionResolves) {
                 ? "" : model.diagnostics().all()[0].actual);
 }
 
-// An unknown type name inside a COMMITTED cast (`(q) z` — the non-
-// operator follower made the cast the only viable parse) fails loud at
-// type resolution: exactly one S_UnknownType for `q`. (`z` additionally
-// fails name resolution — a distinct code, deliberately not conflated.)
-TEST(SemanticAnalyzerC, UnknownTypeNameInCommittedCastFiresUnknownType) {
-    auto model = analyzeShipped("c", {
-        "int main() { (q) z; return 0; }\n",
-    });
-    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 1u);
-    EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_UndeclaredIdentifier), 1u)
-        << "the operand `z` is an ordinary undeclared value reference";
+// P69 L2b2 (ruling 523 (2), P2): an UNKNOWN name before a NON-operator follower is no cast — the
+// type triage refuses it (nothing declares `q`), the value reading `(q)` cannot continue at `z`, and
+// the parser names `q` at the name, then the error at `z`: gcc 13.3.0's pair (✔MEASURED 2026-11-04,
+// probe f01: "'q' undeclared" at 1:15, "expected ';' before 'z'" at 1:17; clang 18.1.3 names `q`
+// only; cl C2065 `q`, C2146, C2065 `z`) and DSS's (MEASURED 2026-11-05 by compile-and-keep on the Mac
+// leg's build: S_UndeclaredIdentifier `q` at 1:15, P_UnexpectedToken at `z`). No cast is committed,
+// so nothing is an unknown TYPE; the analysis, run on the failed tree in-process, names one
+// undeclared identifier (MEASURED, the same build).
+TEST(SemanticAnalyzerC, AnUnknownNameBeforeANonOperatorFollowerIsNoCast) {
+    auto cu = buildShippedUnit("c", {"int main() { (q) z; return 0; }\n"});
+    ASSERT_EQ(cu->trees().size(), 1u);
+    auto const all = cu->trees()[0].diagnostics().all();
+    ASSERT_EQ(all.size(), 2u);
+    EXPECT_EQ(all[0].code, DiagnosticCode::S_UndeclaredIdentifier);
+    EXPECT_EQ(all[0].actual, "q");
+    EXPECT_EQ(all[1].code, DiagnosticCode::P_UnexpectedToken);
+    EXPECT_EQ(spanTextOf(*cu, all[1]), "z");
+    auto model = analyzeShipped("c", {"int main() { (q) z; return 0; }\n"});
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 1u);
 }
 
 // C forbids casts to (and the MIR lattice cannot lower casts from)
@@ -6463,17 +6633,24 @@ TEST(SemanticAnalyzerC, NamedCastDeclaratorFailsLoud) {
            "drop the name and cast to the bare base type";
 }
 
-// FAIL-LOUD: an UNKNOWN base type with an abstract fn-ptr declarator
-// (`(Nope(*)(void))p`) still emits S_UnknownType (the base resolves to nothing —
-// the declarator fold never masks a missing base).
-TEST(SemanticAnalyzerC, AbstractFnPtrCastUnknownBaseStillUnknownType) {
-    auto model = analyzeShipped("c", {
-        "int main() { void* p; return ((Nope(*)(void))p) != 0; }\n",
-    });
-    EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_UnknownType), 1u)
-        << "an unknown base type must still fail loud under an abstract "
-           "fn-ptr declarator";
+// P69 L2b2 (ruling 523 (2), P3): an UNKNOWN base before an abstract function declarator is no cast
+// either — every reference reads `Nope(` as a CALL (✔MEASURED 2026-11-04, probe f03: gcc 13.3.0
+// "implicit declaration of function 'Nope'" at 1:32, then errors at 1:38 and 1:46; clang 18.1.3 at
+// 1:32, 1:38, 1:40), and so does DSS (MEASURED 2026-11-05 by compile-and-keep on the Mac leg's
+// build: S_UndeclaredIdentifier `Nope` at 1:32, then P_BacktrackFailed at the `)` after `*`, 1:38 —
+// the references' first two positions). Nothing is an unknown TYPE: the declarator fold never sees it.
+TEST(SemanticAnalyzerC, AnUnknownBaseBeforeAFunctionDeclaratorIsReadAsACall) {
+    char const* const src = "int main() { void* p; return ((Nope(*)(void))p) != 0; }\n";
+    auto cu = buildShippedUnit("c", {src});
+    ASSERT_EQ(cu->trees().size(), 1u);
+    auto const all = cu->trees()[0].diagnostics().all();
+    ASSERT_EQ(all.size(), 2u);
+    EXPECT_EQ(all[0].code, DiagnosticCode::S_UndeclaredIdentifier);
+    EXPECT_EQ(all[0].actual, "Nope");
+    EXPECT_EQ(all[1].code, DiagnosticCode::P_BacktrackFailed);
+    EXPECT_EQ(spanTextOf(*cu, all[1]), ")");
+    auto model = analyzeShipped("c", {src});
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u);
 }
 
 // ── c29 D-CSUBSET-POST-STAR-CAST-QUALIFIER — post-star cast qualifier stripped ──
@@ -7092,17 +7269,23 @@ TEST(SemanticAnalyzerC, TypedefCompoundLiteralResolvesAndTypes) {
            "type position";
 }
 
-// The commit triage's case-4 arm: an UNKNOWN identifier followed by
-// `{` commits as a compound literal (BlockOpen cannot continue a value
-// reading) and then fails LOUD at semantic — S_UnknownType, exactly
-// once, at the type position. Never a silent value reinterpretation.
-TEST(SemanticAnalyzerC, CompoundLiteralUnknownTypeNameFiresUnknownType) {
-    auto model = analyzeShipped("c", {
-        "int main() { (zzz){1}; return 0; }\n",
-    });
-    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 1u)
-        << "(zzz){...} must commit via the `{` follower and fail loud "
-           "at type resolution";
+// P69 L2b2 (ruling 523 (2), P4): an UNKNOWN name before `{` is no compound literal — the triage
+// refuses it, the value reading `(zzz)` cannot continue at `{`, and the parser names `zzz` first:
+// gcc 13.3.0's pair (✔MEASURED 2026-11-04, probe f04: "'zzz' undeclared" at 1:15, "expected ';'
+// before '{'" at 1:19) and DSS's (MEASURED 2026-11-05 by compile-and-keep on the Mac leg's build:
+// S_UndeclaredIdentifier `zzz` at 1:15, P_UnexpectedToken at `{`, 1:19). Never an unknown TYPE.
+TEST(SemanticAnalyzerC, AnUnknownNameBeforeABraceIsNoCompoundLiteral) {
+    char const* const src = "int main() { (zzz){1}; return 0; }\n";
+    auto cu = buildShippedUnit("c", {src});
+    ASSERT_EQ(cu->trees().size(), 1u);
+    auto const all = cu->trees()[0].diagnostics().all();
+    ASSERT_EQ(all.size(), 2u);
+    EXPECT_EQ(all[0].code, DiagnosticCode::S_UndeclaredIdentifier);
+    EXPECT_EQ(all[0].actual, "zzz");
+    EXPECT_EQ(all[1].code, DiagnosticCode::P_UnexpectedToken);
+    EXPECT_EQ(spanTextOf(*cu, all[1]), "{");
+    auto model = analyzeShipped("c", {src});
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u);
 }
 
 // The commit triage's case-3 arm: a KNOWN-VALUE identifier in the type
@@ -7264,17 +7447,8 @@ TEST(SemanticAnalyzerC, NamedVoidParamFiresInvalidVoidParamPositioned) {
         // "e __BI", six bytes of a prologue `#define` line, instead of "void x".
         // Nothing about the DIAGNOSTIC changed — only whether the wrong buffer
         // happened to coincide with the right one.
-        std::string_view text;
-        for (auto const& buf : cu->auxiliaryBuffers()) {
-            if (buf != nullptr && buf->id() == d.buffer) {
-                text = buf->slice(d.span);
-                break;
-            }
-        }
-        if (text.empty() && d.buffer == cu->trees()[0].source().id()) {
-            text = cu->trees()[0].source().slice(d.span);
-        }
-        EXPECT_EQ(text, "void x")
+        // The read is the fixture's `spanTextOf` (the buffer the span names).
+        EXPECT_EQ(spanTextOf(*cu, d), "void x")
             << "the diagnostic must span the offending param";
     }
 }
@@ -7324,8 +7498,9 @@ TEST(SemanticAnalyzerC, ValueStarValueStaysExpressionStatement) {
         "int main() { int a = 2; int b = 3; a * b; return a; }\n",
     });
     EXPECT_FALSE(model.hasErrors());
-    // main + a + b + the 3 FC12a-core builtin TYPES (__va_list_tag + va_list + the
-    // __builtin_va_list alias, D-CSUBSET-BUILTIN-VA-LIST-TYPE-NAME) + the
+    // main + a + b + the 1 FC12a-core builtin TYPE name (__builtin_va_list,
+    // D-CSUBSET-BUILTIN-VA-LIST-TYPE-NAME; the record is bound under no name since P69
+    // L2b2, and `va_list` is <stdarg.h>'s typedef since P69 L2b2, no builtin) + the
     // 6 intrinsic builtins (c103 __umulh + c104 _InterlockedCompareExchange + c113
     // _ReadWriteBarrier + TF-C95 __sync_synchronize (D-CSUBSET-ATOMIC-FENCE) + c115
     // _exception_code + _exception_info) + the 6 FC17.9(b)
@@ -7350,8 +7525,8 @@ TEST(SemanticAnalyzerC, ValueStarValueStaysExpressionStatement) {
     // inf/huge_val/nan and their f/l twins, ffs/parity and their l/ll twins, popcountl/clzl/ctzl,
     // alloca, object_size, the three generic and eighteen typed checked-arithmetic builtins and
     // the three `_p` predicates).
-    EXPECT_EQ(model.symbols().size() - 1, 157u)
-        << "main + a + b + __va_list_tag + va_list + __builtin_va_list + "
+    EXPECT_EQ(model.symbols().size() - 1, 155u)
+        << "main + a + b + __builtin_va_list + "
            "the 6 intrinsic builtins + __builtin_unreachable + "
            "the 8 GNU value-form __atomic_* builtins + "
            "the 6 __builtin bit-count intrinsics + the 56 __builtin_stdc_* "
@@ -7619,10 +7794,10 @@ TEST(SemanticAnalyzerC, DerefFnPtrCalleeTypesAndChecks) {
 TEST(SemanticAnalyzerC, VaArgWithBuiltinIntTypesClean) {
     auto model = analyzeShipped("c", {
         "int sum(int n, ...) {\n"
-        "  va_list ap;\n"
-        "  va_start(ap, n);\n"
-        "  int t = va_arg(ap, int);\n"
-        "  va_end(ap);\n"
+        "  __builtin_va_list ap;\n"
+        "  __builtin_va_start(ap, n);\n"
+        "  int t = __builtin_va_arg(ap, int);\n"
+        "  __builtin_va_end(ap);\n"
         "  return t;\n"
         "}\n",
     });
@@ -7636,10 +7811,10 @@ TEST(SemanticAnalyzerC, VaArgWithTypedefTypeResolves) {
     auto model = analyzeShipped("c", {
         "typedef int MyInt;\n"
         "int sum(int n, ...) {\n"
-        "  va_list ap;\n"
-        "  va_start(ap, n);\n"
-        "  MyInt t = va_arg(ap, MyInt);\n"
-        "  va_end(ap);\n"
+        "  __builtin_va_list ap;\n"
+        "  __builtin_va_start(ap, n);\n"
+        "  MyInt t = __builtin_va_arg(ap, MyInt);\n"
+        "  __builtin_va_end(ap);\n"
         "  return t;\n"
         "}\n",
     });
@@ -7654,11 +7829,11 @@ TEST(SemanticAnalyzerC, VaArgWithTypedefTypeResolves) {
 TEST(SemanticAnalyzerC, VaArgWithValueInTypePositionFailsLoud) {
     auto model = analyzeShipped("c", {
         "int sum(int n, ...) {\n"
-        "  va_list ap;\n"
-        "  va_start(ap, n);\n"
+        "  __builtin_va_list ap;\n"
+        "  __builtin_va_start(ap, n);\n"
         "  int x = 7;\n"
-        "  int t = va_arg(ap, x);\n"   // x is a VALUE, not a type
-        "  va_end(ap);\n"
+        "  int t = __builtin_va_arg(ap, x);\n"   // x is a VALUE, not a type
+        "  __builtin_va_end(ap);\n"
         "  return t;\n"
         "}\n",
     });
@@ -7674,7 +7849,7 @@ TEST(SemanticAnalyzerC, VaStartWithNonVaListFailsLoud) {
     auto model = analyzeShipped("c", {
         "int sum(int n, ...) {\n"
         "  int notAList;\n"
-        "  va_start(notAList, n);\n"
+        "  __builtin_va_start(notAList, n);\n"
         "  return 0;\n"
         "}\n",
     });

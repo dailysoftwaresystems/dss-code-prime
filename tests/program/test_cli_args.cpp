@@ -17,6 +17,7 @@
 #include "program/cli_args.hpp"
 #include "program/input_resolver.hpp"
 #include "program/program.hpp"          // formatWallTime (the --time formatter)
+#include "driver_diagnostics_listener.hpp"   // AskedDriverCodes
 
 #include <gtest/gtest.h>
 
@@ -1121,6 +1122,7 @@ TEST(CliArgs, ReporterConfigProjectionStillCarriesWarningsAsErrorsAndSuppress) {
 // The CONTROL arm is the load-bearing half — without it the pin would pass over
 // an implementation that always caps, which is the mirror defect.
 TEST(CliArgs, MaxDiagnosticsCapAppearsOnRealStderrThroughProgramRun) {
+    dss::test_support::AskedDriverCodes const asked{dss::DiagnosticCode::D_FileNotFound, dss::DiagnosticCode::P_TooManyDiagnostics};   // missing files are how the cap is reached
     auto const runCapturingStderr = [](Argv& a) {
         std::ostringstream captured;
         auto* const previous = std::cerr.rdbuf(captured.rdbuf());

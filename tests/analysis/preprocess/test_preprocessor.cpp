@@ -5426,12 +5426,14 @@ TEST(Preprocessor, DPerf2ResolvedShippedDescriptorsIncludeTransitiveClosure) {
 }
 
 // D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION (dead-range filter — the effectiveness
-// proof): the recorded seed set is the AUTHORITATIVELY-LIVE one, EQUAL to the
-// finish() oracle's `shippedLibDescriptors`, never a superset. A LIVE angle
+// proof): the recorded seed set is the AUTHORITATIVELY-LIVE one, the descriptors
+// of the headers the program's live text includes, never a superset. A LIVE angle
 // `#include <h>` IS recorded (its un-gated splice offset lands in a live region);
 // the SAME include inside a `#if 0 … #endif` dead branch is DROPPED (its splice
-// offset lands in an AUTHORITATIVE dead range), so the first-parse seed can never
-// resolve a name the finish() reparse would not. RED-ON-DISABLE: revert the
+// offset lands in an AUTHORITATIVE dead range), so the parse's seed can never make
+// a name a type the program does not include. (The seed is the one channel since
+// the compilation-unit oracle's retirement, D-PP-FC2-ORACLE-RETIRE: a C file
+// parses once.) RED-ON-DISABLE: revert the
 // `byteInDeadRegion(off)` skip in `preprocess()`'s closure block -> the dead
 // branch's un-gated splice survives -> the descriptor is surfaced -> the two
 // dead-branch assertions below fail.
@@ -5467,15 +5469,15 @@ TEST(Preprocessor, DPerf2SeedSetMatchesLiveOracleNotDeadBranch) {
 
     // (2) DEAD include (`#if 0 … #endif`) -> NOT recorded: the un-gated splice
     // still fires, but its offset is in an authoritative dead range, so the filter
-    // drops it. The finish() oracle would not resolve it either -> seed == oracle.
+    // drops it: a header in a dead branch is no part of the program.
     PreprocessResult dead;
     (void)ppLexemesWithDirs(
         "#if 0\n#include <stddef.h>\n#endif\nint main(){ return 0; }\n",
         dead, {}, {sysdir});
     EXPECT_FALSE(dead.diagnostics->hasErrors());
     EXPECT_FALSE(containsStddef(dead))
-        << "a dead `#if 0` include must NOT seed -- the finish() oracle would "
-           "not resolve it either";
+        << "a dead `#if 0` include must NOT seed -- its header is no part of "
+           "the program";
     EXPECT_TRUE(dead.resolvedShippedDescriptors.empty())
         << "the dead-branch TU resolves no LIVE system descriptor";
 

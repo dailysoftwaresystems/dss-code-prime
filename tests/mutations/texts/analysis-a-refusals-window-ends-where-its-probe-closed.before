@@ -1,0 +1,1 @@
+        site.refusal->reachPos = site.probe->operandPos().value_or(tokens.position());

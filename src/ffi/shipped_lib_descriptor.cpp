@@ -37,6 +37,7 @@
 #include <limits>      // std::numeric_limits (a derived row's signed 64-bit minimum)
 #include <functional>    // std::function (forEachDescriptorInClosure callbacks)
 #include <initializer_list>
+#include <deque>         // std::deque (the shipped-surface check's closure memo)
 #include <mutex>         // std::mutex/lock_guard (the corpus-index memo)
 #include <optional>
 #include <span>
@@ -177,12 +178,128 @@ void emitMalformed(DiagnosticReporter& reporter, std::string what) {
 [[nodiscard]] core::PathIdentity descriptorPathKey(
     std::filesystem::path const& path);
 
+// ── WHAT A KEPT DECODE READ BEYOND ITS OWN BYTES (P69 L2b2, ruling 630) ─────────────────────────
+// A decode whose answer is kept in a descriptor's entry (the constants view, `readShippedLibConstants`)
+// answers from more than that descriptor's bytes and its caller's arguments: a `shippedTypedef`
+// reference reads the typedef's OWNER (searched in the referrer's shipped root), and a derived row's
+// `of` reference reads ANOTHER header (searched in the consuming language's system dirs, which
+// `resolveSystemDirs` derives from the environment and the working directory as well as from the
+// language). While such a decode runs, each of those reads is recorded here — each descriptor it
+// looked up, by its parse's generation; each search it made, with what the search answered; each set
+// of system dirs it derived — and a kept answer is served again only while every record still holds.
+// A read that FAILED, or a search nobody could examine, is never kept: the next call asks again,
+// exactly as before the memo.
+struct DescriptorReadRecord {
+    std::filesystem::path path;        // as the decode asked for it: what a check looks up again
+    std::string           spelling;    // its generic spelling: the record's identity within one decode
+    std::uint64_t         generation = 0;
+};
+
+struct DescriptorSearchRecord {
+    std::string                        filename;
+    std::vector<std::filesystem::path> dirs;
+    std::vector<std::string>           dirSpellings;
+    HeaderNameMatching                 matching = kDefaultHeaderNameMatching;
+    HeaderSearchStatus                 status   = HeaderSearchStatus::NotFound;
+    std::vector<std::string>           answer;   // the found path's spelling, or the colliding paths'
+};
+
+struct DecodeReads {
+    std::vector<DescriptorReadRecord>     descriptors;
+    std::vector<DescriptorSearchRecord>   searches;
+    std::vector<std::vector<std::string>> systemDirs;   // each derived set, by its spellings
+    bool                                  failed = false;
+
+    void noteDescriptor(std::filesystem::path const& path, std::uint64_t generation) {
+        std::string spelling = core::genericSpelling(path);
+        for (DescriptorReadRecord const& d : descriptors) {
+            if (d.spelling != spelling) continue;
+            if (d.generation != generation) failed = true;   // two versions of one file in one decode
+            return;
+        }
+        descriptors.push_back(DescriptorReadRecord{path, std::move(spelling), generation});
+    }
+    void noteSearch(DescriptorSearchRecord record) {
+        for (DescriptorSearchRecord const& s : searches) {
+            if (s.filename != record.filename || s.dirSpellings != record.dirSpellings
+                || s.matching != record.matching) {
+                continue;
+            }
+            if (s.status != record.status || s.answer != record.answer) failed = true;   // two answers in one decode
+            return;
+        }
+        searches.push_back(std::move(record));
+    }
+    void noteSystemDirs(std::vector<std::string> dirs) {
+        for (std::vector<std::string> const& d : systemDirs) {
+            if (d == dirs) return;
+        }
+        if (!systemDirs.empty()) failed = true;   // one language, two answers in one decode
+        systemDirs.push_back(std::move(dirs));
+    }
+    void absorb(DecodeReads const& other) {
+        for (DescriptorReadRecord const& d : other.descriptors) noteDescriptor(d.path, d.generation);
+        for (DescriptorSearchRecord const& s : other.searches) noteSearch(s);
+        for (std::vector<std::string> const& d : other.systemDirs) noteSystemDirs(d);
+        failed = failed || other.failed;
+    }
+};
+
+// ── THE CONSTANTS VIEW'S KEY: EVERY INPUT ITS DECODE READS, BY VALUE (ruling 630) ───────────────
+// READ from the decode's body (`readShippedLibConstants` → `decodeShippedTypedefs`,
+// `decodeShippedConstants`, `realizeDerivedConstant`, `deriveIntegerLimitOnPair`, `whenFactsFor`,
+// `readShippedHeaderTypedefs`): the descriptor's SPELLING (its diagnostics, and `shippedRootOf` —
+// where a typedef's owner is searched); the active target and format; whether a pair is given; the
+// pair's data model, plain-`char` signedness, ABI typedefs and long-double format; and the consuming
+// LANGUAGE — its type vocabulary, its arithmetic conversions and its `shippedLibDirs` — by the digest
+// of its document and of every document folded into it (`GrammarSchema::contentDigest`,
+// `referencedDocuments`). A language with no digest (one built with no document behind it) has no
+// by-value identity, so a decode for it is never kept. What the decode reads beyond its own bytes
+// keys it too, but as what it READ: recorded per decode (`DecodeReads`) and checked at every hit.
+struct ConstantsMemoKey {
+    std::string                                      spelling;
+    std::optional<std::string>                       target;
+    std::optional<ObjectFormatKind>                  format;
+    bool                                             pair = false;
+    std::optional<DataModel>                         dataModel;
+    std::optional<bool>                              charIsUnsigned;
+    std::vector<std::pair<std::string, TypeKind>>    abiTypedefs;
+    std::optional<LongDoubleFormat>                  longDoubleFormat;
+    bool                                             language = false;
+    std::string                                      languageDigest;
+    std::vector<std::pair<std::string, std::string>> languageDocuments;   // (path, digest)
+    friend bool operator==(ConstantsMemoKey const&, ConstantsMemoKey const&) = default;
+};
+
+// One kept constants view: its key, what its decode read beyond the descriptor's bytes, the answer.
+struct ConstantsMemoRow {
+    ConstantsMemoKey                              key;
+    DecodeReads                                   reads;
+    std::optional<std::vector<ShippedPpConstant>> view;
+};
+
 // One cached document plus the bytes that produced it. The text is what makes the
 // hit EXACT; it costs ~472 KB for the whole shipped corpus, a fraction of the DOM
 // it guards.
+//
+// ★ AND WHAT THE DOCUMENT SAYS ON EACH FORMAT, ONCE (P69 L2b2, ruling 602). A
+// descriptor's surface on a format (`shippedSurfaceNamesForFormat`: its symbols,
+// constants, typedefs, records and macros as that format selects them) is a fact of
+// its BYTES. It used to be re-harvested from the DOM at every ask, and a unit's
+// shipped-surface check asked about 135 times — the quotient of 79.4 ms per check and
+// a mean 0.59 ms per harvest over the 50 shipped descriptors, both ✔MEASURED on MSVC
+// Release — so every unit paid it. The harvest now lives in the entry: built at the
+// first ask on a format, dropped WITH the entry when the bytes change, so it is
+// exactly as current as `doc` and needs no invalidation of its own. Only a harvest
+// that reported nothing is kept — a hit must say what a harvest would have said.
 struct CachedDescriptor {
     std::string text;
     json        doc;
+    std::vector<std::pair<ObjectFormatKind, std::vector<std::string>>> surfaceByFormat;
+    // This parse's number, unique on the thread: a decode that read the document records it, and a
+    // re-parse (the bytes changed) is a new number — so "the same generation" is "the same bytes".
+    std::uint64_t                 generation = 0;
+    std::vector<ConstantsMemoRow> constantsMemo;   // `readShippedLibConstants`' kept views (ruling 630)
 };
 
 // See `shippedDescriptorCacheStats()` in the header: the counters exist for the
@@ -192,15 +309,136 @@ ShippedDescriptorCacheStats& cacheStats() {
     return stats;
 }
 
-json const* cachedDescriptorJson(std::filesystem::path const& path,
-                                 DiagnosticReporter& reporter) {
+// The one door to `descriptorPathKey` for the cache and the read scope: each identity
+// they compute is counted, so a pin can say a check resolved each path ONCE. One
+// `PathIdentity::of` costs ≈0.14 ms on Windows (✔MEASURED, MSVC Release, P69 L2b2), and
+// the identities were most of a warm check before the scope remembered them.
+[[nodiscard]] core::PathIdentity resolvedDescriptorPathKey(std::filesystem::path const& path) {
+    ++cacheStats().identityResolutions;
+    return descriptorPathKey(path);
+}
+
+// ── THE READ SCOPE (P69 L2b2, ruling 602): ONE CHECKED READ PER DESCRIPTOR PER CHECK ──
+// Every lookup above pays the one checked read (≈73 µs) and the path's identity, and
+// one operation asks for the same descriptors again and again: a unit's shipped-surface
+// check makes 71 lookups of 10 distinct descriptors (✔MEASURED, the counters). While a
+// `ShippedDescriptorReadScope` (the header) is alive on this thread, a spelling this
+// scope has already read is served from the entry WITHOUT a second read — the "true
+// snapshot taken where the work begins" the note above says belongs to the caller, not
+// here. A scope is one operation long, so the exactness argument is unchanged: the next
+// operation reads every file again. A read failure inside the scope evicts as before,
+// and the spelling is forgotten with it.
+// ⓘ The scope remembers each SPELLING's identity as `descriptorPathKey` computed it,
+// so a second ask under the same spelling skips the resolution; two spellings of one
+// file are two rows that name ONE identity — identity is still `PathIdentity`'s.
+// ★ AND THE SHIPPED TREE'S SHAPE (P69 L2b2, ruling 630): each descriptor search a decode makes
+// (`searchShippedDescriptor`: a typedef's owner, a header a derived row's `of` names) is answered once per
+// (filename, dirs, matching) for the scope, and forgotten with the rest of the snapshot. An unexaminable
+// answer is not kept: the next ask searches again.
+struct DescriptorReadScopeState {
+    unsigned                                                           depth = 0;
+    std::unordered_map<std::string, core::PathIdentity>                keyOfSpelling;
+    std::unordered_set<core::PathIdentity>                             readInScope;
+    std::vector<std::pair<DescriptorSearchRecord, HeaderSearchResult>> searches;
+};
+
+DescriptorReadScopeState& readScope() {
+    thread_local DescriptorReadScopeState state;
+    return state;
+}
+
+// The identity of `path` as `descriptorPathKey` decides it, remembered per exact SPELLING
+// for the length of a read scope — the same snapshot the scope takes of the bytes. A
+// check asked for about 50 identities of its 10 descriptors (each claim's header, each
+// visited closure member, each first read), at ≈0.14 ms each on Windows (✔MEASURED,
+// MSVC Release, P69 L2b2): most of a warm check. Inside a scope each spelling is now
+// resolved once; outside one every ask resolves.
+[[nodiscard]] core::PathIdentity scopedDescriptorPathKey(std::filesystem::path const& path) {
+    auto& scope = readScope();
+    if (scope.depth == 0) return resolvedDescriptorPathKey(path);
+    std::string spelling = core::genericSpelling(path);
+    if (auto const it = scope.keyOfSpelling.find(spelling); it != scope.keyOfSpelling.end()) {
+        return it->second;
+    }
+    auto key = resolvedDescriptorPathKey(path);
+    scope.keyOfSpelling.emplace(std::move(spelling), key);
+    return key;
+}
+
+// The reads of the decode running on this thread whose answer may be kept, or nullptr. Thread-local,
+// like the cache: a decode and every read it makes run on one thread.
+DecodeReads*& activeDecodeReads() {
+    thread_local DecodeReads* reads = nullptr;
+    return reads;
+}
+
+// Brackets one decode whose reads are recorded. A recorder inside another one hands its reads to the
+// outer decode as well: they are the outer decode's reads too.
+class DecodeReadsRecorder {
+public:
+    explicit DecodeReadsRecorder(DecodeReads& into) noexcept
+        : into_(into), outer_(activeDecodeReads()) {
+        activeDecodeReads() = &into_;
+    }
+    ~DecodeReadsRecorder() {
+        activeDecodeReads() = outer_;
+        if (outer_ != nullptr) outer_->absorb(into_);
+    }
+    DecodeReadsRecorder(DecodeReadsRecorder const&)            = delete;
+    DecodeReadsRecorder& operator=(DecodeReadsRecorder const&) = delete;
+
+private:
+    DecodeReads& into_;
+    DecodeReads* outer_;
+};
+
+// A kept answer's reads, handed to a decode recording around the call that served it.
+void noteReadsOf(DecodeReads const& reads) {
+    if (DecodeReads* const outer = activeDecodeReads()) outer->absorb(reads);
+}
+
+// Each parse of a descriptor takes the thread's next number (`CachedDescriptor::generation`).
+std::uint64_t nextDescriptorGeneration() {
+    thread_local std::uint64_t last = 0;
+    return ++last;
+}
+
+std::unordered_map<core::PathIdentity, CachedDescriptor>& descriptorCache() {
     thread_local std::unordered_map<core::PathIdentity, CachedDescriptor> cache;
-    auto const key = descriptorPathKey(path);
+    return cache;
+}
+
+CachedDescriptor* lookUpDescriptorEntry(std::filesystem::path const& path,
+                                         DiagnosticReporter& reporter) {
+    auto& cache = descriptorCache();
+    auto& scope = readScope();
     ++cacheStats().lookups;
+
+    std::optional<core::PathIdentity> scopedKey;
+    std::string spelling;
+    if (scope.depth > 0) {
+        spelling = core::genericSpelling(path);
+        if (auto const s = scope.keyOfSpelling.find(spelling); s != scope.keyOfSpelling.end()) {
+            if (scope.readInScope.contains(s->second)) {
+                if (auto const it = cache.find(s->second); it != cache.end()) {
+                    ++cacheStats().scopeHits;   // read once in this scope: no second read
+                    return &it->second;
+                }
+            }
+            scopedKey = s->second;
+        }
+    }
+    auto const key = scopedKey ? *scopedKey : resolvedDescriptorPathKey(path);
+    auto const remember = [&] {
+        if (scope.depth == 0) return;
+        scope.keyOfSpelling.insert_or_assign(spelling, key);
+        scope.readInScope.insert(key);
+    };
 
     auto text = core::readFileChecked(path);
     if (!text) {
         cache.erase(key);   // never answer a failed read from a cached document
+        if (scope.depth > 0) scope.readInScope.erase(key);
         emitMalformed(reporter,
             std::string{"shipped-lib descriptor: "}
                 + std::move(text).error().message);
@@ -209,7 +447,8 @@ json const* cachedDescriptorJson(std::filesystem::path const& path,
     if (auto const it = cache.find(key); it != cache.end()) {
         if (it->second.text == *text) {   // byte-identical ⇒ the parse still holds
             ++cacheStats().revalidatedHits;
-            return &it->second.doc;
+            remember();
+            return &it->second;
         }
         cache.erase(it);                  // the file changed ⇒ re-parse it
         ++cacheStats().staleEvictions;
@@ -236,8 +475,143 @@ json const* cachedDescriptorJson(std::filesystem::path const& path,
         return nullptr;
     }
     auto const [it, _] = cache.emplace(
-        key, CachedDescriptor{std::move(*text), std::move(doc)});
-    return &it->second.doc;
+        key, CachedDescriptor{std::move(*text), std::move(doc), {}, nextDescriptorGeneration(), {}});
+    remember();
+    return &it->second;
+}
+
+// THE ONE DOOR to a cached descriptor: every reader's lookup, and the one place a decode whose answer
+// may be kept learns which descriptors it read (`DecodeReads`).
+CachedDescriptor* cachedDescriptorEntry(std::filesystem::path const& path,
+                                        DiagnosticReporter& reporter) {
+    CachedDescriptor* const entry = lookUpDescriptorEntry(path, reporter);
+    if (DecodeReads* const reads = activeDecodeReads()) {
+        if (entry != nullptr) reads->noteDescriptor(path, entry->generation);
+        else reads->failed = true;   // a failed read is never kept: the next call reads again
+    }
+    return entry;
+}
+
+[[nodiscard]] std::vector<std::string> spellingsOf(std::span<std::filesystem::path const> paths) {
+    std::vector<std::string> out;
+    out.reserve(paths.size());
+    for (std::filesystem::path const& p : paths) out.push_back(core::genericSpelling(p));
+    return out;
+}
+
+// What a search answered, as a decode could have used it: the found path's spelling (it becomes the
+// owner's `pathStr`), or the colliding paths' spellings; nothing for "not found".
+[[nodiscard]] std::vector<std::string> searchAnswer(HeaderSearchResult const& found) {
+    if (found.status == HeaderSearchStatus::Found) return {core::genericSpelling(found.path)};
+    if (found.status == HeaderSearchStatus::AmbiguousCase) return spellingsOf(found.ambiguousCandidates);
+    return {};
+}
+
+// THE ONE DOOR to a descriptor SEARCH a decode makes (a typedef's owner, a header a derived row's `of`
+// names): the search, recorded for a decode whose answer may be kept.
+[[nodiscard]] HeaderSearchResult searchShippedDescriptor(std::string_view                       filename,
+                                                         std::span<std::filesystem::path const> dirs,
+                                                         HeaderNameMatching                     matching) {
+    auto&                          scope       = readScope();
+    std::vector<std::string> const spelledDirs = spellingsOf(dirs);
+    auto const asked = std::find_if(scope.searches.begin(), scope.searches.end(), [&](auto const& s) {
+        return s.first.filename == filename && s.first.dirSpellings == spelledDirs && s.first.matching == matching;
+    });
+    HeaderSearchResult found;
+    if (asked != scope.searches.end()) {
+        ++cacheStats().searchScopeHits;   // asked before in this operation: the snapshot's answer
+        found = asked->second;
+    } else {
+        HeaderSearchCache cache;
+        found = resolveSystemDescriptor(filename, dirs, matching, cache);
+        ++cacheStats().descriptorSearches;
+        if (scope.depth > 0 && found.status != HeaderSearchStatus::Unexaminable) {
+            scope.searches.emplace_back(
+                DescriptorSearchRecord{std::string{filename}, {}, spelledDirs, matching, found.status, {}}, found);
+        }
+    }
+    if (DecodeReads* const reads = activeDecodeReads()) {
+        if (found.status == HeaderSearchStatus::Unexaminable) {
+            reads->failed = true;   // nobody could tell: the next call searches again
+        } else {
+            reads->noteSearch(DescriptorSearchRecord{std::string{filename},
+                                                     {dirs.begin(), dirs.end()},
+                                                     spellingsOf(dirs),
+                                                     matching,
+                                                     found.status,
+                                                     searchAnswer(found)});
+        }
+    }
+    return found;
+}
+
+// THE ONE DOOR to the language's system dirs a decode derives (a derived row's `of` header is searched
+// there): `resolveSystemDirs`, which reads the environment and the working directory as well as the
+// language, recorded for a decode whose answer may be kept.
+[[nodiscard]] std::vector<std::filesystem::path> systemDirsOf(GrammarSchema const& language) {
+    std::vector<std::filesystem::path> dirs = resolveSystemDirs(language);
+    if (DecodeReads* const reads = activeDecodeReads()) reads->noteSystemDirs(spellingsOf(dirs));
+    return dirs;
+}
+
+// The entry whose parse is `generation`, or nullptr once that parse is gone (re-parsed or evicted).
+CachedDescriptor* descriptorEntryOfGeneration(std::uint64_t generation) {
+    for (auto& cached : descriptorCache()) {
+        if (cached.second.generation == generation) return &cached.second;
+    }
+    return nullptr;
+}
+
+// Whether every read a kept answer's decode made still answers the same — each descriptor at its
+// generation, each search with its answer, each set of system dirs — so that a decode made now would
+// give the kept answer. `pairFacts` is the CALLER's: its language is the kept key's, by digest.
+[[nodiscard]] bool decodeReadsStillHold(DecodeReads const& reads, ShippedPairFacts const* pairFacts) {
+    for (DescriptorReadRecord const& d : reads.descriptors) {
+        DiagnosticReporter unread;   // a failed read only ends the kept answer; the decode after it says why
+        CachedDescriptor const* const now = cachedDescriptorEntry(d.path, unread);
+        if (now == nullptr || now->generation != d.generation) return false;
+    }
+    for (DescriptorSearchRecord const& s : reads.searches) {
+        HeaderSearchResult const now = searchShippedDescriptor(s.filename, s.dirs, s.matching);
+        if (now.status != s.status || searchAnswer(now) != s.answer) return false;
+    }
+    for (std::vector<std::string> const& dirs : reads.systemDirs) {
+        if (pairFacts == nullptr || pairFacts->language == nullptr) return false;
+        if (spellingsOf(systemDirsOf(*pairFacts->language)) != dirs) return false;
+    }
+    return true;
+}
+
+// The constants view's key for one call (`ConstantsMemoKey`), or nullopt when an input has no by-value
+// identity — a language with no document digest — so that the decode is never kept.
+[[nodiscard]] std::optional<ConstantsMemoKey>
+constantsMemoKey(std::filesystem::path const&    path,
+                 std::optional<std::string_view> activeTarget,
+                 std::optional<ObjectFormatKind> activeFormat,
+                 ShippedPairFacts const*         pairFacts) {
+    ConstantsMemoKey key;
+    key.spelling = core::genericSpelling(path);
+    if (activeTarget.has_value()) key.target = std::string{*activeTarget};
+    key.format = activeFormat;
+    if (pairFacts == nullptr) return key;
+    key.pair             = true;
+    key.dataModel        = pairFacts->dataModel;
+    key.charIsUnsigned   = pairFacts->charIsUnsigned;
+    key.abiTypedefs      = pairFacts->abiTypedefs;
+    key.longDoubleFormat = pairFacts->longDoubleFormat;
+    if (pairFacts->language == nullptr) return key;
+    GrammarSchema const& language = *pairFacts->language;
+    if (language.contentDigest().empty()) return std::nullopt;   // no by-value identity: never kept
+    key.language       = true;
+    key.languageDigest = std::string{language.contentDigest()};
+    for (auto const& d : language.referencedDocuments()) key.languageDocuments.emplace_back(d.path, d.digest);
+    return key;
+}
+
+json const* cachedDescriptorJson(std::filesystem::path const& path,
+                                 DiagnosticReporter& reporter) {
+    CachedDescriptor* const entry = cachedDescriptorEntry(path, reporter);
+    return entry != nullptr ? &entry->doc : nullptr;
 }
 
 // D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD enforcement. Reports one
@@ -1702,6 +2076,45 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
     return false;
 }
 
+// ══ A DESCRIPTOR'S TYPE TEXT, DECODED — AND THE DESCRIPTOR WORD READ WITH NO BINDING ══
+// (P69 L2b2; the contract is c82's, D-FFI-DESCRIPTOR-VA-LIST-TYPE) Every type text a
+// descriptor carries — a field's, a constant's, a typedef's `type`, a symbol's
+// `signature` and each of its arms — is decoded HERE, through the ONE type-text decoder.
+// A descriptor spells the variadic list type by the descriptor word `va_list`
+// (`kVaListDescriptorTypeName`), which names no type of its own: it resolves ONLY through
+// the binding the READ's caller passes in `namedTypes` — the semantic tier binds the
+// target's list type, the pipeline's `.s` read the pair's ABI's, a validation read the
+// builder's (`vaListTypes`). A read that reaches the word with none cannot decode the
+// text, and the decoder's own refusal can only say "unknown type" (it is content-blind
+// by design). So a failed decode whose text names the word, on a read that bound no
+// type to it, is refused once more, NAMING the binding the read lacks: the defect is
+// the caller's, and the message says which fix it takes. It is reachable from far away:
+// a typedef's variants decode EAGERLY, and a `shippedTypedef` decodes its owner's whole
+// typedef list, so a read of any header whose list reaches <stdarg.h>'s crosses it.
+// `where` is the site's own context; each site's refusal still follows this one.
+[[nodiscard]] TypeId decodeDescriptorType(std::string_view                  typeText,
+                                          TypeInterner&                     interner,
+                                          TypeRegistry&                     typeReg,
+                                          DiagnosticReporter&               reporter,
+                                          std::span<NamedTypeBinding const> namedTypes,
+                                          std::string const&                where,
+                                          DeclaredQualification*            outQual = nullptr) {
+    TypeId const t = parseTypeFromText(typeText, interner, typeReg, reporter, namedTypes, outQual);
+    if (t.valid() && t != InvalidType) return t;
+    if (!referencesIdentifierToken(typeText, kVaListDescriptorTypeName)) return t;
+    for (NamedTypeBinding const& b : namedTypes) {
+        if (b.name == kVaListDescriptorTypeName && b.type.valid()) return t;
+    }
+    dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType, DiagnosticSeverity::Error,
+                "shipped-lib descriptor " + where + ": the type '" + std::string{typeText}
+                    + "' names the descriptor word '" + std::string{kVaListDescriptorTypeName}
+                    + "', which resolves only through a binding the read's caller passes "
+                      "(`namedTypes`), and this read bound no type to it — the semantic tier "
+                      "binds the target's list type, a validation read the builder's "
+                      "(`vaListTypes`)");
+    return t;
+}
+
 // ── AN OBJECT-LIKE MACRO THAT SHADOWS A SYMBOL WITHOUT REFERENCING IT IS A
 // ── DEFECT ──────────────────────────────────────────────────────────────────
 //
@@ -2089,7 +2502,7 @@ void decodeShippedIncludes(json const& doc, std::string const& pathStr,
             return false;
         }
         std::string const fTypeText = f.at("type").get<std::string>();
-        TypeId const fty = parseTypeFromText(fTypeText, interner, typeReg, reporter, namedTypes);
+        TypeId const fty = decodeDescriptorType(fTypeText, interner, typeReg, reporter, namedTypes, fat);
         if (!fty.valid() || fty == InvalidType) {
             dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
                         DiagnosticSeverity::Error,
@@ -2134,7 +2547,7 @@ decodeConstantValueAndType(json const& obj, std::string const& at,
         return false;
     }
     std::string const typeText = obj.at("type").get<std::string>();
-    TypeId const cty = parseTypeFromText(typeText, interner, typeReg, reporter, namedTypes);
+    TypeId const cty = decodeDescriptorType(typeText, interner, typeReg, reporter, namedTypes, at);
     if (!cty.valid() || cty == InvalidType) {
         dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
                     DiagnosticSeverity::Error,
@@ -2285,10 +2698,8 @@ locateTypedefReferenceOwner(json const& ref, std::string const& ctx, std::string
                                       "that header is found in cannot be named");
         return std::nullopt;
     }
-    HeaderSearchCache cache;
     std::array<std::filesystem::path, 1> const dirs{*root};
-    HeaderSearchResult const found =
-        resolveSystemDescriptor(ownerHeader, dirs, kDefaultHeaderNameMatching, cache);
+    HeaderSearchResult const found = searchShippedDescriptor(ownerHeader, dirs, kDefaultHeaderNameMatching);
     if (found.status == HeaderSearchStatus::Unexaminable) {   // not "no such descriptor": nobody could tell
         emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": typedef '" + tname + "' names '"
                                     + ownerHeader + "' as its owner, and that header's descriptor "
@@ -2391,8 +2802,8 @@ decodeShippedTypedefs(json const& doc, std::string const& pathStr,
                     return InvalidType;
                 }
                 std::string const typeText = obj.at("type").get<std::string>();
-                TypeId const ty = parseTypeFromText(typeText, interner, typeReg, reporter,
-                                                    mergedNamedTypes);
+                TypeId const ty = decodeDescriptorType(typeText, interner, typeReg, reporter,
+                                                       mergedNamedTypes, ctx);
                 if (!ty.valid() || ty == InvalidType) {
                     dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
                                 DiagnosticSeverity::Error,
@@ -3541,7 +3952,7 @@ decodeShippedFloatConstants(json const& doc, std::string const& pathStr,
             continue;
         }
         std::string const typeText = c.at("type").get<std::string>();
-        TypeId const cty = parseTypeFromText(typeText, interner, typeReg, reporter, namedTypes);
+        TypeId const cty = decodeDescriptorType(typeText, interner, typeReg, reporter, namedTypes, at);
         if (!cty.valid() || cty == InvalidType) {
             dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
                         DiagnosticSeverity::Error,
@@ -3580,6 +3991,19 @@ decodeShippedFloatConstants(json const& doc, std::string const& pathStr,
 // See the header. The counters live beside the cache they describe and share its
 // thread_local lifetime, so a caller reads the numbers for ITS OWN thread.
 ShippedDescriptorCacheStats shippedDescriptorCacheStats() { return cacheStats(); }
+
+// See the header: the read scope's snapshot is the thread's, and only the outermost
+// scope's end forgets it.
+ShippedDescriptorReadScope::ShippedDescriptorReadScope() noexcept { ++readScope().depth; }
+
+ShippedDescriptorReadScope::~ShippedDescriptorReadScope() {
+    auto& s = readScope();
+    if (--s.depth == 0) {
+        s.keyOfSpelling.clear();
+        s.readInScope.clear();
+        s.searches.clear();
+    }
+}
 
 namespace {
 
@@ -4710,7 +5134,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         for (std::string const& arm : sigArms) {
             if (arm == sigText) continue;               // decoded below, with its claim
             if (unpublishedDeclaredNameIn(arm).has_value()) continue;
-            TypeId const armSig = parseTypeFromText(arm, interner, typeReg, reporter, mergedNamedTypes);
+            TypeId const armSig = decodeDescriptorType(arm, interner, typeReg, reporter, mergedNamedTypes, at);
             if (!armSig.valid() || armSig == InvalidType) {
                 dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
                             DiagnosticSeverity::Error,
@@ -4746,7 +5170,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         // SELECTED arm's: each arm is its own statement, and the one this pair
         // selects is what this build is compiled against.
         DeclaredQualification baseQual;
-        TypeId const baseSig = parseTypeFromText(sigText, interner, typeReg, reporter, mergedNamedTypes, &baseQual);
+        TypeId const baseSig = decodeDescriptorType(sigText, interner, typeReg, reporter, mergedNamedTypes, at,
+                                                    &baseQual);
         if (!baseSig.valid() || baseSig == InvalidType) {
             dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
                         DiagnosticSeverity::Error,
@@ -5042,12 +5467,16 @@ readShippedLibMacros(std::filesystem::path const&    path,
     return out;  // empty when the descriptor declares no `macros` (typed-only)
 }
 
-std::optional<std::vector<ShippedPpConstant>>
-readShippedLibConstants(std::filesystem::path const&    path,
-                        DiagnosticReporter&             reporter,
-                        std::optional<std::string_view> activeTarget,
-                        std::optional<ObjectFormatKind> activeFormat,
-                        ShippedPairFacts const*         pairFacts) {
+namespace {
+
+// The constants view of ONE descriptor's document: the decode `readShippedLibConstants` keeps.
+[[nodiscard]] std::optional<std::vector<ShippedPpConstant>>
+decodeConstantsView(json const&                     doc,
+                    std::filesystem::path const&    path,
+                    DiagnosticReporter&             reporter,
+                    std::optional<std::string_view> activeTarget,
+                    std::optional<ObjectFormatKind> activeFormat,
+                    ShippedPairFacts const*         pairFacts) {
     // Interner-FREE preprocessor read of the `constants` surface, through the
     // SAME `decodeShippedConstants` chokepoint the semantic read uses — the
     // `readShippedLibMacros` / `readShippedLibAvailability` /
@@ -5076,8 +5505,7 @@ readShippedLibConstants(std::filesystem::path const&    path,
     // rc=127 before this was a `1`. The id is arbitrary because the lattice is
     // function-local; what matters is only that it is a valid tag.
     std::size_t const errBefore = reporter.errorCount();
-    json const* const docPtr = cachedDescriptorJson(path, reporter);
-    if (!docPtr) return std::nullopt;
+    json const* const docPtr = &doc;
 
     TypeLattice lattice{CompilationUnitId{1}};
     // P68 round 9: the data model a variant is selected by is the PAIR's, or none.
@@ -5138,6 +5566,58 @@ readShippedLibConstants(std::filesystem::path const&    path,
             std::string{lattice.interner().vocabularyName(c.type)}});
     }
     return out;   // empty ⇒ no constants, or none preprocessor-visible
+}
+
+}  // namespace
+
+std::optional<std::vector<ShippedPpConstant>>
+readShippedLibConstants(std::filesystem::path const&    path,
+                        DiagnosticReporter&             reporter,
+                        std::optional<std::string_view> activeTarget,
+                        std::optional<ObjectFormatKind> activeFormat,
+                        ShippedPairFacts const*         pairFacts) {
+    // ★ KEPT PER WHAT ITS DECODE READ (P69 L2b2, ruling 630; the header says why). The key is every
+    // input the decode reads, by value (`constantsMemoKey`); what it reads beyond the descriptor's bytes
+    // is recorded while it runs (`DecodeReads`) and must all still hold for a kept view to be served;
+    // and only a decode that said nothing is kept, so a decode that reports reports again.
+    std::size_t const saidBefore = reporter.all().size();
+    CachedDescriptor* entry = cachedDescriptorEntry(path, reporter);
+    if (entry == nullptr) return std::nullopt;
+    std::optional<ConstantsMemoKey> const key =
+        constantsMemoKey(path, activeTarget, activeFormat, pairFacts);
+    if (key.has_value()) {
+        auto const kept = std::find_if(entry->constantsMemo.begin(), entry->constantsMemo.end(),
+                                       [&](ConstantsMemoRow const& row) { return row.key == *key; });
+        if (kept != entry->constantsMemo.end()) {
+            // COPIED before the check: it looks descriptors up, and a lookup may replace this entry.
+            DecodeReads const                             keptReads = kept->reads;
+            std::optional<std::vector<ShippedPpConstant>> keptView  = kept->view;
+            if (decodeReadsStillHold(keptReads, pairFacts)) {
+                ++cacheStats().constantsMemoHits;
+                noteReadsOf(keptReads);   // a decode recording around this call read them too
+                return keptView;
+            }
+            entry = cachedDescriptorEntry(path, reporter);   // the check's lookups may have replaced it
+            if (entry == nullptr) return std::nullopt;
+            std::erase_if(entry->constantsMemo,
+                          [&](ConstantsMemoRow const& row) { return row.key == *key; });
+        }
+    }
+    std::uint64_t const generation = entry->generation;
+    ++cacheStats().constantsDecodes;
+    DecodeReads                                   reads;
+    std::optional<std::vector<ShippedPpConstant>> view;
+    {
+        DecodeReadsRecorder const recording{reads};
+        view = decodeConstantsView(entry->doc, path, reporter, activeTarget, activeFormat, pairFacts);
+    }
+    if (key.has_value() && !reads.failed && reporter.all().size() == saidBefore) {
+        // Found again by its parse: a read inside the decode may have replaced the entry.
+        if (CachedDescriptor* const same = descriptorEntryOfGeneration(generation)) {
+            same->constantsMemo.push_back(ConstantsMemoRow{*key, std::move(reads), view});
+        }
+    }
+    return view;
 }
 
 std::optional<std::vector<ShippedPpFloatConstant>>
@@ -5247,10 +5727,8 @@ readShippedHeaderTypedefs(std::string_view                header,
     // (see the declaration), then the availability gate, then the ONE typedef read.
     ShippedHeaderTypedefs out;
     if (pair.language == nullptr) return out;   // NoLanguage
-    std::vector<std::filesystem::path> const dirs = resolveSystemDirs(*pair.language);
-    HeaderSearchCache cache;
-    HeaderSearchResult const desc =
-        resolveSystemDescriptor(header, dirs, kDefaultHeaderNameMatching, cache);
+    std::vector<std::filesystem::path> const dirs = systemDirsOf(*pair.language);
+    HeaderSearchResult const desc = searchShippedDescriptor(header, dirs, kDefaultHeaderNameMatching);
     // A descriptor nobody could examine is no "not shipped": it could not be READ.
     if (desc.status == HeaderSearchStatus::Unexaminable) {
         out.status = ShippedHeaderTypedefsStatus::Unreadable;
@@ -5304,11 +5782,11 @@ readShippedLibAvailability(std::filesystem::path const& path,
 std::optional<std::vector<std::string>>
 readShippedLibTypedefNames(std::filesystem::path const& path,
                            DiagnosticReporter&          reporter) {
-    // Interner-FREE TYPEDEF-NAME read for the parse-time cast-vs-call ORACLE
-    // (D-CSUBSET-SHIPPED-TYPEDEF-CAST-PARSE): the post-parse typedef-resolution
-    // reparse (compilation_unit.cpp `finish()`) seeds these names as parse-time
-    // global TYPE NAMES so a shipped-typedef `(size_t)(expr)` parses as a CAST, not
-    // a call. Only the NAMES are needed (not the decoded `type`), so no
+    // Interner-FREE TYPEDEF-NAME read for the parse-time cast-vs-call seed
+    // (D-CSUBSET-SHIPPED-TYPEDEF-CAST-PARSE): UnitBuilder::parseAndAdd_ seeds these
+    // names as parse-time global TYPE NAMES before the parse, so a shipped-typedef
+    // `(size_t)(expr)` parses as a CAST, not a call. Only the NAMES are needed (not
+    // the decoded `type`), so no
     // TypeInterner — mirrors readShippedLibAvailability. LENIENT: a malformed entry
     // is skipped (no name to harvest); the SEMANTIC read (readShippedLibDescriptor)
     // owns strict typedef validation, so this stays no STRICTER than the full read
@@ -5327,7 +5805,7 @@ readShippedLibTypedefNames(std::filesystem::path const& path,
         }
     }
     if (reporter.errorCount() != errBefore) return std::nullopt;
-    return out;  // empty ⇒ no typedef surface (the oracle learns nothing new)
+    return out;  // empty ⇒ no typedef surface (the seed learns nothing new)
 }
 
 std::optional<std::vector<std::string>>
@@ -5439,7 +5917,7 @@ void forEachDescriptorInClosure(
         // A→B→A stops at the second A and a diamond's shared leaf is visited once. The
         // walk is bounded by the finite shipped-descriptor count — no fixpoint
         // iteration, a single DFS is complete + terminating.
-        auto const key = descriptorPathKey(here);
+        auto const key = scopedDescriptorPathKey(here);
         if (!visited.insert(key).second) continue;   // already in the closure
 
         // PARENT FIRST — visit this descriptor before the siblings its `includes`
@@ -5638,27 +6116,18 @@ void harvestNamedSurface(json const& doc, std::string const& pathStr,
     }
 }
 
-}  // namespace
-
-std::optional<std::vector<std::string>>
-shippedSurfaceNamesForFormat(std::filesystem::path const& path,
-                             ObjectFormatKind             fmt,
-                             DiagnosticReporter&          reporter) {
-    std::size_t const errBefore = reporter.errorCount();
-    json const* const docPtr = cachedDescriptorJson(path, reporter);
-    if (!docPtr) return std::nullopt;
-    json const&       doc      = *docPtr;
-    std::string const pathStr  = core::genericSpelling(path);
-
-    std::vector<std::string> out;
-
-    // The DOCUMENT-level availability set is the TIER-2 fallback for a symbol
-    // that declares none of its own — the same two-tier resolution the corpus
-    // symbol index uses, so "which symbols exist on F" has ONE answer.
+// THE VALUE SURFACES, read ONCE for both askers (P69 L2b2): `shippedSurfaceNamesForFormat`'s
+// corpus scan on a format, and `readShippedLibValueNames`' parse-time seed on the unit's format or
+// on none. `symbols` is the one surface with a PER-ENTRY availability set; the DOCUMENT-level set is
+// the TIER-2 fallback for a symbol that declares none of its own — the same two-tier resolution the
+// corpus symbol index uses, so "which symbols exist on F" has ONE answer. With no format nothing is
+// gated and every format's aliases are names (the analyzer, given no format, gates no symbol).
+void harvestValueNames(json const& doc, std::string const& pathStr,
+                       std::optional<ObjectFormatKind> fmt,
+                       DiagnosticReporter& reporter,
+                       std::vector<std::string>& out) {
     std::vector<std::string> docAvail;
     decodeShippedAvailability(doc, pathStr, reporter, docAvail);
-
-    // symbols — the one surface with a PER-ENTRY availability set.
     if (auto const symsIt = doc.find("symbols");
         symsIt != doc.end() && symsIt->is_array()) {
         std::size_t idx = 0;
@@ -5673,8 +6142,9 @@ shippedSurfaceNamesForFormat(std::filesystem::path const& path,
             if (name.empty()) continue;
             std::vector<std::string> symAvail;
             decodeShippedAvailability(sym, at, reporter, symAvail);
-            if (!objectFormatInAvailabilitySet(
-                    symAvail.empty() ? docAvail : symAvail, fmt)) {
+            if (fmt.has_value()
+                && !objectFormatInAvailabilitySet(
+                    symAvail.empty() ? docAvail : symAvail, *fmt)) {
                 continue;
             }
             out.push_back(std::move(name));
@@ -5682,9 +6152,10 @@ shippedSurfaceNamesForFormat(std::filesystem::path const& path,
             // full read appends a row for each (`ShippedSymbol::aliases`), so the
             // name scan answers the same question the same way.
             if (auto const al = sym.find("aliases"); al != sym.end() && al->is_object()) {
-                if (auto const lst = al->find(std::string{objectFormatKindName(fmt)});
-                    lst != al->end() && lst->is_array()) {
-                    for (auto const& a : *lst) {
+                for (auto const& kv : al->items()) {
+                    if (fmt.has_value() && kv.key() != objectFormatKindName(*fmt)) continue;
+                    if (!kv.value().is_array()) continue;
+                    for (auto const& a : kv.value()) {
                         if (a.is_string() && !a.get<std::string>().empty())
                             out.push_back(a.get<std::string>());
                     }
@@ -5692,14 +6163,50 @@ shippedSurfaceNamesForFormat(std::filesystem::path const& path,
             }
         }
     }
+    // `constants` admits per-target `variants` (reachability read on a format; with none, every
+    // entry); `floatConstants` is flat.
+    if (fmt.has_value()) {
+        harvestNamedSurface(doc, pathStr, "constants", true, *fmt, reporter, out);
+        harvestNamedSurface(doc, pathStr, "floatConstants", false, *fmt, reporter, out);
+    } else {
+        for (char const* key : {"constants", "floatConstants"}) {
+            auto const it = doc.find(key);
+            if (it == doc.end() || !it->is_array()) continue;
+            for (auto const& e : *it) {
+                if (e.is_object() && e.contains("name") && e.at("name").is_string()
+                    && !e.at("name").get<std::string>().empty())
+                    out.push_back(e.at("name").get<std::string>());
+            }
+        }
+    }
+}
 
-    // The typed surfaces. `constants` / `typedefs` / `structs` admit per-target
-    // `variants`; `floatConstants` / `unions` are flat. The flags are read off
-    // the SAME facts the full read's key vocabularies declare — a surface that
-    // grows `variants` later must flip its flag here, and the surface-name test
-    // is what makes that visible.
-    harvestNamedSurface(doc, pathStr, "constants",      true,  fmt, reporter, out);
-    harvestNamedSurface(doc, pathStr, "floatConstants", false, fmt, reporter, out);
+}  // namespace
+
+std::optional<std::vector<std::string>>
+shippedSurfaceNamesForFormat(std::filesystem::path const& path,
+                             ObjectFormatKind             fmt,
+                             DiagnosticReporter&          reporter) {
+    std::size_t const errBefore = reporter.errorCount();
+    CachedDescriptor* const entry = cachedDescriptorEntry(path, reporter);
+    if (!entry) return std::nullopt;
+    // (a) the format's surface, if these bytes were harvested on it before.
+    for (auto const& [onFormat, names] : entry->surfaceByFormat) {
+        if (onFormat == fmt) {
+            ++cacheStats().surfaceMemoHits;
+            return names;
+        }
+    }
+    ++cacheStats().surfaceHarvests;
+    std::size_t const saidBefore = reporter.all().size();
+    json const&       doc      = entry->doc;
+    std::string const pathStr  = core::genericSpelling(path);
+
+    std::vector<std::string> out;
+
+    // symbols (and their aliases), constants, floatConstants — the value surfaces,
+    // read through the one helper the parse-time value seed reads them with.
+    harvestValueNames(doc, pathStr, fmt, reporter, out);
     harvestNamedSurface(doc, pathStr, "typedefs",       true,  fmt, reporter, out);
     harvestNamedSurface(doc, pathStr, "structs",        true,  fmt, reporter, out);
     harvestNamedSurface(doc, pathStr, "unions",         false, fmt, reporter, out);
@@ -5713,6 +6220,20 @@ shippedSurfaceNamesForFormat(std::filesystem::path const& path,
         for (auto& m : macros) out.push_back(std::move(m.name));
     }
 
+    if (reporter.errorCount() != errBefore) return std::nullopt;
+    if (reporter.all().size() == saidBefore) entry->surfaceByFormat.emplace_back(fmt, out);
+    return out;
+}
+
+std::optional<std::vector<std::string>>
+readShippedLibValueNames(std::filesystem::path const&   path,
+                         std::optional<ObjectFormatKind> fmt,
+                         DiagnosticReporter&            reporter) {
+    std::size_t const errBefore = reporter.errorCount();
+    json const* const docPtr = cachedDescriptorJson(path, reporter);
+    if (!docPtr) return std::nullopt;
+    std::vector<std::string> out;
+    harvestValueNames(*docPtr, core::genericSpelling(path), fmt, reporter, out);
     if (reporter.errorCount() != errBefore) return std::nullopt;
     return out;
 }
@@ -6937,6 +7458,7 @@ closureSurfaceOnFormat(std::filesystem::path const&           startPath,
                        std::span<std::filesystem::path const> systemDirs,
                        ObjectFormatKind                       fmt,
                        HeaderSearchCache&                     cache) {
+    ++cacheStats().closureWalks;
     ClosureSurfaceOnFormat outS;
     std::unordered_set<core::PathIdentity> visited;
     // Case-SENSITIVE resolution, and the choice is load-bearing rather than
@@ -7189,6 +7711,27 @@ bool validateShippedSurfaceRequirements(
     std::optional<ObjectFormatKind>        activeFormat,
     DiagnosticReporter&                    reporter,
     HeaderSearchCache&                     cache) {
+    // ★ ONE READ PER DESCRIPTOR AND ONE CLOSURE PER (HEADER, FORMAT), PER CHECK (P69
+    // L2b2, ruling 602). Fourteen `surface` claims name 25 (claim, header) pairs over 8
+    // headers, and their closures share members; the check used to re-walk and
+    // re-harvest each. The read scope serves a descriptor this check already read; the
+    // closure memo answers a (header, format) it already resolved.
+    ShippedDescriptorReadScope const readOnce;
+    struct ClaimClosure {
+        core::PathIdentity     header;
+        ObjectFormatKind       fmt;
+        ClosureSurfaceOnFormat surface;
+    };
+    std::deque<ClaimClosure> closures;   // a deque: a reference handed out stays valid
+    auto const closureOf = [&](std::filesystem::path const& header,
+                               ObjectFormatKind fmt) -> ClosureSurfaceOnFormat const& {
+        auto const key = scopedDescriptorPathKey(header);
+        for (ClaimClosure const& c : closures) {
+            if (c.fmt == fmt && c.header == key) return c.surface;
+        }
+        closures.push_back(ClaimClosure{key, fmt, closureSurfaceOnFormat(header, systemDirs, fmt, cache)});
+        return closures.back().surface;
+    };
     // ═══ D-LANG-PREDEFINED-MACRO-REQUIRES-REALIZED-SURFACE — SATISFACTION ═══
     //
     // The SHAPE of the predicate is core's (`ShippedSurfaceClaim`); this
@@ -7301,8 +7844,7 @@ bool validateShippedSurfaceRequirements(
                           "corpus says is absent from it");
                     continue;
                 }
-                ClosureSurfaceOnFormat const cs =
-                    closureSurfaceOnFormat(hit.path, systemDirs, fmt, cache);
+                ClosureSurfaceOnFormat const& cs = closureOf(hit.path, fmt);
                 if (!cs.undecodable.empty()) {
                     emitUnbackedPredefine(reporter,
                         std::string{"predefined macro '"} + pm.name + "' ("

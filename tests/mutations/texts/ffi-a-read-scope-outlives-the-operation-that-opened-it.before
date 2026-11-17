@@ -1,0 +1,5 @@
+    if (--s.depth == 0) {
+        s.keyOfSpelling.clear();
+        s.readInScope.clear();
+        s.searches.clear();
+    }

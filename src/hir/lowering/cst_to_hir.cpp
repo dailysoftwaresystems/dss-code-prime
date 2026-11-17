@@ -7617,28 +7617,21 @@ struct Lowerer {
         // a user who wrote `a[b]`. gcc and clang both refuse both at the user's
         // own token ("array subscript is not an integer" / "subscripted value is
         // neither array nor pointer nor vector").
-        auto const which =
-            indexContainerOperand(interner, base.type, idxE.type);
+        // ★ P69 L2b2 (lane `lm`): the constraint is the ONE law both tiers ask
+        // (type_rules.hpp `subscriptConstraintOf`) — the analysis judges every
+        // subscript with it, an unevaluated one too, and this tier reports the same
+        // words for a tree no analysis judged.
+        auto const verdict =
+            subscriptConstraintOf(interner, base.type, idxE.type);
+        auto const which = verdict.container;
         if (which == IndexContainerOperand::Ambiguous
             || which == IndexContainerOperand::Neither) {
             // Cascade-suppress: an operand that is already InvalidType is a
-            // DOWNSTREAM effect of a fault reported earlier, so saying anything
-            // here would pile a second complaint onto one defect. The untyped
-            // node still fails loud at the verifier.
-            if (base.type.valid() && idxE.type.valid()) {
+            // DOWNSTREAM effect of a fault reported earlier, so the law has no
+            // words for it. The untyped node still fails loud at the verifier.
+            if (!verdict.refusal.empty()) {
                 emitH(DiagnosticCode::S_SubscriptOperandsNotPointerAndInteger,
-                      node,
-                      which == IndexContainerOperand::Ambiguous
-                          ? "both operands of a subscript are pointers or arrays; "
-                            "C 6.5.3.2p1 requires one operand to be a pointer to a "
-                            "complete object type and the OTHER to have integer "
-                            "type (either spelling — `p[i]` and `i[p]` are the "
-                            "same expression)"
-                          : "neither operand of a subscript is a pointer or an "
-                            "array; C 6.5.3.2p1 requires one operand to be a "
-                            "pointer to a complete object type and the OTHER to "
-                            "have integer type (either spelling — `p[i]` and "
-                            "`i[p]` are the same expression)");
+                      node, std::string{verdict.refusal});
             }
             // The house Error sentinel, not an untyped `Index`: `HirKind::Error`
             // carries `HasError`, so the verifier's cascade suppression covers
@@ -7660,11 +7653,9 @@ struct Lowerer {
         // register-class mismatch — a machine fact standing in for a source
         // constraint — and a struct or function-designator index ABORTED THE
         // PROCESS with no diagnostic at all (✔MEASURED at P53's base).
-        if (isDefinitelyNotIndexInteger(interner, idxE.type)) {
+        if (!verdict.refusal.empty()) {
             emitH(DiagnosticCode::S_SubscriptOperandsNotPointerAndInteger, node,
-                  "the operand of a subscript that is not the pointer must have "
-                  "integer type (C 6.5.3.2p1); gcc 13.3.0 and clang 18.1.3 both "
-                  "refuse this with \"array subscript is not an integer\"");
+                  std::string{verdict.refusal});
             return {errorNode(node), InvalidType};
         }
         // D-CSUBSET-INDEX-INTEGER-PROMOTION (C 6.3.1.1 / 6.5.2.1): the
@@ -14825,12 +14816,17 @@ struct Lowerer {
             pushOut(track(
                 builder.makeVarDecl(slotTy, 0, std::nullopt), node), node);
         };
-        if (!carrier.has_value() || *carrier >= vis.size()) {
+        // ★ P69 L2b2 (lane `lm`): a LIST-mode carrier past the visible children is an
+        // ABSENT optional list — no declarators, the empty declaration below — and never a
+        // silent return: `for (int; 0; )` and `for (T; 0; )` (whose init holds no `;` after
+        // the head) used to lower to nothing with no diagnostic once their list became
+        // optional. A single-mode slot keeps its abstract parameter.
+        if (!carrier.has_value() || (singleMode && *carrier >= vis.size())) {
             if (singleMode) emitAbstractSlot();
             return;
         }
         std::vector<NodeId> declarators;
-        collectDeclarators(tree(), vis[*carrier], dc, declarators);
+        if (*carrier < vis.size()) collectDeclarators(tree(), vis[*carrier], dc, declarators);
         if (singleMode && declarators.empty()) {
             emitAbstractSlot();
             return;
@@ -14860,12 +14856,10 @@ struct Lowerer {
             // tier already minted the incomplete tag (block-scoped via c24/c28).
             // Emit NOTHING (no runtime effect), exactly like the top-level
             // forward-decl path; only a head with NEITHER a definition NOR a
-            // forward-declared tag (`int;`) declares nothing and stays loud.
-            if (!spec.valid()
-                && !findForwardCompositeSpecifierIn(node).valid()) {
-                emitH(DiagnosticCode::S_DeclarationDeclaresNothing, node,
-                      std::string{tree().text(node)});
-            }
+            // forward-declared tag (`int;`) declares nothing — and so does an
+            // UNNAMED composite whose members are no names of the scope
+            // (`struct { int a; };`): `reportIfDeclaresNothing` (P69 L2b2).
+            reportIfDeclaresNothing(node, spec, dc);
             return;
         }
         // ★ P69 L2 (lane `lm`): a `typeof ( type-name )` head whose type carries a
@@ -15764,6 +15758,36 @@ struct Lowerer {
         return hit;
     }
 
+    // ★ P69 L2b2 (lane `lm`): C 6.7p2 — THE ONE HOME OF "THIS DECLARATION DECLARES
+    // NOTHING", asked by the file-scope and the block-scope lowering of a declaration with
+    // NO declarator. Such a declaration declares a tag (a composite specifier that names one:
+    // a definition `struct S { … };` or a forward declaration `struct S;`) or an
+    // enumeration's constants (a composite whose members lift into the enclosing scope:
+    // `enum { A };`), or else nothing: `int;`, `T;`, `const T;`, `struct { int a; };`. The
+    // language says how loud the last is (`semantics.declarators.emptyDeclarationWarns`).
+    // ✔MEASURED 2026-11-05 (probes l2b2e, l2b2i): gcc 13.3.0 ("useless type name in empty
+    // declaration", "unnamed struct/union that defines no instances"), clang 18.1.3 and
+    // Apple clang ("declaration does not declare anything") warn and cl accepts in silence,
+    // at both scopes and as a for-init — where DSS refused every one but the unnamed
+    // composite, which it accepted in silence. Either way the declaration lowers to nothing.
+    void reportIfDeclaresNothing(NodeId node, NodeId spec, DeclaratorConfig const& dc) {
+        bool declaresSomething = false;
+        if (spec.valid()) {
+            auto const it = declMap_.find(tree().rule(spec).v);
+            DeclarationRule const& sd = sem.declarations[it->second];
+            declaresSomething =
+                compositeSpecifierHasTagName(sd, spec)
+                || (sd.fieldChildren.has_value() && sd.fieldChildren->liftToEnclosingScope);
+        } else {
+            declaresSomething = findForwardCompositeSpecifierIn(node).valid();
+        }
+        if (declaresSomething) return;
+        emitHAt(DiagnosticCode::S_DeclarationDeclaresNothing,
+                dc.emptyDeclarationWarns ? DiagnosticSeverity::Warning
+                                         : DiagnosticSeverity::Error,
+                node, std::string{tree().text(node)});
+    }
+
     // c35: does composite specifier `n` carry a tag NAME — i.e. is its `name`
     // child a real identifier leaf (`struct S` / `union U`), distinguishing a
     // forward DECLARATION (`struct S;`, mints/refs a tag) from an anonymous
@@ -16114,7 +16138,17 @@ struct Lowerer {
                 break;
             }
         }
+        if (!hasNamedDeclarator && declarators.empty()) {
+            // ★ P69 L2b2 (lane `lm`): NO declarator at all — the empty declaration's one
+            // home decides whether it declares anything, and how loud it is when not.
+            NodeId const spec = findCompositeSpecifierIn(node);
+            if (spec.valid()) out.push_back(lowerTypeDecl(spec));
+            reportIfDeclaresNothing(node, spec, dc);
+            return;
+        }
         if (!hasNamedDeclarator) {
+            // ABSTRACT declarators only (`int *;`): no empty declaration — every reference
+            // refuses it (✔MEASURED 2026-11-05, probe l2b2a), so it stays an error.
             NodeId const spec = findCompositeSpecifierIn(node);
             if (spec.valid()) {
                 out.push_back(lowerTypeDecl(spec));

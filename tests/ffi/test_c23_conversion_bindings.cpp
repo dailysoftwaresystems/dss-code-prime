@@ -176,7 +176,7 @@ struct Decoded {
                                  typeFacts.abiTypedefs, typeFacts.longDoubleFormat};
     // The v* rows spell `va_list`; its identity is irrelevant here (no signature is compared).
     std::array<NamedTypeBinding, 1> const vaList{
-        NamedTypeBinding{"va_list", interner.pointer(interner.primitive(TypeKind::Void))}};
+        NamedTypeBinding{dss::ffi::kVaListDescriptorTypeName, interner.pointer(interner.primitive(TypeKind::Void))}};
     for (char const* header : {"stdio.json", "stdlib.json", "inttypes.json"}) {
         DiagnosticReporter rep;
         auto desc = readShippedLibDescriptor(shippedLibs / header, interner, typeReg, rep,

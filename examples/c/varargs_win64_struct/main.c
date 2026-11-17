@@ -40,6 +40,8 @@
 // A broken by-value slot, a missing/spurious deref, or a desynced cursor flips the
 // total off 45. Runs on the Windows host's differential ctest.
 
+#include <stdarg.h>
+
 struct Small { int  x; int  y; };            // 8B  -> InRegisters[1], by value
 struct Big   { long a; long b; long c; };    // 24B -> ByReference, hidden pointer
 

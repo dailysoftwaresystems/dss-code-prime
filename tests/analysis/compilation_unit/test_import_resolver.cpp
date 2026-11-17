@@ -15,6 +15,7 @@
 #include "analysis/compilation_unit/toy_cu_fixture.hpp"
 #include "repo_root.hpp"
 #include "os_link.hpp"     // links made by the OS: MinGW's library makes none
+#include "driver_diagnostics_listener.hpp"   // AskedDriverCodes
 
 #include <gtest/gtest.h>
 
@@ -290,6 +291,8 @@ TEST(ImportResolver, CAngleIncludeResolvesToDescriptorOnSystemDir) {
              "symbols": [ { "name": "use", "signature": "fn() -> i32" } ] })");
 
     UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
+    dss::test_support::AskedDriverCodes const clearedDirs{dss::DiagnosticCode::C_UnbackedPredefinedMacro};   // no shipped dirs: the language's predefines are unbacked
+    builder.clearSystemDirs();   // the test's own system dirs, not the shipped ones
     builder.addSystemDir(sysDir.path());       // the system (shippedLibDirs) path
     builder.addFile(main);
     auto cu = std::move(builder).finish();
@@ -333,6 +336,8 @@ TEST(ImportResolver, CSubdirAngleIncludeResolvesDistinctFromTopLevel) {
         R"({ "header": "sys/time.h", "typedefs": [ { "name": "suseconds_t", "type": "i64" } ] })");
 
     UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
+    dss::test_support::AskedDriverCodes const clearedDirs{dss::DiagnosticCode::C_UnbackedPredefinedMacro};   // no shipped dirs: the language's predefines are unbacked
+    builder.clearSystemDirs();   // the test's own system dirs, not the shipped ones
     builder.addSystemDir(sysDir.path());
     builder.addFile(main);
     auto cu = std::move(builder).finish();
@@ -350,12 +355,15 @@ TEST(ImportResolver, CSubdirAngleIncludeResolvesDistinctFromTopLevel) {
 // A SYSTEM-header miss is a HARD error (F_ShippedHeaderNotFound), NOT the
 // soft D_UnresolvedImport the quote form uses. (FF11 fail-loud contract.)
 TEST(ImportResolver, CAngleIncludeMissIsHardError) {
+    dss::test_support::AskedDriverCodes const asked{dss::DiagnosticCode::F_ShippedHeaderNotFound};   // the refused include IS the subject
     TempDir srcDir;
     TempDir sysDir;   // empty — the header is absent
     auto main = srcDir.write("main.c",
         "#include <nope.h>\nint main() { return 0; }\n");
 
     UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
+    dss::test_support::AskedDriverCodes const clearedDirs{dss::DiagnosticCode::C_UnbackedPredefinedMacro};   // no shipped dirs: the language's predefines are unbacked
+    builder.clearSystemDirs();   // the test's own system dirs, not the shipped ones
     builder.addSystemDir(sysDir.path());
     builder.addFile(main);
     auto cu = std::move(builder).finish();
@@ -389,6 +397,8 @@ TEST(ImportResolver, CAngleIncludeRecordsTransitiveDescriptorRefs) {
              "symbols": [ { "name": "cfn", "signature": "fn() -> i32" } ] })");
 
     UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
+    dss::test_support::AskedDriverCodes const clearedDirs{dss::DiagnosticCode::C_UnbackedPredefinedMacro};   // no shipped dirs: the language's predefines are unbacked
+    builder.clearSystemDirs();   // the test's own system dirs, not the shipped ones
     builder.addSystemDir(sysDir.path());
     builder.addFile(main);
     auto cu = std::move(builder).finish();
@@ -415,6 +425,7 @@ TEST(ImportResolver, CAngleIncludeRecordsTransitiveDescriptorRefs) {
 // systemDirs to catch it). RED-ON-DISABLE: drop the onUnresolvedInclude arm → a
 // typo'd transitive include is silently swallowed.
 TEST(ImportResolver, CAngleIncludeUnresolvedTransitiveIsHardError) {
+    dss::test_support::AskedDriverCodes const asked{dss::DiagnosticCode::F_ShippedHeaderNotFound};   // the refused include IS the subject
     TempDir srcDir;
     TempDir sysDir;
     auto main = srcDir.write("main.c",
@@ -425,6 +436,8 @@ TEST(ImportResolver, CAngleIncludeUnresolvedTransitiveIsHardError) {
              "symbols": [ { "name": "pfn", "signature": "fn() -> i32" } ] })");
 
     UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
+    dss::test_support::AskedDriverCodes const clearedDirs{dss::DiagnosticCode::C_UnbackedPredefinedMacro};   // no shipped dirs: the language's predefines are unbacked
+    builder.clearSystemDirs();   // the test's own system dirs, not the shipped ones
     builder.addSystemDir(sysDir.path());
     builder.addFile(main);
     auto cu = std::move(builder).finish();
@@ -454,6 +467,8 @@ TEST(ImportResolver, CAngleIncludeCyclicTransitiveTerminates) {
              "symbols": [ { "name": "bf", "signature": "fn() -> i32" } ] })");
 
     UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
+    dss::test_support::AskedDriverCodes const clearedDirs{dss::DiagnosticCode::C_UnbackedPredefinedMacro};   // no shipped dirs: the language's predefines are unbacked
+    builder.clearSystemDirs();   // the test's own system dirs, not the shipped ones
     builder.addSystemDir(sysDir.path());
     builder.addFile(main);
     auto cu = std::move(builder).finish();
@@ -481,6 +496,8 @@ TEST(ImportResolver, CAngleAndQuotePathsAreDistinct) {
     sysDir.write("sysonly.h", "extern int s();\n");
 
     UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
+    dss::test_support::AskedDriverCodes const clearedDirs{dss::DiagnosticCode::C_UnbackedPredefinedMacro};   // no shipped dirs: the language's predefines are unbacked
+    builder.clearSystemDirs();   // the test's own system dirs, not the shipped ones
     builder.addSystemDir(sysDir.path());   // declared as SYSTEM, not include
     builder.addFile(main);
     auto cu = std::move(builder).finish();
@@ -560,6 +577,8 @@ TEST(ImportResolver, CAngleSourceFallbackDescriptorFirst) {
     incDir.write("baz.h", "@@@ this is not valid c and must never be inlined @@@\n");
 
     UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
+    dss::test_support::AskedDriverCodes const clearedDirs{dss::DiagnosticCode::C_UnbackedPredefinedMacro};   // no shipped dirs: the language's predefines are unbacked
+    builder.clearSystemDirs();   // the test's own system dirs, not the shipped ones
     builder.addSystemDir(sysDir.path());
     builder.addIncludeDir(incDir.path());
     builder.addFile(main);
@@ -586,6 +605,7 @@ TEST(ImportResolver, CAngleSourceFallbackDescriptorFirst) {
 // resolve. RED-ON-DISABLE: if the fallback wrongly searched the including dir the
 // angle form would resolve and the hard error would vanish.
 TEST(ImportResolver, CAngleSourceFallbackDoesNotSearchIncludingDir) {
+    dss::test_support::AskedDriverCodes const asked{dss::DiagnosticCode::F_ShippedHeaderNotFound};   // the refused include IS the subject
     // Angle: qux.h only in the including file's own dir -> NOT found.
     {
         TempDir srcDir;
@@ -626,6 +646,7 @@ TEST(ImportResolver, CAngleSourceFallbackDoesNotSearchIncludingDir) {
 // hard, unsuppressable F_ShippedHeaderNotFound (fail-loud — never silently
 // accepted). An -I dir IS present but does not contain the header.
 TEST(ImportResolver, CAngleSourceFallbackTotalMissHardError) {
+    dss::test_support::AskedDriverCodes const asked{dss::DiagnosticCode::F_ShippedHeaderNotFound};   // the refused include IS the subject
     TempDir srcDir;
     TempDir incDir;   // present but does NOT contain none.h
     auto main = srcDir.write("main.c",
@@ -941,6 +962,7 @@ TEST(ImportResolver, NameMatchingIsDrivenByConfigNotLanguageName) {
 // Both policies are asserted against ONE on-disk `windows.json`, so whichever
 // host runs this, one arm contradicts that host's own filesystem convention.
 TEST(ImportResolver, AngleIncludeCaseFollowsFormatPolicyNotHostFilesystem) {
+    dss::test_support::AskedDriverCodes const asked{dss::DiagnosticCode::F_ShippedHeaderNotFound};   // the refused include IS the subject
     for (bool insensitive : {true, false}) {
         TempDir srcDir;
         TempDir sysDir;
@@ -951,6 +973,8 @@ TEST(ImportResolver, AngleIncludeCaseFollowsFormatPolicyNotHostFilesystem) {
                  "symbols": [ { "name": "Sleep", "signature": "fn(i32) -> void" } ] })");
 
         UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
+        dss::test_support::AskedDriverCodes const clearedDirs{dss::DiagnosticCode::C_UnbackedPredefinedMacro};   // no shipped dirs: the language's predefines are unbacked
+        builder.clearSystemDirs();   // the test's own system dirs, not the shipped ones
         builder.addSystemDir(sysDir.path());
         builder.setHeaderNameMatching(insensitive
                                           ? HeaderNameMatching::CaseInsensitive
@@ -994,6 +1018,8 @@ TEST(ImportResolver, AngleIncludeExactSpellingResolvesUnderBothCasePolicies) {
                  "symbols": [ { "name": "Sleep", "signature": "fn(i32) -> void" } ] })");
 
         UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
+        dss::test_support::AskedDriverCodes const clearedDirs{dss::DiagnosticCode::C_UnbackedPredefinedMacro};   // no shipped dirs: the language's predefines are unbacked
+        builder.clearSystemDirs();   // the test's own system dirs, not the shipped ones
         builder.addSystemDir(sysDir.path());
         builder.setHeaderNameMatching(m);
         builder.addFile(main);
@@ -1077,6 +1103,9 @@ TEST(ImportResolver, AngleDescriptorFoldCollisionFailsLoudAndNamesCandidates) {
     }
 
     UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
+    dss::test_support::AskedDriverCodes const subject{dss::DiagnosticCode::F_HeaderNameCaseAmbiguous};   // the collision IS the subject
+    dss::test_support::AskedDriverCodes const clearedDirs{dss::DiagnosticCode::C_UnbackedPredefinedMacro};   // no shipped dirs: the language's predefines are unbacked
+    builder.clearSystemDirs();   // the test's own system dirs, not the shipped ones
     builder.addSystemDir(sysDir.path());
     builder.setHeaderNameMatching(HeaderNameMatching::CaseInsensitive);
     builder.addFile(main);
@@ -1142,6 +1171,8 @@ TEST(ImportResolver, ACompileListsEachSearchedDirectoryOnceAcrossEveryTier) {
         {
             UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
             builder.addIncludeDir(incDir.path());
+            dss::test_support::AskedDriverCodes const clearedDirs{dss::DiagnosticCode::C_UnbackedPredefinedMacro};   // no shipped dirs: the language's predefines are unbacked
+            builder.clearSystemDirs();   // the test's own system dirs, not the shipped ones
             builder.addSystemDir(sysDir.path());
             builder.setHeaderNameMatching(m);
             builder.addFile(main);
@@ -1216,12 +1247,15 @@ namespace {
 } // namespace
 
 TEST(ImportResolver, AnAngleIncludeWhoseDescriptorCannotBeExaminedIsRefusedNamingIt) {
+    dss::test_support::AskedDriverCodes const asked{dss::DiagnosticCode::F_ShippedLibDescriptorMalformed};   // the refused include IS the subject
     TempDir srcDir;
     TempDir sysDir;
     auto main = srcDir.write("main.c", "#include <loop.h>\nint main() { return 0; }\n");
     DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(sysDir.path() / "loop.json", sysDir.path() / "loop.json",
                                                              dss::test_support::LinkTo::File));
     UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
+    dss::test_support::AskedDriverCodes const clearedDirs{dss::DiagnosticCode::C_UnbackedPredefinedMacro};   // no shipped dirs: the language's predefines are unbacked
+    builder.clearSystemDirs();   // the test's own system dirs, not the shipped ones
     builder.addSystemDir(sysDir.path());
     builder.addFile(main);
     auto cu = std::move(builder).finish();
@@ -1237,6 +1271,7 @@ TEST(ImportResolver, AnAngleIncludeWhoseDescriptorCannotBeExaminedIsRefusedNamin
 }
 
 TEST(ImportResolver, AnIncludesEdgeWhoseDescriptorCannotBeExaminedIsRefusedNamingIt) {
+    dss::test_support::AskedDriverCodes const asked{dss::DiagnosticCode::F_ShippedLibDescriptorMalformed};   // the refused include IS the subject
     TempDir srcDir;
     TempDir sysDir;
     auto main = srcDir.write("main.c", "#include <parent.h>\nint main() { return 0; }\n");
@@ -1246,6 +1281,8 @@ TEST(ImportResolver, AnIncludesEdgeWhoseDescriptorCannotBeExaminedIsRefusedNamin
     DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(sysDir.path() / "loop.json", sysDir.path() / "loop.json",
                                                              dss::test_support::LinkTo::File));
     UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
+    dss::test_support::AskedDriverCodes const clearedDirs{dss::DiagnosticCode::C_UnbackedPredefinedMacro};   // no shipped dirs: the language's predefines are unbacked
+    builder.clearSystemDirs();   // the test's own system dirs, not the shipped ones
     builder.addSystemDir(sysDir.path());
     builder.addFile(main);
     auto cu = std::move(builder).finish();
@@ -1260,6 +1297,7 @@ TEST(ImportResolver, AnIncludesEdgeWhoseDescriptorCannotBeExaminedIsRefusedNamin
 }
 
 TEST(ImportResolver, AQuoteIncludeWhoseCandidateCannotBeExaminedIsRefusedNamingItWithThePreprocessorOff) {
+    dss::test_support::AskedDriverCodes const asked{dss::DiagnosticCode::P_PreprocessorIncludeError};   // the refused include IS the subject
     auto const schema = irCWithThePreprocessorOff();
     ASSERT_NE(schema, nullptr);
     ASSERT_FALSE(schema->preprocess().enabled) << "a still-enabled preprocessor would make this ask nothing";

@@ -216,6 +216,20 @@ dss_add_test(NAME analysis/semantic/test_ordinary_identifier_hides_a_typedef
 target_include_directories(dss_analysis_semantic_test_ordinary_identifier_hides_a_typedef
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 
+# P69 L2b2 (lane `lm`): a type name where a value is required is refused at the name
+# (C 6.5.2p2), a typedef name and a builtin type name alike. Shares `semantic_test_fixture.hpp`.
+dss_add_test(NAME analysis/semantic/test_type_name_in_value_position
+             SOURCES test_type_name_in_value_position.cpp)
+target_include_directories(dss_analysis_semantic_test_type_name_in_value_position
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P69 L2b2 (lane `lm`): C 6.5.3.2p1 judged at every subscript, an unevaluated one too
+# (`sizeof`, `__typeof__`, `_Alignof`, `_Generic`), through the one law both tiers ask.
+dss_add_test(NAME analysis/semantic/test_subscript_constraint_in_every_position
+             SOURCES test_subscript_constraint_in_every_position.cpp)
+target_include_directories(dss_analysis_semantic_test_subscript_constraint_in_every_position
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
 # P69 (lane `lm`, a review's finding B): every descent takes its steps by the ONE statement
 # of what a wrapper is (`nodeSaysSomethingItself`) — the constant evaluator's statement
 # expression and braced scalar, the builtins' operand value through a selection and a

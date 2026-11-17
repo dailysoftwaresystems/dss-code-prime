@@ -236,10 +236,10 @@ TEST(LirRewrite, Arm64HighFprSpillScratchPoolHandlesOrdinalsBeyond64) {
     // allocates an FPR up into d31 (global ordinal 64). The named `n` is an int (x0).
     auto out = AllocatedLir{lowerCToLir(
         "double sum_d(int n, ...) {\n"
-        "    va_list ap; va_start(ap, n);\n"
+        "    __builtin_va_list ap; __builtin_va_start(ap, n);\n"
         "    double t = 0.0;\n"
-        "    for (int i = 0; i < n; i = i + 1) { t = t + va_arg(ap, double); }\n"
-        "    va_end(ap);\n"
+        "    for (int i = 0; i < n; i = i + 1) { t = t + __builtin_va_arg(ap, double); }\n"
+        "    __builtin_va_end(ap);\n"
         "    return t;\n"
         "}\n"
         "int main(void) {\n"

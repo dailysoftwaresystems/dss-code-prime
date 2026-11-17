@@ -180,7 +180,7 @@ struct Pair {
 // identity is irrelevant to these pins — none compares a v* signature — so one pointer
 // shape serves every pair.
 [[nodiscard]] std::array<NamedTypeBinding, 1> vaListBinding(TypeInterner& interner) {
-    return {NamedTypeBinding{"va_list", interner.pointer(interner.primitive(TypeKind::Void))}};
+    return {NamedTypeBinding{dss::ffi::kVaListDescriptorTypeName, interner.pointer(interner.primitive(TypeKind::Void))}};
 }
 
 [[nodiscard]] bool availableOn(ShippedSymbol const& s, std::string_view fmt) {

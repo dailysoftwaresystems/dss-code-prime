@@ -191,12 +191,15 @@ inline std::vector<KeyedMapSite> keyedMapSites() {
     static constexpr auto kDataModelNames  = allNames(dss::kDataModelTable);
     static constexpr auto kLongDoubleNames = allNames(dss::kLongDoubleFormatTable);
     static constexpr auto kEnumRuleNames   = allNames(dss::kEnumCompatibleTypeRuleTable);
+    // ★ P69 L2b2 (lane `lm`): the rows are named by the KEY they carry, never by an
+    // index (`shipped_row_pointer.hpp`): `{coreByLongDoubleFormat*}` is EVERY row that
+    // declares the map — the sibling rule above, read off the document rather than a
+    // hand list of two positions that a row added before them would have moved.
     return {
-        {"c", {"/semantics/builtinTypes/1/coreByDataModel"}, "\"I32\"",
+        {"c", {"/semantics/builtinTypes/{coreByDataModel}/coreByDataModel"}, "\"I32\"",
          "coreByDataModel", kDataModelNames, kIgnoreProbeOnly},
         {"c",
-         {"/semantics/typeSpecifiers/36/coreByLongDoubleFormat",
-          "/semantics/typeSpecifiers/39/coreByLongDoubleFormat"},
+         {"/semantics/typeSpecifiers/{coreByLongDoubleFormat*}/coreByLongDoubleFormat"},
          "\"F80\"", "coreByLongDoubleFormat", kLongDoubleNames,
          kIgnoreProbeOnly},
         {"c", {"/semantics/synthesizedTypes/pointerDifference"},
@@ -208,6 +211,19 @@ inline std::vector<KeyedMapSite> keyedMapSites() {
          "{\"unsigned\": [\"unsigned int\"], \"signed\": [\"int\"]}",
          "enumerationCompatibleTypes", kEnumRuleNames, kIgnoreProbeOnly},
     };
+}
+
+// Every pointer a site's templates name in `doc`, resolved BEFORE anything is mutated
+// (a `{member*}` template fans out to each row that declares the member).
+[[nodiscard]] std::vector<std::string> everyPointer(nlohmann::json const& doc,
+                                                    KeyedMapSite const& s) {
+    std::vector<std::string> out;
+    for (char const* tmpl : s.pointers) {
+        for (auto const& r : dss::test_support::resolveRowPointers(doc, tmpl)) {
+            out.push_back(r.pointer);
+        }
+    }
+    return out;
 }
 
 } // namespace
@@ -236,7 +252,7 @@ TEST(EnumVocabularyProjection, ShippedLanguageDocumentsLoadCleanly) {
 // be theatre.
 TEST(EnumVocabularyProjection, ShippedCorpusExercisesEveryProbedVocabulary) {
     for (auto const& s : keyedMapSites()) {
-        for (char const* ptr : s.pointers) {
+        for (std::string const& ptr : everyPointer(shippedLanguageDoc(s.language), s)) {
             SCOPED_TRACE(std::string{s.language} + ptr);
             auto        doc  = shippedLanguageDoc(s.language);
             auto const& node = at(doc, ptr, s.label);
@@ -274,7 +290,7 @@ TEST(EnumVocabularyProjection, EveryAdvertisedSpellingIsAcceptedByTheLoader) {
         for (std::string_view const name : s.names) {
             SCOPED_TRACE(std::string{s.label} + " <- '" + std::string{name} + "'");
             auto doc = shippedLanguageDoc(s.language);
-            for (char const* ptr : s.pointers) {
+            for (std::string const& ptr : everyPointer(doc, s)) {
                 at(doc, ptr, s.label)[std::string{name}] =
                     nlohmann::json::parse(s.value);
             }
@@ -298,7 +314,7 @@ TEST(EnumVocabularyProjection, RefusalNamesExactlyTheVocabulary) {
     for (auto const& s : keyedMapSites()) {
         SCOPED_TRACE(std::string{s.language} + " " + s.label);
         auto doc = shippedLanguageDoc(s.language);
-        for (char const* ptr : s.pointers) {
+        for (std::string const& ptr : everyPointer(doc, s)) {
             auto& node = at(doc, ptr, s.label);
             ASSERT_FALSE(node.contains(kBadSpelling))
                 << "the probe spelling already exists — the injection would be "
@@ -342,17 +358,19 @@ inline std::vector<ScalarSite> scalarSites() {
     static constexpr auto kVerbNames    = allNames(dss::kEntryMaterializationTable);
     // P68 round 13 (lane `cs`): the 6.6p10 constant forms a static initializer may take.
     static constexpr auto kConstantFormNames = allNames(dss::kConstantFormTable);
+    // ★ P69 L2b2 (lane `lm`): the file-scope declaration row by its RULE
+    // (`shipped_row_pointer.hpp`) — it was `/7/` until two rows landed before it.
     return {
         {"c",
-         "/semantics/declarations/7/linkageSpecifiers/weak/binding",
+         "/semantics/declarations/{rule=topLevelDecl}/linkageSpecifiers/weak/binding",
          "linkageSpecifiers binding", kBindingNames, kIgnoreBinding},
         {"c",
-         "/semantics/declarations/7/linkageSpecifiers/visibility:hidden/visibility",
+         "/semantics/declarations/{rule=topLevelDecl}/linkageSpecifiers/visibility:hidden/visibility",
          "linkageSpecifiers visibility", kVisNames, kIgnoreVis},
-        {"c", "/semantics/declarations/7/entryFunctions/main/1/params/0",
+        {"c", "/semantics/declarations/{rule=topLevelDecl}/entryFunctions/main/1/params/0",
          "entryFunctions param shape", dss::kDeclarableEntryParamShapeNames,
          kIgnoreProbeOnly},
-        {"c", "/semantics/declarations/7/entryFunctions/main/0/verb",
+        {"c", "/semantics/declarations/{rule=topLevelDecl}/entryFunctions/main/0/verb",
          "entryFunctions verb", kVerbNames, kIgnoreVerb},
         {"c", "/semantics/staticInitializers/otherConstantForms/0",
          "staticInitializers constant form", kConstantFormNames, kIgnoreProbeOnly},
@@ -379,24 +397,18 @@ TEST(EnumVocabularyProjection, ScalarRefusalNamesExactlyTheVocabulary) {
 }
 
 // The data-section vocabulary lives in the assembly dialect document, and its
-// directive row is found by SEARCHING rather than by index — an index would rot
-// into a different row and the pin would quietly probe the wrong thing.
+// directive row is named by the KEY it carries rather than by index — an index
+// would rot into a different row and the pin would quietly probe the wrong thing.
+// P69 L2b2 (lane `lm`): the search this pin wrote for itself is the shared
+// resolver's `{section}` (`shipped_row_pointer.hpp`), which throws when no row
+// declares one.
 TEST(EnumVocabularyProjection, DataSectionRefusalNamesExactlyTheVocabulary) {
-    auto  doc  = shippedLanguageDoc("asm-arm64-gas");
-    auto& dirs = at(doc, "/assembly/directives", "assembly directives");
-    ASSERT_TRUE(dirs.is_array());
-    nlohmann::json* target = nullptr;
-    for (auto& row : dirs) {
-        if (row.is_object() && row.contains("section")
-            && row.at("section").is_string()) {
-            target = &row;
-            break;
-        }
-    }
-    ASSERT_NE(target, nullptr)
-        << "no shipped directive row declares a 'section' — the data-section "
-           "vocabulary is unexercised and this pin would assert nothing";
-    (*target)["section"] = kBadSpelling;
+    auto  doc     = shippedLanguageDoc("asm-arm64-gas");
+    auto& section = at(doc, "/assembly/directives/{section}/section",
+                       "a directive's data section");
+    ASSERT_TRUE(section.is_string())
+        << "the first directive row declaring a 'section' must spell it as a string";
+    section = kBadSpelling;
     auto const text = doc.dump();
     auto       r    = GrammarSchema::loadFromText(text, "asm-arm64-gas");
     ASSERT_FALSE(r.has_value())

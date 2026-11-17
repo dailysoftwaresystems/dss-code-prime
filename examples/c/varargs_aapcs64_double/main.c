@@ -18,6 +18,8 @@
 // The fixed `n` is an INTEGER (x0), so the GR + VR save areas are BOTH exercised in
 // one function. Runs under qemu-aarch64 (the linux-arm64 CI leg / local qemu).
 
+#include <stdarg.h>
+
 int sum_d(int n, ...) {
     va_list ap;
     va_start(ap, n);

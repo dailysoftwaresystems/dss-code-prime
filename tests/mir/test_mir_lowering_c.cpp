@@ -17,6 +17,7 @@
 #include "hir/hir_node.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
 #include "mir/lowering/hir_to_mir.hpp"
+#include "program/model_to_hir.hpp"   // lowerModelToHir — the pipeline's gates
 #include "mir/mir_asm_descriptor.hpp"           // MirAsmDescriptor (inline-asm P5 carriage)
 #include "mir/mir_text.hpp"
 #include "mir/mir_verifier.hpp"
@@ -25,6 +26,9 @@
 #include "core/types/symbol_attrs.hpp"
 #include "core/types/object_format_kind.hpp"   // ObjectFormatKind (setjmp variant selector)
 #include "diagnostic_count.hpp"                // dss::test_support::countCode (TF-C93)
+#include "driver_diagnostics_listener.hpp"     // AskedDriverCodes
+#include "repo_root.hpp"                       // configRoot — the shipped c document, read whole
+#include <nlohmann/json.hpp>                   // … with its static-initializer rule erased
 #include "core/types/target_schema.hpp"
 #include "link/object_format_schema.hpp"       // ObjectFormatSchema (the shipped format's declared kind)
 #include "scratch_dir.hpp"                      // ScratchDir (setjmp descriptor sys-dir)
@@ -113,6 +117,41 @@ struct Lowered {
     DiagnosticReporter               mirReporter;
 };
 
+// The MIR result of a unit the pipeline's gates stopped before HIR→MIR
+// (`lowerModelToHir`): never entered, so never a lowered program.
+[[nodiscard]] HirToMirResult mirNotEntered() {
+    HirToMirResult r;
+    r.ok = false;
+    return r;
+}
+
+// The shipped c WITHOUT its static-initializer rule (`semantics.staticInitializers` erased):
+// a language whose static objects may be initialized at RUN time. Its ANALYSIS accepts the
+// initializers C refuses, so the pipeline's gates let such a unit reach the module
+// initializer's lowering — and its MIR policy (`languageMirLoweringConfig`) folds the
+// standard's forms only.
+[[nodiscard]] std::shared_ptr<GrammarSchema const> cWithoutStaticInitializerRule() {
+    std::ifstream in{dss::test::configRoot() / "sources" / "c.lang.json", std::ios::binary};
+    if (!in.good()) throw std::runtime_error("the shipped c.lang.json is unreadable");
+    auto doc = nlohmann::json::parse(in);
+    if (doc.at("semantics").erase("staticInitializers") != 1) {
+        throw std::runtime_error("the shipped c declares no static-initializer rule");
+    }
+    auto schema = GrammarSchema::loadFromText(doc.dump(), "<c-without-static-initializer-rule>");
+    if (!schema.has_value()) throw std::runtime_error("the perturbed c schema failed to load");
+    return *schema;
+}
+
+// The format the elf/x86_64 program fixtures below are built for.
+[[nodiscard]] ObjectFormatSchema const& elfX86_64Exec() {
+    static std::shared_ptr<ObjectFormatSchema const> const format = [] {
+        auto f = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-exec");
+        if (!f) throw std::runtime_error("loadShipped(elf64-x86_64-linux-exec) failed");
+        return std::shared_ptr<ObjectFormatSchema const>{*f};
+    }();
+    return *format;
+}
+
 [[nodiscard]] Lowered lowerC(std::string src,
                                    std::string targetName = "x86_64",
                                    std::string ccName     = "sysv_amd64",
@@ -138,12 +177,15 @@ struct Lowered {
                                    // P68 round 13 (lane `cs`): FALSE lowers as a language whose
                                    // static objects may be initialized at RUN time — the one way a
                                    // C fixture still reaches the module initializer's lowering.
+                                   // P69 L2b2: that language is the c document without the rule
+                                   // (`cWithoutStaticInitializerRule`), at the analysis too.
                                    bool staticInitializersMustFold = true,
                                    // P69 fold f26c: applied to the MIR config AFTER the
                                    // convention's copy — the one way a cell lowers under a
                                    // configuration no shipped document states (a refusal's pin).
                                    std::function<void(MirLoweringConfig&)> const& adjustConfig = {}) {
-    auto const schema = dss::test_support::shippedSchemaOrThrow("c");
+    auto const schema = staticInitializersMustFold ? dss::test_support::shippedSchemaOrThrow("c")
+                                                   : cWithoutStaticInitializerRule();
     UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(std::move(src), "<mem>");
     auto cu    = std::make_shared<CompilationUnit>(std::move(builder).finish());
@@ -216,16 +258,23 @@ struct Lowered {
     // extended), that split meant this harness ran the two tiers under DIFFERENT
     // answers: the semantic/HIR tiers with none at all, MIR with the target's.
     // `compile_pipeline.cpp` passes the kind to both, so the fixture now does
-    // too. EMPTY `formatName` ⇒ ELF, the format every pre-existing fixture here
-    // was implicitly written against.
-    auto formatKind = ObjectFormatKind::Elf;
-    if (!formatName.empty()) {
-        auto f = ObjectFormatSchema::loadShipped(formatName);
+    // too. EMPTY `formatName` ⇒ the target's ELF document, the format every
+    // pre-existing fixture here was implicitly written against — LOADED, because the
+    // pipeline's HIR stage settles the HIR for the format it is built for.
+    std::string const formatDocument =
+        !formatName.empty()      ? formatName
+        : targetName == "x86_64" ? std::string{"elf64-x86_64-linux-exec"}
+        : targetName == "arm64"  ? std::string{"elf64-aarch64-linux-exec"}
+                                 : throw std::runtime_error("no ELF document for target " + targetName);
+    std::shared_ptr<ObjectFormatSchema const> formatSchema;
+    {
+        auto f = ObjectFormatSchema::loadShipped(formatDocument);
         if (!f) {
-            throw std::runtime_error("loadShipped(format) failed: " + formatName);
+            throw std::runtime_error("loadShipped(format) failed: " + formatDocument);
         }
-        formatKind = (*f)->kind();
+        formatSchema = *f;
     }
+    auto const formatKind = formatSchema->kind();
     // The analysis takes the one-spelling type
     // ([[D-SEMANTIC-ANALYZE-ACTIVE-FORMAT-ADMITS-THE-UNKNOWN-SENTINEL]]); a shipped
     // format that resolved no kind is a broken fixture, not "no format". A THROW,
@@ -239,8 +288,19 @@ struct Lowered {
                          dataModel, std::nullopt, vaStrategy, selectableFormat,
                          std::nullopt, ldf, targetSchema.get());
     DiagnosticReporter hirReporter;
-    auto hir = lowerToHir(model, hirReporter);
+    ModelLoweredToHir lowered = lowerModelToHir(model, *formatSchema, hirReporter);   // the pipeline's gates
+    auto hir = std::move(lowered.hir);
     DiagnosticReporter mirReporter;
+    if (!lowered.lowersToMir) {   // the build stops here, and so does the fixture
+        return Lowered{
+            .target      = std::move(targetSchema),
+            .model       = std::move(model),
+            .hir         = std::move(hir),
+            .hirReporter = std::move(hirReporter),
+            .mir         = mirNotEntered(),
+            .mirReporter = std::move(mirReporter),
+        };
+    }
     // Cycle 3a wires the HirSourceMap so MIR diagnostics carry source spans
     // (mirroring HirVerifier's `&sourceMap` plumbing). The pointer is bound
     // through `hir->sourceMap` which CstToHirResult always populates.
@@ -905,7 +965,8 @@ TEST(MirLoweringC, ComplexRelationalIsRefusedNamingTheRealOperandRule) {
 // analyzer says so (S_StaticInitializerNotConstant, exactly once), and the MIR tier, told
 // C's constraint, refuses to make it a runtime initializer at all. What this pins is how the
 // MIR tier lowers a runtime initializer of a by-value-class object FOR A LANGUAGE THAT
-// PERMITS ONE, so it lowers past the semantic error with the constraint OFF.
+// PERMITS ONE — the c document without the rule, whose analysis accepts it (P69 L2b2: the
+// fixture keeps the pipeline's gates, so C's refusal would stop it before HIR).
 TEST(MirLoweringC, ComplexGlobalRuntimeInitCopiesTheObjectNotAPointer) {
     auto L = lowerC(
         "double _Complex z0;\n"
@@ -913,9 +974,8 @@ TEST(MirLoweringC, ComplexGlobalRuntimeInitCopiesTheObjectNotAPointer) {
         "int main(void) { return 0; }\n",
         "x86_64", "sysv_amd64", DataModel::Lp64, LongDoubleFormat::None, {},
         /*staticInitializersMustFold=*/false);
-    ASSERT_EQ(dss::test_support::countCode(L.model.diagnostics(),
-                                           DiagnosticCode::S_StaticInitializerNotConstant), 1u)
-        << "C refuses the program; the MIR mechanism below is pinned regardless";
+    ASSERT_FALSE(L.model.hasErrors())
+        << "a language with no static-initializer rule accepts it (C refuses the program)";
     ASSERT_TRUE(L.hir->ok)
         << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
     ASSERT_TRUE(L.mir.ok)
@@ -1094,6 +1154,8 @@ namespace {
 
     auto const schema = dss::test_support::shippedSchemaOrThrow("c");
     UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
+    dss::test_support::AskedDriverCodes const clearedDirs{dss::DiagnosticCode::C_UnbackedPredefinedMacro};   // no shipped dirs: the language's predefines are unbacked
+    builder.clearSystemDirs();   // the test's own system dirs, not the shipped ones
     builder.addSystemDir(sysDir.path());
     builder.addInMemory(std::move(mainSrc), "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
@@ -1102,8 +1164,18 @@ namespace {
                          DataModel::Lp64, std::nullopt, std::nullopt,
                          SelectableObjectFormatKind::of(ObjectFormatKind::Elf), "x86_64");
     DiagnosticReporter hirReporter;
-    auto hir = lowerToHir(model, hirReporter);
+    ModelLoweredToHir lowered = lowerModelToHir(model, elfX86_64Exec(), hirReporter);   // the pipeline's gates
+    auto hir = std::move(lowered.hir);
     DiagnosticReporter mirReporter;
+    if (!lowered.lowersToMir) {   // the build stops here, and so does the fixture
+        return Lowered{
+            .model       = std::move(model),
+            .hir         = std::move(hir),
+            .hirReporter = std::move(hirReporter),
+            .mir         = mirNotEntered(),
+            .mirReporter = std::move(mirReporter),
+        };
+    }
     MirLoweringConfig mirCfg = languageMirLoweringConfig(*schema);   // the pipeline's assembly
     mirCfg.symbolIdSpace = MirSymbolIdSpace::endingAt(   // the unit's name table, as the driver states it
         static_cast<std::uint32_t>(model.symbols().size()));
@@ -1175,6 +1247,8 @@ namespace {
     })JSON";
     auto const schema = dss::test_support::shippedSchemaOrThrow("c");
     UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
+    dss::test_support::AskedDriverCodes const clearedDirs{dss::DiagnosticCode::C_UnbackedPredefinedMacro};   // no shipped dirs: the language's predefines are unbacked
+    builder.clearSystemDirs();   // the test's own system dirs, not the shipped ones
     builder.addSystemDir(sysDir.path());
     builder.setActiveFormat(ObjectFormatKind::Elf);
     builder.addInMemory(std::move(mainSrc), "main.c");
@@ -1183,8 +1257,18 @@ namespace {
                          DataModel::Lp64, std::nullopt, std::nullopt,
                          SelectableObjectFormatKind::of(ObjectFormatKind::Elf), "x86_64");
     DiagnosticReporter hirReporter;
-    auto hir = lowerToHir(model, hirReporter);
+    ModelLoweredToHir lowered = lowerModelToHir(model, elfX86_64Exec(), hirReporter);   // the pipeline's gates
+    auto hir = std::move(lowered.hir);
     DiagnosticReporter mirReporter;
+    if (!lowered.lowersToMir) {   // the build stops here, and so does the fixture
+        return Lowered{
+            .model       = std::move(model),
+            .hir         = std::move(hir),
+            .hirReporter = std::move(hirReporter),
+            .mir         = mirNotEntered(),
+            .mirReporter = std::move(mirReporter),
+        };
+    }
     MirLoweringConfig mirCfg = languageMirLoweringConfig(*schema);   // the pipeline's assembly
     mirCfg.symbolIdSpace = MirSymbolIdSpace::endingAt(   // the unit's name table, as the driver states it
         static_cast<std::uint32_t>(model.symbols().size()));
@@ -5614,8 +5698,11 @@ TEST(MirLoweringC, SyntheticGlobalSymbolsRespectSemanticFloor) {
     auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64);
     ASSERT_FALSE(model.hasErrors());
     DiagnosticReporter hirRep;
-    auto hir = lowerToHir(model, hirRep);
+    ModelLoweredToHir lowered = lowerModelToHir(model, elfX86_64Exec(), hirRep);   // the pipeline's gates
+    auto const& hir = lowered.hir;
+    ASSERT_NE(hir, nullptr);
     ASSERT_TRUE(hir->ok);
+    ASSERT_TRUE(lowered.lowersToMir) << "the pipeline's gates pass the clean unit on to MIR";
     std::uint32_t const floor =
         static_cast<std::uint32_t>(model.symbols().size());
     MirLoweringConfig cfg = languageMirLoweringConfig(**loaded);   // the pipeline's assembly
@@ -7775,9 +7862,9 @@ TEST(MirLoweringC, SizeofDerefTwoDimArrayFoldsRowNotWholeArray) {
 TEST(MirLoweringC, VaStartEmitsFourFieldStoresPlusFrameAddrs) {
     auto L = lowerC(
         "int sum(int n, ...) {\n"
-        "  va_list ap;\n"
-        "  va_start(ap, n);\n"
-        "  va_end(ap);\n"
+        "  __builtin_va_list ap;\n"
+        "  __builtin_va_start(ap, n);\n"
+        "  __builtin_va_end(ap);\n"
         "  return n;\n"
         "}\n");
     ASSERT_FALSE(L.model.hasErrors());
@@ -7800,10 +7887,10 @@ TEST(MirLoweringC, VaStartEmitsFourFieldStoresPlusFrameAddrs) {
 TEST(MirLoweringC, VaArgIntLowersToRegVsOverflowDiamond) {
     auto L = lowerC(
         "int sum(int n, ...) {\n"
-        "  va_list ap;\n"
-        "  va_start(ap, n);\n"
-        "  int t = va_arg(ap, int);\n"
-        "  va_end(ap);\n"
+        "  __builtin_va_list ap;\n"
+        "  __builtin_va_start(ap, n);\n"
+        "  int t = __builtin_va_arg(ap, int);\n"
+        "  __builtin_va_end(ap);\n"
         "  return t;\n"
         "}\n");
     ASSERT_FALSE(L.model.hasErrors());
@@ -7833,10 +7920,10 @@ TEST(MirLoweringC, VaArgIntLowersToRegVsOverflowDiamond) {
 TEST(MirLoweringC, Win64VaArgIntLowersLinearNotDiamond) {
     char const* src =
         "int sum(int n, ...) {\n"
-        "  va_list ap;\n"
-        "  va_start(ap, n);\n"
-        "  int t = va_arg(ap, int);\n"
-        "  va_end(ap);\n"
+        "  __builtin_va_list ap;\n"
+        "  __builtin_va_start(ap, n);\n"
+        "  int t = __builtin_va_arg(ap, int);\n"
+        "  __builtin_va_end(ap);\n"
         "  return t;\n"
         "}\n";
     // Win64 (ms_x64) lowering.
@@ -7895,10 +7982,10 @@ TEST(MirLoweringC, VaArgStructMixedLowersToAtomicRegisterGather) {
     auto L = lowerC(
         "struct Pt { long a; double b; };\n"
         "long sum(int n, ...) {\n"
-        "  va_list ap;\n"
-        "  va_start(ap, n);\n"
-        "  struct Pt p = va_arg(ap, struct Pt);\n"
-        "  va_end(ap);\n"
+        "  __builtin_va_list ap;\n"
+        "  __builtin_va_start(ap, n);\n"
+        "  struct Pt p = __builtin_va_arg(ap, struct Pt);\n"
+        "  __builtin_va_end(ap);\n"
         "  return p.a + (long)p.b;\n"
         "}\n");
     ASSERT_FALSE(L.model.hasErrors());
@@ -7945,10 +8032,10 @@ TEST(MirLoweringC, VaArgStructOver16BDispatchesToOverflowArm) {
     auto L = lowerC(
         "struct Big { long a; long b; long c; };\n"   // 24B → MEMORY class
         "long sum(int n, ...) {\n"
-        "  va_list ap;\n"
-        "  va_start(ap, n);\n"
-        "  struct Big s = va_arg(ap, struct Big);\n"
-        "  va_end(ap);\n"
+        "  __builtin_va_list ap;\n"
+        "  __builtin_va_start(ap, n);\n"
+        "  struct Big s = __builtin_va_arg(ap, struct Big);\n"
+        "  __builtin_va_end(ap);\n"
         "  return s.a;\n"
         "}\n");
     ASSERT_TRUE(L.mir.ok)
@@ -8165,10 +8252,10 @@ anyDiagActualContains(DiagnosticReporter const& r, std::string_view anchor) {
 TEST(MirLoweringC, Aapcs64FieldOffsetHelperSelfTest) {
     auto L = lowerC(
         "int sum(int n, ...) {\n"
-        "  va_list ap;\n"
-        "  va_start(ap, n);\n"
-        "  int t = va_arg(ap, int);\n"
-        "  va_end(ap);\n"
+        "  __builtin_va_list ap;\n"
+        "  __builtin_va_start(ap, n);\n"
+        "  int t = __builtin_va_arg(ap, int);\n"
+        "  __builtin_va_end(ap);\n"
         "  return t;\n"
         "}\n",
         "arm64", "aapcs64");
@@ -8200,10 +8287,10 @@ TEST(MirLoweringC, Win64VaArgStructLeq8ReturnsSlotAddr) {
     auto L = lowerC(
         "struct Pt { int a; int b; };\n"   // 8B (pow2 ≤8) → InRegisters[1], by value
         "int sum(int n, ...) {\n"
-        "  va_list ap;\n"
-        "  va_start(ap, n);\n"
-        "  struct Pt p = va_arg(ap, struct Pt);\n"
-        "  va_end(ap);\n"
+        "  __builtin_va_list ap;\n"
+        "  __builtin_va_start(ap, n);\n"
+        "  struct Pt p = __builtin_va_arg(ap, struct Pt);\n"
+        "  __builtin_va_end(ap);\n"
         "  return p.a + p.b;\n"
         "}\n",
         "x86_64", "ms_x64");
@@ -8248,10 +8335,10 @@ TEST(MirLoweringC, Win64VaArgStructGt8DerefsPointer) {
     auto L = lowerC(
         "struct Big { long a; long b; long c; };\n"  // 24B → ByReference (hidden ptr)
         "long pick(int n, ...) {\n"
-        "  va_list ap;\n"
-        "  va_start(ap, n);\n"
-        "  struct Big b = va_arg(ap, struct Big);\n"
-        "  va_end(ap);\n"
+        "  __builtin_va_list ap;\n"
+        "  __builtin_va_start(ap, n);\n"
+        "  struct Big b = __builtin_va_arg(ap, struct Big);\n"
+        "  __builtin_va_end(ap);\n"
         "  return b.a + b.b + b.c;\n"
         "}\n",
         "x86_64", "ms_x64");
@@ -8383,10 +8470,10 @@ TEST(MirLoweringC, VaStartFixedParamsOverflowToStackSucceeds) {
     // ON THE STACK. gprOver = 7 - 6 = 1 → fixedStackBytes = 1 * gpSlotBytes(8) = 8.
     auto L = lowerC(
         "int pick(int a, int b, int c, int d, int e, int f, int g, ...) {\n"
-        "  va_list ap;\n"
-        "  va_start(ap, g);\n"
-        "  int v = va_arg(ap, int);\n"
-        "  va_end(ap);\n"
+        "  __builtin_va_list ap;\n"
+        "  __builtin_va_start(ap, g);\n"
+        "  int v = __builtin_va_arg(ap, int);\n"
+        "  __builtin_va_end(ap);\n"
         "  return a + g + v;\n"
         "}\n");
     ASSERT_TRUE(L.mir.ok)
@@ -8419,10 +8506,10 @@ TEST(MirLoweringC, Aapcs64VaStartFixedParamsOverflowToStackSucceeds) {
     auto L = lowerC(
         "int pick(int a, int b, int c, int d, int e, int f, int g, int h, int i,"
         " ...) {\n"
-        "  va_list ap;\n"
-        "  va_start(ap, i);\n"
-        "  int v = va_arg(ap, int);\n"
-        "  va_end(ap);\n"
+        "  __builtin_va_list ap;\n"
+        "  __builtin_va_start(ap, i);\n"
+        "  int v = __builtin_va_arg(ap, int);\n"
+        "  __builtin_va_end(ap);\n"
         "  return a + i + v;\n"
         "}\n",
         "arm64", "aapcs64");
@@ -8461,10 +8548,10 @@ TEST(MirLoweringC, Aapcs64VaStartFixedDoubleParamsOverflowToStackSucceeds) {
     auto L = lowerC(
         "double pick(double a, double b, double c, double d, double e, double f,"
         " double g, double h, double i, ...) {\n"
-        "  va_list ap;\n"
-        "  va_start(ap, i);\n"
-        "  double v = va_arg(ap, double);\n"
-        "  va_end(ap);\n"
+        "  __builtin_va_list ap;\n"
+        "  __builtin_va_start(ap, i);\n"
+        "  double v = __builtin_va_arg(ap, double);\n"
+        "  __builtin_va_end(ap);\n"
         "  return a + i + v;\n"
         "}\n",
         "arm64", "aapcs64");
@@ -8496,10 +8583,10 @@ TEST(MirLoweringC, Aapcs64VaStartMixedClassFixedStackOverflow) {
         "double pick(int a, int b, int c, int d, int e, int f, int g, int h, int i,"
         " double m0, double m1, double m2, double m3, double m4, double m5,"
         " double m6, double m7, double m8, ...) {\n"
-        "  va_list ap;\n"
-        "  va_start(ap, m8);\n"
-        "  double v = va_arg(ap, double);\n"
-        "  va_end(ap);\n"
+        "  __builtin_va_list ap;\n"
+        "  __builtin_va_start(ap, m8);\n"
+        "  double v = __builtin_va_arg(ap, double);\n"
+        "  __builtin_va_end(ap);\n"
         "  return a + i + v;\n"
         "}\n",
         "arm64", "aapcs64");
@@ -8538,10 +8625,10 @@ TEST(MirLoweringC, VaStartFixedStructStraddleOverflowSucceeds) {
     auto L = lowerC(
         "struct S16 { long x; long y; };\n"
         "long f(long a, long b, long c, long d, long e, struct S16 s, ...) {\n"
-        "  va_list ap;\n"
-        "  va_start(ap, s);\n"
-        "  long v = va_arg(ap, long);\n"
-        "  va_end(ap);\n"
+        "  __builtin_va_list ap;\n"
+        "  __builtin_va_start(ap, s);\n"
+        "  long v = __builtin_va_arg(ap, long);\n"
+        "  __builtin_va_end(ap);\n"
         "  return a + s.x + v;\n"
         "}\n");
     ASSERT_TRUE(L.mir.ok)
@@ -8585,10 +8672,10 @@ TEST(MirLoweringC, Aapcs64VaStartFixedHfaStraddleOverflowSucceeds) {
         "struct H3 { double a; double b; double c; };\n"
         "double f(double a, double b, double c, double d, double e, double g,"
         " struct H3 h, ...) {\n"
-        "  va_list ap;\n"
-        "  va_start(ap, h);\n"
-        "  double v = va_arg(ap, double);\n"
-        "  va_end(ap);\n"
+        "  __builtin_va_list ap;\n"
+        "  __builtin_va_start(ap, h);\n"
+        "  double v = __builtin_va_arg(ap, double);\n"
+        "  __builtin_va_end(ap);\n"
         "  return a + h.a + v;\n"
         "}\n",
         "arm64", "aapcs64");
@@ -8800,10 +8887,10 @@ TEST(MirLoweringC, VaStartSkipsAStackedScalarThatFollowsAStackedAggregate) {
         "struct S16 { long x; long y; };\n"
         "long f(long a, long b, long c, long d, long e, long g, struct S16 s,"
         " long h, ...) {\n"
-        "  va_list ap;\n"
-        "  va_start(ap, h);\n"
-        "  long v = va_arg(ap, long);\n"
-        "  va_end(ap);\n"
+        "  __builtin_va_list ap;\n"
+        "  __builtin_va_start(ap, h);\n"
+        "  long v = __builtin_va_arg(ap, long);\n"
+        "  __builtin_va_end(ap);\n"
         "  return h + v + s.x;\n"
         "}\n");
     ASSERT_TRUE(L.mir.ok) << firstMirError(L.mirReporter);
@@ -9459,10 +9546,10 @@ TEST(MirLoweringC, AVaArgArmReadingAnotherCarrierThanTheConventionsIsRefusedByNa
     std::string const src =
         "struct Big { long a; long b; long c; };\n"
         "long f(int n, ...) {\n"
-        "  va_list ap;\n"
-        "  va_start(ap, n);\n"
-        "  struct Big b = va_arg(ap, struct Big);\n"
-        "  va_end(ap);\n"
+        "  __builtin_va_list ap;\n"
+        "  __builtin_va_start(ap, n);\n"
+        "  struct Big b = __builtin_va_arg(ap, struct Big);\n"
+        "  __builtin_va_end(ap);\n"
         "  return b.c;\n"
         "}\n";
     struct Cell { char const* target; char const* cc; AggregateMemoryArgument flipped;
@@ -9633,9 +9720,9 @@ TEST(MirLoweringC, VariadicFnFixedStructParamThreadsBothClassCursors) {
     auto L = lowerC(
         "struct Pt { long a; double b; };\n"
         "long sum(struct Pt base, ...) {\n"
-        "  va_list ap;\n"
-        "  va_start(ap, base);\n"
-        "  va_end(ap);\n"
+        "  __builtin_va_list ap;\n"
+        "  __builtin_va_start(ap, base);\n"
+        "  __builtin_va_end(ap);\n"
         "  return base.a;\n"
         "}\n");
     ASSERT_FALSE(L.model.hasErrors());
@@ -9689,9 +9776,9 @@ TEST(MirLoweringC, VariadicFnFixedStructOver16BParamIsReceivedFromTheStack) {
     auto L = lowerC(
         "struct Big { long a; long b; long c; };\n"   // 24B → MEMORY class
         "long sum(struct Big base, ...) {\n"
-        "  va_list ap;\n"
-        "  va_start(ap, base);\n"
-        "  va_end(ap);\n"
+        "  __builtin_va_list ap;\n"
+        "  __builtin_va_start(ap, base);\n"
+        "  __builtin_va_end(ap);\n"
         "  return base.a;\n"
         "}\n");
     ASSERT_TRUE(L.mir.ok)
@@ -9752,10 +9839,10 @@ TEST(MirLoweringC, DiscardedAggregateVaArgRoutesByAddressNoAggregatePhi) {
     auto L = lowerC(
         "struct Pt { long a; double b; };\n"
         "long sum(int n, ...) {\n"
-        "  va_list ap;\n"
-        "  va_start(ap, n);\n"
-        "  va_arg(ap, struct Pt);\n"   // DISCARDED aggregate va_arg (side effect only)
-        "  va_end(ap);\n"
+        "  __builtin_va_list ap;\n"
+        "  __builtin_va_start(ap, n);\n"
+        "  __builtin_va_arg(ap, struct Pt);\n"   // DISCARDED aggregate va_arg (side effect only)
+        "  __builtin_va_end(ap);\n"
         "  return 0;\n"
         "}\n");
     ASSERT_TRUE(L.mir.ok)
@@ -9786,10 +9873,10 @@ TEST(MirLoweringC, VaArgTwoSameClassStructThreadsCursorThroughAdd) {
     auto L = lowerC(
         "struct LL { long a; long b; };\n"
         "long sumLL(int n, ...) {\n"
-        "  va_list ap;\n"
-        "  va_start(ap, n);\n"
-        "  struct LL p = va_arg(ap, struct LL);\n"
-        "  va_end(ap);\n"
+        "  __builtin_va_list ap;\n"
+        "  __builtin_va_start(ap, n);\n"
+        "  struct LL p = __builtin_va_arg(ap, struct LL);\n"
+        "  __builtin_va_end(ap);\n"
         "  return p.a + p.b;\n"
         "}\n");
     ASSERT_FALSE(L.model.hasErrors());
@@ -9858,10 +9945,10 @@ namespace {
 TEST(MirLoweringC, Aapcs64VaArgIntLowersToDualCursorDiamondSignExtend) {
     auto L = lowerC(
         "int sum(int n, ...) {\n"
-        "  va_list ap;\n"
-        "  va_start(ap, n);\n"
-        "  int t = va_arg(ap, int);\n"
-        "  va_end(ap);\n"
+        "  __builtin_va_list ap;\n"
+        "  __builtin_va_start(ap, n);\n"
+        "  int t = __builtin_va_arg(ap, int);\n"
+        "  __builtin_va_end(ap);\n"
         "  return t;\n"
         "}\n",
         "arm64", "aapcs64");
@@ -9897,10 +9984,10 @@ TEST(MirLoweringC, Aapcs64VaArgIntLowersToDualCursorDiamondSignExtend) {
 TEST(MirLoweringC, Aapcs64VaStartInitsNegativeGrOffs) {
     auto L = lowerC(
         "int sum(int n, ...) {\n"
-        "  va_list ap;\n"
-        "  va_start(ap, n);\n"
-        "  int t = va_arg(ap, int);\n"
-        "  va_end(ap);\n"
+        "  __builtin_va_list ap;\n"
+        "  __builtin_va_start(ap, n);\n"
+        "  int t = __builtin_va_arg(ap, int);\n"
+        "  __builtin_va_end(ap);\n"
         "  return t;\n"
         "}\n",
         "arm64", "aapcs64");
@@ -9932,10 +10019,10 @@ TEST(MirLoweringC, Aapcs64VaArgStructGathersViaDualCursor) {
     auto L = lowerC(
         "struct Pt { int a; int b; };\n"   // 8B, non-HFA → 1 GPR piece (GR block)
         "int sum(int n, ...) {\n"
-        "  va_list ap;\n"
-        "  va_start(ap, n);\n"
-        "  struct Pt p = va_arg(ap, struct Pt);\n"
-        "  va_end(ap);\n"
+        "  __builtin_va_list ap;\n"
+        "  __builtin_va_start(ap, n);\n"
+        "  struct Pt p = __builtin_va_arg(ap, struct Pt);\n"
+        "  __builtin_va_end(ap);\n"
         "  return p.a + p.b;\n"
         "}\n",
         "arm64", "aapcs64");
@@ -9996,14 +10083,14 @@ TEST(MirLoweringC, Aapcs64VaArgHfaFromVrNotGr) {
     auto L = lowerC(
         "struct HFA { double a; double b; };\n"   // 16B, 2 FPR pieces (VR block)
         "double sum(int n, ...) {\n"
-        "  va_list ap;\n"
-        "  va_start(ap, n);\n"
+        "  __builtin_va_list ap;\n"
+        "  __builtin_va_start(ap, n);\n"
         "  double t = 0;\n"
         "  for (int i = 0; i < n; i = i + 1) {\n"
-        "    struct HFA p = va_arg(ap, struct HFA);\n"
+        "    struct HFA p = __builtin_va_arg(ap, struct HFA);\n"
         "    t = t + p.a + p.b;\n"
         "  }\n"
-        "  va_end(ap);\n"
+        "  __builtin_va_end(ap);\n"
         "  return t;\n"
         "}\n",
         "arm64", "aapcs64");
@@ -10029,10 +10116,10 @@ TEST(MirLoweringC, Aapcs64VaArgNonHfaFromGrNotVr) {
     auto L = lowerC(
         "struct Pair { long a; long b; };\n"   // 16B, 2 GPR pieces (GR block)
         "long sum(int n, ...) {\n"
-        "  va_list ap;\n"
-        "  va_start(ap, n);\n"
-        "  struct Pair p = va_arg(ap, struct Pair);\n"
-        "  va_end(ap);\n"
+        "  __builtin_va_list ap;\n"
+        "  __builtin_va_start(ap, n);\n"
+        "  struct Pair p = __builtin_va_arg(ap, struct Pair);\n"
+        "  __builtin_va_end(ap);\n"
         "  return p.a + p.b;\n"
         "}\n",
         "arm64", "aapcs64");
@@ -10057,10 +10144,10 @@ TEST(MirLoweringC, Aapcs64VaArgByRefUsesChainedLoad) {
     auto L = lowerC(
         "struct Big { long a; long b; long c; };\n"   // 24B → ByReference (hidden ptr)
         "long pick(int n, ...) {\n"
-        "  va_list ap;\n"
-        "  va_start(ap, n);\n"
-        "  struct Big b = va_arg(ap, struct Big);\n"
-        "  va_end(ap);\n"
+        "  __builtin_va_list ap;\n"
+        "  __builtin_va_start(ap, n);\n"
+        "  struct Big b = __builtin_va_arg(ap, struct Big);\n"
+        "  __builtin_va_end(ap);\n"
         "  return b.a + b.b + b.c;\n"
         "}\n",
         "arm64", "aapcs64");
@@ -10094,10 +10181,10 @@ TEST(MirLoweringC, Aapcs64VaArgByRefRegArmDerefsGrTop) {
     auto L = lowerC(
         "struct Big { long a; long b; long c; };\n"   // 24B → ByReference (hidden ptr)
         "long pick(int n, ...) {\n"
-        "  va_list ap;\n"
-        "  va_start(ap, n);\n"
-        "  struct Big b = va_arg(ap, struct Big);\n"
-        "  va_end(ap);\n"
+        "  __builtin_va_list ap;\n"
+        "  __builtin_va_start(ap, n);\n"
+        "  struct Big b = __builtin_va_arg(ap, struct Big);\n"
+        "  __builtin_va_end(ap);\n"
         "  return b.a + b.b + b.c;\n"
         "}\n",
         "arm64", "aapcs64");
@@ -10225,10 +10312,10 @@ TEST(MirLoweringC, AppleVaArgStructSmallByValueLinear) {
     auto L = lowerC(
         "struct Pair { int a; int b; };\n"   // 8B (pow2 ≤8) → InRegisters, by value
         "long sum(int n, ...) {\n"
-        "  va_list ap;\n"
-        "  va_start(ap, n);\n"
-        "  struct Pair p = va_arg(ap, struct Pair);\n"
-        "  va_end(ap);\n"
+        "  __builtin_va_list ap;\n"
+        "  __builtin_va_start(ap, n);\n"
+        "  struct Pair p = __builtin_va_arg(ap, struct Pair);\n"
+        "  __builtin_va_end(ap);\n"
         "  return p.a + p.b;\n"
         "}\n",
         "arm64", "apple_arm64");
@@ -10253,10 +10340,10 @@ TEST(MirLoweringC, AppleVaArgStructLargeByRefLinear) {
     auto L = lowerC(
         "struct Big { long a; long b; long c; };\n"   // 24B → ByReference (hidden ptr)
         "long pick(int n, ...) {\n"
-        "  va_list ap;\n"
-        "  va_start(ap, n);\n"
-        "  struct Big b = va_arg(ap, struct Big);\n"
-        "  va_end(ap);\n"
+        "  __builtin_va_list ap;\n"
+        "  __builtin_va_start(ap, n);\n"
+        "  struct Big b = __builtin_va_arg(ap, struct Big);\n"
+        "  __builtin_va_end(ap);\n"
         "  return b.a + b.b + b.c;\n"
         "}\n",
         "arm64", "apple_arm64");
@@ -10283,14 +10370,14 @@ TEST(MirLoweringC, AppleVaArgHfa16BBumpsBySixteenNotEight) {
     auto L = lowerC(
         "struct HFA { double a; double b; };\n"   // 16B InRegisters (2 eightbytes)
         "double sum(int n, ...) {\n"
-        "  va_list ap;\n"
-        "  va_start(ap, n);\n"
+        "  __builtin_va_list ap;\n"
+        "  __builtin_va_start(ap, n);\n"
         "  double t = 0;\n"
         "  for (int i = 0; i < n; i = i + 1) {\n"
-        "    struct HFA p = va_arg(ap, struct HFA);\n"
+        "    struct HFA p = __builtin_va_arg(ap, struct HFA);\n"
         "    t = t + p.a + p.b;\n"
         "  }\n"
-        "  va_end(ap);\n"
+        "  __builtin_va_end(ap);\n"
         "  return t;\n"
         "}\n",
         "arm64", "apple_arm64");
@@ -10311,10 +10398,10 @@ TEST(MirLoweringC, AppleVaArgHfa16BBumpsBySixteenNotEight) {
 TEST(MirLoweringC, AppleVaArgIntLowersLinearOverflowBase) {
     auto L = lowerC(
         "int sum(int n, ...) {\n"
-        "  va_list ap;\n"
-        "  va_start(ap, n);\n"
-        "  int t = va_arg(ap, int);\n"
-        "  va_end(ap);\n"
+        "  __builtin_va_list ap;\n"
+        "  __builtin_va_start(ap, n);\n"
+        "  int t = __builtin_va_arg(ap, int);\n"
+        "  __builtin_va_end(ap);\n"
         "  return t;\n"
         "}\n",
         "arm64", "apple_arm64");
@@ -12503,10 +12590,10 @@ TEST(MirLoweringC, C35OpaqueHandleViaPointerLowersClean) {
 // present to mask the backstop).
 TEST(MirLoweringC, ArrayRvalueValueReadDecaysNeverLoads) {
     auto L = lowerC(
-        "void take(va_list ap) { }\n"
-        "struct S { int pad; va_list ap; };\n"
-        "va_list gv;\n"
-        "void f(struct S *s, va_list *pp) {\n"
+        "void take(__builtin_va_list ap) { }\n"
+        "struct S { int pad; __builtin_va_list ap; };\n"
+        "__builtin_va_list gv;\n"
+        "void f(struct S *s, __builtin_va_list *pp) {\n"
         "    take(gv);\n"      // GLOBAL va_list forward  → the Ref-global arm
         "    take(s->ap);\n"   // MEMBER va_list forward  → the member/index arm
         "    take(*pp);\n"     // DEREF va_list forward   → the combineDeref arm
@@ -15244,10 +15331,11 @@ TEST(MirLoweringC, InlineAsmEmptySectionFormsEachLowerToOneCompilerBarrier) {
 // ★★ ITS OWN COMMENT CALLED IT UNREACHABLE, AND THAT WAS TRUE OF THE DRIVER
 // ONLY. `compile_pipeline.cpp` and `c_header_parser.cpp` both bail on
 // `hasErrors()` before lowering, and the semantic tier refuses extended asm, so
-// production never gets here. THIS TIER HAS NO SUCH GUARD: `lowerC` at the
-// top of this file calls `lowerToHir(model, hirReporter)` unconditionally — on
-// purpose, so a lowering bug cannot hide behind a semantic diagnostic — which
-// makes the backstop reachable in exactly one place, here. Until this test it
+// production never gets here — and since P69 L2b2 neither does `lowerC`, which
+// keeps the pipeline's gates (`lowerModelToHir`). THE HIR TIER ITSELF HAS NO SUCH
+// GUARD, so this case hands the refused model to `lowerToHir` DIRECTLY — the tier
+// is its subject, so a lowering bug cannot hide behind a semantic diagnostic —
+// which makes the backstop reachable in exactly one place, here. Until this test it
 // was the one link in the inline-asm chain with NO witness at all, and "the
 // assertion cannot fire today" was a claim nobody had run.
 //
@@ -15297,28 +15385,33 @@ TEST(MirLoweringC, AsmPayloadHirLoweringCannotREPRESENTIsRefusedNotDropped) {
            "longer reaches the HIR backstop and every assertion below is "
            "vacuous — pick a payload the descriptor still cannot represent";
 
-    // ...and lowering ran ANYWAY (lowerC has no `hasErrors()` bail, on
-    // purpose), which is why the arm is live here at all.
+    // `lowerC` keeps the pipeline's gates, so it stopped before HIR; the HIR tier
+    // is asked DIRECTLY on the refused model, which is why the arm is live here at all.
+    EXPECT_EQ(L.hir, nullptr) << "the fixture keeps the pipeline's gates: no HIR for a refused model";
+    DiagnosticReporter hirReporter;
+    auto const hir = lowerToHir(L.model, hirReporter);
+    ASSERT_NE(hir, nullptr);
     EXPECT_EQ(dss::test_support::countCode(
-                  L.hirReporter, DiagnosticCode::H_UnsupportedLoweringForKind), 1u)
+                  hirReporter, DiagnosticCode::H_UnsupportedLoweringForKind), 1u)
         << "the backstop must fail LOUD, exactly once — a descriptor built from "
            "the parts that WERE understood, with this operand silently dropped, "
            "is the miscompile it exists to refuse. Got: "
-        << (L.hirReporter.all().empty() ? std::string{"<no diagnostics>"}
-                                        : L.hirReporter.all()[0].actual);
+        << (hirReporter.all().empty() ? std::string{"<no diagnostics>"}
+                                      : hirReporter.all()[0].actual);
 
     // The message must NAME what could not be carried, otherwise it is a
     // wrong-turn signpost rather than a diagnostic.
-    if (!L.hirReporter.all().empty()) {
-        std::string const msg = L.hirReporter.all()[0].actual;
+    if (!hirReporter.all().empty()) {
+        std::string const msg = hirReporter.all()[0].actual;
         EXPECT_NE(msg.find("inline-asm constraint"), std::string::npos) << msg;
         EXPECT_NE(msg.find("=r,m"), std::string::npos)
             << "quote the constraint verbatim: " << msg;
     }
 
-    // AND NOTHING WAS LOWERED IN ITS PLACE — the Error node the backstop returns
-    // is FATAL to MIR lowering, so no module is produced and there is no
-    // barrier left for an operand to have been dropped from.
+    // AND NOTHING IS LOWERED IN ITS PLACE — the backstop reports an error, and the
+    // pipeline's gate stops a unit whose HIR lowering reported one before MIR
+    // (`lowerModelToHir`), so no module is produced and there is no barrier left
+    // for an operand to have been dropped from.
     EXPECT_FALSE(L.mir.ok)
         << "MIR lowering SUCCEEDED on a statement HIR lowering refused — "
            "'diagnose and lower anyway' leaves an asm instruction standing with "
@@ -15919,6 +16012,8 @@ constexpr char const* kSetjmpRoundTripSrc =
 
     auto const schema = dss::test_support::shippedSchemaOrThrow("c");
     UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
+    dss::test_support::AskedDriverCodes const clearedDirs{dss::DiagnosticCode::C_UnbackedPredefinedMacro};   // no shipped dirs: the language's predefines are unbacked
+    builder.clearSystemDirs();   // the test's own system dirs, not the shipped ones
     builder.addSystemDir(sysDir.path());
     builder.addInMemory(std::move(mainSrc), "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
@@ -15929,8 +16024,18 @@ constexpr char const* kSetjmpRoundTripSrc =
                          DataModel::Lp64, std::nullopt, std::nullopt,
                          SelectableObjectFormatKind::of(ObjectFormatKind::Elf), "x86_64");
     DiagnosticReporter hirReporter;
-    auto hir = lowerToHir(model, hirReporter);
+    ModelLoweredToHir lowered = lowerModelToHir(model, elfX86_64Exec(), hirReporter);   // the pipeline's gates
+    auto hir = std::move(lowered.hir);
     DiagnosticReporter mirReporter;
+    if (!lowered.lowersToMir) {   // the build stops here, and so does the fixture
+        return Lowered{
+            .model       = std::move(model),
+            .hir         = std::move(hir),
+            .hirReporter = std::move(hirReporter),
+            .mir         = mirNotEntered(),
+            .mirReporter = std::move(mirReporter),
+        };
+    }
     MirLoweringConfig mirCfg = languageMirLoweringConfig(*schema);   // the pipeline's assembly
     mirCfg.symbolIdSpace = MirSymbolIdSpace::endingAt(   // the unit's name table, as the driver states it
         static_cast<std::uint32_t>(model.symbols().size()));
@@ -17092,21 +17197,38 @@ TEST(MirLoweringC, ScalarTernaryStillJoinsWithAPhi) {
 // The refusal now lives in `coerceCondition`, the ONE function every controlling-
 // expression site funnels through, so all six contexts close with one arm. This
 // pin walks them all — a per-site fix would pass on `if` and fail on `for`.
+//
+// P69 L2b2 (ruling 575): each row is read at the tier the PIPELINE stops at. A `&&` operand is
+// a value, so the ANALYSIS refuses the void one itself (C 6.3.2.2) and the pipeline's gates stop
+// the unit before HIR — ✔MEASURED 2026-11-13 through the CLI (compile-and-keep, macos-arm64-debug,
+// x86_64:elf64-x86_64-linux-exec, probe l2b2g6 g6a): `error[S_TypeMismatch]` "an expression of
+// type `void` has no value to use (C 6.3.2.2)" at the operand. Every other row reaches the HIR
+// tier's `coerceCondition`.
 TEST(MirLoweringC, AVoidControllingExpressionIsRefusedWithAPositionedDiagnostic) {
-    struct Row { char const* body; char const* what; };
+    struct Row {
+        char const* body;
+        char const* what;
+        bool        byTheAnalysis;   // the model's refusal; else the HIR tier's
+        char const* says;
+    };
     for (Row const r : {
-             Row{"if (g()) { }\n",          "if"},
-             Row{"while (g()) { }\n",       "while"},
-             Row{"do { } while (g());\n",   "do-while"},
-             Row{"for (; g(); ) { }\n",     "for"},
-             Row{"int x = g() ? 1 : 2; (void)x;\n", "the ternary CONDITION"},
-             Row{"int y = g() && 1; (void)y;\n",    "a logical connective"}}) {
+             Row{"if (g()) { }\n",          "if",       false, "controlling expression"},
+             Row{"while (g()) { }\n",       "while",    false, "controlling expression"},
+             Row{"do { } while (g());\n",   "do-while", false, "controlling expression"},
+             Row{"for (; g(); ) { }\n",     "for",      false, "controlling expression"},
+             Row{"int x = g() ? 1 : 2; (void)x;\n", "the ternary CONDITION", false,
+                 "controlling expression"},
+             Row{"int y = g() && 1; (void)y;\n",    "a logical connective", true,
+                 "has no value to use"}}) {
         auto L = lowerC(std::string{"void g(void) { }\n"}
                         + "void f(void) { " + r.body + " }\n");
+        EXPECT_EQ(L.hir == nullptr, r.byTheAnalysis)
+            << r.what << ": the pipeline stops at the analysis exactly when the analysis refuses";
+        DiagnosticReporter const& tier = r.byTheAnalysis ? L.model.diagnostics() : L.hirReporter;
         bool positioned = false;
-        for (auto const& d : L.hirReporter.all()) {
+        for (auto const& d : tier.all()) {
             if (d.code == DiagnosticCode::S_TypeMismatch
-                && d.actual.find("controlling expression") != std::string::npos) {
+                && d.actual.find(r.says) != std::string::npos) {
                 positioned = true;
             }
         }
@@ -18361,11 +18483,16 @@ TEST(MirLoweringC, OnlyAConstNonVolatileObjectsValueFolds) {
 // runs 20260926-161013-cfcd4fdb, -161017-be070270 and -161024-bd368135 on gcc 13.2.0 mingw-w64,
 // gcc 13.3.0, clang 18.1.3 and MSVC 19.51. Each refused case below is refused by all four, and
 // each folded one is built by gcc and mingw-w64, which fold a const, non-volatile object's
-// volatile MEMBER (lane `cs`'s `.temp/probe/f7`). This tier decides it from any input: the
-// semantic tier's refusal of the first cases is not what keeps them from folding here.
+// volatile MEMBER (lane `cs`'s `.temp/probe/f7`). In C the ANALYSIS refuses each refused case
+// first (`validateStaticInitializer` asks the same rule: "a volatile object"), and the pipeline's
+// gates stop the unit there, before the resolver (P69 L2b2, ruling 575; ✔MEASURED 2026-11-13
+// through the CLI, probe l2b2g6 g6b-g6d: S_StaticInitializerNotConstant). So the RESOLVER's own
+// answer is read where it is the one that decides: the language whose static objects may be
+// initialized at run time (the c document without its static-initializer rule) — there the
+// value is not folded, it is read at run time.
 // RED-ON-DISABLE: read the top-level volatility again (the array, 2-D, array-of-structures and
-// typedef'd-element cases fold); refuse on a volatile member on the way down (the member cases
-// stop folding).
+// typedef'd-element cases fold in that language); refuse on a volatile member on the way down
+// (the member cases stop folding).
 TEST(MirLoweringC, AnObjectIsVolatileThroughItsArraySpineForTheResolverToo) {
     for (char const* src : {
              "static const volatile int cva[2] = { 1, 42 };\nint x = cva[1];\n",
@@ -18375,11 +18502,16 @@ TEST(MirLoweringC, AnObjectIsVolatileThroughItsArraySpineForTheResolverToo) {
              "static const volatile struct { int v; } s = { 42 };\nint x = s.v;\n",
          }) {
         auto L = lowerC(src);
-        EXPECT_EQ(initOfGlobalNamed(L, "x"), nullptr) << src << ": a volatile object's value folded";
-        EXPECT_FALSE(hasRuntimeInitializer(L, "x")) << src;
-        EXPECT_EQ(dss::test_support::countCode(L.mirReporter,
-                                               DiagnosticCode::H_StaticInitializerNotFolded), 1u)
-            << src;
+        EXPECT_EQ(dss::test_support::countCode(L.model.diagnostics(),
+                                               DiagnosticCode::S_StaticInitializerNotConstant), 1u)
+            << src << ": C's analysis refuses the volatile read";
+        EXPECT_FALSE(L.mir.ok) << src << ": MIR is never entered";
+        auto U = lowerC(src, "x86_64", "sysv_amd64", DataModel::Lp64, LongDoubleFormat::None, {},
+                        /*staticInitializersMustFold=*/false);
+        ASSERT_TRUE(U.mir.ok) << src << ": "
+            << (U.mirReporter.all().empty() ? "" : U.mirReporter.all()[0].actual);
+        EXPECT_EQ(initOfGlobalNamed(U, "x"), nullptr) << src << ": a volatile object's value folded";
+        EXPECT_TRUE(hasRuntimeInitializer(U, "x")) << src << ": the value is read at run time";
     }
     for (char const* src : {
              "static const struct { volatile int v; } cs = { 42 };\nint x = cs.v;\n",
@@ -18439,10 +18571,16 @@ TEST(MirLoweringC, ANullBasedAddressInANarrowerIntegerFoldsToItsValue) {
 TEST(MirLoweringC, AnUnfoldedStaticInitializerIsRefusedHereNotByTheImageProducer) {
     std::string const src = "int a = 1;\nint b = a;\n";
     {
+        // P69 L2b2: C's ANALYSIS proves this one not constant and refuses it, and the
+        // pipeline's gates stop the unit there — so it never reaches the module initializer,
+        // and the MIR tier's refusal is the backstop for what the analysis cannot prove.
         auto L = lowerC(src);
+        EXPECT_EQ(dss::test_support::countCode(L.model.diagnostics(),
+                                               DiagnosticCode::S_StaticInitializerNotConstant), 1u);
         EXPECT_FALSE(hasRuntimeInitializer(L, "b")) << "no runtime initializer under the constraint";
         EXPECT_EQ(dss::test_support::countCode(L.mirReporter,
-                                               DiagnosticCode::H_StaticInitializerNotFolded), 1u);
+                                               DiagnosticCode::H_StaticInitializerNotFolded), 0u)
+            << "MIR is never entered";
         EXPECT_FALSE(L.mir.ok);
     }
     {
@@ -18598,27 +18736,27 @@ namespace {
 TEST(MirLoweringC, VaCopyCopiesTheListObjectNeverAPointerToIt) {
     char const* local =
         "int f(int n, ...) {\n"
-        "  va_list a, b;\n"
-        "  va_start(a, n);\n"
-        "  va_copy(b, a);\n"
-        "  va_end(b);\n"
-        "  va_end(a);\n"
+        "  __builtin_va_list a, b;\n"
+        "  __builtin_va_start(a, n);\n"
+        "  __builtin_va_copy(b, a);\n"
+        "  __builtin_va_end(b);\n"
+        "  __builtin_va_end(a);\n"
         "  return n;\n"
         "}\n";
     char const* param =
-        "int g(va_list ap) {\n"
-        "  va_list c;\n"
-        "  va_copy(c, ap);\n"
-        "  va_end(c);\n"
+        "int g(__builtin_va_list ap) {\n"
+        "  __builtin_va_list c;\n"
+        "  __builtin_va_copy(c, ap);\n"
+        "  __builtin_va_end(c);\n"
         "  return 0;\n"
         "}\n";
     char const* intoParam =
-        "int h(va_list d, int n, ...) {\n"
-        "  va_list s;\n"
-        "  va_start(s, n);\n"
-        "  va_copy(d, s);\n"
-        "  va_end(d);\n"
-        "  va_end(s);\n"
+        "int h(__builtin_va_list d, int n, ...) {\n"
+        "  __builtin_va_list s;\n"
+        "  __builtin_va_start(s, n);\n"
+        "  __builtin_va_copy(d, s);\n"
+        "  __builtin_va_end(d);\n"
+        "  __builtin_va_end(s);\n"
         "  return n;\n"
         "}\n";
     for (char const* src : {local, param, intoParam}) {
@@ -18661,14 +18799,14 @@ TEST(MirLoweringC, AVaListReachedThroughItsDecayedPointerIsReadThroughThePointer
         char const* decayed;
     };
     Pair const pairs[] = {
-        {"int f(int n, ...) { va_list a; va_start(a, n); int x = va_arg(a, int);\n"
-         "  va_end(a); return x; }\n",
-         "int f(int n, ...) { va_list a; va_start(a, n); __typeof__(&a[0]) p = a;\n"
-         "  int x = va_arg(p, int); va_end(a); return x; }\n"},
-        {"int f(int n, ...) { va_list a, b; va_start(a, n); va_copy(b, a);\n"
-         "  va_end(b); va_end(a); return n; }\n",
-         "int f(int n, ...) { va_list a, b; va_start(a, n); __typeof__(&a[0]) p = a;\n"
-         "  va_copy(b, p); va_end(b); va_end(a); return n; }\n"},
+        {"int f(int n, ...) { __builtin_va_list a; __builtin_va_start(a, n); int x = __builtin_va_arg(a, int);\n"
+         "  __builtin_va_end(a); return x; }\n",
+         "int f(int n, ...) { __builtin_va_list a; __builtin_va_start(a, n); __typeof__(&a[0]) p = a;\n"
+         "  int x = __builtin_va_arg(p, int); __builtin_va_end(a); return x; }\n"},
+        {"int f(int n, ...) { __builtin_va_list a, b; __builtin_va_start(a, n); __builtin_va_copy(b, a);\n"
+         "  __builtin_va_end(b); __builtin_va_end(a); return n; }\n",
+         "int f(int n, ...) { __builtin_va_list a, b; __builtin_va_start(a, n); __typeof__(&a[0]) p = a;\n"
+         "  __builtin_va_copy(b, p); __builtin_va_end(b); __builtin_va_end(a); return n; }\n"},
     };
     for (Pair const& pr : pairs) {
         auto D = lowerC(pr.direct);   // x86_64 SysV
@@ -18686,8 +18824,8 @@ TEST(MirLoweringC, AVaListReachedThroughItsDecayedPointerIsReadThroughThePointer
             << "the decayed list is read through p's VALUE, one pointer load\n" << pr.decayed;
     }
     auto C = lowerC(
-        "int f(int k, ...) { va_list a, b, c; va_start(a, k); va_copy(k ? b : c, a);\n"
-        "  int x = va_arg(k ? b : c, int); va_end(k ? b : c); va_end(a); return x; }\n");
+        "int f(int k, ...) { __builtin_va_list a, b, c; __builtin_va_start(a, k); __builtin_va_copy(k ? b : c, a);\n"
+        "  int x = __builtin_va_arg(k ? b : c, int); __builtin_va_end(k ? b : c); __builtin_va_end(a); return x; }\n");
     ASSERT_FALSE(C.model.hasErrors());
     EXPECT_TRUE(C.mir.ok) << (C.mirReporter.all().empty() ? "" : C.mirReporter.all()[0].actual);
 }
@@ -18736,11 +18874,11 @@ namespace {
 
 TEST(MirLoweringC, VaCopyIntoADecayedListCopiesTheTagItPointsAt) {
     char const* direct =
-        "int f(int n, ...) { va_list a, b; va_start(a, n); va_copy(b, a);\n"
-        "  va_end(b); va_end(a); return n; }\n";
+        "int f(int n, ...) { __builtin_va_list a, b; __builtin_va_start(a, n); __builtin_va_copy(b, a);\n"
+        "  __builtin_va_end(b); __builtin_va_end(a); return n; }\n";
     char const* decayed =
-        "int f(int n, ...) { va_list a, b; va_start(a, n); __typeof__(&b[0]) p = b;\n"
-        "  va_copy(p, a); va_end(b); va_end(a); return n; }\n";
+        "int f(int n, ...) { __builtin_va_list a, b; __builtin_va_start(a, n); __typeof__(&b[0]) p = b;\n"
+        "  __builtin_va_copy(p, a); __builtin_va_end(b); __builtin_va_end(a); return n; }\n";
     auto D = lowerC(direct);   // x86_64 SysV
     auto P = lowerC(decayed);
     for (char const* src : {direct, decayed}) {
@@ -18798,15 +18936,15 @@ namespace {
 
 TEST(MirLoweringC, ADecayedListParameterIsAnOrdinaryPointerNeverTheTagsOwnAddress) {
     char const* decayedParam =
-        "int walk(__typeof__(&((va_list *)0)[0][0]) p, int n) {\n"
+        "int walk(__typeof__(&((__builtin_va_list *)0)[0][0]) p, int n) {\n"
         "  int s = 0;\n"
-        "  for (int i = 0; i < n; ++i) s += va_arg(p, int);\n"
+        "  for (int i = 0; i < n; ++i) s += __builtin_va_arg(p, int);\n"
         "  return s;\n"
         "}\n";
     char const* arrayParam =
-        "int walk(va_list p, int n) {\n"
+        "int walk(__builtin_va_list p, int n) {\n"
         "  int s = 0;\n"
-        "  for (int i = 0; i < n; ++i) s += va_arg(p, int);\n"
+        "  for (int i = 0; i < n; ++i) s += __builtin_va_arg(p, int);\n"
         "  return s;\n"
         "}\n";
     for (char const* src : {decayedParam, arrayParam}) {
@@ -18831,8 +18969,8 @@ TEST(MirLoweringC, ADecayedListParameterIsAnOrdinaryPointerNeverTheTagsOwnAddres
 // at either position — the check va_start's and va_end's operands get.
 TEST(MirLoweringC, VaCopyRefusesAnOperandThatIsNotAVaList) {
     for (char const* src : {
-             "int f(int n, ...) { va_list a; int x = 0; va_start(a, n); va_copy(x, a); va_end(a); return x; }\n",
-             "int f(int n, ...) { va_list a; int x = 0; va_start(a, n); va_copy(a, x); va_end(a); return x; }\n",
+             "int f(int n, ...) { __builtin_va_list a; int x = 0; __builtin_va_start(a, n); __builtin_va_copy(x, a); __builtin_va_end(a); return x; }\n",
+             "int f(int n, ...) { __builtin_va_list a; int x = 0; __builtin_va_start(a, n); __builtin_va_copy(a, x); __builtin_va_end(a); return x; }\n",
          }) {
         auto L = lowerC(src);
         EXPECT_TRUE(L.model.hasErrors()) << src;
@@ -18869,18 +19007,31 @@ TEST(MirLoweringC, ABlockScopeConstObjectsValueFoldsIntoAStaticInitializer) {
         EXPECT_EQ(intOf(*lit), std::optional<std::int64_t>{42}) << src;
         EXPECT_FALSE(hasRuntimeInitializer(L, "x")) << src;
     }
-    // What every reference refuses (probe r1: r1g, r1f, r1e) folds nothing HERE either — this
-    // tier decides it from any input, not because the semantic tier refused the last two first.
-    for (char const* src : {
-             "int f(int n) { const int k = n; static int x = k; return x; }\n",
-             "int f(void) { int k = 42; static int x = k; return x; }\n",
-             "int f(void) { const volatile int k = 42; static int x = k; return x; }\n",
+    // What every reference refuses (probe r1: r1g, r1f, r1e) folds nothing. The ANALYSIS proves the
+    // last two not constant (a non-const object's value, a volatile object's) and the pipeline's
+    // gates stop the unit there (P69 L2b2, ruling 575); the first — a const object whose
+    // initializer is visible — is the fold's question, and the resolver refuses it. ✔MEASURED
+    // 2026-11-13 through the CLI (probe l2b2g6 g6e-g6g): S_StaticInitializerNotConstant,
+    // S_StaticInitializerNotConstant, H_StaticInitializerNotFolded.
+    struct Refused {
+        char const* src;
+        bool        byTheAnalysis;
+    };
+    for (Refused const r : {
+             Refused{"int f(int n) { const int k = n; static int x = k; return x; }\n", false},
+             Refused{"int f(void) { int k = 42; static int x = k; return x; }\n", true},
+             Refused{"int f(void) { const volatile int k = 42; static int x = k; return x; }\n", true},
          }) {
-        auto L = lowerC(src);
-        EXPECT_EQ(initOfGlobalNamed(L, "x"), nullptr) << src << ": a non-constant read folded";
+        auto L = lowerC(r.src);
+        EXPECT_EQ(initOfGlobalNamed(L, "x"), nullptr) << r.src << ": a non-constant read folded";
+        EXPECT_EQ(dss::test_support::countCode(L.model.diagnostics(),
+                                               DiagnosticCode::S_StaticInitializerNotConstant),
+                  r.byTheAnalysis ? 1u : 0u)
+            << r.src;
         EXPECT_EQ(dss::test_support::countCode(L.mirReporter,
-                                               DiagnosticCode::H_StaticInitializerNotFolded), 1u)
-            << src;
+                                               DiagnosticCode::H_StaticInitializerNotFolded),
+                  r.byTheAnalysis ? 0u : 1u)
+            << r.src;
     }
 }
 
@@ -19275,6 +19426,35 @@ TEST(MirLoweringC, ALongDoubleNanCarriesItsPayloadInItsOwnFormat) {
         EXPECT_EQ(wq->pack().lo, row.lo) << row.target << " " << row.spelled;
         EXPECT_EQ(wq->pack().hi, row.hi) << row.target << " " << row.spelled;
     }
+}
+
+// ★ P69 L2b2 (lane `lm`): A MODEL THAT HOLDS AN UNRESOLVED TYPE IS REFUSED, NEVER ABORTED.
+// ArrayRvalueValueReadDecaysNeverLoads's source with the list type NOT in scope — `va_list` with no header, which C 7.16
+// declares only in <stdarg.h> — is the program's own unknown name: the driver refuses it with
+// S_UnknownType and lowers nothing (✔MEASURED 2026-11-05, compile-and-keep on the Mac leg's
+// dsscp, SysV ELF). This harness used to lower past the semantic tier, and the same model then
+// ABORTED the whole binary in-process in the MIR tier (✔MEASURED 2026-11-05, host run
+// 20261105-194136-d2e3e46a, and 2026-11-13, host run 20261113-211922-9a805016: every one of the
+// HIR tier's positions returned — HirLoweringCUnresolvedType — and the binary died after this
+// case's `[ RUN ]`). The fixture now keeps the pipeline's gates (`lowerModelToHir`): the model's
+// error stops the unit before HIR, so no later tier is entered on it, as in the build. Its suite
+// is the file's LAST to be registered, so it runs last and an abort cannot take another case's
+// verdict with it. RED-ON-DISABLE: the model gate dropped → HIR, then MIR, entered again.
+TEST(MirLoweringCUnresolvedType, AModelHoldingAnUnresolvedTypeIsRefusedNeverAborted) {
+    auto L = lowerC(
+        "void take(va_list ap) { }\n"
+        "struct S { int pad; va_list ap; };\n"
+        "va_list gv;\n"
+        "void f(struct S *s, va_list *pp) {\n"
+        "    take(gv);\n"
+        "    take(s->ap);\n"
+        "    take(*pp);\n"
+        "}\n");
+    EXPECT_GE(dss::test_support::countCode(L.model.diagnostics(), DiagnosticCode::S_UnknownType), 1u)
+        << "`va_list` with no header in scope is the program's own unknown name";
+    EXPECT_EQ(L.hir, nullptr) << "the model's error stops the unit before HIR";
+    EXPECT_FALSE(L.mir.ok) << "MIR is never entered";
+    EXPECT_TRUE(L.mirReporter.all().empty()) << "MIR is never entered";
 }
 
 // The `_p` predicates are the checked arithmetic with NO store: a runtime call compares the exact

@@ -198,6 +198,53 @@ GrammarSchema::GrammarSchema(detail::GrammarSchemaData&& d) noexcept : d_(std::m
         }
     }
 
+    // ── P69 L2b2 (lane `lm`): THE TYPE-NAME TRIAGE'S STATIC HALF ──────────
+    // ONE load-time home for what the triage's two base askers — the early base ask
+    // and the same ask hoisted before a probe opens — need to know before they may
+    // read the type child's base as a token (`CompiledRule::typeBaseAskable`), and
+    // for the entry run that puts the type child at a fixed grammar-token offset
+    // (`CompiledRule::typeChildLeadRun`). Read off the sealed table: a linear walk
+    // of each guarded rule's entry run, no recursion; it names no token, rule or
+    // language beyond the engine's built-in Identifier kind, the kind every
+    // identifier token carries.
+    {
+        SchemaTokenId const identifier =
+            d_.schemaTokens ? d_.schemaTokens->find("Identifier") : SchemaTokenId{};
+        auto const firstHoldsIdentifier = [&](RuleId attr) {
+            if (!attr.valid() || attr.v >= compiledDense_.size() || !identifier.valid()) return false;
+            auto const& set = compiledDense_[attr.v].firstSet;
+            return std::any_of(set.begin(), set.end(),
+                               [&](SchemaTokenId t) { return t.v == identifier.v; });
+        };
+        bool const anAttributeStartsWithAName =
+            firstHoldsIdentifier(d_.semantics.attrSpecRule)
+            || firstHoldsIdentifier(d_.semantics.stdAttrRule);
+        for (auto& rule : compiledDense_) {
+            rule.typeBaseAskable = false;
+            rule.typeChildLeads  = false;
+            rule.typeChildLeadRun.clear();
+            RuleId const typeRule = rule.typeNameCommitRule;
+            if (!typeRule.valid()) continue;
+            bool const typeRuleNullable =
+                typeRule.v < compiledDense_.size() && compiledDense_[typeRule.v].nullable;
+            rule.typeBaseAskable = !typeRuleNullable && !anAttributeStartsWithAName;
+            if (rule.entryPos == 0 || rule.entryPos >= rule.positions.size()) continue;
+            std::vector<std::uint32_t> run;
+            std::uint32_t at = rule.entryPos;
+            while (at < rule.positions.size()
+                   && rule.positions[at].slotKind() == SlotKind::TokenLeaf) {
+                run.push_back(at);
+                at = rule.positions[at].nextPos();
+            }
+            if (at < rule.positions.size()
+                && rule.positions[at].slotKind() == SlotKind::RuleLeaf
+                && rule.positions[at].ruleId().v == typeRule.v) {
+                rule.typeChildLeads   = true;
+                rule.typeChildLeadRun = std::move(run);
+            }
+        }
+    }
+
     // ── longest-match probe index ─────────────────────────────────────
     // D-PERF-TOK-LONGEST-MATCH-PROBES-EVERY-DECLARED-LENGTH-AT-EVERY-POSITION.
     // Derived HERE, in the same sealing pass and for the same reason as the
@@ -878,9 +925,34 @@ GrammarSchema::typeNameCommitPolarity(RuleId rule) const noexcept {
     return r->typeNameCommitPolarity;
 }
 
+bool GrammarSchema::typeBaseAskable(RuleId rule) const noexcept {
+    auto const* r = ruleRow(rule.v);
+    return r != nullptr && r->typeBaseAskable;
+}
+
+std::optional<std::size_t> GrammarSchema::typeChildLeadRunLength(RuleId rule) const noexcept {
+    auto const* r = ruleRow(rule.v);
+    if (r == nullptr || !r->typeChildLeads) return std::nullopt;
+    return r->typeChildLeadRun.size();
+}
+
+bool GrammarSchema::typeChildLeadRunAdmits(RuleId rule, std::size_t i,
+                                           SchemaTokenId tok) const noexcept {
+    auto const* r = ruleRow(rule.v);
+    if (r == nullptr || !r->typeChildLeads || i >= r->typeChildLeadRun.size()) return false;
+    std::uint32_t const pos = r->typeChildLeadRun[i];
+    return pos < r->positions.size()
+        && detail::tokenBitsContain(r->positions[pos].expectedBits(), tok.v);
+}
+
 bool GrammarSchema::commitAfterPrefix(RuleId rule) const noexcept {
     auto const* r = ruleRow(rule.v);
     return r != nullptr && r->commitAfterPrefix;
+}
+
+bool GrammarSchema::isValueReading(RuleId rule) const noexcept {
+    auto const* r = ruleRow(rule.v);
+    return r != nullptr && r->valueReading;
 }
 
 std::span<SchemaTokenId const> GrammarSchema::notFollowedBy(RuleId rule) const noexcept {

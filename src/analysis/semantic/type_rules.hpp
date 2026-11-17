@@ -1706,9 +1706,9 @@ indexContainerOperand(TypeInterner const& interner, TypeId base,
 }
 
 // `Index` (`a[b]`): the element type of whichever operand is the container.
-// Ambiguous / Neither → InvalidType (cascade-suppress; the CST→HIR tier refuses
-// loud at the site that still knows the SOURCE construct, which is why this law
-// stays a pure derivation and reports nothing itself).
+// Ambiguous / Neither → InvalidType (cascade-suppress; the constraint itself is
+// `subscriptConstraintOf` below, which both tiers ask and report, which is why this
+// law stays a pure derivation and reports nothing itself).
 //
 // ⚠ BOTH operand types are required. Passing only the base was the defect: it
 // assumed the base is the pointer instead of ASKING which operand is, and BOTH
@@ -1730,6 +1730,65 @@ indexResultType(TypeInterner const& interner, TypeId base,
             break;
     }
     return InvalidType;
+}
+
+// ══ THE SUBSCRIPT CONSTRAINT (C 6.5.3.2p1): ONE LAW, ASKED BY BOTH TIERS ════════
+// (P69 L2b2, lane `lm`) One operand of `E1[E2]` shall be a pointer to a complete
+// object type and the other shall have integer type. The tiers used to split it: the
+// CST→HIR lowering JUDGED it, at a subscript it lowers, while the semantic typer
+// above only DERIVES the element and answers InvalidType for a pair that breaks it.
+// So an UNEVALUATED subscript — which no lowering reaches: `sizeof(s[0])`,
+// `__typeof__(i[0])`, a `_Generic` controlling expression — was judged by NO tier,
+// and a later tier's internal refusal stood in for the user's error. ✔MEASURED
+// 2026-11-05 (probes l2b2t, SysV x86-64 and AAPCS64 ELF): gcc 13.3.0, clang 18.1.3,
+// cl 19.51 and Apple clang refuse a struct and an int subscripted inside `sizeof` and
+// `__typeof__` at the subscript; DSS answered "sizeof value-operand was not typed by
+// the semantic analyzer" / H_TypeUnresolved.
+// The verdict names the CONTAINER (the operand `indexResultType` takes the element
+// of; Ambiguous / Neither when there is none) and, when the pair breaks the
+// constraint, the WORDS — one text both tiers report, so a subscript the analysis
+// and the lowering both judge reads as ONE diagnostic. An operand that is already
+// InvalidType is a fault reported earlier: no words (cascade suppression). The other
+// half — "the other shall have INTEGER type" — is judged only where the lattice
+// PROVES it is not one (`isDefinitelyNotIndexInteger`, and why).
+inline constexpr std::string_view kSubscriptBothContainers =
+    "both operands of a subscript are pointers or arrays; C 6.5.3.2p1 requires one "
+    "operand to be a pointer to a complete object type and the OTHER to have integer "
+    "type (either spelling — `p[i]` and `i[p]` are the same expression)";
+inline constexpr std::string_view kSubscriptNoContainer =
+    "neither operand of a subscript is a pointer or an array; C 6.5.3.2p1 requires "
+    "one operand to be a pointer to a complete object type and the OTHER to have "
+    "integer type (either spelling — `p[i]` and `i[p]` are the same expression)";
+inline constexpr std::string_view kSubscriptIndexNotInteger =
+    "the operand of a subscript that is not the pointer must have integer type "
+    "(C 6.5.3.2p1); gcc 13.3.0 and clang 18.1.3 both refuse this with \"array "
+    "subscript is not an integer\"";
+struct SubscriptConstraintVerdict {
+    IndexContainerOperand container = IndexContainerOperand::Neither;
+    std::string_view      refusal;   // empty: nothing to report
+};
+[[nodiscard]] inline SubscriptConstraintVerdict
+subscriptConstraintOf(TypeInterner const& interner, TypeId base,
+                      TypeId subscript) noexcept {
+    SubscriptConstraintVerdict v{indexContainerOperand(interner, base, subscript), {}};
+    switch (v.container) {
+        case IndexContainerOperand::Ambiguous:
+        case IndexContainerOperand::Neither:
+            if (base.valid() && subscript.valid())
+                v.refusal = v.container == IndexContainerOperand::Ambiguous
+                                ? kSubscriptBothContainers
+                                : kSubscriptNoContainer;
+            break;
+        case IndexContainerOperand::Base:
+            if (isDefinitelyNotIndexInteger(interner, subscript))
+                v.refusal = kSubscriptIndexNotInteger;
+            break;
+        case IndexContainerOperand::Subscript:
+            if (isDefinitelyNotIndexInteger(interner, base))
+                v.refusal = kSubscriptIndexNotInteger;
+            break;
+    }
+    return v;
 }
 
 // C 6.3.2.1p3 ARRAY-TO-POINTER DECAY, as a lattice law: an `Array<T,N>` in a

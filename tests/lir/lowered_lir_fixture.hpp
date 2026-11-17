@@ -18,8 +18,10 @@
 #include "hir/lowering/cst_to_hir.hpp"
 #include "lir/lir.hpp"
 #include "lir/lowering/mir_to_lir.hpp"
+#include "link/object_format_schema.hpp"
 #include "mir/lowering/hir_to_mir.hpp"
 #include "mir/mir.hpp"
+#include "program/model_to_hir.hpp"   // lowerModelToHir — the pipeline's gates
 
 #include <gtest/gtest.h>
 
@@ -28,7 +30,9 @@
 #include <cstdlib>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace dss::test_support {
@@ -144,7 +148,10 @@ lirFuncInstCount(Lir const& lir, LirFuncId f) {
 // survived it.
 inline void enforceLoweringExpectation(LoweredLir const& out,
                                        LoweringExpectation expect) {
-    bool const refused = out.hirReporter.hasErrors() || !out.hir->ok ||
+    // P69 L2b2: the fixture keeps the pipeline's gates (`lowerModelToHir`), so a model with an
+    // error has NO HIR (and no MIR or LIR) — that unit is refused at the analysis.
+    bool const refused = out.model.hasErrors() || out.hir == nullptr ||
+                         out.hirReporter.hasErrors() || !out.hir->ok ||
                          out.mirReporter.hasErrors() || !out.mir.ok ||
                          out.lirReporter.hasErrors() || !out.lir.ok;
 
@@ -163,12 +170,14 @@ inline void enforceLoweringExpectation(LoweredLir const& out,
         ADD_FAILURE()
             << "lowerCToLir: A TIER REFUSED THIS SOURCE AND THE PIN IS "
                "ASSERTING OVER WHAT SURVIVED THE REFUSAL.\n"
-               "  hir.ok=" << out.hir->ok
+               "  model errors=" << out.model.diagnostics().errorCount()
+            << " | hir.ok=" << (out.hir != nullptr && out.hir->ok)
             << " errors=" << out.hirReporter.errorCount()
             << " | mir.ok=" << out.mir.ok
             << " errors=" << out.mirReporter.errorCount()
             << " | lir.ok=" << out.lir.ok
             << " errors=" << out.lirReporter.errorCount()
+            << renderTierErrors("model", out.model.diagnostics())
             << renderTierErrors("hir", out.hirReporter)
             << renderTierErrors("mir", out.mirReporter)
             << renderTierErrors("lir", out.lirReporter)
@@ -264,9 +273,35 @@ lowerCToLir(std::string src, std::shared_ptr<TargetSchema> target,
     auto model = analyze(cu, DiagnosticBudget::libraryDefault(),
                          DataModel::Lp64, std::nullopt, vaStrategy, std::nullopt,
                          std::nullopt, longDoubleFormat, target.get());
+    // The target's ELF document: the format the unit is built for.
+    std::string_view const arch = target->name();
+    char const* const formatName = arch == "x86_64" ? "elf64-x86_64-linux-exec"
+                                   : arch == "arm64" ? "elf64-aarch64-linux-exec"
+                                                     : nullptr;
+    // A miss THROWS (`no_abort_in_tests_guard`): GoogleTest reports it as a failure of the one test.
+    if (formatName == nullptr) {
+        throw std::runtime_error("lowerCToLir: no ELF document for target '" + std::string{arch} + "'");
+    }
+    auto const format = ObjectFormatSchema::loadShipped(formatName);
+    if (!format) {
+        throw std::runtime_error(std::string{"lowerCToLir: ObjectFormatSchema::loadShipped("} + formatName
+                                 + ") failed");
+    }
     DiagnosticReporter hirReporter;
-    auto hir = lowerToHir(model, hirReporter);
+    ModelLoweredToHir lowered = lowerModelToHir(model, **format, hirReporter);   // the pipeline's gates
+    auto hir = std::move(lowered.hir);
     DiagnosticReporter mirReporter;
+    if (!lowered.lowersToMir) {   // the build stops here, and so does the fixture: MIR and LIR never entered
+        HirToMirResult mir;
+        mir.ok = false;
+        MirToLirResult lir;
+        lir.ok = false;
+        LoweredLir out{std::move(model), std::move(hir), std::move(hirReporter),
+                       std::move(mir), std::move(mirReporter), std::move(target),
+                       DiagnosticReporter{}, std::move(lir)};
+        fixture_detail::enforceLoweringExpectation(out, expect);
+        return out;
+    }
     // The LANGUAGE's policy, through the ONE assembly `compile_pipeline.cpp` uses
     // (`languageMirLoweringConfig`) — the static-initializer constraint and its constant forms
     // among it. ⚠ P68 round 13 (fold F7): this fixture assembled the config by hand and read

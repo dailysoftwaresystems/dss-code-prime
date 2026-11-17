@@ -6256,6 +6256,10 @@ namespace {
     return doc;
 }
 
+// POSITIONAL ON PURPOSE (P69 L2b2, lane `lm`): a pin naming a row of a SHIPPED array
+// names it by its key (`shipped_row_pointer.hpp`), because a row added before it moves
+// it. This is the LOADER's own answer for the one-row document `nonVoidEndRuleDoc`
+// writes above: no shipped array, no second row, nothing that can move.
 constexpr std::string_view kNonVoidEndRulePointer =
     "/semantics/declarations/0/nonVoidFunctionEndReached";
 }  // namespace

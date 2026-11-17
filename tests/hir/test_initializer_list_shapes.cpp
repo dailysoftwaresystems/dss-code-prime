@@ -125,7 +125,6 @@ using Inspect = std::function<void(SemanticModel const&, CstToHirResult const&)>
 [[nodiscard]] Lowered lowerC(std::string src, Inspect const& inspect = {}) {
     auto const loaded = dss::test_support::shippedSchemaOrThrow("c");
     UnitBuilder builder{loaded, DiagnosticBudget::libraryDefault()};
-    builder.addSystemDir(dss::test::configRoot() / "shippedLibs");   // `#include <stddef.h>`
     builder.setActiveFormat(ObjectFormatKind::Elf);
     builder.addInMemory(std::move(src), "<mem>");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());

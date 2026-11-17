@@ -175,8 +175,132 @@ TEST(TreeBuilder, ScopeStackCapturedOnDiagnostic) {
     });
     ASSERT_NE(it, diags.end());
     ASSERT_EQ(it->scopeStack.size(), 2u);
-    EXPECT_EQ(it->scopeStack[0], ScopeKind::Block);
-    EXPECT_EQ(it->scopeStack[1], ScopeKind::Paren);
+    EXPECT_EQ(it->scopeStack.kinds(), (std::vector<ScopeKind>{ScopeKind::Block, ScopeKind::Paren}));
+}
+
+// ── P69 L2b2 (lane `lm`): A DIAGNOSTIC'S SCOPE STACK IS A HANDLE, TAKEN IN O(1) ──
+//
+// The builder copied its whole scope stack into every diagnostic, and a probe nest's refuted
+// alternatives raise diagnostics at every level, so the nest cost the builder Θ(depth²)
+// (✔MEASURED by the climbed probe nests of test_parser_speculation_refusal_cost.cpp, which pin the
+// cost). A diagnostic holds a `ScopeTrail` now (scope_trail.hpp): the top's node in the builder's
+// append-only chain and the depth. The three pins below hold what that must keep true.
+
+// A probe's refuted branch pushes and pops scopes and raises diagnostics, and is rolled back: the
+// top the next diagnostic's trail is read from is where it was, the same handle, and the branch's
+// diagnostics are gone with it.
+// RED-ON-DISABLE: a trail whose top is the chain's NEWEST node — a head kept beside the stack, which
+// the rollback does not restore — reads the refuted branch's last scope.
+TEST(TreeBuilder, ARolledBackProbesDiagnosticsLeaveTheScopeTrailWhereItWas) {
+    auto h = Harness::make("@ @ @");
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
+    {
+        auto root = b.open(h.schema->rules().find("root"));
+        b.pushScope(ScopeKind::Block);
+        ScopeTrail const before = b.scopeStack();
+        {
+            auto cp = b.checkpoint();
+            b.pushScope(ScopeKind::Paren);
+            b.pushToken(h.tok("@", 0, CoreTokenKind::Operator));   // raised under Block > Paren
+            b.popScope();
+            b.pushScope(ScopeKind::Bracket);
+            b.pushToken(h.tok("@", 2, CoreTokenKind::Operator));   // raised under Block > Bracket
+            b.rollback(std::move(cp));
+        }
+        ASSERT_TRUE(b.scopeStack().isSameTrail(before))
+            << "after the rollback the stack's trail is not the one the checkpoint saw: its top "
+               "is the refuted branch's";
+        EXPECT_EQ(b.scopeStack().kinds(), std::vector<ScopeKind>{ScopeKind::Block});
+        b.pushToken(h.tok("@", 4, CoreTokenKind::Operator));       // kept, under Block
+        b.popScope();
+    }
+    Tree t = std::move(b).finish();
+    auto const diags = t.diagnostics().all();
+    ASSERT_EQ(countCode(diags, DiagnosticCode::P_UnknownToken), 1u)
+        << "the refuted branch's diagnostics survived its rollback";
+    auto const it = std::ranges::find_if(diags, [](ParseDiagnostic const& d) {
+        return d.code == DiagnosticCode::P_UnknownToken;
+    });
+    EXPECT_EQ(it->scopeStack.kinds(), std::vector<ScopeKind>{ScopeKind::Block})
+        << "the diagnostic raised after the rollback reads a scope of the refuted branch";
+}
+
+// A kept diagnostic renders the stack of the moment it was raised, whatever is pushed and popped
+// after it: the scope it was raised under is popped and another pushed at the same depth.
+// RED-ON-DISABLE: a chain that reuses a popped scope's node for the next push at its depth (a chain
+// shaped like the stack) — the first diagnostic then reads the later scope.
+TEST(TreeBuilder, AKeptDiagnosticRendersItsFullStackAfterLaterPushesAndPops) {
+    auto h = Harness::make("@ @");
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
+    {
+        auto root = b.open(h.schema->rules().find("root"));
+        b.pushScope(ScopeKind::Block);
+        b.pushScope(ScopeKind::Paren);
+        b.pushToken(h.tok("@", 0, CoreTokenKind::Operator));   // kept: Block > Paren
+        b.popScope();
+        b.pushScope(ScopeKind::Bracket);                       // where Paren was
+        b.pushScope(ScopeKind::Generic);
+        b.pushToken(h.tok("@", 2, CoreTokenKind::Operator));   // kept: Block > Bracket > Generic
+        b.popScope();
+        b.popScope();
+        b.popScope();
+    }
+    Tree t = std::move(b).finish();
+    std::vector<ParseDiagnostic> unknown;
+    for (ParseDiagnostic const& d : t.diagnostics().all()) {
+        if (d.code == DiagnosticCode::P_UnknownToken) unknown.push_back(d);
+    }
+    ASSERT_EQ(unknown.size(), 2u);
+    std::ranges::sort(unknown, {}, [](ParseDiagnostic const& d) { return d.span.start(); });
+    EXPECT_EQ(unknown[0].scopeStack.kinds(), (std::vector<ScopeKind>{ScopeKind::Block, ScopeKind::Paren}))
+        << "the first diagnostic reads a scope pushed after it was raised";
+    EXPECT_EQ(unknown[1].scopeStack.kinds(),
+              (std::vector<ScopeKind>{ScopeKind::Block, ScopeKind::Bracket, ScopeKind::Generic}));
+    BufferRegistry bufs;
+    bufs.add(h.src);
+    EXPECT_NE(t.diagnostics().format(unknown[0], bufs).find("scope: Block > Paren\n"), std::string::npos)
+        << t.diagnostics().format(unknown[0], bufs);
+}
+
+// A finished tree's diagnostics keep only the scope nodes they read: the builder's chain holds the
+// nodes its live stack, its kept diagnostics and its handed-out trails can read (P69 L2b2: pinned in
+// tests/core/test_scope_chain_marks.cpp), and the trails that outlive it are re-homed at `finish`
+// into a chain of their own nodes — two trails sharing a bottom share its node there too. The loop's
+// stacks are handed out (`scopeStack()`), so their nodes stay in the builder's chain though no
+// diagnostic reads them: the re-homing is what leaves them behind.
+// RED-ON-DISABLE: no re-homing at `finish` — the kept trails hold the whole chain alive.
+TEST(TreeBuilder, AFinishedTreesDiagnosticsKeepOnlyTheScopeNodesTheyRead) {
+    auto h = Harness::make("@ @");
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
+    {
+        auto root = b.open(h.schema->rules().find("root"));
+        for (int i = 0; i < 8; ++i) {   // scopes no diagnostic is raised under, each stack handed out
+            b.pushScope(ScopeKind::Paren);
+            b.pushScope(ScopeKind::Bracket);
+            (void)b.scopeStack();   // P69 L2b2: the held watermark keeps these nodes in the builder's chain
+            b.popScope();
+            b.popScope();
+        }
+        ASSERT_EQ(b.scopeChainSize(), 16u) << "the handed-out stacks' nodes left the builder's chain";
+        b.pushScope(ScopeKind::Block);
+        b.pushScope(ScopeKind::Paren);
+        b.pushToken(h.tok("@", 0, CoreTokenKind::Operator));   // reads Block, Paren
+        b.popScope();
+        b.pushScope(ScopeKind::Bracket);
+        b.pushToken(h.tok("@", 2, CoreTokenKind::Operator));   // reads Block, Bracket
+        b.popScope();
+        b.popScope();
+    }
+    Tree t = std::move(b).finish();
+    std::size_t seen = 0;
+    for (ParseDiagnostic const& d : t.diagnostics().all()) {
+        if (d.code != DiagnosticCode::P_UnknownToken) continue;
+        ++seen;
+        EXPECT_EQ(d.scopeStack.chainSize(), 3u)
+            << "a kept trail holds " << d.scopeStack.chainSize()
+            << " scope nodes alive; it reads 2, and the two kept trails 3 (Block shared)";
+    }
+    EXPECT_EQ(seen, 2u);
 }
 
 // ── (c) Premature EOF synthesizes Missing + per-frame diagnostic ───────
@@ -566,7 +690,7 @@ TEST(TreeBuilder, ARolledBackErroredFrameRestoresTheScopeStackAndTheCheckStaysAr
     TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
     auto root = b.open(h.schema->rules().find("root"));
     b.pushToken(h.tok("{", 0, CoreTokenKind::Operator));   // root's own scope
-    std::vector<ScopeKind> const before(b.scopeStack().begin(), b.scopeStack().end());
+    std::vector<ScopeKind> const before = b.scopeStack().kinds();
     ASSERT_EQ(before.size(), 1u);
 
     auto cp = b.checkpoint();
@@ -578,7 +702,7 @@ TEST(TreeBuilder, ARolledBackErroredFrameRestoresTheScopeStackAndTheCheckStaysAr
     }                                            // ...and closes its `(` with it
     EXPECT_EQ(b.scopeStack().size(), 1u);
     b.rollback(std::move(cp));                   // the branch is refuted
-    EXPECT_EQ(std::vector<ScopeKind>(b.scopeStack().begin(), b.scopeStack().end()), before)
+    EXPECT_EQ(b.scopeStack().kinds(), before)
         << "a rollback restores the scope stack the checkpoint saw";
 
     b.pushToken(h.tok("}"));                     // root's own closer
@@ -1307,7 +1431,7 @@ TEST(TreeBuilderIngest, PreservesScopeStackVerbatim) {
     ASSERT_NE(it, all.end()) << "ingested diagnostic missing from the Tree";
     ASSERT_EQ(it->scopeStack.size(), 1u)
         << "scope stack was clobbered (likely routed through emitDiagnostic_)";
-    EXPECT_EQ(it->scopeStack[0], ScopeKind::Generic);
+    EXPECT_EQ(it->scopeStack.kinds(), std::vector<ScopeKind>{ScopeKind::Generic});
 }
 
 TEST(TreeBuilderIngest, EmptySpanDiagnosticReachesTheTree) {
@@ -1485,8 +1609,7 @@ TEST(TreeBuilder, ARollbackAcrossAPushedAndPoppedScopeRestoresTheScopeKindCounts
         b.pushScope(ScopeKind::Bracket);   // a kind first seen inside the rolled-back branch
         b.rollback(std::move(cp));
     }
-    EXPECT_EQ(std::vector<ScopeKind>(b.scopeStack().begin(), b.scopeStack().end()),
-              std::vector<ScopeKind>{ScopeKind::Block});
+    EXPECT_EQ(b.scopeStack().kinds(), std::vector<ScopeKind>{ScopeKind::Block});
     b.pushToken(h.tok("#", 2, CoreTokenKind::Operator));          // Hash: Paren closed again
     b.pushToken(h.tok("!", 3, CoreTokenKind::Operator));          // Bang: Bracket closed again
     b.pushScope(ScopeKind::Paren);

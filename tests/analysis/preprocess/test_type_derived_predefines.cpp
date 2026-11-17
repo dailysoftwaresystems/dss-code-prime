@@ -419,7 +419,6 @@ struct IntFacts {
 [[nodiscard]] std::string errorsOf(TargetSchema const& target, ObjectFormatSchema const& format,
                                    std::string source) {
     UnitBuilder builder{cLanguage(), DiagnosticBudget::libraryDefault()};
-    applySystemDirs(builder, *cLanguage());
     applyTargetFormatPair(builder, target, format);
     builder.addInMemory(std::move(source), "probe.c");
     auto const cu = std::make_shared<CompilationUnit const>(std::move(builder).finish());

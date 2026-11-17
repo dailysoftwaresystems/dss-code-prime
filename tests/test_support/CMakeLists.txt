@@ -101,3 +101,19 @@ dss_add_test(NAME test_support/test_coverage_boundary
 # pinned here, where an arm can reach it: no corpus runner can be an arm's runner.
 dss_add_test(NAME test_support/test_forbidden_diagnostics
              SOURCES test_forbidden_diagnostics.cpp)
+# P69 L2b2 (lane `lm`): `shipped_row_pointer.hpp` is the ONE home of "a test names a
+# row of a shipped document by its key, never its position" — the vocabulary pins
+# probe a shipped document at a pointer, and an index there moved under them each
+# time a row landed before it. Each selector form is pinned in both directions: the
+# row it names, and the throw where it names none or two.
+dss_add_test(NAME test_support/test_shipped_row_pointer
+             SOURCES test_shipped_row_pointer.cpp)
+target_link_libraries(dss_test_support_test_shipped_row_pointer
+                      PRIVATE nlohmann_json::nlohmann_json)
+# P69 L2b2 (lane `lm`): the fixture home's own pin — `dss_test_driver_diagnostics`
+# (tests/CMakeLists.txt) on the production `UnitFinishedObservers`: a finished unit is
+# heard, an unasked driver Error fails the test that built it, an asked one does not,
+# and an asked code no unit carried fails too. Linked like every test, through
+# `dss_add_test`, so it asks the library every binary gets.
+dss_add_test(NAME test_support/test_driver_diagnostics_listener
+             SOURCES test_driver_diagnostics_listener.cpp)

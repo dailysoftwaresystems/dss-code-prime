@@ -28,6 +28,7 @@
 #include "scoped_env.hpp"                             // DSS_CONFIG_ROOT: a scratch config root
 #include "os_link.hpp"                            // links made by the OS: MinGW's library makes none
 #include "shipped_read_pairs.hpp"                 // the real pairs a REAL descriptor is read on
+#include "validation_va_list_binding.hpp"   // the descriptor word a validation read binds (c82)
 
 #include <gtest/gtest.h>
 
@@ -1905,7 +1906,8 @@ TEST(ShippedLibDescriptor, RealDescriptorsCarryTheirDarwinLinkNames) {
         DiagnosticReporter rep;
         auto const desc = readShippedLibDescriptor(p, interner, typeReg, rep,
                                                    DataModel::Lp64, arch,
-                                                   ObjectFormatKind::MachO);
+                                                   ObjectFormatKind::MachO,
+                                                   dss::test_support::validationVaListBinding(interner));
         if (!desc.has_value()) {
             ADD_FAILURE() << descriptor << " failed to read for arch " << arch;
             return "<unreadable>";
@@ -3682,22 +3684,101 @@ TEST(ShippedLibDescriptor, MissingHeaderFailsLoud) {
                   rep, DiagnosticCode::F_ShippedLibDescriptorMalformed), 0u);
 }
 
-// c82 (D-FFI-DESCRIPTOR-VA-LIST-TYPE): the SysV `va_list` named-type binding
-// production threads into every shipped-descriptor read (stdio.json's
-// vfprintf spells `va_list`). Tests reading SHIPPED files bind it the same
-// way — the exact `__va_list_tag[1]` mint the analyzer's SysVRegisterSave
-// arm produces. Returns the storage by value; the caller keeps it alive
-// across the read.
-[[nodiscard]] std::array<NamedTypeBinding, 1>
-sysvVaListBinding(TypeInterner& interner) {
-    TypeId const voidPtr =
-        interner.pointer(interner.primitive(TypeKind::Void));
-    std::array<TypeId, 4> tagFields{
-        interner.primitive(TypeKind::U32), interner.primitive(TypeKind::U32),
-        voidPtr, voidPtr};
-    TypeId const vaListTy =
-        interner.array(interner.structType("__va_list_tag", tagFields), 1);
-    return {NamedTypeBinding{"va_list", vaListTy}};
+// ══ THE DESCRIPTOR WORD, READ WITH NO BINDING ═══════════════════════════════════
+// (P69 L2b2; c82's contract, D-FFI-DESCRIPTOR-VA-LIST-TYPE, read from the other side)
+// The descriptor word `va_list` names no type of its own: it resolves ONLY through the
+// binding the read's caller passes. A read that reaches it with none is REFUSED, and the
+// refusal NAMES the binding the read lacks — the decoder's own "unknown type" cannot (it
+// is content-blind by design), and a reader that eagerly decodes another header's
+// typedefs can reach the word from a read that never spelled it.
+// Four cells: no binding (refused, naming it); a binding of the word to no valid type
+// (no binding, the same refusal); a valid binding (decodes, the word IS the bound type);
+// a NEIGHBOUR of the word (`va_listx`, unknown, no binding) — refused by the decoder
+// alone, since only the word itself, as a whole identifier, is the binding's.
+// RED-ON-DISABLE: never refuse a failed decode by name, and the first two cells carry
+// the decoder's "unknown type" alone; take a substring of the text for the word, and the
+// neighbour cell is named too; take a binding with no valid type for one, and the second
+// cell decodes nothing yet names nothing.
+TEST(ShippedLibDescriptor, ADescriptorWordReadWithNoBindingFailsLoudNamingTheBinding) {
+    ScratchDir dir{Location::Temp, "shipped-lib-descriptor-word"};
+    auto const descFor = [&](std::string const& file, std::string const& word) {
+        return writeTemp(dir, file, R"({
+        "header": "wordy.h",
+        "library": { "pe": "msvcrt.dll", "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
+        "typedefs": [ { "name": "my_list", "type": ")" + word + R"(" } ],
+        "symbols": [
+            { "name": "vwordy", "signature": "fn(ptr<char>, )" + word + R"() -> i32",
+              "kind": "function", "linkage": "external" }
+        ]
+    })");
+    };
+    auto const word      = descFor("wordy.json", std::string{ffi::kVaListDescriptorTypeName});
+    auto const neighbour = descFor("neighbour.json", std::string{ffi::kVaListDescriptorTypeName} + "x");
+    auto const dump = [](DiagnosticReporter const& rep) {
+        std::string out;
+        for (auto const& d : rep.all()) out += "\n    " + d.actual;
+        return out;
+    };
+    auto const namingTheBinding = [](DiagnosticReporter const& rep) {
+        std::size_t n = 0;
+        for (auto const& d : rep.all()) {
+            if (d.code == DiagnosticCode::F_ShippedLibUnsupportedType
+                && d.actual.find("names the descriptor word 'va_list'") != std::string::npos
+                && d.actual.find("bound no type to it") != std::string::npos)
+                ++n;
+        }
+        return n;
+    };
+    auto const read = [](fs::path const& p, TypeInterner& interner, TypeRegistry& typeReg,
+                         DiagnosticReporter& rep, std::span<NamedTypeBinding const> named) {
+        return readShippedLibDescriptor(p, interner, typeReg, rep, DataModel::Lp64,
+                                        std::string_view{"x86_64"}, ObjectFormatKind::Elf, named);
+    };
+    {   // no binding: refused, and the refusal names the binding the read lacks
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto const desc = read(word, interner, typeReg, rep, {});
+        EXPECT_FALSE(desc.has_value());
+        EXPECT_GE(namingTheBinding(rep), 1u)
+            << "a read with no binding must name the binding it lacks; it said:" << dump(rep);
+    }
+    {   // a binding of the word to no valid type is no binding
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        std::array<NamedTypeBinding, 1> const unbound{
+            NamedTypeBinding{ffi::kVaListDescriptorTypeName, InvalidType}};
+        auto const desc = read(word, interner, typeReg, rep, unbound);
+        EXPECT_FALSE(desc.has_value());
+        EXPECT_GE(namingTheBinding(rep), 1u)
+            << "a binding of the word with no valid type is no binding; it said:" << dump(rep);
+    }
+    {   // bound: decodes, and the word is the bound type in both positions
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto const bound = dss::test_support::validationVaListBinding(interner);
+        auto const desc  = read(word, interner, typeReg, rep, bound);
+        ASSERT_TRUE(desc.has_value()) << dump(rep);
+        EXPECT_FALSE(rep.hasErrors()) << dump(rep);
+        ShippedTypedef const* myList = nullptr;
+        for (auto const& t : desc->typedefs) {
+            if (t.name == "my_list") myList = &t;
+        }
+        ASSERT_NE(myList, nullptr);
+        EXPECT_EQ(myList->type, bound[0].type);
+    }
+    {   // the word's NEIGHBOUR is no word: refused by the decoder alone
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto const desc = read(neighbour, interner, typeReg, rep, {});
+        EXPECT_FALSE(desc.has_value());
+        EXPECT_GT(rep.errorCount(), 0u);
+        EXPECT_EQ(namingTheBinding(rep), 0u)
+            << "only the word itself, as a whole identifier, is the binding's; it said:" << dump(rep);
+    }
 }
 
 // The shipped descriptor dir, resolved through the ONE test-side resolver
@@ -4094,7 +4175,7 @@ TEST(ShippedLibDescriptor, RealTimeStructTmPerFormatLayout) {
         DiagnosticReporter rep;
         auto desc = readShippedLibDescriptor(timePath, interner, typeReg, rep,
                                              DataModel::Lp64, std::string_view{"x86_64"},
-                                             fmt);
+                                             fmt, dss::test_support::validationVaListBinding(interner));
         EXPECT_TRUE(desc.has_value());
         EXPECT_FALSE(rep.hasErrors());
         if (!desc.has_value()) return 0;
@@ -4504,7 +4585,7 @@ TEST(ShippedLibDescriptor, AllShippedDescriptorsDecode) {
             DiagnosticReporter rep;
             // c82 (D-FFI-DESCRIPTOR-VA-LIST-TYPE): thread the SysV va_list
             // binding exactly as production does (stdio.json's vfprintf).
-            auto const namedTypes = sysvVaListBinding(interner);
+            auto const namedTypes = dss::test_support::validationVaListBinding(interner);
             ShippedPairFacts const facts = pair.pairFacts();
             auto desc = readShippedLibDescriptor(entry.path(), interner, typeReg, rep,
                                                  pair.dataModel(), pair.activeTarget(),
@@ -4622,7 +4703,7 @@ TEST(ShippedLibDescriptor, ShippedLongPositionsTakeThePairsDataModelArm) {
             TypeInterner interner{CompilationUnitId{1}};
             TypeRegistry typeReg;
             DiagnosticReporter rep;
-            auto const namedTypes = sysvVaListBinding(interner);   // c82
+            auto const namedTypes = dss::test_support::validationVaListBinding(interner);   // c82
             ShippedPairFacts const facts = pair.pairFacts();
             auto desc = readShippedLibDescriptor(
                 root / (std::string(at.lib) + ".json"), interner, typeReg, rep,
@@ -4679,7 +4760,7 @@ TEST(ShippedLibDescriptor, ShippedDwordPositionsAreUnsignedLong) {
     TypeInterner interner{CompilationUnitId{1}};
     TypeRegistry typeReg;
     DiagnosticReporter rep;
-    auto const namedTypes = sysvVaListBinding(interner);
+    auto const namedTypes = dss::test_support::validationVaListBinding(interner);
     ShippedPairFacts const facts = pair->pairFacts();
     auto desc = readShippedLibDescriptor(root / "windows.json", interner, typeReg, rep,
                                          pair->dataModel(), pair->activeTarget(),
@@ -4729,7 +4810,7 @@ TEST(ShippedLibDescriptor, ShippedStdioLibraryMapRoutesPerObjectFormat) {
     TypeInterner interner{CompilationUnitId{1}};
     TypeRegistry typeReg;
     DiagnosticReporter rep;
-    auto const namedTypes = sysvVaListBinding(interner);   // c82: vfprintf's va_list
+    auto const namedTypes = dss::test_support::validationVaListBinding(interner);   // c82: vfprintf's va_list
     // Read on a REAL pair (P68 round 12, S2a-1): the map below is read whole, on
     // any pair, but a compile never reads the descriptor without one.
     auto const* pair = dss::test_support::shippedReadPair("x86_64", ObjectFormatKind::Elf);
@@ -5437,7 +5518,8 @@ TEST(ShippedLibDescriptor, RealSysTypesBsdSpellingGroupPerFormat) {
     auto readFor = [&](std::string_view arch, ObjectFormatKind fmt,
                        Read& out) {
         out.desc = readShippedLibDescriptor(path, out.interner, out.typeReg,
-                                            out.rep, DataModel::Lp64, arch, fmt);
+                                            out.rep, DataModel::Lp64, arch, fmt,
+                                            dss::test_support::validationVaListBinding(out.interner));
         ASSERT_TRUE(out.desc.has_value())
             << "sys/types.json failed to load for arch=" << arch;
         ASSERT_FALSE(out.rep.hasErrors())
@@ -5943,7 +6025,8 @@ static std::optional<ShippedLibDescriptor> decodeShippedFor(
     DiagnosticReporter rep;
     auto desc = readShippedLibDescriptor(p, interner, typeReg, rep,
                                          model,
-                                         std::string_view{"x86_64"}, fmt);
+                                         std::string_view{"x86_64"}, fmt,
+                                         dss::test_support::validationVaListBinding(interner));
     EXPECT_TRUE(desc.has_value()) << p.generic_string();
     EXPECT_FALSE(rep.hasErrors()) << p.generic_string();
     return desc;
@@ -5982,7 +6065,8 @@ TEST(ShippedLibDescriptor, RealStddefWcharPerFormatWidth) {
         }
         DiagnosticReporter rep;
         auto desc = readShippedLibDescriptor(root / "stddef.json", interner, typeReg, rep, model,
-                                             std::string_view{"x86_64"}, fmt, {}, nullptr,
+                                             std::string_view{"x86_64"}, fmt,
+                                             dss::test_support::validationVaListBinding(interner), nullptr,
                                              withPairFacts ? &facts : nullptr);
         EXPECT_TRUE(desc.has_value());
         EXPECT_FALSE(rep.hasErrors());
@@ -6749,7 +6833,7 @@ TEST(ShippedLibDescriptor, EveryShippedSynthesizeTagIsPinnedToItsFamily) {
             TypeInterner interner{CompilationUnitId{1}};
             TypeRegistry typeReg;
             DiagnosticReporter rep;
-            auto const namedTypes = sysvVaListBinding(interner);
+            auto const namedTypes = dss::test_support::validationVaListBinding(interner);
             ShippedPairFacts const facts = pair.pairFacts();
             auto desc = readShippedLibDescriptor(entry.path(), interner, typeReg, rep,
                                                  pair.dataModel(), pair.activeTarget(),
@@ -7021,7 +7105,8 @@ TEST(ShippedLibDescriptor, RealStdlibAtexitPerFormatAvailabilitySplit) {
     auto desc = readShippedLibDescriptor(stdlibPath, interner, typeReg, rep,
                                          DataModel::Lp64,
                                          std::string_view{"x86_64"},
-                                         ObjectFormatKind::Elf);
+                                         ObjectFormatKind::Elf,
+                                         dss::test_support::validationVaListBinding(interner));
     ASSERT_TRUE(desc.has_value());
     ASSERT_FALSE(rep.hasErrors());
 
@@ -7104,7 +7189,7 @@ TEST(ShippedLibDescriptor, ShippedFixedWidthAliasesCarryTheirVocabularyTag) {
             DiagnosticReporter rep;
             // stdio's `vfprintf` needs the SysV va_list binding, exactly as the
             // production reader threads it (c82).
-            auto const namedTypes = sysvVaListBinding(interner);
+            auto const namedTypes = dss::test_support::validationVaListBinding(interner);
             auto desc = readShippedLibDescriptor(
                 root / (std::string{row.lib} + ".json"), interner, typeReg, rep,
                 dm, "x86_64",
@@ -7535,7 +7620,7 @@ static void readDarwinBsdCluster(fs::path const& path, std::string_view arch,
     out.desc = readShippedLibDescriptor(path, out.interner, out.typeReg, out.rep,
                                         fmt == ObjectFormatKind::Pe ? DataModel::Llp64
                                                                     : DataModel::Lp64,
-                                        arch, fmt);
+                                        arch, fmt, dss::test_support::validationVaListBinding(out.interner));
     ASSERT_TRUE(out.desc.has_value())
         << path.generic_string() << " failed to load for arch=" << arch;
     ASSERT_FALSE(out.rep.hasErrors())
@@ -8293,10 +8378,12 @@ TEST(ShippedLibDescriptor, RealTimeAndSysStatShareOneTimespecTypeId) {
     DiagnosticReporter rep;
     auto timeDesc = readShippedLibDescriptor(
         root / "time.json", interner, typeReg, rep, DataModel::Lp64,
-        std::string_view{"arm64"}, ObjectFormatKind::MachO);
+        std::string_view{"arm64"}, ObjectFormatKind::MachO,
+        dss::test_support::validationVaListBinding(interner));
     auto statDesc = readShippedLibDescriptor(
         root / "sys" / "stat.json", interner, typeReg, rep, DataModel::Lp64,
-        std::string_view{"arm64"}, ObjectFormatKind::MachO);
+        std::string_view{"arm64"}, ObjectFormatKind::MachO,
+        dss::test_support::validationVaListBinding(interner));
     ASSERT_TRUE(timeDesc.has_value());
     ASSERT_TRUE(statDesc.has_value());
     EXPECT_FALSE(rep.hasErrors());

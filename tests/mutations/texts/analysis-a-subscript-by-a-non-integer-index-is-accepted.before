@@ -1,0 +1,1 @@
+            if (isDefinitelyNotIndexInteger(interner, subscript))

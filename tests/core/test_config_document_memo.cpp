@@ -136,8 +136,25 @@ namespace {
         num(s.exprMinPrecedence(rule));
         num(s.typeNameCommitRule(rule).v);
         num(static_cast<int>(s.typeNameCommitPolarity(rule)));
+        // P69 L2b2: the triage's static half, the value reading, and the run before the type child
+        // (each token the run's i-th element admits) — every one a load-time answer the parser reads.
+        out += s.typeBaseAskable(rule) ? "a" : "-";
+        out += s.isValueReading(rule) ? "v" : "-";
+        if (auto const run = s.typeChildLeadRunLength(rule)) {
+            out += "R";
+            num(*run);
+            for (std::size_t i = 0; i < *run; ++i) {
+                out += '(';
+                for (std::uint32_t t = 0; t < s.schemaTokens().size() + 1; ++t) {
+                    if (s.typeChildLeadRunAdmits(rule, i, SchemaTokenId{t})) num(t);
+                }
+                out += ')';
+            }
+        }
         out += "N";   // P69: the `notFollowedBy` predicate
         for (auto const t : s.notFollowedBy(rule)) num(t.v);
+        out += "B";   // P69 L2b2: the `followedByFirstOf` predicate
+        for (auto const t : s.followedBy(rule)) num(t.v);
         out += "F";
         for (auto const t : s.firstSetOf(rule)) num(t.v);
         out += "L";

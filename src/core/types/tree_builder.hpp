@@ -7,6 +7,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/schema_walker.hpp"
 #include "core/types/scope_kind.hpp"
+#include "core/types/scope_trail.hpp"
 #include "core/types/source_buffer.hpp"
 #include "core/types/source_span.hpp"
 #include "core/types/speculation_trail.hpp"
@@ -242,7 +243,13 @@ public:
     void pushScope(ScopeKind kind);
     void popScope();    // emits P_BuilderInvariant on underflow
     [[nodiscard]] ScopeKind                   currentScope() const noexcept;
-    [[nodiscard]] std::span<ScopeKind const>  scopeStack()   const noexcept;
+    // The stack as an O(1) handle (`ScopeTrail`, scope_trail.hpp) — the one a diagnostic
+    // raised now would carry; its kinds by `kinds()`. P69 L2b2: the caller may hold it for as
+    // long as it likes; the nodes it reads are kept for it.
+    [[nodiscard]] ScopeTrail                  scopeStack()   const noexcept;
+    // P69 L2b2 (lane `lm`): the nodes the scope chain holds now — the memory a parse's scopes
+    // cost (`ParseResult::scopeChainNodesAtFinish`); see `scopeChain_` for its bound.
+    [[nodiscard]] std::size_t                 scopeChainSize() const noexcept;
     // The builder's own scope work, counted (P69 L2a2, lane `lm`): one unit per token
     // resolution and one per scope-presence question it asks — a deterministic proxy, as the
     // parser's token accesses are for what it reads. Linear in the input for a correct
@@ -391,12 +398,21 @@ private:
     // the input the way depth does, and the reporter's own caps bound it —
     // but "O(1) per checkpoint" was the wrong sentence to leave alone once
     // `maxSpeculationDepth` moved.
+    // ★ P69 L2b2 (lane `lm`): an open scope — its kind, and its node in `scopeChain_`, the
+    // append-only chain a diagnostic's `ScopeTrail` is read from. ONE trailed stack holds both, so
+    // the node a capture reads is the top a rollback restores, by construction: the two cannot
+    // disagree, and there is no second stack to keep in step.
+    struct ScopeEntry {
+        ScopeKind     kind = ScopeKind::None;
+        std::uint32_t node = ScopeChain::kNoNode;
+    };
+
     struct CheckpointSnapshot {
         std::size_t                       nodesSize;
         TrailedStack<NodeId>::Mark        childIndex;
         TrailedStack<NodeId>::Mark        pendingChildren;
         TrailedStack<Frame>::Mark         openFrames;
-        TrailedStack<ScopeKind>::Mark     scopes;
+        TrailedStack<ScopeEntry>::Mark    scopes;
         TrailedStack<std::uint32_t>::Mark scopeKindCounts;
         TrailedSet<std::uint32_t>::Mark   closedCookies;
         TrailedWriteLog<NodeId,
@@ -409,6 +425,10 @@ private:
         std::uint32_t                     nextCookie;
         bool                              maxSpeculationDepthReached;
         DiagnosticReporter::Snapshot      reporterSnap;
+        // P69 L2b2 (lane `lm`): the scope chain's size and the own-trail watermark at the
+        // checkpoint — what a rollback truncates the chain to and restores (`rollbackToId_`).
+        std::size_t                       scopeChainSize;
+        std::size_t                       capturedTrailEnd;
     };
 
     // ── helpers ──
@@ -502,7 +522,41 @@ private:
     TrailedStack<NodeId>                   pendingChildren_;
 
     TrailedStack<Frame>                    open_;        // LIFO open-frame stack
-    TrailedStack<ScopeKind>                scopes_;      // current scope stack
+    TrailedStack<ScopeEntry>               scopes_;      // current scope stack
+    // The scopes trails are read from, a node each (`ScopeEntry::node`): every open scope, and every
+    // scope a trail handed out still reads. Shared with the trails handed out; at `finish` the kept
+    // diagnostics' trails are re-homed into a chain of only the nodes they read
+    // (`ScopeChainCompaction`).
+    //
+    // ★ P69 L2b2 (lane `lm`): A NODE GOES WHEN NOTHING CAN READ IT. The chain used to keep a node
+    // for every scope ever pushed — a rolled-back probe's and a popped scope's alike, reclaimed
+    // only at `finish` (✔MEASURED 2026-11-16: 149,187 nodes at the end of sqlite3.c's parse, its
+    // scope pushes exactly) — where the stack it mirrors is as deep as the nesting. Now:
+    //   * a ROLLBACK drops every node pushed since its checkpoint: every live entry is restored to
+    //     one below them, and every diagnostic raised since is gone with the reporter's truncation
+    //     (forced ones included), so the trails it carried go with it — `capturedTrailEnd_` comes
+    //     back with them;
+    //   * a POP drops the popped scope's node when it is the chain's newest, no trail handed out
+    //     reads it (`capturedTrailEnd_`, `heldTrailEnd_`), and no live checkpoint can restore an
+    //     entry naming it (it was pushed after the innermost one; an outer one's size is never
+    //     larger). Node ids climb up the live stack, so every live entry is below it.
+    // The bound: the live depth, plus the nodes the trails handed out read, plus the nodes a
+    // checkpoint that COMMITTED kept (a scope pushed before it and popped inside it: a labelled
+    // statement's cut, a committed probe that closed an enclosing scope) and those a capture
+    // the reporter's cap or dedup window then dropped still protects — never the probes, never
+    // the scopes pushed and popped. A trail that outlived its node is fatal at its first read
+    // (the push serial, scope_trail.hpp).
+    std::shared_ptr<ScopeChain>            scopeChain_ = std::make_shared<ScopeChain>();
+    // One past the newest node a trail of the builder's OWN diagnostics reads (`captureOwnTrail_`);
+    // a rollback restores it, as the reporter's truncation removes those diagnostics.
+    std::size_t                            capturedTrailEnd_ = 0;
+    // One past the newest node a trail `scopeStack()` handed a caller reads — no rollback recalls
+    // such a trail, so this mark never moves down. `mutable`: the handing out is const.
+    mutable std::size_t                    heldTrailEnd_ = 0;
+    // The O(1) handle: the top's node and the depth, never a copy of the stack.
+    [[nodiscard]] ScopeTrail scopeTrail_() const noexcept;
+    // The trail a diagnostic the builder raises carries: the handle, its nodes marked as read.
+    [[nodiscard]] ScopeTrail captureOwnTrail_() noexcept;
     // P69 L2a2 (lane `lm`): how many scopes of each kind `scopes_` holds — indexed densely, by
     // the order in which the grammar's kinds are first opened (`scopeKindSlot_`) — so a token's
     // scope check asks PRESENCE in O(1) instead of reading the stack. Trailed with `scopes_`:

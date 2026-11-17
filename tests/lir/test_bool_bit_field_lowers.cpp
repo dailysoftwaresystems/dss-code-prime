@@ -29,8 +29,10 @@
 #include "hir/lowering/cst_to_hir.hpp"
 #include "lir/lir.hpp"
 #include "lir/lowering/mir_to_lir.hpp"
+#include "link/object_format_schema.hpp"
 #include "mir/lowering/hir_to_mir.hpp"
 #include "mir/mir.hpp"
+#include "program/model_to_hir.hpp"   // lowerModelToHir — the pipeline's gates
 #include "mir/mir_opcode.hpp"
 #include "shipped_schema_or_throw.hpp"
 
@@ -75,11 +77,29 @@ struct Lowered {
     builder.addInMemory(std::string{program}, "<mem>");
     auto cu    = std::make_shared<CompilationUnit>(std::move(builder).finish());
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
+    // The target's ELF document: the format the unit is built for.
+    std::string const formatName = targetName == "x86_64" ? std::string{"elf64-x86_64-linux-exec"}
+                                   : targetName == "arm64" ? std::string{"elf64-aarch64-linux-exec"}
+                                   : throw std::runtime_error("no ELF document for target " + targetName);
+    auto const format = ObjectFormatSchema::loadShipped(formatName);
+    if (!format) throw std::runtime_error("loadShipped(" + formatName + ") failed");
     DiagnosticReporter hirReporter;
-    auto hir = lowerToHir(model, hirReporter);
+    ModelLoweredToHir lowered = lowerModelToHir(model, **format, hirReporter);   // the pipeline's gates
+    auto hir = std::move(lowered.hir);
     auto target = TargetSchema::loadShipped(targetName);
     if (!target) throw std::runtime_error("loadShipped(" + targetName + ") failed");
     DiagnosticReporter mirReporter;
+    if (!lowered.lowersToMir) {   // the build stops here, and so does the fixture: MIR never entered
+        HirToMirResult notEntered;
+        notEntered.ok = false;
+        return Lowered{
+            .model       = std::move(model),
+            .hir         = std::move(hir),
+            .hirReporter = std::move(hirReporter),
+            .mir         = std::move(notEntered),
+            .mirReporter = std::move(mirReporter),
+        };
+    }
     MirLoweringConfig mirCfg = languageMirLoweringConfig(*loaded);
     mirCfg.symbolIdSpace = MirSymbolIdSpace::endingAt(
         static_cast<std::uint32_t>(model.symbols().size()));

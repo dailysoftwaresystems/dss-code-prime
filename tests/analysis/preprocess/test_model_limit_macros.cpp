@@ -137,7 +137,6 @@ struct Analyzed {
     }
     std::shared_ptr<GrammarSchema const> const grammar = *grammarR;
     UnitBuilder builder{grammar, DiagnosticBudget::libraryDefault()};
-    applySystemDirs(builder, *grammar);
     applyTargetFormatPair(builder, **targetR, **formatR);
     builder.addInMemory(source, "limit.c");
     auto const cu =

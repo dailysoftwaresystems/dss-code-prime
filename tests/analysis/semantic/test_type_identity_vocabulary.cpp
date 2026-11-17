@@ -41,6 +41,7 @@
 #include "core/types/type_name_resolve.hpp"   // resolveLanguageTypeName: each rung is the spelled type
 #include "repo_root.hpp"
 #include "scratch_dir.hpp"
+#include "driver_diagnostics_listener.hpp"   // AskedDriverCodes
 
 #include <nlohmann/json.hpp>
 
@@ -136,7 +137,7 @@ void expectGenericClean(SemanticModel const& m) {
 // first two sources, so an out-of-tree build — whose cwd has no `src/dss-config`
 // in its ancestry — missed on every hop. It THROWS rather than returning `{}`:
 // GoogleTest turns a throw into a failure of the ONE running test, and an empty
-// path here used to propagate SILENTLY through `findShippedLibDir()` below.
+// path here used to propagate SILENTLY into the system-include path.
 [[nodiscard]] std::filesystem::path findShippedSourceConfig() {
     std::filesystem::path const path =
         dss::test::configRoot() / "sources" / "c.lang.json";
@@ -147,18 +148,6 @@ void expectGenericClean(SemanticModel const& m) {
     return path;
 }
 
-// The REAL shipped-descriptor directory (`src/dss-config/shippedLibs`), so a
-// test can drive `#include <stdint.h>` against the descriptors that actually
-// ship rather than a scratch stand-in — the point of the size_t/uint64_t pins is
-// that the SHIPPED spelling resolves to the right vocabulary entry.
-//
-// Asked of the resolver directly instead of being derived by walking two levels
-// UP from the lang.json above: on a miss that derivation produced the RELATIVE
-// path `shippedLibs` from an empty base and handed it to `addSystemDir`, so the
-// system-include path silently pointed at nothing.
-[[nodiscard]] std::filesystem::path findShippedLibDir() {
-    return dss::test::configRoot() / "shippedLibs";
-}
 
 // Analyze through the FULL front end with the shipped descriptors on the system
 // include path — `analyzeC` above never runs `#include`.
@@ -166,7 +155,6 @@ void expectGenericClean(SemanticModel const& m) {
     std::string src, DataModel dm, ObjectFormatKind fmt, std::string_view arch) {
     auto schema = loadShippedSchema("c");
     UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
-    builder.addSystemDir(findShippedLibDir());
     builder.setActiveFormat(fmt);
     builder.addInMemory(std::move(src), "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
@@ -230,6 +218,8 @@ constexpr char const* kFfiWideDescriptorJson = R"JSON({
         << kFfiWideDescriptorJson;
     auto build = [&](auto const& schema) {
         UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
+        dss::test_support::AskedDriverCodes const clearedDirs{dss::DiagnosticCode::C_UnbackedPredefinedMacro};   // no shipped dirs: the language's predefines are unbacked
+        builder.clearSystemDirs();   // the test's own system dirs, not the shipped ones
         builder.addSystemDir(sysDir.path());
         builder.setActiveFormat(ax.fmt);
         builder.addInMemory(mainSrc, "main.c");

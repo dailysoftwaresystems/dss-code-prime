@@ -212,7 +212,7 @@ using dss::ffi_test::FixtureRoleResolver;
     // stand-in works — the checker compares TypeIds and every descriptor is
     // handed the same binding.
     std::array<NamedTypeBinding, 1> const named{
-        NamedTypeBinding{"va_list",
+        NamedTypeBinding{dss::ffi::kVaListDescriptorTypeName,
                          interner.pointer(interner.primitive(TypeKind::Void))}};
     // (C) needs no language vocabulary: it compares realizations, not type
     // spellings. An empty vocabulary disables (B) only, which is pinned by the

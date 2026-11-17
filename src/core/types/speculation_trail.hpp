@@ -102,6 +102,17 @@ public:
         std::size_t journal = 0;
     };
 
+    // ★ P69 L2b2 (lane `lm`, the L2b1 review's R1): MOVE-ONLY. A copy hands out every entry and
+    // counted none: `TrailedStack<LiveScope> saved = liveScopes_;` in a snapshot would bring back
+    // the per-probe Θ(depth) copy this type exists to remove, with every owner's work counter
+    // linear. No copy is ever needed (`take` is the hand-off), so none compiles.
+    TrailedStack()                                   = default;
+    TrailedStack(TrailedStack const&)                = delete;
+    TrailedStack& operator=(TrailedStack const&)     = delete;
+    TrailedStack(TrailedStack&&) noexcept            = default;
+    TrailedStack& operator=(TrailedStack&&) noexcept = default;
+    ~TrailedStack()                                  = default;
+
     // ── reads (a drop-in for the vector this replaces) ──
     //
     // ★ P69 L2b1 (lane `lm`, the L2a2 review's A4): EVERY READ PATH COUNTS THE ENTRIES IT HANDS

@@ -1,0 +1,1 @@
+        if (scope.depth > 0 && found.status == HeaderSearchStatus::Unexaminable) {   // the arm: no search is kept

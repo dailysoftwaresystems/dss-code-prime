@@ -1,0 +1,1 @@
+    if (activeTarget.has_value()) key.target = std::string{*activeTarget};

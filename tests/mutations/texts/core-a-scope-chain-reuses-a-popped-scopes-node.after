@@ -1,0 +1,1 @@
+        if (std::uint32_t const at = below == kNoNode ? 0u : below + 1u; at < nodes_.size()) { nodes_[at] = Node{below, kind, nodes_[at].serial, belowSerial}; return at; } nodes_.push_back(Node{below, kind, ++lastSerial_, belowSerial});

@@ -246,6 +246,12 @@ struct Parser::Impl {
     // (`bindDefinitionParamsAtItsBody_`) reads it in O(1) instead of walking the frames.
     static constexpr std::uint32_t      kNoFrameAnchor = ~std::uint32_t{0};
     std::vector<std::uint32_t>          frameAnchors;
+    // P69 L2b2 (lane `lm`, the L2b1 review's D1): parallel to `frameRules` — for each frame, the
+    // sketch's parameter-list mark when it opened (`BinderSketch::paramListMark`). A declarator's
+    // end and a declarator-mode row's close consume the lists noted since their own frame opened:
+    // PARSE order, whatever offsets a macro gave the tokens. Pushed and popped with `frameRules`,
+    // a probe's rollback included.
+    std::vector<std::uint64_t>          frameListMarks;
 
     // Parser-side walker. The builder embeds its own; the two are
     // driven lock-step by the dispatch loop. Divergence is a load-
@@ -330,7 +336,7 @@ struct Parser::Impl {
     // refutation reads) and, when it asked the sketch, the sketch's `version()`
     // at the probe's start (equal versions answer every lookup alike); a later
     // probe of the same key is answered from the record: the candidate fails at
-    // once, the type-name candidate that failure handed out is recorded again,
+    // once, the unknown-name refusal that failure handed out is recorded again,
     // and the site moves on exactly as after an abandoned probe.
     //
     // ✔MEASURED 2026-10-20 (macos-arm64-debug, the shipped ceilings): without
@@ -343,6 +349,7 @@ struct Parser::Impl {
     // (rule, token) fails once now. gcc 13.3.0 and clang 18.1.3 build and run a
     // 30-deep chain.
     std::uint64_t sketchLookups_  = 0;   // the triage's sketch questions, ever
+    std::uint64_t speculationProbes_ = 0;   // P69 L2b2: the probes opened (`ParseResult`)
     std::uint64_t ceilingLatches_ = 0;   // ceilings met (each one, latched or not)
     // The version a failure that asked the sketch nothing is recorded under: it
     // fails whatever the sketch holds.
@@ -361,7 +368,7 @@ struct Parser::Impl {
                  ^ (static_cast<std::size_t>(k.sketchVersion) * 0xC2B2AE3D27D4EB4Full);
         }
     };
-    // The value: the type-name candidate the failure's triage handed out, if any — and, P69
+    // The value: the unknown-name refusal the failure's triage handed out, if any — and, P69
     // L2a (lane `lm`), WHAT OF THE THREE CEILINGS THE FAILURE USED: the deepest speculation
     // nesting and the deepest expression nesting it ATTEMPTED, each relative to its start, and
     // the largest token charge its budget was asked about. A probe that met no ceiling where it
@@ -369,7 +376,11 @@ struct Parser::Impl {
     // THERE by that ceiling, latching it; so the record answers only where all three fit
     // (`recordedFailure_`), and elsewhere the probe runs again.
     struct FailedProbe {
-        std::optional<AmbiguousTypeNameCandidate> candidate;
+        std::optional<UnknownNameRefusal> refusal;
+        // P69 L2b2: the failure was its committed TYPE reading's, on the program
+        // (`SpeculationProbe::failedAsItsCommittedTypeReading`) — replayed, so the site skips its
+        // value readings exactly as the run did.
+        bool        committedTypeReading = false;
         std::size_t relSpeculationPeak = 0;   // deepest open attempted, minus the start depth
         std::size_t relExpressionPeak  = 0;   // deepest expression push attempted, minus the start
         std::size_t peakCharge         = 0;   // the largest charge its budget was asked about
@@ -440,7 +451,7 @@ struct Parser::Impl {
     // watchdog) a parenthesised `__builtin_expect(` chain under `maxSpeculationDepth` 64 parsed
     // 64 levels in 20836 token accesses, 65 in 29661, and did not finish 96 — exponential past the
     // ceiling, linear below it (16383: 45476 at 128).
-    // ★ WHY THIS KEY IS SOUND. A probe's outcome — fail or not, the type-name candidate its
+    // ★ WHY THIS KEY IS SOUND. A probe's outcome — fail or not, the unknown-name refusal its
     // triage hands out, and the first ceiling it meets — is a function of: the tokens from its
     // start (the position), its rule, whether the walker had desynced before it, the binder
     // sketch's answers when it asked them (its version), and the room the three ceilings left it
@@ -469,11 +480,13 @@ struct Parser::Impl {
                  ^ (k.budget * 0xE7037ED1A0B428DBull);
         }
     };
-    // The value: the candidate (as for `failedProbes_`) and the FIRST ceiling hit the probe met —
+    // The value: the refusal (as for `failedProbes_`) and the FIRST ceiling hit the probe met —
     // replayed on a hit, so the latch and the enclosing probe's first hit are what the run made.
+    // P69 L2b2: no commit bit — a failure that met a ceiling is never a committed type reading's
+    // failure (`SpeculationProbe::failedAsItsCommittedTypeReading`).
     struct CeilingRefutation {
-        std::optional<AmbiguousTypeNameCandidate> candidate;
-        SpeculationCapHit                         hit;
+        std::optional<UnknownNameRefusal> refusal;
+        SpeculationCapHit                 hit;
     };
     std::unordered_map<CeilingRefutedKey, CeilingRefutation, CeilingRefutedKeyHash>
         ceilingRefuted_;
@@ -556,9 +569,10 @@ struct Parser::Impl {
     // would have keyed it, never by `kAnySketchVersion` (which would refute it under ANY later
     // sketch, where the nested failure might not recur).
     struct RecordedFailure {
-        std::optional<AmbiguousTypeNameCandidate> candidate;
-        std::optional<SpeculationCapHit>          hit;
-        bool                                      askedTheSketch = false;
+        std::optional<UnknownNameRefusal> refusal;
+        std::optional<SpeculationCapHit>  hit;
+        bool                              askedTheSketch = false;
+        bool                              committedTypeReading = false;
     };
     [[nodiscard]] std::optional<RecordedFailure> recordedFailure_(RuleId branch) {
         std::size_t const budget = probeBudgetNow_();
@@ -574,13 +588,15 @@ struct Parser::Impl {
                                                        speculationDepth + f.relSpeculationPeak);
                     peakExpressionAttempt_  = std::max(peakExpressionAttempt_,
                                                        expressionDepth + f.relExpressionPeak);
-                    return RecordedFailure{f.candidate, std::nullopt, keyedBySketch};
+                    return RecordedFailure{f.refusal, std::nullopt, keyedBySketch,
+                                           f.committedTypeReading};
                 }
             }
             if (auto const it = ceilingRefuted_.find(
                     CeilingRefutedKey{key, speculationDepth, expressionDepth, budget});
                 it != ceilingRefuted_.end())
-                return RecordedFailure{it->second.candidate, it->second.hit, keyedBySketch};
+                return RecordedFailure{it->second.refusal, it->second.hit, keyedBySketch,
+                                       /*committedTypeReading=*/false};
         }
         return std::nullopt;
     }
@@ -655,6 +671,8 @@ struct Parser::Impl {
             .maxSyncScanTokens       = cfg.maxSyncScanTokens,
             .prattWalker             = nullptr,
             .seedGlobalTypeNames     = std::move(cfg.seedGlobalTypeNames),
+            .seedGlobalValueNames    = std::move(cfg.seedGlobalValueNames),
+            .hoistTriageBaseAsk      = cfg.hoistTriageBaseAsk,
           }
         , identifierKind(schema->schemaTokens().find("Identifier"))
         , errorKind(schema->schemaTokens().find("Error"))
@@ -739,6 +757,7 @@ struct Parser::Impl {
         // failed", and the probe would commit a half-built branch. Inside a
         // probe every diagnostic is rolled back anyway.
         if (suppressCascadeUntilSync_ && speculationDepth == 0) return;
+        if (speculationDepth == 0) nameRefusedUnknownNames_(tokens.position());
         ParseDiagnostic d;
         d.code        = code;
         d.severity    = DiagnosticSeverity::Error;
@@ -753,6 +772,39 @@ struct Parser::Impl {
         }
         emitDiag(std::move(d));
     }
+
+    // ★ P69 L2b2 (lane `lm`, rulings 512 / 513 / 516): THE UNKNOWN-NAME REFUSALS, READ. A
+    // refusal (`UnknownNameRefusal`) is a lone name the type-name triage refused as a type because
+    // the binder sketch knows nothing of it — and the sketch knows every name the unit can see
+    // declared: the source's own declarations, the shipped descriptors' typedefs and values, and
+    // the language's predefined and builtin names (`BinderSketch`). So the name is UNDECLARED where
+    // it stands. When the reading the parser took instead then fails at a token the refused probe
+    // had already read — `(U)42`'s `42`, `(U){ 42 }`'s `{`, `(U)x`'s `x`, `(U *)0`'s `)` — the
+    // references name that identifier first and the follower second (✔MEASURED 2026-11-04: gcc
+    // 13.3.0 "'U' undeclared", clang 18.1.3 "use of undeclared identifier", cl C2065, then gcc and
+    // cl "expected ';'"; probe-reference-cc linux host run 20261105-003401-8165f7eb, windows run
+    // 20261105-003419-4b2a8b73), while the later tiers, which would have named it, do not run on a
+    // tree that failed to parse. So each such refusal is reported here, ONCE, S_UndeclaredIdentifier
+    // at the name, before the parse error. Depth 0 only: a probe's diagnostics roll back with it,
+    // and at depth 0 no snapshot can truncate the records an index here names. The reach is
+    // filled where a refusal is handed out (`noteRefusalReach_`, after `SpeculationSite`).
+    void nameRefusedUnknownNames_(std::size_t at) {
+        auto const refusals = sketch.refusals();
+        for (std::size_t i = 0; i < refusals.size(); ++i) {
+            UnknownNameRefusal const& r = refusals[i];
+            if (at < r.fromPos || at > r.reachPos) continue;
+            if (!namedRefusals_.insert(i).second) continue;
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::S_UndeclaredIdentifier;
+            d.severity = DiagnosticSeverity::Error;
+            d.buffer   = src->id();
+            d.span     = r.span;
+            d.actual   = r.name;
+            emitDiag(std::move(d));
+        }
+    }
+    // The refusals already named (`nameRefusedUnknownNames_`), by their index in the sketch.
+    std::unordered_set<std::size_t> namedRefusals_;
 
     // Lookup helper: returns true when `kind` is in the FOLLOW set
     // of the nearest enclosing rule that has a non-empty followSet.
@@ -1110,58 +1162,52 @@ struct Parser::Impl {
         walker.leaveRule(SourceSpan::empty(0), rule);
         frames.back().close();
         frames.pop_back();
+        // The closing frame's own parameter-list mark (P69 L2b2): what its declarator's end or its
+        // row's close consumes is what was noted since it opened.
+        std::uint64_t ownListMark = 0;
         if (!frameRules.empty()) {
             frameRules.pop_back();
             frameAnchors.pop_back();
+            ownListMark = frameListMarks.back();
+            frameListMarks.pop_back();
         }
         if (sketch.enabled()) {
             // The node this frame closed into, when it is one (a frame of an error shape may
-            // leave none): a parameter list's and a declarator-mode row's own start below.
+            // leave none): a parameter list's own, to note it.
             NodeId closedNode{};
-            if (declaratorMode || sketch.isPrototypeParamScopeRule(rule)) {
+            if (sketch.isPrototypeParamScopeRule(rule)) {
                 closedNode = newestVisiblePendingChild_();
                 if (closedNode.valid() && (builder->nodeKind(closedNode) != NodeKind::Internal
                                            || builder->nodeRule(closedNode).v != rule.v))
                     closedNode = NodeId{};
             }
-            recordAtDeclaratorEnd_(rule);
+            recordAtDeclaratorEnd_(rule, ownListMark);
             if (sketch.isScopeRule(rule)) {
                 BinderSketch::ClosedScope const closedScope = sketch.closeScope();
                 // P69 L2a2 (lane `lm`): a parameter list's prototype scope, noted with its
                 // node so the declarator's end can keep a definition's own (see BinderSketch);
-                // P69 L2b1: and with where it starts, which says which declarator and which row
-                // it closed inside. A list with no token declares no name and is not noted.
-                if (sketch.isPrototypeParamScopeRule(rule) && closedNode.valid()) {
-                    SourceSpan const listSpan = builder->nodeSpan(closedNode);
-                    if (!listSpan.isEmpty())
-                        sketch.notePrototypeParamScope(closedScope, closedNode, listSpan.start());
-                }
+                // P69 L2b2: in the order lists close, which says which declarator and which row it
+                // closed inside.
+                if (sketch.isPrototypeParamScopeRule(rule) && closedNode.valid())
+                    sketch.notePrototypeParamScope(closedScope, closedNode);
             }
             for (auto& bn : binderNames) {
                 if (declaratorMode && !liftToEnclosingScope) {
-                    sketch.recordUnlessBoundAtItsDeclarator(std::move(bn.name),
-                                                            bn.isType, bn.span);
+                    sketch.recordUnlessBoundAtItsDeclarator(std::move(bn.name), bn.isType,
+                                                            bn.node);
                     continue;
                 }
-                sketch.record(std::move(bn.name), bn.isType, bn.span,
-                              liftToEnclosingScope);
+                sketch.record(std::move(bn.name), bn.isType, liftToEnclosingScope);
             }
             // P69 L2a2: a declarator-mode row's close ends whatever its declarators kept —
             // a definition's body has opened and bound them by now, or there is none.
-            // P69 L2b1 (lane `lm`, the L2a2 review's A1): only what the row itself holds — the
-            // lists that start at or after the row does. A `param` row of a definition's RETURNED
-            // function type closes after the definition's own list closed and before its body
-            // opens; it ended that list too. A row with no token holds no list; a row whose node
-            // the frame did not leave drops everything, as every row did before.
-            if (declaratorMode) {
-                if (!closedNode.valid()) {
-                    sketch.dropDefinitionParams(0);
-                } else if (SourceSpan const rowSpan = builder->nodeSpan(closedNode);
-                           !rowSpan.isEmpty()) {
-                    sketch.dropDefinitionParams(rowSpan.start());
-                }
-            }
+            // P69 L2b1 (lane `lm`, the L2a2 review's A1): only what the row itself holds. A `param`
+            // row of a definition's RETURNED function type closes after the definition's own list
+            // closed and before its body opens; it ended that list too. P69 L2b2 (the L2b1 review's
+            // D1): "what the row holds" is what was noted since its frame opened — parse order.
+            if (declaratorMode) sketch.dropDefinitionParams(ownListMark);
         }
+        noteTypeChildClosed_(rule);   // P69 L2b2: a certain type name commits its branch
     }
 
     // ★ P69 L2 (lane `lm`): A DECLARATOR-MODE ROW'S NAME IS IN SCOPE FROM THE END OF
@@ -1187,7 +1233,7 @@ struct Parser::Impl {
         return NodeId{};
     }
 
-    void recordAtDeclaratorEnd_(RuleId closed) {
+    void recordAtDeclaratorEnd_(RuleId closed, std::uint64_t declaratorListMark) {
         auto const& dcOpt = schema->semantics().declarators;
         if (!dcOpt.has_value() || closed != dcOpt->declaratorRule || frameRules.empty())
             return;
@@ -1218,19 +1264,17 @@ struct Parser::Impl {
         // definition's body may see — by the predicate the analyzer asks
         // (core/types/prototype_param_scope.hpp); every other list's names died with its scope.
         // P69 L2b1 (lane `lm`, the L2a2 review's A1 and A3): the lists this declarator consumes are
-        // those closed inside it (they start at or after it), and the suffix is the declarator
-        // walk's one answer (`declaratorFnSuffixOf`, the analyzer's and the lowering's question).
-        // A declarator with no token (an abstract parameter's) closed no list inside it.
-        if (SourceSpan const declaratorSpan = builder->nodeSpan(closedNode); !declaratorSpan.isEmpty()) {
-            sketch.keepDefinitionParamsOf(
-                prototypeParamListOf(view, declaratorFnSuffixOf(view, closedNode, dc), dc),
-                declaratorSpan.start());
-        }
+        // those closed inside it, and the suffix is the declarator walk's one answer
+        // (`declaratorFnSuffixOf`, the analyzer's and the lowering's question). P69 L2b2 (the L2b1
+        // review's D1): "inside it" is the lists noted since its frame opened.
+        sketch.keepDefinitionParamsOf(
+            prototypeParamListOf(view, declaratorFnSuffixOf(view, closedNode, dc), dc),
+            declaratorListMark);
         NodeId const nameNode = declaratorNameNode(view, closedNode, dc);
         if (!nameNode.valid()) return;   // abstract — no binding
         SourceSpan const nameSpan = builder->nodeSpan(nameNode);
         sketch.recordAtDeclaratorEnd(std::string{src->slice(nameSpan)}, row->isType,
-                                     nameSpan, sketch.isScopeRule(rowRule));
+                                     sketch.isScopeRule(rowRule), nameNode);
     }
 
     // ── FC2 binder-sketch name extraction ───────────────────────────────
@@ -1315,13 +1359,12 @@ struct Parser::Impl {
     // Legacy rows yield 0 or 1 entries; FC4 declarator-mode rows yield one
     // entry PER named declarator below the carrier child (abstract
     // declarators contribute nothing — a legal outcome).
-    // A binder name plus the source span of its declaring name-token. The
-    // span flows into the sketch binding so the CU oracle can distinguish a
-    // typedef's own defining occurrence from a use (D-CSUBSET-FN-TYPE-TYPEDEF-PAREN-NAME).
+    // A binder name plus its declaring name-token's node: a declarator-mode row's close takes back
+    // the note its declarator's end left on that node (P69 L2b2).
     struct BinderName {
         std::string name;
         bool        isType;
-        SourceSpan  span;
+        NodeId      node;
     };
     [[nodiscard]] std::vector<BinderName>
     extractBinderNames_(BinderSketch::BinderDecl const& decl) const {
@@ -1358,7 +1401,7 @@ struct Parser::Impl {
                 if (!nameNode.valid()) continue;   // abstract — no binding
                 const SourceSpan nameSpan = builder->nodeSpan(nameNode);
                 out.emplace_back(
-                    std::string{src->slice(nameSpan)}, decl.isType, nameSpan);
+                    std::string{src->slice(nameSpan)}, decl.isType, nameNode);
             }
             return out;
         }
@@ -1372,7 +1415,7 @@ struct Parser::Impl {
         }
         const SourceSpan nameSpan = builder->nodeSpan(nameNode);
         out.emplace_back(std::string{src->slice(nameSpan)}, decl.isType,
-                         nameSpan);
+                         nameNode);
         return out;
     }
 
@@ -1456,16 +1499,16 @@ struct Parser::Impl {
     //         parenthesized value parse keep going", derived ENTIRELY
     //         from the operator table — never a hardcoded token list.
     //         When it IS an operator: ROLLBACK to the value reading and
-    //         hand an AmbiguousTypeNameCandidate out via `outCandidate`
-    //         for the compilation unit's cross-file oracle (one-shot
-    //         seeded reparse). The CALLER records it after the probe's
-    //         rollback so it survives (the probe restore would otherwise
-    //         erase it with the rest of the sketch delta).
+    //         hand an UnknownNameRefusal out via `outRefusal`. The
+    //         CALLER records it after the probe's rollback so it
+    //         survives (the probe restore would otherwise erase it with
+    //         the rest of the sketch delta).
     //       * RequireKnownType (C 6.7.6.3p11 — `T (name)` in parameter
     //         position is a parenthesized declarator unless `name` is a
-    //         visible typedef) — NEVER commit on Unknown: always roll
-    //         back AND record the candidate, so a cross-file typedef in
-    //         the guarded position still resolves on the oracle reparse.
+    //         visible typedef; and C's cast, compound literal, sizeof and
+    //         _Alignof, whose undeclared name gcc, clang and cl read as a
+    //         value) — NEVER commit on Unknown: always roll back AND hand
+    //         the refusal out the same way.
     //       Rules 1-3 are polarity-INDEPENDENT: a keyword-led type child
     //       commits always (rule 1 — it cannot be an expression), a
     //       sketch-KNOWN Type commits, a sketch-KNOWN Value rolls back.
@@ -1475,7 +1518,7 @@ struct Parser::Impl {
     // value reading.
     [[nodiscard]] bool typeNameCommitApproved_(
         RuleId branch, RuleId typeRule, TypeNameCommitPolarity polarity,
-        std::optional<AmbiguousTypeNameCandidate>& outCandidate) {
+        std::optional<UnknownNameRefusal>& outRefusal) {
         // The just-built branch subtree is the parent frame's newest
         // pending child (the branch frame closed inside the probe loop).
         const auto pending = builder->currentFramePendingChildren();
@@ -1523,17 +1566,33 @@ struct Parser::Impl {
             }
         }
         return triageApprovesTypeChild_(typeChild, followerKind, polarity,
-                                        outCandidate);
+                                        outRefusal);
     }
 
     // Rules 1-4 (above) on a BUILT type child whose operand begins with
     // `followerKind` (invalid: no operand leaf) — asked at the branch's close
     // (`typeNameCommitApproved_`) and when its operand opens
     // (`askTriageAtTheOperand_`). True: commit.
+    // The BASE of a built type child — its first leaf outside an attribute specifier —
+    // when that leaf is an IDENTIFIER token (a type-vs-value ambiguous base); invalid when
+    // the base cannot be an expression (a keyword, a tag, a qualifier: rule 1 below).
+    // The triage and the commit note (`noteTypeChildClosed_`) read it through here.
+    [[nodiscard]] NodeId typeChildIdentifierBase_(NodeId typeChild) {
+        std::vector<NodeId> typeLeaves;
+        collectLeavesBelow_(typeChild, typeLeaves, /*cap=*/1,
+                            /*skipAttributeSpecifiers=*/true);
+        if (typeLeaves.empty()
+            || builder->nodeKind(typeLeaves[0]) != NodeKind::Token
+            || builder->nodeTokenKind(typeLeaves[0]).v != identifierKind.v) {
+            return NodeId{};
+        }
+        return typeLeaves[0];
+    }
+
     [[nodiscard]] bool triageApprovesTypeChild_(
         NodeId typeChild, SchemaTokenId followerKind,
         TypeNameCommitPolarity polarity,
-        std::optional<AmbiguousTypeNameCandidate>& outCandidate) {
+        std::optional<UnknownNameRefusal>& outRefusal) {
         // Rule 1 — the type-name's BASE cannot be an expression (a keyword
         // base, struct/union/enum tag, const, …) → COMMIT: no value reading
         // competes. The discriminator is the BASE (leftmost) leaf, NOT the
@@ -1550,17 +1609,11 @@ struct Parser::Impl {
         // errors: the rollback re-reads the call, then checkCall reports it.)
         // ★ P69 round 4: the BASE leaf is the first leaf that is not inside an
         // attribute specifier (see `collectLeavesBelow_`).
-        std::vector<NodeId> typeLeaves;
-        collectLeavesBelow_(typeChild, typeLeaves, /*cap=*/1,
-                            /*skipAttributeSpecifiers=*/true);
-        if (typeLeaves.empty()
-            || builder->nodeKind(typeLeaves[0]) != NodeKind::Token
-            || builder->nodeTokenKind(typeLeaves[0]).v != identifierKind.v) {
-            return true;
-        }
+        NodeId const baseLeaf = typeChildIdentifierBase_(typeChild);
+        if (!baseLeaf.valid()) return true;
 
         // Rules 2 + 3 — the sketch knows the name.
-        const SourceSpan nameSpan = builder->nodeSpan(typeLeaves[0]);
+        const SourceSpan nameSpan = builder->nodeSpan(baseLeaf);
         const std::string_view name = src->slice(nameSpan);
         ++sketchLookups_;   // the failed-probe memo keys this probe by the sketch version
         switch (sketch.lookup(name)) {
@@ -1571,10 +1624,9 @@ struct Parser::Impl {
 
         // Rule 4 — unknown name. Strict polarity first (FC4 c1 M4):
         // RequireKnownType never commits an unknown — roll back to the
-        // competing reading and record the candidate so the CU oracle's
-        // seeded reparse gives a cross-file typedef its second chance.
+        // competing reading and hand out the refusal.
         if (polarity == TypeNameCommitPolarity::RequireKnownType) {
-            outCandidate = AmbiguousTypeNameCandidate{
+            outRefusal = UnknownNameRefusal{
                 .name = std::string{name},
                 .span = nameSpan,
             };
@@ -1590,7 +1642,7 @@ struct Parser::Impl {
         if (!followerIsOperator) {
             return true;   // value reading could not continue → commit
         }
-        outCandidate = AmbiguousTypeNameCandidate{
+        outRefusal = UnknownNameRefusal{
             .name = std::string{name},
             .span = nameSpan,
         };
@@ -1615,7 +1667,7 @@ struct Parser::Impl {
     // type rule cannot derive nothing (the token would then be the next element's),
     // and no attribute specifier can start with an identifier (the base is the first
     // leaf outside one). Only rule 3 is answered here. A TYPE (rule 2) is left to the
-    // close, and an unknown name (rule 4, its follower test and its candidate) to the
+    // close, and an unknown name (rule 4, its follower test and its refusal) to the
     // operand's opening (`askTriageAtTheOperand_`) and the close.
     //
     // The close would answer the same. A VALUE binding of the name visible now is
@@ -1624,6 +1676,11 @@ struct Parser::Impl {
     // parameters), which the close no longer sees; or as a value (an enumeration
     // constant), which changes nothing. A tag of the name is never recorded (C 6.2.3:
     // tags are no ordinary identifiers).
+    // P69 L2b2 (lane `lm`): the schema answers the ask's two static conditions ONCE, at load
+    // (`GrammarSchema::typeBaseAskable`: the type rule cannot derive nothing, and no attribute
+    // specifier can start with an identifier), and the hoist below reads the same answer; the
+    // base is the next GRAMMAR token (`peekGrammarToken_`), and the question about it is
+    // `theBaseIsAKnownValue_`'s, the hoist's too.
     void askTriageBaseEarly_(RuleId opened) {
         if (innermostProbe_ == nullptr || specStack.empty()) return;
         SpeculationSite& site = specStack.back();
@@ -1633,22 +1690,69 @@ struct Parser::Impl {
         const RuleId typeRule = schema->typeNameCommitRule(site.branch);
         if (!typeRule.valid() || typeRule.v != opened.v) return;
         probe.markBaseAsked();
-        if (schema->isNullable(typeRule)) return;
-        auto const& sem = schema->semantics();
-        for (RuleId const attr : {sem.attrSpecRule, sem.stdAttrRule}) {
-            if (attr.valid() && schema->firstSetContains(attr, identifierKind)) return;
+        if (!schema->typeBaseAskable(site.branch)) return;
+        if (theBaseIsAKnownValue_(peekGrammarToken_(0), /*countEveryAsk=*/true)) {
+            probe.refuteByTheTriage();
         }
-        for (std::size_t raw = 0;; ++raw) {
-            Token const& t = tokens.peek(raw);
-            if (t.coreKind == CoreTokenKind::Eof) return;
-            if (isTriviaToken(t, *schema)) continue;
-            if (effectiveKind(t, identifierKind, errorKind).v != identifierKind.v) return;
-            ++sketchLookups_;   // the failed-probe memo keys this probe by the sketch
-            if (sketch.lookup(src->slice(t.span)) == BinderSketch::NameKind::Value) {
-                probe.refuteByTheTriage();
-            }
-            return;
+    }
+
+    // ★★ P69 L2b2 (lane `lm`): RULE 3's QUESTION OF ONE TOKEN, ONE HOME FOR BOTH BASE ASKERS — is
+    // `base` an identifier the binder sketch knows as a VALUE? `countEveryAsk`: the early ask
+    // counts every lookup it makes (`sketchLookups_`, by which the failed-probe memo keys a probe
+    // that asked the sketch); the hoist counts only the lookup it ACTS on, so a candidate it lets
+    // through is asked — and counted — by its own probe, exactly as before the hoist.
+    [[nodiscard]] bool theBaseIsAKnownValue_(Token const& base, bool countEveryAsk) {
+        if (base.coreKind == CoreTokenKind::Eof) return false;
+        if (effectiveKind(base, identifierKind, errorKind).v != identifierKind.v) return false;
+        bool const value =
+            sketch.lookup(src->slice(base.span)) == BinderSketch::NameKind::Value;
+        if (countEveryAsk || value) ++sketchLookups_;   // the failed-probe memo keys a probe by it
+        return value;
+    }
+
+    // ★★★ P69 L2b2 (lane `lm`): THE EARLY BASE ASK, ASKED BEFORE THE PROBE OPENS.
+    //
+    // A candidate whose type child is entered after a fixed run of single-token elements
+    // (`GrammarSchema::typeChildLeadRunLength`) has its base at a fixed grammar-token offset, the
+    // run's length s. When the run's tokens are the ones it admits and the base is a name the
+    // sketch knows as a VALUE, the probe would open, consume the run, open the type child's frame,
+    // be refuted there by `askTriageBaseEarly_` and be abandoned at the driver's next loop top —
+    // having recorded no refusal (rule 3 hands none out), committed no type reading, opened no
+    // site and met no ceiling. Asked here, the same question at the same token under the same
+    // sketch costs no probe: it takes the path an abandoned probe takes, the failed-probe memo
+    // replay's (`startNextCandidate_`). ✔MEASURED 2026-11-16 (sqlite3.c on windows-x86_64-release,
+    // the per-rule probe counts): the empty typedef-named declaration's bare form, probed on
+    // every identifier-led statement, failed there 40,224 times, and identVarDecl as often.
+    //
+    // EXACT, and what keeps it exact (the design audit of 2026-11-16, F4, verified each):
+    //   * the sketch's version contract — two moments with the same version answer every lookup
+    //     alike — so a later visit at the same memo key asks the same question and gets the same
+    //     answer, whether or not a memo record stands for it;
+    //   * the two pieces of bookkeeping a refuted probe leaves behind, both read by an ENCLOSING
+    //     probe's failure memo, are left here too: the counted lookup (`theBaseIsAKnownValue_`)
+    //     and the expression-attempt peak that the probe's constructor and destructor raise to the
+    //     current depth;
+    //   * the run's frames bind nothing: neither the candidate nor its type rule is a definition
+    //     body (`BinderSketch::isDefinitionBodyRule`), whose frame binds a definition's parameters
+    //     — the one lookup-visible effect a frame opening has;
+    //   * the run fits the probe's token budget (a probe consuming more would latch the budget
+    //     ceiling, which survives its rollback), and the run's tokens MATCH its leaves (a probe
+    //     failing at the run asks the sketch nothing, which an enclosing probe's memo key reads).
+    // `ParserConfig::hoistTriageBaseAsk` false takes every candidate through its probe: the
+    // identity witness's other side.
+    [[nodiscard]] bool hoistRefutesTheCandidate_(RuleId branch) {
+        if (!config.hoistTriageBaseAsk) return false;
+        if (schema->isExprRule(branch) || !schema->typeBaseAskable(branch)) return false;
+        std::optional<std::size_t> const run = schema->typeChildLeadRunLength(branch);
+        if (!run.has_value() || *run > probeBudgetNow_()) return false;
+        const RuleId typeRule = schema->typeNameCommitRule(branch);
+        if (sketch.isDefinitionBodyRule(branch) || sketch.isDefinitionBodyRule(typeRule)) return false;
+        for (std::size_t i = 0; i < *run; ++i) {
+            if (!schema->typeChildLeadRunAdmits(branch, i, peekSignificantKind(i))) return false;
         }
+        if (!theBaseIsAKnownValue_(peekGrammarToken_(*run), /*countEveryAsk=*/false)) return false;
+        peakExpressionAttempt_ = std::max(peakExpressionAttempt_, expressionDepth);
+        return true;
     }
 
     // ★★ P69 L2 (lane `lm`): THE TRIAGE IS ASKED AGAIN WHEN THE OPERAND OPENS. Rule 4
@@ -1661,7 +1765,7 @@ struct Parser::Impl {
     // — because at every level the cast probe parsed the rest of the chain as its operand
     // before its close rolled it back. Here the four rules run on the built type child
     // through the one function the close runs (`triageApprovesTypeChild_`); a ROLLBACK
-    // refutes the probe and hands the site its candidate, as the close does; a COMMIT is
+    // refutes the probe and hands the site its refusal, as the close does; a COMMIT is
     // left to the close. The operand is dispatched as a rule of the branch's own frame,
     // its first token in that rule's FIRST — so it is the operand's first leaf, the token
     // the close reads — and it is the branch's first child frame after the type child
@@ -1670,19 +1774,16 @@ struct Parser::Impl {
     // The close would answer the same but for a binding the OPERAND makes that is still
     // visible at the close: an enumeration constant of the base's spelling declared in it
     // (`(u)(sizeof(enum { u = 1 }))`) — the close reads a VALUE (rule 3: rollback, no
-    // candidate), this ask an unknown name (rule 4: rollback and a candidate). And an
+    // refusal), this ask an unknown name (rule 4: rollback and a refusal). And an
     // operand that would not have parsed (`(u)()`) never reached the close, which handed
-    // out no candidate. In both the parse is the same — the identity corpus pins the
-    // trees — and the compilation unit's oracle is handed one more candidate.
+    // out no refusal. In both the parse is the same — the identity corpus pins the
+    // trees — and the sketch holds one more refusal: `u` is unknown where it stands.
     void askTriageAtTheOperand_(RuleId operandRule, SchemaTokenId followerKind) {
         if (innermostProbe_ == nullptr || specStack.empty()) return;
         SpeculationSite& site = specStack.back();
         if (site.probe.get() != innermostProbe_ || site.exprBranch) return;
         SpeculationProbe& probe = *site.probe;
-        if (!probe.baseAsked() || probe.operandAsked()
-            || frames.size() != probe.targetDepth() + 1) {
-            return;
-        }
+        if (probe.operandAsked() || frames.size() != probe.targetDepth() + 1) return;
         const RuleId typeRule = schema->typeNameCommitRule(site.branch);
         if (!typeRule.valid() || typeRule.v == operandRule.v) return;
         // The branch's children so far: the type child, then only tokens (its closer).
@@ -1699,13 +1800,59 @@ struct Parser::Impl {
             if (builder->nodeKind(c) == NodeKind::Internal) return;   // not the operand
         }
         if (!typeChild.valid()) return;
+        // P69 L2b2: the operand opens HERE, at the type-name's follower — the end of the
+        // window a refusal of this branch names its identifier in (`noteRefusalReach_`),
+        // whichever ask hands the refusal out.
+        probe.noteOperandPos(tokens.position());
+        if (!probe.baseAsked()) return;
         probe.markOperandAsked();
-        std::optional<AmbiguousTypeNameCandidate> candidate;
+        std::optional<UnknownNameRefusal> refusal;
         if (!triageApprovesTypeChild_(typeChild, followerKind,
                                       schema->typeNameCommitPolarity(site.branch),
-                                      candidate)) {
-            site.rolledBackCandidate = std::move(candidate);
+                                      refusal)) {
+            site.refusal = std::move(refusal);
+            noteRefusalReach_(site);
             probe.refuteByTheTriage();
+        }
+    }
+
+    // ★★ P69 L2b2 (lane `lm`): A CERTAIN TYPE NAME COMMITS ITS READING WHEN ITS TYPE CHILD
+    // CLOSES. A branch whose type child closes with a base that cannot be an expression
+    // (rule 1) or that the sketch knows as a TYPE (rule 2) is the type reading of its
+    // position for good: C reads `( type-name )` as a cast or a compound literal and never as
+    // a parenthesized value, and a statement led by a typedef name as a declaration. The
+    // note is what a FAILURE of the branch later says to its site (`abandonCandidate_` →
+    // `committedFailure`): no VALUE reading after it, and at depth 0 the replay of the
+    // declared-last such branch. ✔MEASURED 2026-11-05 (probes l2b2q / l2b2t, SysV x86-64
+    // vs gcc 13.3.0, clang 18.1.3, cl 19.51): `(int)(v *)0`, `(int)sizeof(v *)`,
+    // `(int)(long)(v *)0`, `(int)(U *)0` — every reference says "expected expression" at the
+    // inner `)` (and names U), where DSS replayed the parenthesized-value reading of `(int)`
+    // and refused `int`; `sizeof((T))` with T a typedef — every reference refuses the cast's
+    // missing operand at the closing `)`, where DSS read `(T)` as a value and COMPILED it. An
+    // unknown base (rule 4) commits nothing here: its value reading stays open, as the
+    // references read an undeclared name.
+    void noteTypeChildClosed_(RuleId closed) {
+        if (innermostProbe_ == nullptr || specStack.empty()) return;
+        SpeculationSite& site = specStack.back();
+        if (site.probe.get() != innermostProbe_ || site.exprBranch) return;
+        SpeculationProbe& probe = *site.probe;
+        if (probe.typeReadingCommitted() || frames.size() != probe.targetDepth() + 1) return;
+        const RuleId typeRule = schema->typeNameCommitRule(site.branch);
+        if (!typeRule.valid() || typeRule.v != closed.v) return;
+        NodeId const typeChild = newestVisiblePendingChild_();
+        if (!typeChild.valid() || builder->nodeKind(typeChild) != NodeKind::Internal
+            || builder->nodeRule(typeChild).v != typeRule.v) {
+            return;
+        }
+        NodeId const baseLeaf = typeChildIdentifierBase_(typeChild);
+        if (!baseLeaf.valid()) {               // rule 1
+            probe.commitTypeReading();
+            return;
+        }
+        ++sketchLookups_;   // the failed-probe memo keys this probe by the sketch version
+        if (sketch.lookup(src->slice(builder->nodeSpan(baseLeaf)))
+            == BinderSketch::NameKind::Type) {   // rule 2
+            probe.commitTypeReading();
         }
     }
 
@@ -1729,25 +1876,41 @@ struct Parser::Impl {
         return schema->canEndSource(post);
     }
 
-    // The effective kind of the `n`-th SIGNIFICANT (non-trivia) token at
-    // or after the current stream position, looking through skippable
-    // trivia exactly as the AltChoice dispatch does. `n == 0` is the
-    // upcoming significant token (the alt already skipped leading trivia,
-    // so it equals the dispatched `tokKind`). Returns the Eof kind once
-    // the stream is exhausted (peek past end is idempotent-Eof). Used by
-    // the speculative-alt predictive prune to compare input offsets >0
-    // against a candidate's FIRST_k prefix.
-    [[nodiscard]] SchemaTokenId peekSignificantKind(std::size_t n) const noexcept {
+    // P69 L2b2 (lane `lm`): an off-grammar BODY token — a non-coalesced lexer mode's per-codepoint
+    // leaf (its closer included), which the driver's body drain pushes without advancing the
+    // walker and the loader forbids every shape to name (`C_BodyDefaultKindInShape`). The drain
+    // and the grammar-token view below ask THIS, so they cannot disagree.
+    [[nodiscard]] bool isBodyDefaultToken_(Token const& t) const noexcept {
+        return bodyDefaultTokenKinds->contains(effectiveKind(t, identifierKind, errorKind));
+    }
+
+    // ★★ P69 L2b2 (lane `lm`): THE NEXT GRAMMAR TOKENS, ONE VIEW. The `n`-th token at or after the
+    // current stream position that the walker consumes as a grammar element: trivia
+    // (`isTriviaToken`) and off-grammar body tokens (`isBodyDefaultToken_`) are looked through,
+    // as the dispatch and the body drain look through them. `n == 0` is the upcoming grammar
+    // token. The Eof token once the stream is exhausted (peek past end is idempotent-Eof).
+    // EVERY reader that compares a grammar position with a token ahead reads THIS: the predictive
+    // prune (a candidate's FIRST_k offsets ≥ 1), the follower predicates (`notFollowedBy`,
+    // `followedByFirstOf`), the type-name triage's early base ask and the same ask hoisted before
+    // a probe. ✔ The defect it closes (READ by the design audit of 2026-11-16, F5): the view
+    // looked through trivia only, so past a non-coalesced body-mode opener — the `[` of a
+    // tsql-subset bracket identifier — the i-th token it counted was a body codepoint no
+    // derivation holds, and a candidate whose prefix is `BracketIdStart ParenOpen ParenClose` was
+    // pruned on `[a]()`, a valid input then refused.
+    [[nodiscard]] Token const& peekGrammarToken_(std::size_t n) const noexcept {
         std::size_t seen = 0;
         for (std::size_t raw = 0; ; ++raw) {
             Token const& t = tokens.peek(raw);
-            if (t.coreKind == CoreTokenKind::Eof) {
-                return effectiveKind(t, identifierKind, errorKind);
-            }
-            if (isTriviaToken(t, *schema)) continue;
-            if (seen == n) return effectiveKind(t, identifierKind, errorKind);
+            if (t.coreKind == CoreTokenKind::Eof) return t;
+            if (isTriviaToken(t, *schema) || isBodyDefaultToken_(t)) continue;
+            if (seen == n) return t;
             ++seen;
         }
+    }
+
+    // The effective kind of the `n`-th grammar token ahead (`peekGrammarToken_`).
+    [[nodiscard]] SchemaTokenId peekSignificantKind(std::size_t n) const noexcept {
+        return effectiveKind(peekGrammarToken_(n), identifierKind, errorKind);
     }
 
     // Enumerate candidate branch rules at the current speculative
@@ -2042,6 +2205,7 @@ struct Parser::Impl {
                     if (!impl_.frameRules.empty()) {
                         impl_.frameRules.pop_back();
                         impl_.frameAnchors.pop_back();
+                        impl_.frameListMarks.pop_back();
                     }
                 }
                 // SF-2: truncate the expression work-stack back to its pre-
@@ -2279,6 +2443,29 @@ struct Parser::Impl {
         [[nodiscard]] bool operandAsked() const noexcept { return operandAsked_; }
         void markOperandAsked() noexcept { operandAsked_ = true; }
         void refuteByTheTriage() noexcept { refutedByTheTriage_ = true; }
+        // P69 L2b2: the branch's type child closed as a CERTAIN type name
+        // (`noteTypeChildClosed_`) — the branch has committed to its type reading.
+        [[nodiscard]] bool typeReadingCommitted() const noexcept { return typeReadingCommitted_; }
+        void commitTypeReading() noexcept { typeReadingCommitted_ = true; }
+        // P69 L2b2: the branch read clean and its FOLLOWER predicate refused it (`notFollowedBy`,
+        // `followedByFirstOf`) — the token after it says the position is ANOTHER reading's
+        // (`sizeof ( int[] ){ 1, 2 }` is `sizeof` of a compound literal, C 6.5.2.5).
+        void refuteByAFollower() noexcept { refutedByAFollower_ = true; }
+        // ★ P69 L2b2: THE ONE QUESTION a site's `committedFailure` and the failure memos ask — did
+        // this branch fail ON THE PROGRAM as its committed type reading? Not when a ceiling was met
+        // under it: the failure is the parser's resource, the ceiling's own report is the answer,
+        // and replaying the committed reading would run again the speculation that met the ceiling
+        // (✔MEASURED, l2b2A-6, macos-arm64-debug: a cast chain one past the shipped ceilings TIMED
+        // OUT, the replay descending one level per failure). Not when its follower refused it: the
+        // other reading must stay open (✔MEASURED, l2b2A-6: `sizeof (int[]){ 1, 2 }` refused).
+        [[nodiscard]] bool failedAsItsCommittedTypeReading() const noexcept {
+            return typeReadingCommitted_ && !refutedByAFollower_ && metNoCeiling();
+        }
+        // P69 L2b2: where the branch's operand opened (`operandPos_`).
+        [[nodiscard]] std::optional<std::size_t> operandPos() const noexcept { return operandPos_; }
+        void noteOperandPos(std::size_t pos) noexcept {
+            if (!operandPos_.has_value()) operandPos_ = pos;
+        }
 
         // Commit the probe. After this the dtor is a no-op (beyond
         // the speculation-depth decrement) and the four-machine
@@ -2350,7 +2537,13 @@ struct Parser::Impl {
         bool                                   baseAsked_          = false;
         bool                                   operandAsked_       = false;
         bool                                   refutedByTheTriage_ = false;
+        bool                                   typeReadingCommitted_ = false;
+        bool                                   refutedByAFollower_ = false;
         bool                                   committed_ = false;
+        // P69 L2b2: the token position where the branch's OPERAND opened — the
+        // type-name's FOLLOWER (`askTriageAtTheOperand_`); unset for a branch whose
+        // type position is its last element (`sizeof ( T )`).
+        std::optional<std::size_t>             operandPos_;
     };
 
     // Open a frame for `rule` (parser side + builder side + parser
@@ -2385,6 +2578,7 @@ struct Parser::Impl {
             sketch.enabled() && (sketch.binderFor(rule) != nullptr || sketch.isScopeRule(rule))
                 ? static_cast<std::uint32_t>(frameRules.size() - 1)
                 : (frameAnchors.empty() ? kNoFrameAnchor : frameAnchors.back()));
+        frameListMarks.push_back(sketch.paramListMark());
         walker.enterRule(rule);
         // FC2 binder sketch: a `semantics.scopes` rule's frame is a
         // lexical scope — the SAME rule-driven scope model the semantic
@@ -2489,20 +2683,41 @@ struct Parser::Impl {
         // and its post-step checks are still owed. Consumed the next time
         // the site is innermost.
         bool                               stepPending = false;
-        // FC2: an ambiguous type-name candidate produced by the commit triage
-        // must SURVIVE the rollback of its own probe (the rolled-back value
-        // reading is the chosen parse; the candidate is the oracle's input
-        // for the cross-file second chance). The probe's RAII restore covers
-        // the sketch — so the triage hands the candidate OUT here and it is
-        // recorded after the probe destructs, into the restored sketch. An
-        // ENCLOSING probe that later rolls back erases it correctly (the
-        // winning parse re-encounters and re-records the site) — convergent
-        // to exactly the surviving parse's candidates. (The Pratt walker
-        // itself records each site exactly once: its wrap-in-place climb
-        // never rolls back.)
-        std::optional<AmbiguousTypeNameCandidate> rolledBackCandidate;
+        // An unknown-name refusal produced by the commit triage must SURVIVE
+        // the rollback of its own probe (the rolled-back value reading is the
+        // chosen parse; the refusal is the record of the name it refused).
+        // The probe's RAII restore covers the sketch — so the triage hands
+        // the refusal OUT here and it is recorded after the probe destructs,
+        // into the restored sketch. An ENCLOSING probe that later rolls back
+        // erases it correctly (the winning parse re-encounters and re-records
+        // the site) — convergent to exactly the surviving parse's refusals.
+        // (The Pratt walker itself records each site exactly once: its
+        // wrap-in-place climb never rolls back.)
+        std::optional<UnknownNameRefusal> refusal;
+        // P69 L2b2: the declared-LAST candidate that committed to its TYPE reading and then
+        // failed (candidates are tried in declared order and each such failure overwrites it).
+        // While it is set the site tries no VALUE reading (`GrammarSchema::isValueReading`):
+        // C reads a certain type name in that position as a type, never as a value. At depth 0
+        // it is what the site's failure REPLAYS (`finishFailedSpeculation_`) — the deepest type
+        // reading's own error, where the references put it.
+        RuleId                            committedFailure{};
+        // The ONE place the rule "the declared-LAST committed failure" is applied: each
+        // committed failure overwrites the last (both the probe's own and a replayed record).
+        void noteCommittedFailure(RuleId candidate) noexcept { committedFailure = candidate; }
     };
     std::vector<SpeculationSite> specStack;
+
+    // Where a refusal is handed out (the close, the operand-time ask): the window
+    // `nameRefusedUnknownNames_` reads — from the refused probe's first token to the type
+    // name's FOLLOWER (the token its operand opened at; with no operand, the close's next
+    // token, which is the follower). An error inside the parenthesised type or AT the
+    // follower is the refused reading's own (`(U)42`, `(U){1}`, `(U *)0`); an error past the
+    // follower is the operand's, whatever the refused probe went on to read (`(q)-x z`).
+    void noteRefusalReach_(SpeculationSite& site) {
+        if (!site.refusal.has_value() || !site.probe) return;
+        site.refusal->fromPos  = site.probe->startPos();
+        site.refusal->reachPos = site.probe->operandPos().value_or(tokens.position());
+    }
 
     // Open a probe on the site's next admissible candidate. Returns true
     // when one is live (the driver takes it from here) and false when the
@@ -2512,6 +2727,9 @@ struct Parser::Impl {
     [[nodiscard]] bool startNextCandidate_(SpeculationSite& site) {
         while (site.next < site.candidates.size()) {
             const RuleId branch = site.candidates[site.next++];
+            // P69 L2b2: after a committed type reading failed, no VALUE reading of the same
+            // position is tried (`committedFailure`, `GrammarSchema::isValueReading`).
+            if (site.committedFailure.valid() && schema->isValueReading(branch)) continue;
             if (speculationDepth > peakSpeculationAttempt_) peakSpeculationAttempt_ = speculationDepth;
             if (speculationDepth >= config.maxSpeculationDepth) {
                 // LATCH, do not emit. Emitting here would land the
@@ -2529,7 +2747,7 @@ struct Parser::Impl {
             }
             // P69 L2 (`failedProbes_`): this rule failed at this token, by the tokens
             // alone or under the sketch as it is now — it fails again: its handed-out
-            // type-name candidate is recorded again, and the site moves on exactly as
+            // unknown-name refusal is recorded again, and the site moves on exactly as
             // after an abandoned probe (`abandonAndAdvance_`): the final candidate's
             // direct descent, else the next candidate.
             // P69 L2a (lane `lm`): or met a ceiling under exactly this room — it is refuted by it
@@ -2538,15 +2756,24 @@ struct Parser::Impl {
             if (std::optional<RecordedFailure> const rec = recordedFailure_(branch)) {
                 if (rec->askedTheSketch) ++sketchLookups_;   // the replay asks what the run asked
                 if (rec->hit.has_value()) replayCeilingHit_(*rec->hit);
-                if (rec->candidate.has_value()) sketch.recordCandidate(*rec->candidate);
+                if (rec->refusal.has_value()) sketch.recordRefusal(*rec->refusal);
+                if (rec->committedTypeReading) site.noteCommittedFailure(branch);
+                if (finalCandidateDirectDescent_()) return true;
+                continue;
+            }
+            // P69 L2b2 (lane `lm`): the triage's early base ask, asked BEFORE the probe would open
+            // (`hoistRefutesTheCandidate_`). Refuted there, the candidate moves on exactly as after
+            // an abandoned probe: the memo replay's path, above.
+            if (hoistRefutesTheCandidate_(branch)) {
                 if (finalCandidateDirectDescent_()) return true;
                 continue;
             }
             site.branch      = branch;
             site.exprBranch  = schema->isExprRule(branch);
             site.stepPending = false;
-            site.rolledBackCandidate.reset();
+            site.refusal.reset();
             site.probe       = std::make_unique<SpeculationProbe>(*this);
+            ++speculationProbes_;
             if (site.exprBranch) {
                 // FC4 c1: an `expr`-shape BRANCH (e.g. c forInitAmbig's
                 // `expression`) must hand off to the Pratt walker exactly
@@ -2569,7 +2796,7 @@ struct Parser::Impl {
     }
 
     // Abandon the candidate under probe: the probe's destructor restores the
-    // five state machines, then the triage's rolled-back candidate (if any)
+    // five state machines, then the triage's refusal (if any)
     // is recorded into the RESTORED sketch — the order the recursive form
     // kept by recording after its probe went out of scope.
     void abandonCandidate_(SpeculationSite& site) {
@@ -2585,7 +2812,8 @@ struct Parser::Impl {
                                          : kAnySketchVersion};
             if (site.probe->metNoCeiling()) {
                 failedProbes_.insert_or_assign(
-                    key, FailedProbe{site.rolledBackCandidate, site.probe->relSpeculationPeak(),
+                    key, FailedProbe{site.refusal, site.probe->failedAsItsCommittedTypeReading(),
+                                     site.probe->relSpeculationPeak(),
                                      site.probe->relExpressionPeak(),
                                      site.probe->peakCharge()});
             } else if (site.probe->firstCeilingHit().has_value()) {
@@ -2593,14 +2821,14 @@ struct Parser::Impl {
                     CeilingRefutedKey{key, site.probe->speculationDepthBefore(),
                                       site.probe->expressionDepthBefore(),
                                       site.probe->budget()},
-                    CeilingRefutation{site.rolledBackCandidate,
-                                      *site.probe->firstCeilingHit()});
+                    CeilingRefutation{site.refusal, *site.probe->firstCeilingHit()});
             }
+            if (site.probe->failedAsItsCommittedTypeReading()) site.noteCommittedFailure(site.branch);
         }
         site.probe.reset();
-        if (site.rolledBackCandidate.has_value()) {
-            sketch.recordCandidate(std::move(*site.rolledBackCandidate));
-            site.rolledBackCandidate.reset();
+        if (site.refusal.has_value()) {
+            sketch.recordRefusal(std::move(*site.refusal));
+            site.refusal.reset();
         }
     }
 
@@ -2690,6 +2918,9 @@ struct Parser::Impl {
         SpeculationSite& site = specStack.back();
         if (site.next + 1 != site.candidates.size()) return false;
         if (speculationDepth != 0) return false;
+        // P69 L2b2: a committed type reading failed — a value reading is not the fallback.
+        if (site.committedFailure.valid() && schema->isValueReading(site.candidates[site.next]))
+            return false;
         if (walker.nullableTail()) return false;
         const RuleId last = site.candidates[site.next];
         if (candidateNeedsProbe_(last)) return false;
@@ -2722,8 +2953,9 @@ struct Parser::Impl {
         abandonCandidate_(specStack.back());
         if (finalCandidateDirectDescent_()) return;
         if (startNextCandidate_(specStack.back())) return;
+        RuleId const committed = specStack.back().committedFailure;
         specStack.pop_back();
-        (void)finishFailedSpeculation_();
+        (void)finishFailedSpeculation_(committed);
     }
 
     // P69 (lane `cs`, D-C-SIZEOF-OF-A-COMPOUND-LITERAL-IS-A-PARSE-ERROR): a candidate the
@@ -2767,6 +2999,7 @@ struct Parser::Impl {
             SchemaTokenId const next = peekSignificantKind(0);
             if (std::binary_search(notAfter.begin(), notAfter.end(), next,
                                    [](SchemaTokenId a, SchemaTokenId b) { return a.v < b.v; })) {
+                site.probe->refuteByAFollower();   // P69 L2b2: no committed failure
                 abandonAndAdvance_();
                 return;
             }
@@ -2782,6 +3015,7 @@ struct Parser::Impl {
             SchemaTokenId const next = peekSignificantKind(0);
             if (!std::binary_search(mustFollow.begin(), mustFollow.end(), next,
                                     [](SchemaTokenId a, SchemaTokenId b) { return a.v < b.v; })) {
+                site.probe->refuteByAFollower();   // P69 L2b2: no committed failure
                 abandonAndAdvance_();
                 return;
             }
@@ -2790,7 +3024,8 @@ struct Parser::Impl {
             typeRule.valid()) {
             if (!typeNameCommitApproved_(site.branch, typeRule,
                                          schema->typeNameCommitPolarity(site.branch),
-                                         site.rolledBackCandidate)) {
+                                         site.refusal)) {
+                noteRefusalReach_(site);
                 abandonAndAdvance_();
                 return;
             }
@@ -2805,7 +3040,10 @@ struct Parser::Impl {
     // declared-last candidate non-speculatively (depth 0, one-shot), else
     // `P_BacktrackFailed` + panic scan. Returns the dispatch outcome exactly
     // as that arm returned it.
-    StepOutcome finishFailedSpeculation_() {
+    // P69 L2b2: `committed` — the site's declared-last candidate that committed to its type
+    // reading and failed (`SpeculationSite::committedFailure`), which the depth-0 replay takes
+    // instead of the declared-last structural candidate.
+    StepOutcome finishFailedSpeculation_(RuleId committed = RuleId{}) {
         // THE CEILING, REPORTED AS ITSELF. Every candidate failed and the
         // parse hit one of its speculation ceilings on the way — so the
         // failure is the parser running out of a resource, not the program
@@ -2872,7 +3110,11 @@ struct Parser::Impl {
         // e.g. `A X ;` where neither `A B ;` nor `A C ;` matches at offset
         // 1), but the fallback must still replay a branch to surface its
         // precise diagnostic instead of an opaque P_BacktrackFailed.
-        const RuleId fallback = lastStructuralCandidate_(tokKind);
+        // ★ P69 L2b2: unless a candidate COMMITTED to its type reading and failed — then the
+        // declared-last such candidate's own error is the one the user can act on, where the
+        // references put it (`noteTypeChildClosed_`).
+        const RuleId fallback =
+            committed.valid() ? committed : lastStructuralCandidate_(tokKind);
         if (speculationDepth == 0 && fallback.valid()
             && !(replayedFallback_
                  && lastReplayCursor_ == walker.cursor()
@@ -3045,9 +3287,7 @@ struct Parser::Impl {
         while (!tokens.isAtEnd()) {
             Token const& bodyPeek = tokens.peek();
             if (bodyPeek.coreKind == CoreTokenKind::Eof) break;
-            const SchemaTokenId k =
-                effectiveKind(bodyPeek, identifierKind, errorKind);
-            if (!bodyDefaultTokenKinds->contains(k)) break;
+            if (!isBodyDefaultToken_(bodyPeek)) break;
             const std::size_t before = tokens.position();
             builder->pushToken(tokens.advance());
             if (tokens.position() == before) {
@@ -3325,8 +3565,9 @@ struct Parser::Impl {
                 if (startNextCandidate_(specStack.back())) {
                     return StepOutcome::Continue;
                 }
+                RuleId const committed = specStack.back().committedFailure;
                 specStack.pop_back();
-                return finishFailedSpeculation_();
+                return finishFailedSpeculation_(committed);
             }
 
             // Non-speculative AltChoice.
@@ -3511,13 +3752,16 @@ ParseResult Parser::parse() && {
         fatal("dss::Parser::parse: schema has no root rule");
     }
 
-    // FC2: seed cross-file type names into the binder sketch's global
-    // scope BEFORE any frame opens — the compilation-unit oracle's
-    // channel for the one-shot ambiguous-candidate reparse.
+    // Seed the descriptors' typedef and value names (`ParserConfig::seedGlobalTypeNames`,
+    // `seedGlobalValueNames`) into the binder sketch's global scope BEFORE any frame opens.
     for (auto& seed : I.config.seedGlobalTypeNames) {
         I.sketch.seedGlobalType(std::move(seed));
     }
     I.config.seedGlobalTypeNames.clear();
+    for (auto& seed : I.config.seedGlobalValueNames) {
+        I.sketch.seedGlobalValue(std::move(seed));
+    }
+    I.config.seedGlobalValueNames.clear();
 
     I.openExprFrame(rootRule);
 
@@ -3551,23 +3795,19 @@ ParseResult Parser::parse() && {
         I.closeFrameOnce();
     }
 
-    // FC2 sidecars: the ambiguous type-name sites this parse rolled
-    // back on (the CU oracle's input) + the global-scope TYPE names it
-    // bound (the oracle's harvest surface). Both empty for binder-less
-    // languages.
     // c108: capture the total token-work BEFORE moving the builder (the stream is
     // untouched by finish()) — the deterministic O(N)-work proxy for the perf pin.
     std::uint64_t const accesses = I.tokens.accessCount();
     std::uint64_t const sketchWork = I.sketch.workCount();   // P69 L2a2: the sketch's own
     std::uint64_t const scopeWork  = I.builder->scopeWork();  // and the builder's scope work
+    std::uint64_t const chainNodes = I.builder->scopeChainSize();   // P69 L2b2: before `finish`
     return ParseResult{
-        .tree               = std::move(*I.builder).finish(),
-        .typeNameCandidates = I.sketch.takeCandidates(),
-        .globalTypeNames    = I.sketch.globalTypeNames(),
-        .globalTypeBindings = I.sketch.globalTypeBindings(),
-        .tokenAccessCount   = accesses,
-        .sketchWorkCount    = sketchWork,
-        .scopeWorkCount     = scopeWork,
+        .tree                    = std::move(*I.builder).finish(),
+        .tokenAccessCount        = accesses,
+        .sketchWorkCount         = sketchWork,
+        .scopeWorkCount          = scopeWork,
+        .speculationProbeCount   = I.speculationProbes_,
+        .scopeChainNodesAtFinish = chainNodes,
     };
 }
 

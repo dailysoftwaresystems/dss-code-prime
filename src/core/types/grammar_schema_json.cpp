@@ -1754,6 +1754,29 @@ void buildPositionTables(GrammarSchemaData& data, json const& shapesJson,
             }
         }
 
+        // `valueReading` (P69 L2b2, lane `lm`): a boolean flag on the shape body — the rule is
+        // the VALUE reading of its position (see CompiledRule::valueReading). A value reading
+        // carries no type-name guard: a shape declaring both is refused loud, because the parser
+        // would then skip, after a committed type reading failed, a candidate that is itself a
+        // type reading. Must be a boolean if present; absent => false.
+        if (body.is_object() && body.contains("valueReading")) {
+            json const& flag = body.at("valueReading");
+            auto const flagPath = std::format("{}/valueReading", shapePath);
+            if (!flag.is_boolean()) {
+                coll.emit(DiagnosticCode::C_UnknownShape, flagPath,
+                          "'valueReading' must be a boolean");
+            } else if (flag.get<bool>()) {
+                if (rule.typeNameCommitRule.valid()) {   // a value reading carries no type guard
+                    coll.emit(DiagnosticCode::C_UnknownShape, flagPath,
+                              "'valueReading' and 'commitRequiresTypeName' are mutually "
+                              "exclusive on a single shape — a value reading carries no "
+                              "type-name guard");
+                } else {
+                    rule.valueReading = true;
+                }
+            }
+        }
+
         // `notFollowedBy` (P69, lane `cs`, D-C-SIZEOF-OF-A-COMPOUND-LITERAL-IS-A-PARSE-ERROR): a
         // PEG not-predicate on the shape's FOLLOWER — a non-empty array of TOKEN kind names. A
         // speculative probe of this rule that closes cleanly is abandoned when the next token
@@ -9689,7 +9712,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "'semantics.declarators' must be an object of "
                               "declarator role names");
                 } else {
-                    static constexpr std::array<std::string_view, 25>
+                    static constexpr std::array<std::string_view, 26>
                         kDeclaratorKeys{
                             "declaratorRule",     "pointerLayerRule",
                             "pointerToken",       "directRule",
@@ -9746,7 +9769,10 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             "asmLabelRule",
                             // P69 (lane `cs`, fold f26c): the OPTIONAL boolean — a use
                             // sees only a declaration whose declarator completed before it.
-                            "scopeBeginsAfterDeclarator"};
+                            "scopeBeginsAfterDeclarator",
+                            // P69 L2b2 (lane `lm`): the OPTIONAL boolean — a declaration
+                            // that declares nothing (C 6.7p2) is a warning, not an error.
+                            "emptyDeclarationWarns"};
                     DSS_CHECK_KEY_VOCABULARY(kDeclaratorKeys);
                     bool dOk = true;
                     if (!checkKeysAgainst(dj, kDeclaratorKeys, dPath,
@@ -9931,6 +9957,21 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             dOk = false;
                         } else {
                             dc.scopeBeginsAfterDeclarator = v.get<bool>();
+                        }
+                    }
+                    // P69 L2b2 (lane `lm`): `emptyDeclarationWarns` (C 6.7p2) — OPTIONAL, a
+                    // boolean; absent ⇒ a declaration that declares nothing is an error.
+                    if (dj.contains("emptyDeclarationWarns")) {
+                        json const& v = dj.at("emptyDeclarationWarns");
+                        if (!v.is_boolean()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      dPath + "/emptyDeclarationWarns",
+                                      "'emptyDeclarationWarns' must be a BOOLEAN: whether a "
+                                      "declaration that declares nothing is a warning rather than "
+                                      "an error");
+                            dOk = false;
+                        } else {
+                            dc.emptyDeclarationWarns = v.get<bool>();
                         }
                     }
                     // c26 (D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME): the OPTIONAL
@@ -17502,6 +17543,35 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                   "/semantics/variadic/vaCopyRule",
                                   "'vaCopyDestinationChild' / 'vaCopySourceChild' name the "
                                   "children of a 'vaCopyRule' this block does not declare");
+                    }
+                    // P69 L2b2 (lane `lm`): the spellings the source names the list TYPE by with
+                    // no declaration — REQUIRED with the block (a variadic surface whose list type
+                    // no spelling reaches cannot declare an `ap`), each a non-empty string, none twice.
+                    if (!va.contains("vaListTypeNames") || !va.at("vaListTypeNames").is_array()
+                        || va.at("vaListTypeNames").empty()) {
+                        coll.emit(DiagnosticCode::C_MissingField,
+                                  "/semantics/variadic/vaListTypeNames",
+                                  "'vaListTypeNames' is required: a non-empty array of the "
+                                  "spellings the source names the va_list type by");
+                    } else {
+                        std::size_t at = 0;
+                        for (json const& n : va.at("vaListTypeNames")) {
+                            std::string const where =
+                                std::format("/semantics/variadic/vaListTypeNames/{}", at++);
+                            if (!n.is_string() || n.get<std::string>().empty()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics, where,
+                                          "each 'vaListTypeNames' entry must be a non-empty string");
+                                continue;
+                            }
+                            std::string name = n.get<std::string>();
+                            if (std::find(cfg.vaListTypeNames.begin(), cfg.vaListTypeNames.end(),
+                                          name) != cfg.vaListTypeNames.end()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics, where,
+                                          std::format("'vaListTypeNames' names '{}' twice", name));
+                                continue;
+                            }
+                            cfg.vaListTypeNames.push_back(std::move(name));
+                        }
                     }
                     (void)idxOk;
                 }

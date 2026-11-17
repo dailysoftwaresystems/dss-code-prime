@@ -147,7 +147,6 @@ struct PairRun {
                                      ObjectFormatSchema const& format,
                                      std::string source) {
     UnitBuilder builder{grammar, DiagnosticBudget::libraryDefault()};
-    applySystemDirs(builder, *grammar);
     applyTargetFormatPair(builder, target, format);
     builder.addInMemory(std::move(source), "probe.c");
     auto const cu = std::make_shared<CompilationUnit const>(std::move(builder).finish());

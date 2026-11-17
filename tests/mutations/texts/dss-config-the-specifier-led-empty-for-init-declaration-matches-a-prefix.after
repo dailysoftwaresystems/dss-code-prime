@@ -1,0 +1,2 @@
+      "$followerComment": "P69 L2b2 (lane lm): a for-init reading holds no terminator (the for grammar owns the `;`), so without a follower test this probe MATCHES A PREFIX and wins the alternative: `for (size_t i = 0; …)` read `size_t` alone as an empty declaration and the for's `;` then failed at `i` (MEASURED 2026-11-05, the batch-A Mac run, host run 20261105-185605-77db1ade: every shipped runtime unit with such a loop failed to compile). `followedByFirstOf: emptyStmt` keeps a probe that closes only where the for's `;` follows.",
+      "followedByFirstOf": "identDeclHead"

@@ -7,9 +7,9 @@
 //   * preferType (the FC2 default; the bare-string config form) — commit
 //     iff the follower token could not continue a value reading;
 //   * requireKnownType (C 6.7.6.3p11) — NEVER commit on Unknown: roll
-//     back to the competing reading AND record the
-//     AmbiguousTypeNameCandidate so the CU oracle's seeded reparse still
-//     gives a cross-file typedef its second chance.
+//     back to the competing reading AND record the refusal
+//     (`UnknownNameRefusal`), which names the identifier when that
+//     reading then fails within the refused probe's reach.
 // Rules 1-3 are polarity-independent (keyword-led type child commits;
 // sketch-KNOWN Type commits; sketch-KNOWN Value rolls back) — pinned for
 // BOTH polarities below.
@@ -22,6 +22,7 @@
 #include "analysis/syntactic/parser.hpp"
 #include "core/types/diagnostic_budget.hpp"
 #include "core/types/grammar_schema.hpp"
+#include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
 #include "core/types/tree.hpp"
 #include "core/types/tree_node.hpp"
@@ -202,7 +203,6 @@ TEST(CommitPolarityMatrix, PreferTypeCommitsUnknownOnNonOperatorFollower) {
     auto r = parsePol(kPreferTypeGuard, "(q) z;");
     EXPECT_FALSE(r.tree.diagnostics().hasErrors());
     EXPECT_TRUE(hasRule(r.tree, "castish"));
-    EXPECT_TRUE(r.typeNameCandidates.empty());
 }
 
 // The bare-string form keeps the SAME default — backward compatible.
@@ -210,29 +210,42 @@ TEST(CommitPolarityMatrix, BareStringFormKeepsPreferTypeDefault) {
     auto r = parsePol(kBareStringGuard, "(q) z;");
     EXPECT_FALSE(r.tree.diagnostics().hasErrors());
     EXPECT_TRUE(hasRule(r.tree, "castish"));
-    EXPECT_TRUE(r.typeNameCandidates.empty());
 }
 
-// requireKnownType + the SAME input → ROLLBACK + candidate recorded. (The
-// value reading then cannot consume `z` — diagnostics are expected; the
-// pinned facts are the ABSENT castish and the RECORDED candidate.)
-TEST(CommitPolarityMatrix, RequireKnownTypeRollsBackUnknownAndRecords) {
+// requireKnownType + the SAME input → ROLLBACK, and the refusal NAMES `q`: the value
+// reading cannot consume `z`, and the error there lies within the refused probe's
+// reach — S_UndeclaredIdentifier at `q` first, then the error.
+TEST(CommitPolarityMatrix, RequireKnownTypeRollsBackUnknownAndNamesIt) {
     auto r = parsePol(kRequireKnownGuard, "(q) z;");
     EXPECT_FALSE(hasRule(r.tree, "castish"));
-    ASSERT_EQ(r.typeNameCandidates.size(), 1u);
-    EXPECT_EQ(r.typeNameCandidates[0].name, "q");
-    EXPECT_EQ(r.tree.source().slice(r.typeNameCandidates[0].span), "q");
+    auto const all = r.tree.diagnostics().all();
+    ASSERT_GE(all.size(), 2u);
+    EXPECT_EQ(all[0].code, DiagnosticCode::S_UndeclaredIdentifier);
+    EXPECT_EQ(all[0].actual, "q");
+    EXPECT_EQ(r.tree.source().slice(all[0].span), "q");
+    EXPECT_NE(all[1].code, DiagnosticCode::S_UndeclaredIdentifier);
 }
 
 // Operator follower: BOTH polarities roll back (`(q)-x` stays binary
-// minus); requireKnownType records the candidate exactly like preferType.
+// minus) and record the refusal alike — read in the next pin.
 TEST(CommitPolarityMatrix, BothPolaritiesRollBackOnOperatorFollower) {
     for (auto guard : {kPreferTypeGuard, kRequireKnownGuard}) {
         auto r = parsePol(guard, "(q)-x;");
         EXPECT_FALSE(r.tree.diagnostics().hasErrors()) << guard;
         EXPECT_FALSE(hasRule(r.tree, "castish")) << guard;
-        ASSERT_EQ(r.typeNameCandidates.size(), 1u) << guard;
-        EXPECT_EQ(r.typeNameCandidates[0].name, "q") << guard;
+    }
+}
+
+// The operator follower's refusal, read: `(q)-x z;` fails at `z`, PAST the type name's
+// follower `-` — the operand's error, not the refused type's — so NEITHER polarity names
+// `q`, whichever ask (the operand's opening or the close) handed the refusal out; and
+// `(q) z;` under requireKnownType, failing AT the follower, does (the pin above).
+TEST(CommitPolarityMatrix, NeitherPolarityNamesAnOperatorFollowersRefusal) {
+    for (auto guard : {kPreferTypeGuard, kRequireKnownGuard}) {
+        auto r = parsePol(guard, "(q)-x z;");
+        ASSERT_TRUE(r.tree.diagnostics().hasErrors()) << guard;
+        for (auto const& d : r.tree.diagnostics().all())
+            EXPECT_NE(d.code, DiagnosticCode::S_UndeclaredIdentifier) << guard;
     }
 }
 
@@ -244,7 +257,6 @@ TEST(CommitPolarityMatrix, KeywordTypeChildCommitsUnderBothPolarities) {
         auto r = parsePol(guard, "(base) z;");
         EXPECT_FALSE(r.tree.diagnostics().hasErrors()) << guard;
         EXPECT_TRUE(hasRule(r.tree, "castish")) << guard;
-        EXPECT_TRUE(r.typeNameCandidates.empty()) << guard;
     }
 }
 
@@ -254,24 +266,26 @@ TEST(CommitPolarityMatrix, KnownTypeNameCommitsUnderRequireKnownType) {
     auto r = parsePol(kRequireKnownGuard, "alias T; (T) z;");
     EXPECT_FALSE(r.tree.diagnostics().hasErrors());
     EXPECT_TRUE(hasRule(r.tree, "castish"));
-    EXPECT_TRUE(r.typeNameCandidates.empty());
 }
 
 // Rule 3: a sketch-KNOWN value rolls back under BOTH polarities — and a
-// KNOWN name records NO candidate (the oracle is for unknowns only).
+// KNOWN name is no refusal: `(v)-x z;` fails at `z` and names nothing.
 TEST(CommitPolarityMatrix, KnownValueRollsBackUnderBothPolarities) {
     for (auto guard : {kPreferTypeGuard, kRequireKnownGuard}) {
         auto r = parsePol(guard, "let v; (v)-x;");
         EXPECT_FALSE(r.tree.diagnostics().hasErrors()) << guard;
         EXPECT_FALSE(hasRule(r.tree, "castish")) << guard;
-        EXPECT_TRUE(r.typeNameCandidates.empty()) << guard;
+        auto f = parsePol(guard, "let v; (v)-x z;");
+        ASSERT_TRUE(f.tree.diagnostics().hasErrors()) << guard;
+        for (auto const& d : f.tree.diagnostics().all())
+            EXPECT_NE(d.code, DiagnosticCode::S_UndeclaredIdentifier) << guard;
     }
 }
 
-// ── the oracle channel under the strict polarity ────────────────────────
+// ── the seed channel under the strict polarity ────────────────────────
 
 // The SAME unknown-name input that rolled back commits the castish once
-// the name is SEEDED as a global type (the CU oracle's reparse channel) —
+// the name is SEEDED as a global type (the shipped descriptors' typedef channel) —
 // so a cross-file typedef in the guarded position resolves on the second
 // pass exactly as designed.
 TEST(CommitPolarityMatrix, SeededTypeNameFlipsRequireKnownTypeSiteToCommit) {
@@ -280,5 +294,4 @@ TEST(CommitPolarityMatrix, SeededTypeNameFlipsRequireKnownTypeSiteToCommit) {
     auto r = parsePol(kRequireKnownGuard, "(q) z;", std::move(cfg));
     EXPECT_FALSE(r.tree.diagnostics().hasErrors());
     EXPECT_TRUE(hasRule(r.tree, "castish"));
-    EXPECT_TRUE(r.typeNameCandidates.empty());
 }

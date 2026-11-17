@@ -1,0 +1,1 @@
+    auto const live     = liveScopes_.mark();

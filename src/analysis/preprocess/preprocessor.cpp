@@ -403,10 +403,10 @@ std::function<void(BufferId&, SourceSpan&)> PreprocessResult::makeRemap() const 
     // TU -- which mis-positioned a post-include main error: the
     // D-PP-INCLUDE-SPLICE-POSITION-ATTRIBUTION deferral, now closed.)
     // Capture the line-map BY VALUE: the returned closure is stored in the
-    // CU sidecar (`ppRemap`) and re-invoked by the FC2 oracle reparse LONG
-    // after this PreprocessResult is destroyed, so a pointer into
-    // `this->lineMap` would dangle. The copy is a vector of segments
-    // (shared_ptr origins), cheap relative to a reparse.
+    // CU sidecar (`ppRemap`) and handed on to the finished unit, which
+    // invokes it LONG after this PreprocessResult is destroyed, so a pointer
+    // into `this->lineMap` would dangle. The copy is a vector of segments
+    // (shared_ptr origins).
     LineMap mapCopy = lineMap;
     return [synthId, mapCopy = std::move(mapCopy)]
            (BufferId& buffer, SourceSpan& span) {
@@ -420,8 +420,8 @@ std::function<void(BufferId&, SourceSpan&)> PreprocessResult::makeRemap() const 
 // actionable. Separate from `makeRemap` rather than replacing it because the two
 // have genuinely different consumers: the LSP's `PreprocessedPositionMap`, the
 // shipped-descriptor refs and every post-parse tier convert POSITIONS and have no
-// diagnostic to annotate, while the parse tier and the FC2 oracle reparse hand
-// whole `ParseDiagnostic`s through. `DiagnosticReporter::remapBuffers` accepts
+// diagnostic to annotate, while the parse tier hands whole `ParseDiagnostic`s
+// through. `DiagnosticReporter::remapBuffers` accepts
 // either shape and dispatches on the callable's signature, so no call site had to
 // learn which one it holds.
 //
@@ -1880,8 +1880,8 @@ struct SynthBuilder {
     // the splice point. The splice is UN-GATED (it fires for every angle include,
     // dead branch or not -- D-PP-PRESCAN-ANGLE-MACRO-SPLICE-AUTHORITATIVE-LIVENESS);
     // `preprocess()` then DROPS any record whose offset falls in an AUTHORITATIVE
-    // dead range, so the surviving set == the finish() oracle's authoritatively-live
-    // `shippedLibDescriptors`. Shared by reference across every child builder (like
+    // dead range, so the surviving set == the authoritatively-live
+    // `shippedLibDescriptors` the semantic tier reads. Shared by reference across every child builder (like
     // `includeStack` / `fatal`), so a header spliced deep in a quote-include chain
     // still reaches `preprocess()`. Raw (parent, offset) pairs (dups allowed);
     // `preprocess()` dead-filters, then expands the transitive `includes` closure +
@@ -3594,8 +3594,8 @@ struct SynthBuilder {
                 // the verbatim copy up to the directive, before the spliced `#define`s
                 // land -> the offset sits INSIDE the include's conditional region).
                 // `preprocess()` drops this record if the offset lies in an
-                // AUTHORITATIVE dead range, so the seed set matches the finish() oracle
-                // EXACTLY (never a superset). EMIT-ONLY.
+                // AUTHORITATIVE dead range, so the seed set matches the semantic tier's
+                // descriptor set EXACTLY (never a superset). EMIT-ONLY.
                 resolvedDescriptorsOut.push_back(
                     {splicedParent, static_cast<ByteOffset>(out.size())});
                 out.append(defs);
@@ -5977,7 +5977,7 @@ private:
                 // textually splices it) -> 1. NotFound -> 0.
                 //   D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION: a `__has_include(<h>)` probe
                 //   does NOT seed -- the un-gated angle-`#include` splice is the SOLE
-                //   recorder, so the seed set stays == the finish() oracle's live set.
+                //   recorder, so the seed set stays == the semantic tier's live set.
                 AngleIncludeResolution const ar =
                     resolveAngleInclude(filename, systemDirs_, includeDirs_,
                                         headerNameMatching_, headerSearch_);
@@ -10691,7 +10691,7 @@ PreprocessResult preprocessRun(
     // of the splice point. The splice is UN-GATED (it fires for a dead-branch include
     // too); the closure block below DROPS any pair whose offset lies in an
     // AUTHORITATIVE dead range (`expander.deadRanges()`), leaving exactly the
-    // authoritatively-live set the finish() oracle's `shippedLibDescriptors` holds.
+    // authoritatively-live set the semantic tier's `shippedLibDescriptors` holds.
     // Threaded by reference into the SynthBuilder (and its recursive children).
     std::vector<std::pair<fs::path, ByteOffset>> resolvedParents;
     // TF-C60 (D-PP-PRESCAN-CROSS-BUFFER-MACRO-STATE): the pre-scan's macro state
@@ -10972,9 +10972,9 @@ PreprocessResult preprocessRun(
     // (1) DROP any record whose splice offset lies in an AUTHORITATIVE dead range
     //     (`byteInDeadRegion`) -- the splice is UN-GATED (it fires for a dead-branch
     //     angle include too, D-PP-PRESCAN-ANGLE-MACRO-SPLICE-AUTHORITATIVE-LIVENESS),
-    //     so THIS filter is what makes the surviving set == the finish() oracle's
+    //     so THIS filter is what makes the surviving set == the semantic tier's
     //     authoritatively-live `shippedLibDescriptors` (never a superset -> the seed
-    //     can never resolve a name the reparse would not). An include the pre-scan
+    //     can never make a name a type the semantic tier would not). An include the pre-scan
     //     mis-judged dead but the full macro table makes LIVE was still spliced +
     //     recorded, and its offset is NOT in a dead range, so it is KEPT (C30-safe).
     // (2) EXPAND each surviving PARENT to its TRANSITIVE `includes` closure and dedup

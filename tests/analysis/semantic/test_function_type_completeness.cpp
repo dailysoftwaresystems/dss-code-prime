@@ -149,11 +149,9 @@ TEST(FunctionDeclaratorReturn, TheRefusalIsPositionedAtTheFunctionSuffix) {
     ASSERT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_InvalidFunctionDeclarator), 1u);
     for (auto const& d : model.diagnostics().all()) {
         if (d.code != DiagnosticCode::S_InvalidFunctionDeclarator) continue;
-        // The span is remapped onto its ORIGIN buffer — slice that one, never the synth tree source.
-        std::string_view text;
-        for (auto const& buf : cu->auxiliaryBuffers())
-            if (buf != nullptr && buf->id() == d.buffer) { text = buf->slice(d.span); break; }
-        EXPECT_EQ(text, "(void)");
+        // The span is remapped onto its ORIGIN buffer — the fixture's `spanTextOf` slices the
+        // buffer it names, never the synth tree source.
+        EXPECT_EQ(spanTextOf(*cu, d), "(void)");
         EXPECT_NE(d.actual.find("array return type (C 6.7.6.3p1)"), std::string::npos) << d.actual;
     }
 }

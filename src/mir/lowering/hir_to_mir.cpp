@@ -16152,9 +16152,10 @@ struct Lowerer {
             if (!t.valid()) return false;
             if (interner.kind(t) != TypeKind::Array) return false;
             auto const ops = interner.operands(t);
+            // The strategy's record by IDENTITY (`vaListTypes`), never its spelling: a
+            // user's own `struct __va_list_tag p[1]` parameter is an ordinary array (P69 L2b2).
             return !ops.empty() && ops[0].valid()
-                && interner.kind(ops[0]) == TypeKind::Struct
-                && interner.name(ops[0]) == "__va_list_tag";
+                && ops[0] == vaListTypes(VaListStrategy::SysVRegisterSave, interner).record;
         };
         for (std::size_t i = 0; i < params.size(); ++i) {
             HirNodeId const p = params[i];

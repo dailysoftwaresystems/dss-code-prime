@@ -245,13 +245,31 @@ void TreeBuilder::discardTrailsIfIdle_() noexcept {
 void TreeBuilder::emitDiagnostic_(ParseDiagnostic d) {
     // Snapshot the scope stack at error-time. Done here (rather than at
     // call sites) so every diagnostic gets it for free.
-    d.scopeStack.assign(scopes_.begin(), scopes_.end());
+    // P69 L2b2 (lane `lm`): as a HANDLE, O(1) — it was a copy of the whole stack, and a probe
+    // nest's refuted alternatives raise diagnostics at every level (scope_trail.hpp).
+    d.scopeStack = captureOwnTrail_();
     reporter_->report(std::move(d));
 }
 
 void TreeBuilder::forceReport_(ParseDiagnostic d) {
-    d.scopeStack.assign(scopes_.begin(), scopes_.end());
+    d.scopeStack = captureOwnTrail_();
     reporter_->forceReport(std::move(d));
+}
+
+ScopeTrail TreeBuilder::scopeTrail_() const noexcept {
+    if (scopes_.empty()) return ScopeTrail{};
+    return ScopeTrail::at(scopeChain_, scopes_.back().node,
+                          static_cast<std::uint32_t>(scopes_.size()));
+}
+
+// P69 L2b2 (lane `lm`): the nodes the trail reads are every node up to its top, so marking the
+// top marks them all (node ids climb up the stack).
+ScopeTrail TreeBuilder::captureOwnTrail_() noexcept {
+    if (!scopes_.empty()) {
+        capturedTrailEnd_ =
+            std::max<std::size_t>(capturedTrailEnd_, std::size_t{scopes_.back().node} + 1u);
+    }
+    return scopeTrail_();
 }
 
 void TreeBuilder::reportDiagnostic(ParseDiagnostic d) {
@@ -902,8 +920,8 @@ void TreeBuilder::pushToken(Token const& tok) {
     //  2. Word fallback to Identifier when the lexeme isn't a keyword.
     //  3. No match at all → Error leaf + P_UnknownToken.
     bool const noScope = scopes_.empty();
-    ScopeView const scopeView{.top     = noScope ? ScopeKind::None : scopes_.back(),
-                              .bottom  = noScope ? ScopeKind::None : scopes_[0],
+    ScopeView const scopeView{.top     = noScope ? ScopeKind::None : scopes_.back().kind,
+                              .bottom  = noScope ? ScopeKind::None : scopes_[0].kind,
                               .empty   = noScope,
                               .open    = &TreeBuilder::scopeKindOpenThunk_,
                               .builder = this,
@@ -1153,20 +1171,33 @@ std::uint32_t TreeBuilder::scopeKindSlot_(ScopeKind kind) {
     return it->second;
 }
 
+// P69 L2b2 (lane `lm`): a push also grows the chain a diagnostic's trail is read from — a node
+// above the top's — and records it beside the kind, in the one entry a rollback rewinds.
 void TreeBuilder::pushScopeEntry_(ScopeKind kind) {
     std::uint32_t const slot = scopeKindSlot_(kind);
     scopeKindCounts_.assign(slot, scopeKindCounts_[slot] + 1);
-    scopes_.push(kind);
+    std::uint32_t const below = scopes_.empty() ? ScopeChain::kNoNode : scopes_.back().node;
+    scopes_.push(ScopeEntry{.kind = kind, .node = scopeChain_->push(kind, below)});
 }
 
 void TreeBuilder::popScopeEntry_() {
-    std::uint32_t const slot = scopeKindSlot_(scopes_.back());
+    std::uint32_t const slot = scopeKindSlot_(scopes_.back().kind);
     if (scopeKindCounts_[slot] == 0) {
         tbFatal("a scope's kind count is 0 while the stack holds it — the counts and the "
                 "scope stack disagree");
     }
     scopeKindCounts_.assign(slot, scopeKindCounts_[slot] - 1);
+    std::uint32_t const node = scopes_.back().node;
     scopes_.pop();
+    // P69 L2b2 (lane `lm`): the popped scope's node goes with it when nothing can read it again
+    // (`scopeChain_` states the rule and the bound): the chain's newest, read by no trail handed
+    // out, and pushed after the innermost live checkpoint, so no rollback restores an entry
+    // naming it.
+    std::size_t const n = node;
+    if (n + 1u == scopeChain_->size() && n >= capturedTrailEnd_ && n >= heldTrailEnd_
+        && (checkpointStack_.empty() || n >= checkpointStack_.back().second.scopeChainSize)) {
+        scopeChain_->dropNewest();
+    }
 }
 
 bool TreeBuilder::scopeKindOpen_(ScopeKind kind) const noexcept {
@@ -1202,11 +1233,18 @@ void TreeBuilder::popScope() {
 }
 
 ScopeKind TreeBuilder::currentScope() const noexcept {
-    return scopes_.empty() ? ScopeKind::None : scopes_.back();
+    return scopes_.empty() ? ScopeKind::None : scopes_.back().kind;
 }
 
-std::span<ScopeKind const> TreeBuilder::scopeStack() const noexcept {
-    return scopes_.span();
+ScopeTrail TreeBuilder::scopeStack() const noexcept {
+    if (!scopes_.empty()) {
+        heldTrailEnd_ = std::max<std::size_t>(heldTrailEnd_, std::size_t{scopes_.back().node} + 1u);
+    }
+    return scopeTrail_();
+}
+
+std::size_t TreeBuilder::scopeChainSize() const noexcept {
+    return scopeChain_->size();
 }
 
 RuleId TreeBuilder::currentRule() const noexcept {
@@ -1355,6 +1393,14 @@ Tree TreeBuilder::finish() && {
     // rules() identical to schema().rules() — same namespace, same memory.
     td.rules      = std::shared_ptr<RuleInterner const>(schema_, &schema_->rules());
     td.schema     = schema_;
+    // P69 L2b2 (lane `lm`): the kept diagnostics' trails are re-homed into a chain of only the
+    // nodes they read, so the finished tree does not keep a node alive for every scope its parse
+    // ever pushed; an ingested diagnostic's own trail passes unchanged.
+    {
+        ScopeChainCompaction compaction{scopeChain_};
+        reporter_->remapBuffers(
+            [&](ParseDiagnostic& d) { d.scopeStack = compaction.rehome(d.scopeStack); });
+    }
     td.diagnostics = std::move(reporter_);
 
     using NodeArena = substrate::ArenaContainer<detail::Node, NodeId, TreeId>;
@@ -1412,6 +1458,8 @@ TreeBuilder::Checkpoint TreeBuilder::checkpoint() {
     snap.nextCookie                 = nextCookie_;
     snap.maxSpeculationDepthReached = maxSpeculationDepthReached_;
     snap.reporterSnap               = reporter_->snapshotForRollback();
+    snap.scopeChainSize             = scopeChain_->size();   // P69 L2b2
+    snap.capturedTrailEnd           = capturedTrailEnd_;     // P69 L2b2
 
     const auto id = nextCheckpointId_++;
     checkpointStack_.emplace_back(id, std::move(snap));
@@ -1524,6 +1572,12 @@ void TreeBuilder::rollbackToId_(std::uint32_t id) noexcept {
     closedCookies_.rewindTo(snap.closedCookies);
     maxSpeculationDepthReached_ = snap.maxSpeculationDepthReached;
     reporter_->truncateTo(snap.reporterSnap);
+    // P69 L2b2 (lane `lm`): the nodes pushed since the checkpoint go (`scopeChain_`): every live
+    // entry now names one below them, and the diagnostics raised since are gone with the
+    // truncation above, so the mark of the trails they carried comes back with them. A trail
+    // `scopeStack()` handed a caller is never recalled: the nodes up to it stay.
+    capturedTrailEnd_ = snap.capturedTrailEnd;
+    scopeChain_->truncateTo(std::max(snap.scopeChainSize, heldTrailEnd_));
     discardTrailsIfIdle_();
 }
 

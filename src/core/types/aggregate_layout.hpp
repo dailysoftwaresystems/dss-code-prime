@@ -2,7 +2,9 @@
 
 #include "core/export.hpp"
 #include "core/types/enum_name_table.hpp"   // EnumNameTable<E,N> — dependency-free leaf
+#include "core/types/type_lattice/type_interner.hpp"   // vaListTypes builds the list type
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <string_view>
@@ -466,6 +468,46 @@ vaListStrategyName(VaListStrategy s) noexcept {
 [[nodiscard]] constexpr std::optional<VaListStrategy>
 vaListStrategyFromName(std::string_view s) noexcept {
     return kVaListStrategyTable.fromName(s);
+}
+
+// ★ P69 L2b2 (lane `lm`): THE STRATEGY'S LIST TYPE, BUILT IN ONE PLACE. A strategy that mints a
+// record builds it HERE, name and fields — SysV's `__va_list_tag` (psABI §3.5.7: {u32 gp_offset;
+// u32 fp_offset; void *overflow_arg_area; void *reg_save_area}; `va_list` is an array of one) and
+// AAPCS64's `__va_list` (§B.4: {void *__stack; void *__gr_top; void *__vr_top; int __gr_offs;
+// int __vr_offs}; `va_list` is the record itself) — for every tier that needs the type: the
+// semantic injection, the `.s` path's descriptor read, and each recognition of a list, which
+// compares against `record` by IDENTITY and never by its spelling. The record's name is no source
+// name: every reference binds it in neither namespace (MEASURED 2026-11-04 on gcc 13.3.0 and
+// clang 18.1.3 for x86-64 and aarch64, cl and Apple clang: `sizeof(__va_list_tag)` and
+// `sizeof(__va_list)` are undeclared, `sizeof(struct __va_list_tag)` and `sizeof(struct __va_list)`
+// an incomplete tag of the user's own),
+// so a user's own `struct __va_list_tag` is another type — the complete-at-once `structType` keys
+// this record by its content, a source definition by its declaration site. HomogeneousPointer
+// (Win64, Apple arm64) mints none: its list is `char *`.
+struct VaListTypes {
+    TypeId list{};     // the type `va_list` names
+    TypeId record{};   // the record the strategy mints; invalid when it mints none
+};
+[[nodiscard]] inline VaListTypes vaListTypes(VaListStrategy s, TypeInterner& in) {
+    switch (s) {
+        case VaListStrategy::SysVRegisterSave: {
+            TypeId const voidPtr = in.pointer(in.primitive(TypeKind::Void));
+            std::array<TypeId, 4> const fields{in.primitive(TypeKind::U32),
+                                               in.primitive(TypeKind::U32), voidPtr, voidPtr};
+            TypeId const record = in.structType("__va_list_tag", fields);
+            return {in.array(record, 1), record};
+        }
+        case VaListStrategy::Aapcs64DualCursor: {
+            TypeId const voidPtr = in.pointer(in.primitive(TypeKind::Void));
+            TypeId const i32     = in.primitive(TypeKind::I32);
+            std::array<TypeId, 5> const fields{voidPtr, voidPtr, voidPtr, i32, i32};
+            TypeId const record = in.structType("__va_list", fields);
+            return {record, record};
+        }
+        case VaListStrategy::HomogeneousPointer:
+            return {in.pointer(in.primitive(TypeKind::I8)), TypeId{}};
+    }
+    return {};
 }
 
 // D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT: does an UNNAMED bit-field contribute its

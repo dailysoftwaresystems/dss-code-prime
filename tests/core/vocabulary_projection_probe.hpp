@@ -61,6 +61,7 @@
 // `dss::test_support` — no call site changed spelling.
 
 #include "vocabulary_message_probe.hpp"
+#include "shipped_row_pointer.hpp"   // a row named by its key, never its position
 
 #include "core/types/config_path_walk.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -109,11 +110,12 @@ shippedLanguageDoc(std::string_view name) {
 
 // The JSON-pointer guard. `where` names the ROW whose pointer is being
 // resolved, so a stale pointer reports which pin went blind instead of only
-// that one did.
+// that one did. `pointer` is a TEMPLATE (`shipped_row_pointer.hpp`): a row of a
+// shipped array is named by its key (`{rule=topLevelDecl}`), never by its index.
 [[nodiscard]] inline nlohmann::json&
 at(nlohmann::json& doc, std::string_view pointer, std::string_view where) {
     try {
-        return doc.at(nlohmann::json::json_pointer{std::string{pointer}});
+        return doc.at(nlohmann::json::json_pointer{resolveRowPointer(doc, pointer).pointer});
     } catch (std::exception const& e) {
         throw VocabularyProbeError{
             std::string{"["} + std::string{where} + "] the JSON pointer '"

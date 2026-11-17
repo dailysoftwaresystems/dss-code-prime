@@ -749,7 +749,6 @@ struct FunctionFacts {
 FunctionFacts factsOf(Toolchain const& tc, CompileConfig config, std::string const& source,
                       std::string_view name) {
     UnitBuilder builder{tc.grammar, DiagnosticBudget::libraryDefault()};
-    dss::applySystemDirs(builder, *tc.grammar);
     builder.addInMemory(source, "guarded.c");
     CompilationUnit cu = std::move(builder).finish();
     DiagnosticReporter rep;
@@ -913,7 +912,6 @@ LoweredSource lowerSource(Toolchain const& tc, CompileConfig config, std::string
                           std::string_view name) {
     LoweredSource out;
     UnitBuilder builder{tc.grammar, DiagnosticBudget::libraryDefault()};
-    dss::applySystemDirs(builder, *tc.grammar);
     builder.addInMemory(source, "guarded.c");
     CompilationUnit cu = std::move(builder).finish();
     DiagnosticReporter rep;

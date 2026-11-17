@@ -24,6 +24,8 @@
 // Runs natively on the x86_64-Linux CI leg (SysV); the optimized arms re-witness it
 // under the real shipped release pipeline (Inlining ON — the FC7-C3 frame-slack lesson).
 
+#include <stdarg.h>
+
 struct S16 { long x; long y; };
 
 long gx = 10;    // mutable globals → opaque loads (anti-fold)

@@ -14,6 +14,8 @@
 // flips the exit. `n` is the only fixed param (1 GR), so the fixed-params-overflow-to-
 // stack sub-case stays fail-loud and is NOT exercised here. Runs under qemu-aarch64.
 
+#include <stdarg.h>
+
 int sum(int n, ...) {
     va_list ap;
     va_start(ap, n);

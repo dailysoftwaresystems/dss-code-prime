@@ -64,6 +64,7 @@
 
 #include "probe_config_root.hpp"
 #include "vocabulary_message_probe.hpp"
+#include "shipped_row_pointer.hpp"   // a row named by its key, never its position
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
@@ -139,7 +140,8 @@ public:
         return &doc[ptr];
     }
     try {
-        node = &doc.at(nlohmann::json::json_pointer{std::string{pointer}});
+        node = &doc.at(nlohmann::json::json_pointer{
+            dss::test_support::resolveRowPointer(doc, pointer).pointer});
     } catch (std::exception const& e) {
         throw ProbeError{std::string{"["} + std::string{where} +
                          "] the JSON pointer '" + std::string{pointer} +
@@ -237,7 +239,10 @@ constexpr KeyShapeBlock kKeyShapeBlocks[] = {
     {"c", "/shapes/expression/expr/wrapperRules",
      "a 'wrapperRules' object", "'wrapperRules' must be an object",
      "wrapperRules"},
-    {"c", "/numberStyle/integerPrefixes/0/float",
+    // P69 L2b2 (lane `lm`): a row is named by its key (`shipped_row_pointer.hpp`):
+    // the first integer prefix that declares a `float` block, the row of the
+    // `varDecl` rule — never an index a row added before it would move.
+    {"c", "/numberStyle/integerPrefixes/{float}/float",
      "a prefix's 'float' block", "'float' must be an object", "float"},
     {"asm-arm64-gas", "/numberStyle/emitKind",
      "the 'emitKind' block", "'numberStyle.emitKind' is required",
@@ -245,7 +250,7 @@ constexpr KeyShapeBlock kKeyShapeBlocks[] = {
     // The linkage effect is the one block whose sentence carries NO self-quote:
     // the object is keyed by specifier SOURCE TEXT, so it has no fixed name to
     // open with. The empty string here is a measured fact, not a placeholder.
-    {"c", "/semantics/declarations/0/linkageSpecifiers/static",
+    {"c", "/semantics/declarations/{rule=varDecl}/linkageSpecifiers/static",
      "a linkage effect", "linkage effect must be an object", ""},
     {"c", "/requires", "the 'requires' block",
      "'requires' must be an object", "requires", /*created=*/true},
@@ -365,7 +370,8 @@ void expectEveryAdvertisedValueIsAccepted(std::string_view language,
     auto const setValue = [&](nlohmann::json& doc, std::string_view value) {
         nlohmann::json* node = nullptr;
         try {
-            node = &doc.at(nlohmann::json::json_pointer{std::string{pointer}});
+            node = &doc.at(nlohmann::json::json_pointer{
+                dss::test_support::resolveRowPointer(doc, pointer).pointer});
         } catch (std::exception const& e) {
             throw ProbeError{std::string{"["} + std::string{label} +
                              "] the JSON pointer '" + std::string{pointer} +
@@ -495,8 +501,8 @@ struct HirAttrVocabulary {
 // `Bool/I*/U*/F*/Char/Byte/Void` and omitted `NullptrT`.
 TEST(TextTierVocabulary, CoreTypeRefusalNamesEverySpellingTheLoaderAccepts) {
     expectEveryAdvertisedValueIsAccepted(
-        "c", "/semantics/builtinTypes/0/core", "unknown core TypeKind",
-        20, "semantics.builtinTypes[0].core");
+        "c", "/semantics/builtinTypes/{core}/core", "unknown core TypeKind",
+        20, "semantics.builtinTypes[].core");
 }
 
 // The `builtinFunctions[].lowering` refusal — a closed set of verbs, and it
@@ -513,8 +519,8 @@ TEST(TextTierVocabulary, CoreTypeRefusalNamesEverySpellingTheLoaderAccepts) {
 // walk below proves each is accepted.
 TEST(TextTierVocabulary, BuiltinLoweringRefusalNamesEveryVerbTheLoaderAccepts) {
     expectEveryAdvertisedValueIsAccepted(
-        "c", "/semantics/builtinFunctions/0/lowering",
-        "unknown builtin lowering", 52, "semantics.builtinFunctions[0].lowering");
+        "c", "/semantics/builtinFunctions/{lowering}/lowering",
+        "unknown builtin lowering", 52, "semantics.builtinFunctions[].lowering");
 }
 
 // ★★ THE `.dsshir` ATTRIBUTE VOCABULARIES. Six sets that each used to exist

@@ -63,8 +63,8 @@ fs::path plantTarget(fs::path const& root, std::string const& stem) {
 }
 
 // Plant `<root>/src/dss-config/<subdir>` as a DIRECTORY — what the directory
-// form resolves. `subdir` may be nested (`applySystemDirs` feeds it whole
-// `semantics.shippedLibDirs` strings). Returns the planted directory path.
+// form resolves. `subdir` may be nested (`resolveSystemDirs`, which every
+// `UnitBuilder` asks at construction, feeds it whole `semantics.shippedLibDirs` strings). Returns the planted directory path.
 fs::path plantConfigDir(fs::path const& root, std::string const& subdir) {
     fs::path const dir = root / "src" / "dss-config" / subdir;
     std::error_code ec;
@@ -202,7 +202,7 @@ TEST(ConfigPathWalk, EnvRootMissFallsThroughToWalk) {
 // env falls THROUGH to the walk, the walk alone works, and nothing resolves to
 // nullopt. Then the two properties the call sites depend on: an explicit
 // `startPath` outranks the env (the LSP's fixtures), and a nested subdir is
-// accepted (`applySystemDirs` forwards whole `semantics.shippedLibDirs`
+// accepted (`resolveSystemDirs` forwards whole `semantics.shippedLibDirs`
 // strings, which the config permits to contain a `/`).
 
 // (1) ENV WINS. The planted tree sits under a temp dir with no repo anywhere in
@@ -318,7 +318,7 @@ TEST(ConfigPathWalk, DirExplicitStartPathOutranksEnvRoot) {
     expectSameDir(*got, wanted);
 }
 
-// A NESTED subdir resolves. `applySystemDirs` forwards `semantics.shippedLibDirs`
+// A NESTED subdir resolves. `resolveSystemDirs` forwards `semantics.shippedLibDirs`
 // verbatim, and that config permits a nested value (semantic_config.hpp cites
 // "shippedLibs/windows-x86_64"), so the directory form must NOT inherit the file
 // form's path-like-name rejection. This pins that: add the rejection and the

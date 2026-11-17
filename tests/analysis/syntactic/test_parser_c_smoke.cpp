@@ -1762,10 +1762,8 @@ TEST(ParserCSmoke, ValueStarValueRollsBackToExpression) {
 
 // UNKNOWN lone identifier: `u * v;` with NO `u` anywhere — the
 // follower-operator test sees `*` (continues a value reading) and ROLLS
-// BACK; single-file compile keeps the expression reading (the
-// cross-file oracle candidate is recorded for the CU reparse, which a
-// single-file unit never seeds). Structure pin only — the TWO
-// positioned S_UndeclaredIdentifier are the semantic-tier mirror.
+// BACK; the compile keeps the expression reading. Structure pin only —
+// the TWO positioned S_UndeclaredIdentifier are the semantic-tier mirror.
 TEST(ParserCSmoke, UnknownStarUnknownRollsBackToExpression) {
     auto h = loadAndTokenize("int main() { u * v; }");
     Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};

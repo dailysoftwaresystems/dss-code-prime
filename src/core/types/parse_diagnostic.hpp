@@ -2,6 +2,7 @@
 
 #include "core/export.hpp"
 #include "core/types/scope_kind.hpp"
+#include "core/types/scope_trail.hpp"
 #include "core/types/source_span.hpp"
 #include "core/types/strong_ids.hpp"
 
@@ -2242,10 +2243,30 @@ enum class DiagnosticCode : std::uint16_t {
     // ordinal shown to a user who wrote `a[b]`. gcc 13.3.0 and clang 18.1.3 both
     // refuse both shapes at the user's own token.
     //
-    // Emitted by the CST→HIR tier, which still knows the source construct.
+    // ★ P69 L2b2 (lane `lm`): JUDGED WHERE EVERY SUBSCRIPT IS TYPED. One law
+    // (type_rules.hpp `subscriptConstraintOf`, beside `indexResultType`) decides
+    // it, and the semantic tier asks it at EVERY subscript — an unevaluated one
+    // too (`sizeof(s[0])`, `__typeof__(i[0])`), which no lowering ever reaches:
+    // ✔MEASURED 2026-11-05, gcc 13.3.0, clang 18.1.3, cl 19.51 and Apple clang
+    // refuse a struct or an int subscripted inside `sizeof` / `__typeof__` at
+    // the subscript, where DSS left it untyped for an internal refusal later. The
+    // CST→HIR tier asks the same law for a tree no analysis judged.
     // Suppressable: silencing it cannot ship a wrong artifact, because the
     // lowering returns an Error sentinel either way and the build still fails.
     S_SubscriptOperandsNotPointerAndInteger = 0xE077,
+    // C 6.5.2p2 (P69 L2b2, lane `lm`): an identifier that names a TYPE
+    // (a typedef name, or a builtin type name the language binds in the ordinary
+    // namespace such as `__builtin_va_list`) where an expression is required —
+    // `return T;`, `T + 1`, `f(T)`, `int y = T;`, `(int)T`. A primary expression
+    // that is an identifier must designate an object or a function (6.5.2p2);
+    // the analyzer's reference arm found a type and used to type the use as a
+    // VALUE of that type. ✔MEASURED 2026-11-05: gcc 13.3.0 ("expected expression
+    // before 'T'"), clang 18.1.3 and Apple clang ("unexpected type name 'T':
+    // expected expression") and cl 19.51 (C2275) refuse all five positions at the
+    // name, for a typedef and (gcc / clang) for `__builtin_va_list`; DSS refused
+    // the typedef only by an internal lowering refusal and COMPILED the builtin
+    // as a value. Unsuppressable: the use has no meaning.
+    S_TypeNameInValuePosition             = 0xE0B0,
     // C 6.7.1p2 (D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS): TWO DISTINCT
     // members of one config-declared mutual-exclusion group appear in one
     // declaration's specifier prefix — for C, two different storage-class
@@ -6354,7 +6375,10 @@ struct DSS_EXPORT ParseDiagnostic {
 
     // Builder-captured scope stack at the moment of error. Powers
     // "got '>' while inside Generic scope" without state reconstruction.
-    std::vector<ScopeKind> scopeStack;
+    // P69 L2b2 (lane `lm`): a HANDLE taken in O(1) (`ScopeTrail`), its kinds
+    // read by `kinds()` only when rendered or asked for — a copy per
+    // diagnostic cost a probe nest Θ(depth²) (scope_trail.hpp).
+    ScopeTrail scopeStack;
 
     // Secondary locations (matching opener, previous declaration, ...).
     std::vector<RelatedLocation> related;

@@ -79,6 +79,10 @@ target_link_libraries(dss_examples_runner
         GTest::gtest
         GTest::gtest_main
         nlohmann_json::nlohmann_json
+        # The fixture home (tests/CMakeLists.txt): a unit with an unasked driver
+        # Error fails the run that built it — this runner builds its own target, so
+        # it links the library itself rather than through `dss_add_test`.
+        dss_test_driver_diagnostics
 )
 target_include_directories(dss_examples_runner
     PRIVATE

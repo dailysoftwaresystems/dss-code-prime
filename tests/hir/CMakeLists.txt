@@ -68,6 +68,15 @@ dss_add_test(NAME hir/test_scalar_brace_initializer
              SOURCES test_scalar_brace_initializer.cpp)
 target_link_libraries(dss_hir_test_scalar_brace_initializer
                       PRIVATE nlohmann_json::nlohmann_json)
+# P69 L2b2 (lane `lm`): a declaration that declares nothing (C 6.7p2) is the language's
+# warning (`semantics.declarators.emptyDeclarationWarns`) and lowers to nothing; every
+# typedef-named form parses as the declaration it is. A binary of its own: it reads the
+# shipped C document with that ONE key rewritten, and `hir/test_hir_lowering_c` is the
+# claim runner of many mutation arms.
+dss_add_test(NAME hir/test_empty_declaration_declares_nothing
+             SOURCES test_empty_declaration_declares_nothing.cpp)
+target_link_libraries(dss_hir_test_empty_declaration_declares_nothing
+                      PRIVATE nlohmann_json::nlohmann_json)
 # P69 L2 (lane `lm`): the comma operator in an integer constant expression — admitted per
 # position (`semantics.integerConstantExpressions`), warned once per comma, refused by name where
 # no reference folds it; a bare top-level comma is no bound, case or designator. A binary of its

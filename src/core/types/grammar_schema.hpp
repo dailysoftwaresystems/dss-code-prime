@@ -1291,6 +1291,16 @@ public:
     // `typeNameCommitRule(rule).valid()`; returns the default otherwise.
     [[nodiscard]] TypeNameCommitPolarity
         typeNameCommitPolarity(RuleId rule) const noexcept;
+    // P69 L2b2 (lane `lm`): the triage's STATIC half (see `CompiledRule::typeBaseAskable`),
+    // one load-time computation both base askers read. `typeBaseAskable`: may the type
+    // child's base be read as the first grammar token when its frame opens?
+    // `typeChildLeadRunLength`: the number of single-token elements before the type child
+    // when the entry is such a run and then the type rule (nullopt otherwise);
+    // `typeChildLeadRunAdmits`: does the run's `i`-th element admit `tok`?
+    [[nodiscard]] bool typeBaseAskable(RuleId rule) const noexcept;
+    [[nodiscard]] std::optional<std::size_t> typeChildLeadRunLength(RuleId rule) const noexcept;
+    [[nodiscard]] bool typeChildLeadRunAdmits(RuleId rule, std::size_t i,
+                                              SchemaTokenId tok) const noexcept;
 
     // commitAfterPrefix CUT (`commitAfterPrefix` on the shape body; PEG
     // "cut"; D-CSUBSET-LABEL-BUDGET-CLIFF, p19 Cluster G c31). True iff a
@@ -1303,6 +1313,12 @@ public:
     // `Parser::Impl::trySpeculativeBranch`. Names no token, rule, or
     // language.
     [[nodiscard]] bool commitAfterPrefix(RuleId rule) const noexcept;
+
+    // P69 L2b2 (lane `lm`): `rule` is a VALUE reading of its position (`valueReading` on the
+    // shape body). After a candidate of a speculative site COMMITTED to its type reading and
+    // failed, the parser tries none of the site's value readings. False for every rule that
+    // omits the flag. Names no token, rule, or language.
+    [[nodiscard]] bool isValueReading(RuleId rule) const noexcept;
 
     // P69 (lane `cs`): the token kinds that must NOT follow a cleanly-closed speculative
     // probe of `rule` (`notFollowedBy` on the shape body — a PEG not-predicate); when the

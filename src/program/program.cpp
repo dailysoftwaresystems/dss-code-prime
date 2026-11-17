@@ -115,10 +115,10 @@ namespace dss {
 // which builds a `UnitBuilder` per open document, could not call them and grew
 // no system dirs at all, while `dump_predefined_macros.cpp` re-walked
 // `shippedLibDirs` with a private loop. The walk now lives once in
-// `core/types/config_path_walk.hpp` (`resolveSystemDirs`) and its builder
-// binding once beside `UnitBuilder::addSystemDir`
-// (`analysis/compilation_unit/compilation_unit.hpp`, `applySystemDirs`) — both
-// reached through includes this file already had.
+// `core/types/config_path_walk.hpp` (`resolveSystemDirs`), and a unit takes its
+// language's dirs at construction (`UnitBuilder`, `LanguageSystemDirs` in
+// `analysis/compilation_unit/compilation_unit.hpp`) — both reached through
+// includes this file already had.
 
 namespace {
 
@@ -5327,11 +5327,10 @@ int runCusToTargets(
             // one. The UNION is conservative in the safe direction: a unit that
             // errored is excluded.
             auto const errorsBefore = rep.errorCount();
-            bool       failed       = cu.driverDiagnostics().hasErrors();
-            copyDiagnostics(cu.driverDiagnostics(), rep);
+            // The unit's own streams, and its own verdict, through their one home.
+            bool failed = cu.forEachOwnDiagnosticStream(
+                [&rep](DiagnosticReporter const& stream) { copyDiagnostics(stream, rep); });
             for (auto const& tree : cu.trees()) {
-                if (tree.diagnostics().hasErrors()) failed = true;
-                copyDiagnostics(tree.diagnostics(), rep);
                 // Defense-in-depth: a driver-produced tree always has a non-null
                 // source, but `BufferRegistry::add` THROWS on null — guard so a
                 // future tree-producer (or a hand-built test tree) can't abort the
@@ -6747,9 +6746,11 @@ int Program::transpile(
 //   * the WALK          -> `dss::resolveSystemDirs(GrammarSchema const&)`,
 //                          `core/types/config_path_walk.hpp`, beside the
 //                          `findShippedConfigDir` it wraps;
-//   * the BUILDER BIND  -> `dss::applySystemDirs(UnitBuilder&, GrammarSchema const&)`,
-//                          `analysis/compilation_unit/compilation_unit.hpp`,
-//                          beside `UnitBuilder::addSystemDir`.
+//   * the BUILDER BIND  -> the `UnitBuilder` constructor itself (P69 L2b2, ruling
+//                          570: a unit has its language's system dirs BY
+//                          CONSTRUCTION; `LanguageSystemDirs` for a caller that
+//                          resolves them ahead, as this file's batch build does),
+//                          `analysis/compilation_unit/compilation_unit.hpp`.
 //
 // Both are already reachable from here: this file includes both headers. Do NOT
 // re-open a local copy -- the whole history of this seam is copies drifting
@@ -6764,8 +6765,8 @@ int Program::transpile(
 // regardless of any later cwd change; the resolver searches these AFTER the
 // including file's own directory (C 6.10.2, the quote form). A nonexistent dir
 // is added anyway (gcc parity — it simply yields no hits, and a genuinely-
-// missing header still fails loud P0016 downstream). Distinct from
-// `applySystemDirs` (the angle-form `/usr/include` analogue via `addSystemDir`).
+// missing header still fails loud P0016 downstream). Distinct from the unit's
+// SYSTEM dirs (the angle-form `/usr/include` analogue `UnitBuilder` takes itself).
 // AGNOSTIC: pure path plumbing — no language/target/format branch.
 void applyIncludeDirs(UnitBuilder& builder,
                       std::vector<std::string> const& dirs) {
@@ -6880,8 +6881,8 @@ int Program::compileFiles(
     // (cross-file references resolved WITHIN the CU; each file routes to the language's
     // schema by extension). For one CU per file (a multi-CU image the linker MERGES, LK11)
     // use `compileUnits` — this entry's single-CU semantics are unchanged.
-    // D-PARSE-DEEP-FRONTEND-STACK: the CU build (preprocess + parse + the
-    // type-name oracle reparse) recurses over the expression tree on the
+    // D-PARSE-DEEP-FRONTEND-STACK: the CU build (preprocess + parse)
+    // recurses over the expression tree on the
     // thread stack (the parser's residual paren/postfix arm), so a deeply-
     // nested-but-legal expression that the config-driven parser cap
     // (`parser.maxExpressionDepth`, c = 1024) admits would overflow the
@@ -6925,7 +6926,6 @@ int Program::compileFiles(
                 // the merge, so a budget derived from one would hand the front
                 // end no bound at all.
                 UnitBuilder builder{keyGrammar, DiagnosticBudget{rep.config()}};
-                applySystemDirs(builder, *keyGrammar);
                 // D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE: everything the
                 // pair decides about the build — the format kind, its header-
                 // name case rule, the target's plain-`char` sign, the target's
@@ -7298,8 +7298,8 @@ int Program::compileUnits(
         std::size_t const n = sources.size();
         // Resolved ONCE for the whole batch rather than once per file: the
         // answer is fixed for this key, and it is a filesystem walk (see
-        // `resolveSystemDirs`).
-        std::vector<fs::path> const systemDirs = resolveSystemDirs(*keyGrammar);
+        // `resolveSystemDirs`). Each unit takes it at construction.
+        LanguageSystemDirs const systemDirs{*keyGrammar};
 
         std::vector<std::optional<CompilationUnit>> slots(n);
         auto buildOne = [&](std::size_t i) {
@@ -7317,8 +7317,7 @@ int Program::compileUnits(
                     // note above; writing it from a job would reintroduce
                     // exactly the completion-order dependence this shape
                     // exists to prevent.
-                    UnitBuilder builder{keyGrammar, DiagnosticBudget{rep.config()}};
-                    for (auto const& d : systemDirs) builder.addSystemDir(d);
+                    UnitBuilder builder{keyGrammar, DiagnosticBudget{rep.config()}, systemDirs};
                     // D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE: the pair's
                     // consequences in ONE call (see the `compileFiles` twin).
                     if (pairTarget != nullptr && pairFormat != nullptr) {

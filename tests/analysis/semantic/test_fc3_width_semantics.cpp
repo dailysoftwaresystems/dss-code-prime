@@ -28,6 +28,7 @@
 #include "repo_root.hpp"
 #include "scratch_dir.hpp"
 #include "shipped_read_pairs.hpp"   // the real pairs a REAL descriptor is read on
+#include "validation_va_list_binding.hpp"   // the descriptor word a validation read binds (c82)
 
 #include <nlohmann/json.hpp>
 
@@ -1243,18 +1244,10 @@ TEST(Fc3Descriptor, FseekOffsetFollowsTheDataModel) {
         TypeInterner interner{CompilationUnitId{1}};
         TypeRegistry registry;
         DiagnosticReporter rep;
-        // c82: stdio.json's vfprintf spells `va_list` — bind it (the SysV
-        // shape) exactly as the analyzer threads it in production; this
-        // test's subject (fseek's per-model offset) is unchanged.
-        TypeId const voidPtr =
-            interner.pointer(interner.primitive(TypeKind::Void));
-        std::array<TypeId, 4> vaTagFields{
-            interner.primitive(TypeKind::U32),
-            interner.primitive(TypeKind::U32), voidPtr, voidPtr};
-        TypeId const vaListTy = interner.array(
-            interner.structType("__va_list_tag", vaTagFields), 1);
-        std::array<NamedTypeBinding, 1> namedTypes{
-            NamedTypeBinding{"va_list", vaListTy}};
+        // c82: stdio.json's vfprintf spells the descriptor word `va_list` — the
+        // read binds it as every validation read does; this test's subject
+        // (fseek's per-model offset) is unchanged.
+        auto const namedTypes = dss::test_support::validationVaListBinding(interner);
         ffi::ShippedPairFacts const facts = pair.pairFacts();
         auto d = ffi::readShippedLibDescriptor(desc, interner, registry, rep,
                                                pair.dataModel(), pair.activeTarget(),

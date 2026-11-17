@@ -117,6 +117,13 @@ enum class DiagnosticCode : std::uint16_t;
 
 namespace ffi {
 
+// The DESCRIPTOR VOCABULARY's spelling of the active ABI's list type (P69 L2b2): a descriptor
+// signature that names `va_list` (stdio.json's `vfprintf`, …) reads the type a caller binds under
+// THIS name in `namedTypes` (`readShippedLibDescriptor`). It is the descriptor schema's word, not a
+// source language's — a descriptor read for a `.s` has no source language — so every caller that
+// binds it (the semantic tier, the assembly path) reads this one constant.
+inline constexpr std::string_view kVaListDescriptorTypeName = "va_list";
+
 // What kind of symbol the descriptor declares — selects the HIR extern node
 // the CST→HIR lowering synthesizes. Closed enum (descriptor-local; deliberately
 // decoupled from the FF1/FF2 `import_surface.hpp` SymbolKind, whose Tls/NoType
@@ -1153,8 +1160,45 @@ struct DSS_EXPORT ShippedDescriptorCacheStats {
     std::size_t parses          = 0;  // documents actually `json::parse`d
     std::size_t revalidatedHits = 0;  // served from cache after a byte-compare
     std::size_t staleEvictions  = 0;  // dropped because the file's bytes changed
+    // P69 L2b2 (ruling 602): the work a shipped-surface check does, counted so a pin can
+    // say "once" without a clock.
+    std::size_t scopeHits       = 0;  // served inside a read scope with no second read
+    std::size_t surfaceHarvests = 0;  // a descriptor's surface harvested from its DOM on a format
+    std::size_t surfaceMemoHits = 0;  // a surface served from the entry's per-format memo
+    std::size_t closureWalks    = 0;  // a descriptor closure's surface resolved on a format
+    std::size_t identityResolutions = 0;  // a descriptor path's identity computed (`PathIdentity::of`)
+    // P69 L2b2 (ruling 630): the constants view `readShippedLibConstants` keeps in a descriptor's entry.
+    std::size_t constantsDecodes  = 0;  // a constants view decoded from a descriptor's document
+    std::size_t constantsMemoHits = 0;  // a constants view served from its entry, every read it made still holding
+    std::size_t descriptorSearches = 0; // a descriptor search a decode made on the file system (a typedef's owner, an `of` header)
+    std::size_t searchScopeHits    = 0; // such a search answered from the read scope: asked before in the operation
 };
 [[nodiscard]] DSS_EXPORT ShippedDescriptorCacheStats shippedDescriptorCacheStats();
+
+// ── ONE SNAPSHOT OF THE SHIPPED CORPUS PER OPERATION (P69 L2b2, ruling 602) ─────────────
+//
+// While a `ShippedDescriptorReadScope` lives on a thread, a descriptor that thread has
+// already read under the same spelling is served from the cache with NO second read, and
+// each spelling's identity is resolved once. When the thread's OUTERMOST scope ends, the
+// snapshot is forgotten and the next scope reads every file again — so the cache stays
+// exact ACROSS operations, which is what an editor session needs: a descriptor rewritten
+// between two operations is read from its new bytes. A scope is one OPERATION long (a
+// unit's parse of one source, a unit's finish, the shipped-surface check), never a
+// builder's or a session's lifetime. ✔MEASURED before it (MSVC Release, warm): a unit
+// including six headers made 82 descriptor lookups outside the check, each a checked
+// read and a path identity (≈0.14–0.23 ms on Windows). THREAD-LOCAL, like the cache;
+// scopes nest, and only the outermost one's end forgets. ★ The snapshot holds the SHAPE of the shipped
+// tree too (P69 L2b2, ruling 630): a descriptor search a decode makes — a typedef's owner, a header a
+// derived row's `of` names — is answered once per (header, dirs, matching) for the operation; each one
+// a fresh-cache search of the file system (≈0.09 ms on Windows, ✔MEASURED quiet), and one unit's decodes
+// and the checks of its kept constants views asked the same ones again and again.
+class DSS_EXPORT ShippedDescriptorReadScope {
+public:
+    ShippedDescriptorReadScope() noexcept;
+    ~ShippedDescriptorReadScope();
+    ShippedDescriptorReadScope(ShippedDescriptorReadScope const&)            = delete;
+    ShippedDescriptorReadScope& operator=(ShippedDescriptorReadScope const&) = delete;
+};
 
 // ── `roleResolver` (D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE)
 //
@@ -1268,6 +1312,18 @@ readShippedLibMacros(std::filesystem::path const&    path,
 // here for that alone, into a scratch reporter, so a typedef that needs the
 // semantic tier's cross-descriptor bindings costs nothing but its own rows).
 // nullptr ⇒ no derived row is realized, and no data model is assumed.
+//
+// ★ KEPT PER WHAT ITS DECODE READ (P69 L2b2, ruling 630). The decode costs about 1.1 ms a call for
+// `<stdio.h>` and 4.4 ms over the closure of a unit including six headers (✔MEASURED, MSVC Release,
+// warm, the pe pair the driver applies), and the preprocessor asks it once per descriptor of every
+// unit's closure. The answer is kept in the descriptor's cache entry and dropped with it, so a
+// rewritten descriptor decodes again. It is keyed by every input the decode reads, by VALUE: the descriptor's spelling,
+// `activeTarget`, `activeFormat`, whether a pair is given and each of its facts, and the language by
+// the digest of its document and of the documents folded into it (a language with no digest is never
+// kept). What the decode reads BEYOND the descriptor's bytes — a `shippedTypedef` owner, a header a
+// derived row's `of` names, the searches that found them, the language's system dirs — is recorded
+// while it runs, and a kept answer is served only while every one of those reads still answers the
+// same. Only a decode that said NOTHING is kept, so a decode that reports says it again at every call.
 [[nodiscard]] DSS_EXPORT std::optional<std::vector<ShippedPpConstant>>
 readShippedLibConstants(std::filesystem::path const&    path,
                         DiagnosticReporter&             reporter,
@@ -1444,11 +1500,11 @@ readShippedLibAvailability(std::filesystem::path const& path,
                            DiagnosticReporter&          reporter);
 
 // Read ONLY the `typedefs[].name` list from the descriptor at `path`, WITHOUT a
-// TypeInterner — the PARSE-TIME cast-vs-call ORACLE (D-CSUBSET-SHIPPED-TYPEDEF-CAST-PARSE).
-// Shipped typedefs are injected SEMANTICALLY (post-parse), so the parser's binder
-// sketch never sees `size_t` as a TYPE NAME and parses `(size_t)(expr)` as a CALL.
-// The post-parse typedef-resolution reparse (compilation_unit.cpp) seeds these
-// NAMES as parse-time global types so the reparse commits the cast. Only the names
+// TypeInterner — the PARSE-TIME cast-vs-call seed (D-CSUBSET-SHIPPED-TYPEDEF-CAST-PARSE,
+// D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION). Shipped typedefs are injected SEMANTICALLY
+// (post-parse), so without the seed the parser's binder sketch never sees `size_t`
+// as a TYPE NAME and parses `(size_t)(expr)` as a CALL; UnitBuilder::parseAndAdd_
+// seeds these NAMES as parse-time global types before the parse. Only the names
 // are needed (not the decoded `type`), so no interner — mirrors
 // readShippedLibAvailability. LENIENT: malformed entries are skipped (the SEMANTIC
 // read owns strict typedef validation — this must be no STRICTER). std::nullopt on
@@ -1456,6 +1512,23 @@ readShippedLibAvailability(std::filesystem::path const& path,
 [[nodiscard]] DSS_EXPORT std::optional<std::vector<std::string>>
 readShippedLibTypedefNames(std::filesystem::path const& path,
                            DiagnosticReporter&          reporter);
+
+// The VALUE names the descriptor at `path` declares — the ordinary identifiers the
+// semantic read binds into the unit as functions, objects and constants: every
+// `symbols[]` row and its `aliases`, every `constants[]` and `floatConstants[]` entry.
+// On a KNOWN format, exactly the ones `shippedSurfaceNamesForFormat` names on it (it
+// reads those three surfaces through the same decode): a symbol gated by its own
+// availability set, else the document's, with the format's aliases; a constant by its
+// variants' reachability. With NO format, every row and every format's aliases — a
+// superset, as the analyzer, which then gates no symbol, binds them all. WITHOUT a
+// TypeInterner, for the parse (P69 L2b2): its binder sketch learns them as VALUES
+// (`BinderSketch::seedGlobalValue`), so a lone name it does not know is one nothing the
+// unit can see declares. LENIENT on shape, as readShippedLibTypedefNames; std::nullopt
+// (the reason in `reporter`) when the descriptor does not decode far enough to answer.
+[[nodiscard]] DSS_EXPORT std::optional<std::vector<std::string>>
+readShippedLibValueNames(std::filesystem::path const&   path,
+                         std::optional<ObjectFormatKind> fmt,
+                         DiagnosticReporter&            reporter);
 
 // Read ONLY the `includes` surface (the transitive sibling-header NAMES) from the
 // descriptor at `path`, WITHOUT a TypeInterner — the interner-free sibling of

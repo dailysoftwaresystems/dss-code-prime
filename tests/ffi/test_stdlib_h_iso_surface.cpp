@@ -73,6 +73,7 @@
 #include "program/program.hpp"
 #include "repo_root.hpp"
 #include "scratch_dir.hpp"
+#include "validation_va_list_binding.hpp"   // the descriptor word a validation read binds (c82)
 
 #include <gtest/gtest.h>
 
@@ -293,7 +294,8 @@ TEST(StdlibHIsoSurface, EveryS1FactHoldsOnEveryExecutablePair) {
         TypeRegistry       typeReg;
         DiagnosticReporter rep;
         auto const desc = readShippedLibDescriptor(path, interner, typeReg, rep, model,
-                                                   std::string_view{p.arch}, kind, {},
+                                                   std::string_view{p.arch}, kind,
+                                                   dss::test_support::validationVaListBinding(interner),
                                                    nullptr, &facts);
         ASSERT_TRUE(desc.has_value());
         ASSERT_FALSE(rep.hasErrors()) << (rep.all().empty() ? std::string{} : rep.all().front().actual);
@@ -392,7 +394,8 @@ TEST(StdlibHIsoSurface, EveryS1FactHoldsOnEveryExecutablePair) {
         DiagnosticReporter sRep;
         auto const stddef = readShippedLibDescriptor(path.parent_path() / "stddef.json", sInterner,
                                                      sTypeReg, sRep, model, std::string_view{p.arch},
-                                                     kind, {}, nullptr, &facts);
+                                                     kind,
+                                                     dss::test_support::validationVaListBinding(sInterner), nullptr, &facts);
         ASSERT_TRUE(stddef.has_value());
         ShippedMacro const* off = nullptr;
         for (auto const& m : stddef->macros) if (m.name == "offsetof") off = &m;
@@ -483,7 +486,8 @@ TEST(StdlibHIsoSurface, TheRestOfC23sStdlibIsDeclaredAndBoundOnEveryPair) {
         auto read = [&](fs::path const& file) -> std::optional<ShippedLibDescriptor> {
             DiagnosticReporter rep;
             auto desc = readShippedLibDescriptor(file, interner, typeReg, rep, (*formatR)->dataModel(),
-                                                 std::string_view{p.arch}, kind, {}, nullptr, &facts);
+                                                 std::string_view{p.arch}, kind,
+                                                 dss::test_support::validationVaListBinding(interner), nullptr, &facts);
             EXPECT_FALSE(rep.hasErrors()) << file.filename().string() << ": "
                                           << (rep.all().empty() ? std::string{} : rep.all().front().actual);
             return desc;

@@ -1,4 +1,4 @@
-// The USER-FACING symptom pin for `applySystemDirs`: an angle `#include` must
+// The USER-FACING symptom pin for a unit's system dirs: an angle `#include` must
 // resolve when the process cwd is OUTSIDE the source tree and `DSS_CONFIG_ROOT`
 // names it.
 //
@@ -23,7 +23,7 @@
 // — so the pin has to be end-to-end too.
 //
 // ── RED ON DISABLE ─────────────────────────────────────────────────────────
-// Revert `applySystemDirs` to the cwd-only walk and `ResolvesAngleIncludeFrom
+// Revert `resolveSystemDirs` to the cwd-only walk and `ResolvesAngleIncludeFrom
 // CwdOutsideTheSourceTree` fails with the F_ShippedHeaderNotFound this file
 // asserts against, while the in-tree control below stays green — which is
 // precisely the asymmetry that made the bug invisible for so long.

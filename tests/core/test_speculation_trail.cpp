@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -320,6 +321,10 @@ TEST(SpeculationTrail, EveryReadPathCountsTheEntriesItHandsOut) {
         {"assign() and truncate()", true,
          [](TrailedStack<int>& s) { s.assign(0, 9); s.truncate(0); }, none},
         {"discardJournal()", false, [](TrailedStack<int>& s) { s.discardJournal(); }, none},
+        // P69 L2b2 (the L2b1 review's R1): a move hands the storage over and reads no entry; a copy
+        // does not compile (the static_asserts below).
+        {"a move", false, [](TrailedStack<int>& s) { TrailedStack<int> t = std::move(s); (void)t; },
+         none},
     };
     for (Path const& p : paths) {
         for (std::size_t const n : {std::size_t{0}, std::size_t{1}, std::size_t{5}}) {
@@ -333,6 +338,18 @@ TEST(SpeculationTrail, EveryReadPathCountsTheEntriesItHandsOut) {
         }
     }
 }
+
+// ── P69 L2b2 (lane `lm`, the L2b1 review's R1): A TRAILED STACK CANNOT BE COPIED ──
+// The one read path that handed out every entry and counted none was the implicit copy: a snapshot
+// keeping `TrailedStack<LiveScope> saved = liveScopes_;` brings back the per-probe Θ(depth) copy with
+// every owner's work counter linear. Move-only, it does not compile.
+static_assert(!std::is_copy_constructible_v<TrailedStack<int>>,
+              "a TrailedStack copy hands out every entry uncounted");
+static_assert(!std::is_copy_assignable_v<TrailedStack<int>>,
+              "a TrailedStack copy hands out every entry uncounted");
+static_assert(std::is_nothrow_move_constructible_v<TrailedStack<int>>
+                  && std::is_nothrow_move_assignable_v<TrailedStack<int>>,
+              "a TrailedStack moves (its owners move it)");
 
 // ── fail-loud contracts ──────────────────────────────────────────────────
 

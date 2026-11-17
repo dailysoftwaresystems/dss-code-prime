@@ -34,14 +34,13 @@ enum class SlotKind : std::uint8_t {
 //   PreferType       — the FC2 default: commit iff the follower token could
 //                      not continue a value reading (not an infix/postfix/
 //                      ternary operator per the operator table); an
-//                      operator follower rolls back + records the
-//                      AmbiguousTypeNameCandidate for the CU oracle.
+//                      operator follower rolls back + records an
+//                      UnknownNameRefusal.
 //   RequireKnownType — commit ONLY on a sketch-KNOWN type. Unknown always
 //                      rolls back to the competing reading AND records the
-//                      candidate (so a cross-file typedef still resolves on
-//                      the oracle's seeded reparse). The C 6.7.6.3p11
-//                      parameter-position rule: `T (name)` is a parenthesized
-//                      declarator unless `name` is a visible typedef.
+//                      refusal. The C 6.7.6.3p11 parameter-position rule:
+//                      `T (name)` is a parenthesized declarator unless
+//                      `name` is a visible typedef.
 enum class TypeNameCommitPolarity : std::uint8_t {
     PreferType,
     RequireKnownType,
@@ -373,6 +372,23 @@ struct CompiledRule {
     TypeNameCommitPolarity     typeNameCommitPolarity =
         TypeNameCommitPolarity::PreferType;
 
+    // P69 L2b2 (lane `lm`): THE TYPE-NAME TRIAGE'S STATIC HALF, computed ONCE by the
+    // GrammarSchema sealing pass and read by both of the triage's base askers — the early
+    // base ask when the type child's frame opens (`Parser::Impl::askTriageBaseEarly_`) and
+    // the same ask hoisted before the probe opens (`Parser::Impl::hoistRefutesTheCandidate_`)
+    // — so the two cannot disagree about when the base may be asked.
+    //   * `typeBaseAskable`: the rule has a type guard, its type rule cannot derive nothing
+    //     (else the next grammar token would be the NEXT element's), and no attribute
+    //     specifier of the language can start with an identifier (else the base is the first
+    //     leaf outside one, which a token peek cannot tell).
+    //   * `typeChildLeads` / `typeChildLeadRun`: the rule's entry is a run of single-token
+    //     elements (the run's positions, possibly none) and then a RuleLeaf of its type rule,
+    //     so the type child opens at a FIXED grammar-token offset: the run's length.
+    // Config-derived (the position table, the guard, the language's attribute rules).
+    bool                       typeBaseAskable = false;
+    bool                       typeChildLeads  = false;
+    std::vector<std::uint32_t> typeChildLeadRun;
+
     // commitAfterPrefix CUT (PEG "cut"; D-CSUBSET-LABEL-BUDGET-CLIFF, p19
     // Cluster G c31). When true, a speculative probe of this rule COMMITS
     // as soon as the rule's FIXED leading token-prefix (predictivePrefix,
@@ -387,6 +403,15 @@ struct CompiledRule {
     // rule, or language. Default false ⇒ standard rollback-on-failure
     // speculation.
     bool                       commitAfterPrefix = false;
+
+    // P69 L2b2 (lane `lm`): the rule is a VALUE READING of its position (`valueReading` on the
+    // shape body) — the reading a speculative site's rollback hands the parse to when a type
+    // reading does not hold (c `exprStmt` against the declarations, `parenExpr` against the
+    // cast). When a candidate of the same site has COMMITTED to its type reading (its type
+    // child closed as a certain type name) and then failed, the site tries no value reading
+    // after it: C reads a certain type name in that position as a type, never as a value.
+    // Config-sourced; the engine names no rule. Default false.
+    bool                       valueReading = false;
 
     // P69 (lane `cs`, D-C-SIZEOF-OF-A-COMPOUND-LITERAL-IS-A-PARSE-ERROR): a PEG NOT-PREDICATE
     // on the rule's FOLLOWER (`notFollowedBy` on the shape body): a speculative probe of this
