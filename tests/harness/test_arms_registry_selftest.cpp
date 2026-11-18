@@ -40,6 +40,11 @@ namespace {
     X(O1AnArmOutOfOrderInItsSectionIsRefused, "O1 an arm out of order in its section is refused")                      \
     X(O2AnArmInASectionAlreadyClosedIsRefused, "O2 an arm in a section already closed is refused")                     \
     X(O3SectionsOutOfAlphabeticalOrderAreRefused, "O3 sections out of alphabetical order are refused")                 \
+    X(O4AnArmUnderAnotherSectionSHeaderIsRefusedItsOwnSectionStillInOrder,                                             \
+      "O4 an arm under another section's header is refused, its own section still in order")                           \
+    X(O5AnArmUnderNoSectionHeaderIsRefused, "O5 an arm under no section header is refused")                            \
+    X(O6TwoHeadersForOneSectionAreRefused, "O6 two headers for one section are refused")                               \
+    X(O7AHeaderNamingAnotherAreaSPlaceIsRefused, "O7 a header naming another area's place is refused")                 \
     X(C1TwoCaseCountsForOneRunnerOnOneLegAreRefused, "C1 two case counts for one runner on one leg are refused")       \
     X(C2TwoCaseCountsForOneRunnerOnTwoLegsAreNotCompared,                                                              \
       "C2 two case counts for one runner on two legs are not compared")                                                \

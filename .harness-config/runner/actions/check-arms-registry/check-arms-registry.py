@@ -9,7 +9,8 @@ that is repeated here. What the tool does NOT check, and every hand-back of an a
   stand     every A and M row's before-text stands EXACTLY ONCE in its site as the tree holds it now, and differs
             from its after-text -- a row that no longer stands is found here, before a sweep, never by one;
   order     the arm blocks are grouped by area (the first directory of the A row's site under src/, `tests` for a
-            site outside src/), the areas in alphabetical order, the arms sorted within each;
+            site outside src/), the areas in alphabetical order, the arms sorted within each; each area has ONE
+            section header naming its place, and every arm stands under its own area's header;
   cases     the arms that run ONE runner on ONE leg (their S row's legs) state ONE `cases` -- a binary runs one
             number of cases on a leg; two counts there mean one of them is wrong. (A binary's count may differ by
             leg -- a case compiled only on one host -- so counts on different legs are not compared.)
@@ -54,7 +55,7 @@ for _stream in (sys.stdout, sys.stderr):
 TOOL = "check-arms-registry"
 SELFTEST_MARKER = TOOL + " self-test: "
 # The self-test's own ratchet: an arm lost (or one added without raising this) is a FAIL no arm reports.
-EXPECTED_ARMS = 17
+EXPECTED_ARMS = 21
 REGISTRY = os.path.join("tests", "mutations", "arms.registry")
 
 
@@ -133,6 +134,22 @@ def area_of(site):
     return parts[1] if parts[0] == "src" and len(parts) > 2 else "tests"
 
 
+def headers_of(registry_text):
+    """(line number, area) for each section header: `# <area> -- sites under src/<area>/ -- ...`, or
+    `# tests -- sites outside src/ -- ...`. A header is the section's boundary a reader goes by, so the order check
+    reads it too: a comment the guard never read could stand inside another area's arms."""
+    out = []
+    for n, line in enumerate(registry_text.split("\n"), 1):
+        s = line.strip()
+        if not s.startswith("# ") or " -- sites " not in s:
+            continue
+        area = s[2:].split(" -- ", 1)[0].strip()
+        place = s.split(" -- ")[1] if s.count(" -- ") >= 1 else ""
+        wanted = "sites outside src/" if area == "tests" else "sites under src/%s/" % area
+        out.append((n, area, place == wanted))
+    return out
+
+
 def check_stand(tree, rows):
     problems = []
     for n, kind, f in rows:
@@ -160,9 +177,26 @@ def check_stand(tree, rows):
     return problems
 
 
-def check_order(rows):
+def check_order(rows, headers):
     arms = [(n, f[1], area_of(f[2])) for n, kind, f in rows if kind == "A" and len(f) >= 3]
     problems = []
+    # Each section's header: one per area, naming the place its own area's sites are, and every arm standing under
+    # its own area's header (the last header above it).
+    header_lines = collections.defaultdict(list)
+    for n, area, names_its_place in headers:
+        header_lines[area].append(n)
+        if not names_its_place:
+            problems.append("line %d: the header of section %s does not name that area's place" % (n, area))
+    for area, at in sorted(header_lines.items()):
+        if len(at) > 1:
+            problems.append("section %s has %d headers (lines %s)" % (area, len(at), ", ".join(map(str, at))))
+    for n, arm, area in arms:
+        above = [(hn, ha) for hn, ha, _ in headers if hn < n]
+        if not above:
+            problems.append("line %d: arm %s (area %s) stands under no section header" % (n, arm, area))
+        elif above[-1][1] != area:
+            problems.append("line %d: arm %s (area %s) stands under the header of section %s (line %d)"
+                            % (n, arm, area, above[-1][1], above[-1][0]))
     seen = []
     for i, (n, arm, area) in enumerate(arms):
         if not seen or seen[-1] != area:
@@ -200,9 +234,10 @@ def check_cases(rows):
 
 def verify(tree):
     reg = os.path.join(tree, REGISTRY)
-    rows = rows_of(read_bytes_text(reg))
+    text = read_bytes_text(reg)
+    rows = rows_of(text)
     found = [("stand", p) for p in check_stand(tree, rows)]
-    found += [("order", p) for p in check_order(rows)]
+    found += [("order", p) for p in check_order(rows, headers_of(text))]
     found += [("cases", p) for p in check_cases(rows)]
     arms = sum(1 for _, k, _ in rows if k == "A")
     return found, arms, len(rows)
@@ -271,18 +306,27 @@ def _a(arm, site="src/core/x.cpp", runner="bin", cases="5", after="tests/mutatio
             "tests/mutations/texts/a.diag | why" % (arm, site, after, runner, cases))
 
 
+def _h(area, place=None):
+    """A section header as the registry writes it."""
+    if place is None:
+        place = "sites outside src/" if area == "tests" else "sites under src/%s/" % area
+    return "# %s -- %s -- default leg: macos-arm64-debug" % (area, place)
+
+
 def self_test():
     ran = []   # (label, ok, what it found)
 
     def arm(label, registry_lines, check, expect_problem, site_text="int f() { return 1; }\n"):
         with tempfile.TemporaryDirectory(prefix="arms-registry-selftest-") as root:
             _fixture(root, registry_lines, site_text)
-            rows = rows_of(read_bytes_text(os.path.join(root, REGISTRY)))
-            got = {"stand": lambda: check_stand(root, rows), "order": lambda: check_order(rows),
+            text = read_bytes_text(os.path.join(root, REGISTRY))
+            rows = rows_of(text)
+            got = {"stand": lambda: check_stand(root, rows), "order": lambda: check_order(rows, headers_of(text)),
                    "cases": lambda: check_cases(rows)}[check]()
             ran.append((label, bool(got) == expect_problem, got, expect_problem))
 
-    control = [_a("core-a"), "C | core-a | S.T | why", "S | core-a | macos-arm64-debug | why",
+    control = [_h("core"),
+               _a("core-a"), "C | core-a | S.T | why", "S | core-a | macos-arm64-debug | why",
                _a("core-b"), "C | core-b | S.U | why", "S | core-b | macos-arm64-debug | why"]
     arm("R1 the control registry, standing, in order, one count per runner and leg: the stand check finds nothing",
         control, "stand", False)
@@ -296,11 +340,18 @@ def self_test():
         [_a("core-a", after="tests/mutations/texts/a.before"), "C | core-a | S.T | why"], "stand", True)
     arm("S4 a CRLF site still reads an LF text once", control, "stand", False,
         site_text="int f() {\r\n return 1; }\r\n")
-    arm("O1 an arm out of order in its section is refused", [_a("core-b"), _a("core-a")], "order", True)
+    arm("O1 an arm out of order in its section is refused", [_h("core"), _a("core-b"), _a("core-a")], "order", True)
     arm("O2 an arm in a section already closed is refused",
-        [_a("core-a"), _a("tests-a", site="tests/x.cpp"), _a("core-b")], "order", True)
+        [_h("core"), _a("core-a"), _h("tests"), _a("tests-a", site="tests/x.cpp"), _a("core-b")], "order", True)
     arm("O3 sections out of alphabetical order are refused",
-        [_a("tests-a", site="tests/x.cpp"), _a("core-a")], "order", True)
+        [_h("tests"), _a("tests-a", site="tests/x.cpp"), _h("core"), _a("core-a")], "order", True)
+    arm("O4 an arm under another section's header is refused, its own section still in order",
+        [_h("core"), _a("core-a"), _h("tests"), _a("core-b")], "order", True)
+    arm("O5 an arm under no section header is refused", [_a("core-a")], "order", True)
+    arm("O6 two headers for one section are refused",
+        [_h("core"), _a("core-a"), _h("core"), _a("core-b")], "order", True)
+    arm("O7 a header naming another area's place is refused",
+        [_h("core", place="sites under src/mir/"), _a("core-a")], "order", True)
     arm("C1 two case counts for one runner on one leg are refused",
         [_a("core-a", cases="5"), "S | core-a | macos-arm64-debug | why",
          _a("core-b", cases="6"), "S | core-b | macos-arm64-debug | why"], "cases", True)

@@ -1111,6 +1111,21 @@ round's close; each checkpoint's commit message says what was and was not run on
     arms are swept with 3f's, --pending.
   - Fold order now: f26e → H6c3 (with U1) → f26f → 3g → 3h → L2b4 → L2b3 → H6d → H7 → H7b1 → H7b2 → H7c, with
     f26g (SVE) placed where ready. xa continues in 3f's tail: PE-IMAGE items (4), (7), (1).
+- **Checkpoint 50 (2026-11-18) = main's repair of checkpoint 49's two repo-guard reds:**
+  - Main's post-fold repo-guard (run 20261118-012121-bb97c3c9, windows-x86_64-debug) read two reds that fold 3f
+    carried and its review did not see. `arms_registry_guard` found `lsp-the-completion-lists-its-items-in-hash-order`
+    out of order. `emitted_anchor_ids_guard` found two ceilings left above the sites fold 3f burned down: macho.cpp
+    46 → 45, compile_pipeline.cpp 22 → 19.
+  - THE CLASS UNDER THE ORDER RED: the guard grouped arms by their site's area and never read the section headers. So
+    three lsp arms had stood under the `mir` header since checkpoint 45 (one) and checkpoint 48 (two), unseen. The
+    guard now requires ONE header per area naming its place, and every arm under its own area's header. Its self-test
+    gains O4–O7 (21 arms), each a synthesized negative. The lsp arms are moved into their section.
+  - The guard passes on the whole registry (2094 arms, 13 sections) on windows-x86_64-debug. Its linux-x86_64-debug
+    run was refused-locked by checkpoint 49's suite.
+  - INFERRED, not measured: both misplacements came through the merge of a lane's registry into main's. The guard now
+    reds on the next one, which names its cause.
+  - Fold order now: f26e → H6c3 (with U1) → f26f → 3f2 (xa's send-back of review-xa3f: two home audits, then the
+    findings) → 3g → 3h → L2b4 → L2b3 → H6d → H7 → H7b1 → H7b2 → H7c, with f26g (SVE) placed where ready.
 - **★ KNOWN DEFECTS ON THIS TREE — each a MERGE BLOCKER of this PR's own making, each in a lane's hands:**
   (1) `orphan_tests_guard` — FIXED by checkpoint 16;
   (2) the valid ELF link refused since checkpoint 12 — LINKS AGAIN since checkpoint 18 (above);
