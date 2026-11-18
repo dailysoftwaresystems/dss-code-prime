@@ -753,3 +753,10 @@ dss_add_test(NAME analysis/semantic/test_symbol_alias
              SOURCES test_symbol_alias.cpp)
 target_include_directories(dss_analysis_semantic_test_symbol_alias
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P69 fold 3f (lane `xa`, review-xa3e F3): the pointer width's home answers none for a value that names no data
+# model, and ONE predicate decides whether the back end lowers a model -- the semantic gate asks it.
+dss_add_test(NAME analysis/semantic/test_data_model_admission
+             SOURCES test_data_model_admission.cpp)
+target_include_directories(dss_analysis_semantic_test_data_model_admission
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)

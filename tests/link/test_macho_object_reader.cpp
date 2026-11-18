@@ -54,20 +54,27 @@
 #include "link/format/macho.hpp"
 #include "link/format/macho_object_reader.hpp"
 #include "link/linker.hpp"   // the image half of the call-frame pins
+#include "link/unit_linker_decisions.hpp"   // decideUnitLinkerRequests -- the image link's newer-OS warning
 #include "link/object_format_schema.hpp"
 
 #include "clang_macho_equal_offset_label_object.inc"
 #include "clang_macho_subsections_object.inc"
 #include "format_reject_support.hpp"   // countAtPath / countWithMessage / rejectSummary
 #include "repo_root.hpp"   // the ONE test-side repo/config-root resolver
+#include "run_binary.hpp"   // the native tier: the image Apple's ld links from DSS's object
+#include "scratch_dir.hpp"
+
+#include "../core/native_c_probe.hpp"   // captureCmd / tailOf: the reference link's output, read whole
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>   // the "shipped file MINUS one key" fixture (5c)
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>   // std::system: the native tier's reference link
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <iterator>
 #include <memory>
 #include <optional>
@@ -425,6 +432,59 @@ TEST(MachoObjectReader, MultiItemSectionSlicesEachAtomValueCorrect) {
     ASSERT_EQ(rd1->relocations.size(), 1u);
     EXPECT_EQ(rd1->relocations[0].offset, 0u);
     EXPECT_EQ(nameOf(*got, rd1->relocations[0].target), "f");
+}
+
+// An object's atoms are read in the order of its SECTIONS, by ordinal: the
+// object's own data, never the order a hash table keyed by the ordinal happens
+// to iterate in. The writer lays the data sections out in the format's row
+// order (__TEXT,__const, then __DATA,__data, then __DATA,__const), so the data
+// items must come back in that order. The module meets the three sections in
+// neither that order nor its reverse, so a walk in the order the reader met
+// them and one in its reverse are both told apart from the sorted walk.
+TEST(MachoObjectReader, AtomsAreReadInTheOrderOfTheirSections) {
+    auto loaded = loadShipped("arm64", "macho64-arm64-darwin");
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction f;
+    f.symbol = SymbolId{1};
+    f.bytes  = {0xC0, 0x03, 0x5F, 0xD6};   // arm64 RET
+    mod.functions.push_back(f);
+    struct Item { std::uint32_t id; DataSectionKind kind; char const* name; };
+    Item const items[] = {
+        {11, DataSectionKind::Data,       "data_item"},
+        {12, DataSectionKind::RelRoConst, "relro_item"},
+        {10, DataSectionKind::Rodata,     "rodata_item"},
+    };
+    for (Item const& it : items) {
+        AssembledData d;
+        d.symbol    = SymbolId{it.id};
+        d.section   = it.kind;
+        d.bytes     = {1, 2, 3, 4, 5, 6, 7, 8};
+        d.alignment = Alignment::of<8>();
+        mod.dataItems.push_back(d);
+    }
+    mod.symbols = {
+        ModuleSymbol{SymbolId{11}, "data_item",   SymbolBinding::Global, SymbolVisibility::Default},
+        ModuleSymbol{SymbolId{12}, "relro_item",  SymbolBinding::Global, SymbolVisibility::Default},
+        ModuleSymbol{SymbolId{10}, "rodata_item", SymbolBinding::Global, SymbolVisibility::Default},
+        ModuleSymbol{SymbolId{1},  "f",           SymbolBinding::Global, SymbolVisibility::Default},
+    };
+
+    DiagnosticReporter wrep;
+    auto objBytes = macho::encode(mod, *loaded.target, *loaded.format, wrep);
+    ASSERT_EQ(wrep.errorCount(), 0u);
+    ASSERT_FALSE(objBytes.empty());
+    DiagnosticReporter rrep;
+    auto got = macho::readRelocatableObject(objBytes, *loaded.target, *loaded.format, rrep);
+    ASSERT_TRUE(got.has_value()) << "errors=" << rrep.errorCount();
+    ASSERT_EQ(rrep.errorCount(), 0u);
+
+    std::vector<std::string> order;
+    for (AssembledData const& d : got->dataItems) order.push_back(nameOf(*got, d.symbol));
+    EXPECT_EQ(order, (std::vector<std::string>{"rodata_item", "data_item", "relro_item"}))
+        << "the data items come back in the order of their sections' ordinals";
 }
 
 // -- 2. Truncation fuzz ----------------------------------------------
@@ -2790,9 +2850,184 @@ TEST(MachoObjectReader, AnInstructionAddendTravelsInTheAddendRecordBothWays) {
     EXPECT_NE(whatItSaid(frep).find("does not fit the 24-bit addend record"), std::string::npos) << whatItSaid(frep);
 }
 
+// ── Which entries the record carries: the document's `carriesAddendOf` (P69 fold 3f) ────────────────────────────────
+//
+// ✔MEASURED 2026-11-14 (probe-reference-cc, macos-arm64-debug, Apple clang 21.0.0 and the host's Apple ld; host runs
+// 20261114-091613-4edb0e10 and -091923-c6a91569): Apple's assembler writes the record before PAGE21, PAGEOFF12 and
+// BRANCH26, and refuses an addend on a GOT page reference ("gotpage label reference not allowed an addend"). So the
+// record carries those three alone: DSS writes `bl k+8` with a record and reads it back with its addend, refuses to
+// write `adrp x0, g@GOTPAGE+8`, and refuses to read a record standing before a GOT page entry, each by name.
+// RED-ON-DISABLE: drop the writer's list check -> the GOT page addend is written; drop the reader's -> the patched
+// object reads, its GOT entry carrying 8.
+TEST(MachoObjectReader, AnAddendRecordCarriesOnlyTheEntriesItsDocumentLists) {
+    auto loaded = loadShipped("arm64", "macho64-arm64-darwin");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    ASSERT_TRUE(loaded.format->macho().addendRelocation.has_value());
+    std::uint32_t const recordId = loaded.format->macho().addendRelocation->nativeId;
+    auto const* branch = loaded.format->relocationByName("ARM64_RELOC_BRANCH26");
+    auto const* gotPage = loaded.format->relocationByName("ARM64_RELOC_GOT_LOAD_PAGE21");
+    ASSERT_TRUE(branch != nullptr && gotPage != nullptr);
+
+    // `bl k+8; ret` against a second function `k`, or `adrp x0, g@GOTPAGE+8; ret` against an extern `g`.
+    auto const objectOf = [&](RelocationKind kind, std::int64_t addend, DiagnosticReporter& rep) {
+        AssembledModule mod;
+        mod.expectedFuncCount = 2;
+        AssembledFunction fn;
+        fn.symbol = SymbolId{1};
+        fn.bytes  = {0x00, 0x00, 0x00, kind.v == branch->kind.v ? std::uint8_t{0x94} : std::uint8_t{0x90},
+                     0xc0, 0x03, 0x5f, 0xd6};
+        fn.relocations = {Relocation{0u, kind.v == branch->kind.v ? SymbolId{3} : SymbolId{2}, kind, addend}};
+        AssembledFunction k;
+        k.symbol = SymbolId{3};
+        k.bytes  = {0x20, 0x00, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6, 0xc0, 0x03, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6};
+        mod.functions.push_back(std::move(fn));
+        mod.functions.push_back(std::move(k));
+        mod.symbols = {ModuleSymbol{SymbolId{1}, "f", SymbolBinding::Global, SymbolVisibility::Default},
+                       ModuleSymbol{SymbolId{3}, "k", SymbolBinding::Global, SymbolVisibility::Default}};
+        mod.externImports = {ExternImport{SymbolId{2}, "g", "/usr/lib/libSystem.B.dylib", false}};
+        return macho::encode(mod, *loaded.target, *loaded.format, rep);
+    };
+
+    // BRANCH26 +8: written with its record, read back with its addend.
+    DiagnosticReporter wrep;
+    auto const obj = objectOf(branch->kind, 8, wrep);
+    ASSERT_FALSE(obj.empty()) << "DSS's writer refuses `bl k+8`: " << whatItSaid(wrep);
+    std::uint32_t const reloff = rd32(obj, kTextReloffField);
+    std::uint32_t const nreloc = rd32(obj, kTextReloffField + 4);
+    ASSERT_EQ(nreloc, 2u) << "the branch, after its addend record";
+    ASSERT_LE(reloff + 16u, obj.size());
+    EXPECT_EQ(rd32(obj, reloff + 4u) & 0xFF000000u, recordId) << "the record first";
+    EXPECT_EQ(rd32(obj, reloff + 4u) & 0x00FFFFFFu, 8u) << "carrying 8";
+    DiagnosticReporter rrep;
+    auto const back = macho::readRelocatableObject(obj, *loaded.target, *loaded.format, rrep);
+    ASSERT_TRUE(back.has_value()) << whatItSaid(rrep);
+    std::vector<std::int64_t> branchAddends;
+    for (auto const& f : back->functions) {
+        for (auto const& r : f.relocations) {
+            if (r.kind.v == branch->kind.v) branchAddends.push_back(r.addend);
+        }
+    }
+    EXPECT_EQ(branchAddends, (std::vector<std::int64_t>{8})) << "the branch reads back with its addend";
+
+    // A GOT page reference with an addend: refused by the writer, naming the entry.
+    DiagnosticReporter gotRep;
+    EXPECT_TRUE(objectOf(gotPage->kind, 8, gotRep).empty()) << "`g@GOTPAGE+8` is written";
+    EXPECT_NE(whatItSaid(gotRep).find("relocation 'ARM64_RELOC_GOT_LOAD_PAGE21'"), std::string::npos)
+        << whatItSaid(gotRep);
+    EXPECT_NE(whatItSaid(gotRep).find("carriesAddendOf"), std::string::npos) << whatItSaid(gotRep);
+
+    // A record before a GOT page entry: DSS's own object with its branch entry's wire id turned into the GOT page
+    // row's (r_extern and r_symbolnum kept) -- refused by the reader, naming the entry it stands before.
+    auto patched = obj;
+    std::uint32_t const second = rd32(patched, reloff + 12u);
+    std::uint32_t const turned = (second & 0x08FFFFFFu) | gotPage->nativeId;
+    for (std::size_t b = 0; b < 4; ++b) patched[reloff + 12u + b] = static_cast<std::uint8_t>(turned >> (8u * b));
+    DiagnosticReporter prep;
+    EXPECT_FALSE(macho::readRelocatableObject(patched, *loaded.target, *loaded.format, prep).has_value())
+        << "a record before a GOT page entry is read";
+    EXPECT_NE(whatItSaid(prep).find("is followed by a relocation of wire id " + std::to_string(gotPage->nativeId)),
+              std::string::npos)
+        << whatItSaid(prep);
+}
+
+// ── NATIVE: Apple's ld takes DSS's addend records, the NEGATIVE one included (P69 fold 3f) ──────────────────────────
+//
+// What DSS writes for a negative addend: the record's r_symbolnum holds it masked to the declared 24 bits, -4 as
+// 0xFFFFFC (the in-process cell above reads it back). The reference for that record is Apple's ld's ACCEPTANCE, not
+// Apple's assembler's output: ✔MEASURED 2026-11-14 (probe-reference-cc, host run 20261114-091923-c6a91569), the
+// assembler writes `sym@PAGE-4` with the record's sign bits unmasked into r_info (r_type 15, r_extern 1), and Apple's
+// ld refuses that entry ("relocation ... is not supported: r_type=15"). So this tier links DSS's own `-c` object with
+// a C harness under `cc` and runs the image: `_f` computes (g + 8) - (g - 4) through two page pairs (12) and calls
+// `_k + 8`, which returns 30, so the program exits 42 only when Apple's ld applies +8, -4 and the branch's +8 alike.
+// A record ld64 read as +0xFFFFFC, or ignored, makes another number; one it refused fails the link, its output said.
+TEST(MachoObjectReaderNative, AppleLdLinksDssAddendRecordsAndTheImageReadsEachAddend) {
+#if !(defined(__APPLE__) && defined(__aarch64__))
+    GTEST_SKIP() << "Apple's ld and an arm64 Mach-O image run only on an arm64 Mac; the in-process cells of the addend "
+                    "record (AnInstructionAddendTravelsInTheAddendRecordBothWays, "
+                    "AnAddendRecordCarriesOnlyTheEntriesItsDocumentLists) ran here.";
+#else
+    auto loaded = loadShipped("arm64", "macho64-arm64-darwin");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto const* page    = loaded.format->relocationByName("ARM64_RELOC_PAGE21");
+    auto const* pageOff = loaded.format->relocationByName("ARM64_RELOC_PAGEOFF12");
+    auto const* branch  = loaded.format->relocationByName("ARM64_RELOC_BRANCH26");
+    ASSERT_TRUE(page != nullptr && pageOff != nullptr && branch != nullptr);
+
+    auto const words = [](std::initializer_list<std::uint32_t> ws) {
+        std::vector<std::uint8_t> out;
+        for (std::uint32_t const w : ws) {
+            for (unsigned b = 0; b < 4; ++b) out.push_back(static_cast<std::uint8_t>(w >> (8u * b)));
+        }
+        return out;
+    };
+    AssembledModule mod;
+    mod.cuId = CompilationUnitId{1};
+    mod.expectedFuncCount = 2;
+    AssembledFunction f;
+    f.symbol = SymbolId{1};
+    f.bytes  = words({0xA9BF7BFDu,    // stp x29, x30, [sp, #-16]!
+                      0x90000000u,    // adrp x0, _g@PAGE+8
+                      0x91000000u,    // add  x0, x0, _g@PAGEOFF+8
+                      0x90000001u,    // adrp x1, _g@PAGE-4
+                      0x91000021u,    // add  x1, x1, _g@PAGEOFF-4
+                      0xCB010009u,    // sub  x9, x0, x1            (12)
+                      0x94000000u,    // bl   _k+8                  (w0 = 30)
+                      0x0B090000u,    // add  w0, w0, w9            (42)
+                      0xA8C17BFDu,    // ldp x29, x30, [sp], #16
+                      0xD65F03C0u});  // ret
+    f.relocations = {Relocation{4u, SymbolId{2}, page->kind, 8},   Relocation{8u, SymbolId{2}, pageOff->kind, 8},
+                     Relocation{12u, SymbolId{2}, page->kind, -4}, Relocation{16u, SymbolId{2}, pageOff->kind, -4},
+                     Relocation{24u, SymbolId{3}, branch->kind, 8}};
+    AssembledFunction k;
+    k.symbol = SymbolId{3};
+    k.bytes  = words({0x52800020u, 0xD65F03C0u,    // _k:   mov w0, #1 ; ret
+                      0x528003C0u, 0xD65F03C0u});  // _k+8: mov w0, #30 ; ret
+    mod.functions.push_back(std::move(f));
+    mod.functions.push_back(std::move(k));
+    mod.symbols = {ModuleSymbol{SymbolId{1}, "_f", SymbolBinding::Global, SymbolVisibility::Default},
+                   ModuleSymbol{SymbolId{3}, "_k", SymbolBinding::Global, SymbolVisibility::Default}};
+    ExternImport g;
+    g.symbol      = SymbolId{2};
+    g.mangledName = "_g";
+    mod.externImports.push_back(std::move(g));
+    DiagnosticReporter rep;
+    auto const obj = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_FALSE(obj.empty()) << "DSS's writer refuses the object: " << whatItSaid(rep);
+
+    test_support::ScratchDir scratch{test_support::Location::Temp, "macho-addend-ld64"};
+    auto const dir     = scratch.path();
+    auto const object  = dir / "dss_addends.o";
+    auto const harness = dir / "harness.c";
+    auto const image   = dir / "addends";
+    {
+        std::ofstream out{object, std::ios::binary};
+        out.write(reinterpret_cast<char const*>(obj.data()), static_cast<std::streamsize>(obj.size()));
+        ASSERT_TRUE(out.good()) << "could not stage " << object;
+    }
+    {
+        std::ofstream out{harness, std::ios::binary};
+        out << "int g[16];\nint f(void);\nint main(void) { return f(); }\n";
+        ASSERT_TRUE(out.good()) << "could not stage " << harness;
+    }
+    auto const log = dir / "link.txt";
+    std::string const link = "cc -arch arm64 -o \"" + image.string() + "\" \"" + harness.string() + "\" \""
+                           + object.string() + "\"";
+    ASSERT_EQ(std::system(test_support::native_probe::captureCmd(link, log).c_str()), 0)
+        << "Apple's ld refused DSS's object: " << test_support::native_probe::tailOf(log, 20);
+    auto const run = test_support::runBinary(image, test_support::kRunBudget);
+    ASSERT_TRUE(run.spawned) << run.diagnostic;
+    ASSERT_FALSE(run.timedOut) << run.diagnostic;
+    EXPECT_EQ(run.exitCode, 42u)
+        << "12 from (g + 8) - (g - 4) and 30 from `_k + 8`: another exit means Apple's ld applied an addend record "
+           "other than as DSS wrote it (a -4 read as +0xFFFFFC, or a record dropped)";
+#endif
+}
+
 // The loader holds the record to the wire and to its readers: refused at its own path when an image document states
-// it, when its id sets r_extern or is a relocation row's, and when its addend is wider than r_symbolnum.
-// RED-ON-DISABLE: take any addend width -> the 25-bit cell loads.
+// it, when its id sets r_extern or is a relocation row's, and when its addend is wider than r_symbolnum; and (P69
+// fold 3f) when the entries it may stand before (`carriesAddendOf`) are missing, none, not this document's relocation
+// rows, or one of them twice.
+// RED-ON-DISABLE: take any addend width -> the 25-bit cell loads; take any listed id -> the unlisted-row cell loads.
 TEST(MachoObjectReader, TheLoaderHoldsTheAddendRecordToItsRules) {
     struct Cell {
         char const* label;
@@ -2809,6 +3044,19 @@ TEST(MachoObjectReader, TheLoaderHoldsTheAddendRecordToItsRules) {
          [](nlohmann::json& d) { d["macho"]["addendRelocation"]["nativeId"] = 889192448u; }},
         {"its addend is 25 bits", "macho64-arm64-darwin", "/macho/addendRelocation/addendBits",
          [](nlohmann::json& d) { d["macho"]["addendRelocation"]["addendBits"] = 25; }},
+        {"it lists no carried entry", "macho64-arm64-darwin", "/macho/addendRelocation",
+         [](nlohmann::json& d) { d["macho"]["addendRelocation"].erase("carriesAddendOf"); }},
+        {"its carried entries are none", "macho64-arm64-darwin", "/macho/addendRelocation/carriesAddendOf",
+         [](nlohmann::json& d) { d["macho"]["addendRelocation"]["carriesAddendOf"] = nlohmann::json::array(); }},
+        {"it carries its own id", "macho64-arm64-darwin", "/macho/addendRelocation/carriesAddendOf/3",
+         [](nlohmann::json& d) { d["macho"]["addendRelocation"]["carriesAddendOf"].push_back(2751463424u); }},
+        {"it carries an id no row has", "macho64-arm64-darwin", "/macho/addendRelocation/carriesAddendOf/3",
+         [](nlohmann::json& d) { d["macho"]["addendRelocation"]["carriesAddendOf"].push_back(0x12000000u); }},
+        {"it carries PAGE21 twice", "macho64-arm64-darwin", "/macho/addendRelocation/carriesAddendOf/3",
+         [](nlohmann::json& d) { d["macho"]["addendRelocation"]["carriesAddendOf"].push_back(889192448u); }},
+        {"the archive document carries an id no row has", "macho64-arm64-darwin-staticlib",
+         "/macho/addendRelocation/carriesAddendOf/3",
+         [](nlohmann::json& d) { d["macho"]["addendRelocation"]["carriesAddendOf"].push_back(0x12000000u); }},
     };
     for (Cell const& c : cells) {
         SCOPED_TRACE(c.label);
@@ -2819,5 +3067,203 @@ TEST(MachoObjectReader, TheLoaderHoldsTheAddendRecordToItsRules) {
         c.mutate(doc);
         auto const loaded = ObjectFormatSchema::loadFromText(doc.dump(), c.stem);
         EXPECT_GE(countAtPath(loaded, c.path), 1u) << rejectSummary(loaded);
+    }
+}
+
+// ══ THE LOAD COMMANDS (P69 fold 3f, D-LK-MACHO-READER-SKIPS-LOAD-COMMANDS-IN-SILENCE) ═════════════════════════════
+//
+// A relocatable object's every load command is READ, stepped over for the reason its document states
+// (`macho.skippedLoadCommands`), or REFUSED by name -- never stepped over in silence. ✔MEASURED (P69 fold 3f, run 20261117-192243-260e95c2:
+// Apple clang 21's relocatable objects, arm64 and x86_64, and ld64's `-r` outputs): eight commands -- LC_SEGMENT_64,
+// LC_SYMTAB, LC_DYSYMTAB, LC_BUILD_VERSION, LC_VERSION_MIN_MACOSX and LC_LINKER_OPTION read;
+// LC_LINKER_OPTIMIZATION_HINT and LC_DATA_IN_CODE stepped over. ld64 REFUSES an object of another platform and WARNS
+// of one built for a newer OS than the link, the same probe.
+
+namespace {
+
+// The file offset of the first load command numbered `cmd`, or nullopt.
+[[nodiscard]] std::optional<std::size_t> loadCommandAt(std::vector<std::uint8_t> const& b, std::uint32_t cmd) {
+    std::uint32_t const ncmds = rd32(b, 16);
+    std::size_t         at    = 32;
+    for (std::uint32_t i = 0; i < ncmds && at + 8 <= b.size(); ++i) {
+        if (rd32(b, at) == cmd) return at;
+        at += rd32(b, at + 4);
+    }
+    return std::nullopt;
+}
+
+// One row of `macho.skippedLoadCommands`.
+[[nodiscard]] nlohmann::json skippedRow(std::uint32_t command, char const* name, char const* reason) {
+    return nlohmann::json{{"command", command}, {"name", name}, {"reason", reason}};
+}
+
+}  // namespace
+
+// The command a document states a reason for is stepped over; the same object read by a document that states none
+// is REFUSED by name. An Apple clang arm64 object carries LC_LINKER_OPTIMIZATION_HINT (run 20261117-192243-260e95c2; this one, committed at its
+// build, carries it -- READ by the fold's scan of tests/), and every section it holds is a row of the document.
+TEST(MachoObjectLoadCommands, ACommandItsDocumentStatesAReasonForIsSteppedOver) {
+    auto loaded = loadShipped("arm64", "macho64-arm64-darwin");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto const obj = unwindFixture("macho_input_section_const_arm64_clang_O2.o");   // the committed-object reader
+    ASSERT_TRUE(loadCommandAt(obj, 0x2Eu).has_value()) << "the fixture no longer carries LC_LINKER_OPTIMIZATION_HINT";
+    {
+        DiagnosticReporter rep;
+        EXPECT_TRUE(macho::readRelocatableObject(obj, *loaded.target, *loaded.format, rep).has_value()) << saidBy(rep);
+    }
+    auto const silent = shippedFormatWith("macho64-arm64-darwin",
+                                          [](nlohmann::json& d) { d["macho"].erase("skippedLoadCommands"); });
+    ASSERT_NE(silent, nullptr);
+    DiagnosticReporter rep;
+    EXPECT_FALSE(macho::readRelocatableObject(obj, *loaded.target, *silent, rep).has_value());
+    EXPECT_TRUE(saidWithCode(rep, DiagnosticCode::F_UnsupportedBinaryFormat, "(cmd 0x2E)")) << saidBy(rep);
+}
+
+// A command the reader neither reads nor finds in its document's list is REFUSED by name, with its index and number.
+TEST(MachoObjectLoadCommands, ACommandNeitherReadNorStatedIsRefusedByName) {
+    auto loaded = loadShipped("arm64", "macho64-arm64-darwin");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto obj = validArm64Object(loaded);
+    {
+        DiagnosticReporter rep;
+        ASSERT_TRUE(macho::readRelocatableObject(obj, *loaded.target, *loaded.format, rep).has_value())
+            << "CONTROL: " << saidBy(rep);
+    }
+    auto const at = loadCommandAt(obj, macho::kLcBuildVersion);
+    ASSERT_TRUE(at.has_value()) << "the arm64 document's objects state their build version";
+    wr32(obj, *at, 0x1Bu);   // LC_UUID, 24 bytes like the command it replaces
+    DiagnosticReporter rep;
+    EXPECT_FALSE(macho::readRelocatableObject(obj, *loaded.target, *loaded.format, rep).has_value());
+    EXPECT_TRUE(saidWithCode(rep, DiagnosticCode::F_UnsupportedBinaryFormat, "(cmd 0x1B) is none this reader reads"))
+        << saidBy(rep);
+}
+
+// An object built for ANOTHER platform is refused, as ld64 refuses it ("building for 'macOS', but linking in object
+// file (...) built for 'iOS'", run 20261117-192243-260e95c2); LC_VERSION_MIN_MACOSX states macOS, and its version is the unit's minimum OS.
+TEST(MachoObjectLoadCommands, AnObjectBuiltForAnotherPlatformIsRefusedAsLd64RefusesIt) {
+    auto loaded = loadShipped("arm64", "macho64-arm64-darwin");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto const obj = validArm64Object(loaded);
+    auto const at  = loadCommandAt(obj, macho::kLcBuildVersion);
+    ASSERT_TRUE(at.has_value());
+    struct Case {
+        char const*   label;
+        std::uint32_t platform;
+        char const*   said;
+    };
+    for (Case const& c : {Case{"iOS", 2u, "built for 'ios'"}, Case{"no platform DSS names", 99u, "platform 99"}}) {
+        SCOPED_TRACE(c.label);
+        auto other = obj;
+        wr32(other, *at + 8, c.platform);
+        DiagnosticReporter rep;
+        EXPECT_FALSE(macho::readRelocatableObject(other, *loaded.target, *loaded.format, rep).has_value());
+        EXPECT_TRUE(saidWithCode(rep, DiagnosticCode::K_NoMatchingObjectFormat, c.said)) << saidBy(rep);
+        EXPECT_TRUE(saidWithCode(rep, DiagnosticCode::K_NoMatchingObjectFormat, "links for 'macos'")) << saidBy(rep);
+    }
+    auto versionMin = obj;
+    wr32(versionMin, *at, macho::kLcVersionMinMacosx);
+    wr32(versionMin, *at + 8, 0x000A0D00u);   // 10.13
+    DiagnosticReporter rep;
+    auto const read = macho::readRelocatableObject(versionMin, *loaded.target, *loaded.format, rep);
+    ASSERT_TRUE(read.has_value()) << saidBy(rep);
+    ASSERT_EQ(read->linkerRequests.minimumOs.size(), 1u);
+    EXPECT_EQ(read->linkerRequests.minimumOs[0].version, 0x000A0D00u);
+}
+
+// LC_DYSYMTAB's tables are ones a relocatable object never fills (run 20261117-192243-260e95c2: every count 0 in 12 Apple clang objects): one
+// that fills one is refused by name, never read without it.
+TEST(MachoObjectLoadCommands, ADysymtabThatFillsATableIsRefusedByName) {
+    auto loaded = loadShipped("arm64", "macho64-arm64-darwin");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto obj = dss::test::clangMachoSubsectionsObject();
+    {
+        DiagnosticReporter rep;
+        ASSERT_TRUE(macho::readRelocatableObject(obj, *loaded.target, *loaded.format, rep).has_value())
+            << "CONTROL: " << saidBy(rep);
+    }
+    auto const at = loadCommandAt(obj, macho::kLcDysymtab);
+    ASSERT_TRUE(at.has_value()) << "the fixture no longer carries LC_DYSYMTAB";
+    wr32(obj, *at + 60, 2u);   // nindirectsyms
+    DiagnosticReporter rep;
+    EXPECT_FALSE(macho::readRelocatableObject(obj, *loaded.target, *loaded.format, rep).has_value());
+    EXPECT_TRUE(saidWithCode(rep, DiagnosticCode::F_UnsupportedBinaryFormat, "2 entries of its indirect symbols"))
+        << saidBy(rep);
+}
+
+// An object built for a NEWER OS than the image is warned of by the link that makes the image, as ld64 warns ("object
+// file (...) was built for newer 'macOS' version (26.0) than being linked (11.0)", run 20261117-192243-260e95c2) -- and decided all the same.
+TEST(MachoObjectLoadCommands, AnObjectBuiltForANewerOsIsWarnedOfByTheImageLink) {
+    auto loaded = loadShipped("arm64", "macho64-arm64-darwin");
+    ASSERT_TRUE(loaded.target && loaded.format);
+    auto const exec = ObjectFormatSchema::loadShipped("macho64-arm64-darwin-exec");
+    ASSERT_TRUE(exec.has_value() && (*exec)->machoImage().buildVersion.has_value());
+    auto obj = validArm64Object(loaded);
+    auto const at = loadCommandAt(obj, macho::kLcBuildVersion);
+    ASSERT_TRUE(at.has_value());
+    auto const decided = [&](std::vector<std::uint8_t> const& bytes) {
+        DiagnosticReporter rep;
+        auto const read = macho::readRelocatableObject(bytes, *loaded.target, *loaded.format, rep);
+        EXPECT_TRUE(read.has_value()) << saidBy(rep);
+        if (read.has_value()) {
+            EXPECT_TRUE(linker::decideUnitLinkerRequests(read->linkerRequests, **exec, {}, rep).has_value())
+                << saidBy(rep);
+        }
+        return rep.all().empty() ? std::string{} : saidBy(rep);
+    };
+    EXPECT_EQ(decided(obj), "") << "CONTROL: an object built for the image's own minimum OS is said nothing of";
+    wr32(obj, *at + 12, 0x001A0000u);   // minos 26.0
+    EXPECT_NE(decided(obj).find("was built for a newer 'macos' version (26.0) than this image is linked for (11.0"),
+              std::string::npos)
+        << decided(obj);
+}
+
+// The loader refuses a skipped command it cannot stand behind: one the reader READS, one named twice, a row with no
+// name or no reason, and the list on a document the reader is never handed.
+TEST(MachoObjectLoadCommands, TheLoaderRefusesASkippedCommandItCannotStand) {
+    struct Cell {
+        char const* label;
+        char const* stem;
+        void (*mutate)(nlohmann::json&);
+        char const* path;
+    };
+    Cell const cells[] = {
+        {"a command the reader reads", "macho64-arm64-darwin",
+         [](nlohmann::json& d) { d["macho"]["skippedLoadCommands"].push_back(skippedRow(0x0Bu, "LC_DYSYMTAB", "x")); },
+         "/macho/skippedLoadCommands/2/command"},
+        {"the linker-option command", "macho64-arm64-darwin",
+         [](nlohmann::json& d) {
+             d["macho"]["skippedLoadCommands"].push_back(skippedRow(45u, "LC_LINKER_OPTION", "x"));
+         },
+         "/macho/skippedLoadCommands/2/command"},
+        {"a command named twice", "macho64-arm64-darwin",
+         [](nlohmann::json& d) {
+             d["macho"]["skippedLoadCommands"].push_back(skippedRow(41u, "LC_DATA_IN_CODE", "x"));
+         },
+         "/macho/skippedLoadCommands/2/command"},
+        {"a row with no reason", "macho64-arm64-darwin",
+         [](nlohmann::json& d) { d["macho"]["skippedLoadCommands"][0]["reason"] = ""; },
+         "/macho/skippedLoadCommands/0/reason"},
+        {"a row with no name", "macho64-arm64-darwin",
+         [](nlohmann::json& d) { d["macho"]["skippedLoadCommands"][0]["name"] = ""; },
+         "/macho/skippedLoadCommands/0/name"},
+        {"command 0", "macho64-arm64-darwin",
+         [](nlohmann::json& d) { d["macho"]["skippedLoadCommands"][0]["command"] = 0; },
+         "/macho/skippedLoadCommands/0/command"},
+        {"on an image document", "macho64-arm64-darwin-exec",
+         [](nlohmann::json& d) {
+             d["macho"]["skippedLoadCommands"] = nlohmann::json::array({skippedRow(41u, "x", "y")});
+         },
+         "/macho/skippedLoadCommands/0"},
+    };
+    for (Cell const& c : cells) {
+        SCOPED_TRACE(c.label);
+        auto const text = shippedFormatText(c.stem);
+        ASSERT_FALSE(text.empty());
+        ASSERT_TRUE(ObjectFormatSchema::loadFromText(text, c.stem).has_value()) << "the control loads";
+        nlohmann::json doc = nlohmann::json::parse(text);
+        c.mutate(doc);
+        auto const result = ObjectFormatSchema::loadFromText(doc.dump(), c.stem);
+        EXPECT_FALSE(result.has_value());
+        EXPECT_GE(countAtPath(result, c.path), 1u) << rejectSummary(result);
     }
 }

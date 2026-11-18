@@ -70,6 +70,7 @@
 #include "core/types/header_name_matching.hpp"  // HeaderNameMatching (D-PP-HEADER-CASE-INSENSITIVE-PE)
 #include "core/types/include_path_resolve.hpp"  // HeaderSearchCache (the compile's view of the include tree)
 #include "core/types/line_map.hpp"              // LineMap / LineMapSegment (the coordinate map, shared with the CU + src/lsp/)
+#include "core/types/preprocess_config.hpp"     // PragmaLinkRequest (`#pragma comment`'s product, P69 fold 3f)
 #include "core/types/object_format_kind.hpp"
 #include "core/types/source_buffer.hpp"
 #include "core/types/source_span.hpp"
@@ -229,6 +230,13 @@ struct DSS_EXPORT PreprocessResult {
     // nothing — see `noOptimizeByOffset_` in the .cpp for why that is a sound
     // resolution here and was NOT one for `pack`.
     std::unordered_set<std::uint32_t> pragmaNoOptimizeByOffset;
+
+    // ★ P69 (lane `xa`, fold 3f): what the TU asks of its LINK -- each reached
+    // `#pragma comment` whose kind asks something (`PragmaCommentRequest`), with
+    // its text, in reach order. Unlike the two maps above it is not keyed per
+    // token: a request concerns the whole unit, wherever it stands. EMPTY for a TU
+    // that states none.
+    std::vector<PragmaLinkRequest> pragmaLinkRequests;
 
     // Build a remap closure usable by `DiagnosticReporter::remapBuffers`:
     // it rewrites any diagnostic whose buffer is the synth buffer to the

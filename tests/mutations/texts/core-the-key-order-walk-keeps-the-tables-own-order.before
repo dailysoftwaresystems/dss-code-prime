@@ -1,0 +1,2 @@
+    std::sort(entries.begin(), entries.end(),
+              [](auto const* a, auto const* b) { return a->first < b->first; });

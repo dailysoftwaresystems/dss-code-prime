@@ -75,6 +75,7 @@ struct Lowered {
     TypeId const pI32 = interner.pointer(i32);
     TypeId const params[] = {i32};
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
     mb.stateArgCounting(MirArgCounting::PerClass);
     mb.stateSelfContainedSymbolIds();
     mb.addFunction(interner.fnSig(params, i32, CallConv::CcSysV), SymbolId{100});

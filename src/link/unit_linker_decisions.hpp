@@ -10,6 +10,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <variant>
 #include <vector>
 
 // ── WHAT A LINK DECIDES FROM ITS UNITS' LINKER-DIRECTIVE REQUESTS ──────────
@@ -133,11 +134,27 @@ DSS_EXPORT void dropPulledMemberEntryRequests(UnitLinkerRequests& requests);
 // function leaves no C entry to elect). None when no named unit states one, or
 // when two state one under two precedences (that link the decision refuses by
 // name). A member the archive search pulls names no entry and is never asked.
-struct StandingEntryRequest {
+struct StandingImageRequest {
     std::size_t             unit    = 0;         // its index among the named units
-    UnitImageRequest const* request = nullptr;   // holds a UnitEntryRequest
+    UnitImageRequest const* request = nullptr;   // holds the alternative asked for
 };
-[[nodiscard]] DSS_EXPORT std::optional<StandingEntryRequest>
-standingEntryRequest(std::span<AssembledModule const> namedUnits);
+// The same question of any image setting's requests (`holds` says which): the
+// SUBSYSTEM request that stands is the program's entry election's too (P69
+// fold 3f: with no entry request standing, a stated subsystem ranks the
+// entries its C runtime startups call first).
+[[nodiscard]] DSS_EXPORT std::optional<StandingImageRequest>
+standingImageRequest(std::span<AssembledModule const> namedUnits, bool (*holds)(UnitImageRequestValue const&));
+[[nodiscard]] inline std::optional<StandingImageRequest>
+standingEntryRequest(std::span<AssembledModule const> namedUnits) {
+    return standingImageRequest(namedUnits, [](UnitImageRequestValue const& v) {
+        return std::holds_alternative<UnitEntryRequest>(v);
+    });
+}
+[[nodiscard]] inline std::optional<StandingImageRequest>
+standingSubsystemRequest(std::span<AssembledModule const> namedUnits) {
+    return standingImageRequest(namedUnits, [](UnitImageRequestValue const& v) {
+        return std::holds_alternative<UnitSubsystemRequest>(v);
+    });
+}
 
 }  // namespace dss::linker

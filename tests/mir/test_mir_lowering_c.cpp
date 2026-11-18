@@ -328,8 +328,10 @@ struct Lowered {
     // FC7 (D-FC7-MEMBER-ACCESS): thread the target's aggregate-layout params
     // (struct/union field offsets + sizes) into the MIR config exactly as
     // compile_pipeline.cpp does, so member-access + aggregate-local lowering
-    // resolves field byte offsets. dataModel stays the Lp64 default (an
-    // int-based struct's field offsets are dataModel-independent here).
+    // resolves field byte offsets. The data model is the one the unit was
+    // analysed for, and the module states it (`MirModuleFacts::dataModel`, P69
+    // fold 3f), as the driver's `mirCfg.dataModel` is the format's.
+    mirCfg.dataModel = dataModel;
     // Reuse the ONE load taken above (which already failed loud if the document
     // will not load) instead of asking the same question a second time.
     {
@@ -361,7 +363,7 @@ struct Lowered {
         // (the C1/C1c pins); the AAPCS64 x8-sret pins pass "arm64"/"aapcs64" so
         // `aggregateSretViaHiddenArg` resolves false (indirectResultRegister = x8).
         // The convention's facts, through the one assembly the pipeline calls.
-        if (auto const* cc = t->callingConventionByName(ccName)) takeCallingConvention(mirCfg, *cc);
+        if (auto const* cc = t->callingConventionByName(ccName)) takeCallingConvention(mirCfg, *t, *cc);
     }
     if (adjustConfig) adjustConfig(mirCfg);
     // D-CSUBSET-LINKAGE-SPECIFIERS: thread the native-decl linkage side-table
@@ -454,6 +456,18 @@ struct Lowered {
 // ML2 cycle 1: the minimal vertical slice.
 // `int add(int a, int b) { return a + b; }` lowers to ONE MIR function,
 // ONE block, FOUR instructions: Arg(0:i32), Arg(1:i32), Add(%0, %1), Return(%2).
+TEST(MirLoweringC, TheModuleStatesTheDataModelItIsLoweredFor) {
+    // P69 (lane `xa`, fold 3f -- review-xa3e F3): HIR→MIR states the data model of its config in the module
+    // (`MirModuleFacts::dataModel`), the one every address width below MIR is read from and the build half no
+    // longer captures a second time.
+    for (DataModel const model : {DataModel::Lp64, DataModel::Llp64}) {
+        auto L = lowerC("int f(void) { return 0; }\n", "x86_64", "sysv_amd64", model);
+        ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        EXPECT_EQ(L.mir.mir.moduleFacts().dataModel, model)
+            << "the module does not state the data model it was lowered for";
+    }
+}
+
 TEST(MirLoweringC, StraightLineAddFunction) {
     auto L = lowerC("int add(int a, int b) { return a + b; }");
     ASSERT_FALSE(L.model.hasErrors())
@@ -1178,6 +1192,7 @@ namespace {
         };
     }
     MirLoweringConfig mirCfg = languageMirLoweringConfig(*schema);   // the pipeline's assembly
+    mirCfg.dataModel = DataModel::Lp64;   // a config states its unit's data model
     mirCfg.symbolIdSpace = MirSymbolIdSpace::endingAt(   // the unit's name table, as the driver states it
         static_cast<std::uint32_t>(model.symbols().size()));
     // A target that will not load is a STOP, never a fixture that quietly
@@ -1187,7 +1202,7 @@ namespace {
         mirCfg.aggregateLayout       = t->aggregateLayout();
         mirCfg.aggregateLayoutLoaded = t->aggregateLayoutLoaded();
         if (auto const* cc = t->callingConventionByName("sysv_amd64"))
-            takeCallingConvention(mirCfg, *cc);   // the one assembly the pipeline calls
+            takeCallingConvention(mirCfg, *t, *cc);   // the one assembly the pipeline calls
     }
     HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
                                     model.lattice().interner(), mirReporter,
@@ -1271,6 +1286,7 @@ namespace {
         };
     }
     MirLoweringConfig mirCfg = languageMirLoweringConfig(*schema);   // the pipeline's assembly
+    mirCfg.dataModel = DataModel::Lp64;   // a config states its unit's data model
     mirCfg.symbolIdSpace = MirSymbolIdSpace::endingAt(   // the unit's name table, as the driver states it
         static_cast<std::uint32_t>(model.symbols().size()));
     // A target that will not load is a STOP, never a fixture that quietly
@@ -1280,7 +1296,7 @@ namespace {
         mirCfg.aggregateLayout       = t->aggregateLayout();
         mirCfg.aggregateLayoutLoaded = t->aggregateLayoutLoaded();
         if (auto const* cc = t->callingConventionByName("sysv_amd64"))
-            takeCallingConvention(mirCfg, *cc);   // the one assembly the pipeline calls
+            takeCallingConvention(mirCfg, *t, *cc);   // the one assembly the pipeline calls
     }
     HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
                                     model.lattice().interner(), mirReporter,
@@ -1892,6 +1908,10 @@ TEST(MirLoweringC, RawCharBinaryOpSignednessIsTargetKeyed) {
 
         HirLiteralPool pool;
         MirLoweringConfig cfg;
+        cfg.dataModel = DataModel::Lp64;   // a config states its unit's data model
+        // A config stating no convention passes every parameter on the stack, so it states the quantum it is
+        // read at: 8, every shipped convention's (`argumentSlotBytes`), the value it had as the deleted default.
+        cfg.argumentSlotBytes = 8;
         cfg.charIsUnsigned = charIsUnsigned;
         return lowerToMir(hir, pool, ti, rep, /*sourceMap=*/nullptr, cfg);
     };
@@ -5707,6 +5727,7 @@ TEST(MirLoweringC, SyntheticGlobalSymbolsRespectSemanticFloor) {
     std::uint32_t const floor =
         static_cast<std::uint32_t>(model.symbols().size());
     MirLoweringConfig cfg = languageMirLoweringConfig(**loaded);   // the pipeline's assembly
+    cfg.dataModel = DataModel::Lp64;   // a config states its unit's data model
     cfg.symbolIdSpace = MirSymbolIdSpace::endingAt(floor);   // what compile_pipeline says
     DiagnosticReporter mirRep;
     auto mir = lowerToMir(hir->hir, hir->literalPool,
@@ -8903,6 +8924,80 @@ TEST(MirLoweringC, VaStartSkipsAStackedScalarThatFollowsAStackedAggregate) {
     EXPECT_EQ(recvStackPayloads(m, fi), (std::vector<std::uint32_t>{0u, 16u}));
 }
 
+TEST(MirLoweringC, AConfigStatingNoDataModelIsRefusedByName) {
+    // P69 (lane `xa`, fold 3f -- review-xa3e F3): a config's data model is STATED, never defaulted; one stating no
+    // pointer size -- none at all, or a value no table row names -- is refused before anything is lowered, by name.
+    for (DataModel const model : {DataModel{}, static_cast<DataModel>(0x7f)}) {
+        auto L = lowerC("int f(void) { return 0; }\n", "x86_64", "sysv_amd64", DataModel::Lp64,
+                        LongDoubleFormat::None, {}, true, [&](MirLoweringConfig& c) { c.dataModel = model; });
+        EXPECT_FALSE(L.mir.ok) << "a config stating no data model lowered";
+        bool named = false;
+        for (auto const& d : L.mirReporter.all()) {
+            if (d.code == DiagnosticCode::S_UnsupportedDataModel
+                && d.actual.find("states no data model") != std::string::npos)
+                named = true;
+        }
+        EXPECT_TRUE(named) << "the refusal does not name the missing data model: "
+                           << firstMirError(L.mirReporter);
+    }
+}
+
+TEST(MirLoweringC, TheStackedParameterStrideIsTheConventionsQuantumNotThePointerWidth) {
+    // P69 (lane `xa`, fold 3f -- review-xa3e F3 P12b, Q2): HIR->MIR walks the incoming overflow area in the
+    // convention's ARGUMENT-SLOT QUANTUM, stated by `takeCallingConvention` from its home (`argumentSlotBytes`) --
+    // never the data model's pointer width. The two are equal on every shipped pair, so the x32-shaped cell states a
+    // 4-byte quantum under LP64: the two stacked named `int`s put `va_start`'s base at two slots of IT. A config
+    // stating no quantum is refused at the first stacked parameter, by name.
+    std::string const src =
+        "int f(int a, int b, int c, int d, int e, int g, int h, int i, ...) {\n"
+        "  __builtin_va_list ap;\n"
+        "  __builtin_va_start(ap, i);\n"
+        "  int v = __builtin_va_arg(ap, int);\n"
+        "  __builtin_va_end(ap);\n"
+        "  return a + h + i + v;\n"
+        "}\n";
+    auto const baseOf = [](Lowered const& L) -> std::optional<std::uint32_t> {
+        return vaOverflowArgAreaPayload(L.mir.mir, funcWithVaStart(L.mir.mir));
+    };
+    auto const shipped = lowerC(src);
+    ASSERT_TRUE(shipped.mir.ok) << firstMirError(shipped.mirReporter);
+    EXPECT_EQ(baseOf(shipped), std::optional<std::uint32_t>{16u})
+        << "the shipped SysV quantum (8 bytes): two stacked ints span 16";
+    auto const x32 = lowerC(src, "x86_64", "sysv_amd64", DataModel::Lp64, LongDoubleFormat::None, {}, true,
+                            [](MirLoweringConfig& c) { c.argumentSlotBytes = 4; });
+    ASSERT_TRUE(x32.mir.ok) << firstMirError(x32.mirReporter);
+    EXPECT_EQ(baseOf(x32), std::optional<std::uint32_t>{8u})
+        << "the stacked parameters are not walked in the convention's quantum";
+    auto const none = lowerC(src, "x86_64", "sysv_amd64", DataModel::Lp64, LongDoubleFormat::None, {}, true,
+                             [](MirLoweringConfig& c) { c.argumentSlotBytes = 0; });
+    EXPECT_FALSE(none.mir.ok) << "a config stating no argument-slot quantum lowered a stacked parameter";
+    EXPECT_NE(firstMirError(none.mirReporter).find("argument-slot quantum"), std::string::npos)
+        << firstMirError(none.mirReporter);
+}
+
+TEST(MirLoweringC, EveryShippedConventionStatesItsVaListSlotsInTheArgumentSlotQuantum) {
+    // P69 (lane `xa`, fold 3f -- review-xa3e F3, Q2): the quantum's home answers the widest general register, the
+    // convention assembly states exactly that, and the va_list layout's integer save slot and named-argument slot --
+    // Q2 statements of the convention's own -- are held to it on every shipped convention.
+    for (char const* name : {"x86_64", "arm64"}) {
+        auto const t = requireShippedTarget(name);
+        std::uint32_t const quantum = argumentSlotBytes(*t);
+        EXPECT_EQ(quantum, 8u) << name << ": the widest general register is 8 bytes";
+        for (TargetCallingConvention const& cc : t->callingConventions()) {
+            MirLoweringConfig cfg;
+            cfg.dataModel = DataModel::Lp64;
+            takeCallingConvention(cfg, *t, cc);
+            EXPECT_EQ(cfg.argumentSlotBytes, quantum) << name << "/" << cc.name;
+            if (!cc.vaListLayout.has_value()) continue;
+            if (cc.vaListLayout->gpSlotBytes != 0)
+                EXPECT_EQ(cc.vaListLayout->gpSlotBytes, quantum) << name << "/" << cc.name << ": gpSlotBytes";
+            if (cc.vaListLayout->namedArgSlotBytes != 0)
+                EXPECT_EQ(cc.vaListLayout->namedArgSlotBytes, quantum)
+                    << name << "/" << cc.name << ": namedArgSlotBytes";
+        }
+    }
+}
+
 // ── P69 fold f26c — D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET ──
 // A SysV MEMORY-class aggregate ARGUMENT travels as its BYTES in the outgoing argument
 // area (psABI 3.2.3), at its own alignment as `stackArgPacking` honours it, consuming no
@@ -11276,6 +11371,7 @@ TEST(MirLoweringC, LabelAddressInStaticInitializerIsRefusedWithoutProvenance) {
     // Re-lower the SAME HIR with the provenance map withheld.
     DiagnosticReporter rep;
     MirLoweringConfig cfg;
+    cfg.dataModel = DataModel::Lp64;   // a config states its unit's data model
     cfg.symbolIdSpace = MirSymbolIdSpace::endingAt(   // the unit's name table: a block symbol is minted
         static_cast<std::uint32_t>(withMap.model.symbols().size()));
     auto const bare = lowerToMir(withMap.hir->hir, withMap.hir->literalPool,
@@ -11360,7 +11456,7 @@ TEST(MirLoweringC, IterativeDeepBinaryChainLowersFlatAndByteIdentical) {
     DiagnosticReporter rep;
     HirLiteralPool pool;
     auto result = lowerToMir(hir, pool, ti, rep, /*sourceMap=*/nullptr,
-                             MirLoweringConfig{});
+                             MirLoweringConfig{.dataModel = DataModel::Lp64, .argumentSlotBytes = 8});
     ASSERT_TRUE(result.ok)
         << "deep BinaryOp chain must lower clean: "
         << (rep.all().empty() ? "" : rep.all()[0].actual);
@@ -11450,7 +11546,7 @@ TEST(MirLoweringC, IterativeDeepUnaryChainLowersFlatAndByteIdentical) {
     DiagnosticReporter rep;
     HirLiteralPool pool;
     auto result = lowerToMir(hir, pool, ti, rep, /*sourceMap=*/nullptr,
-                             MirLoweringConfig{});
+                             MirLoweringConfig{.dataModel = DataModel::Lp64, .argumentSlotBytes = 8});
     ASSERT_TRUE(result.ok)
         << "deep UnaryOp chain must lower clean: "
         << (rep.all().empty() ? "" : rep.all()[0].actual);
@@ -11569,6 +11665,7 @@ TEST(MirLoweringC, IterativeDeepIndexAddressChainLowersFlatAndByteIdentical) {
     // Thread the x86_64 aggregate layout so array stride/size resolve (mirrors
     // lowerC). A char[1]…[1] is 1 byte; stride at every level is 1.
     MirLoweringConfig mirCfg;
+    mirCfg.dataModel = DataModel::Lp64;   // a config states its unit's data model
     // A target that will not load is a STOP, never a fixture that quietly
     // measures a default machine model.
     {
@@ -11709,7 +11806,7 @@ TEST(MirLoweringC, IterativeDeepTernaryChainLowersFlatAndByteIdentical) {
     DiagnosticReporter rep;
     HirLiteralPool pool;
     auto result = lowerToMir(hir, pool, ti, rep, /*sourceMap=*/nullptr,
-                             MirLoweringConfig{});
+                             MirLoweringConfig{.dataModel = DataModel::Lp64, .argumentSlotBytes = 8});
     ASSERT_TRUE(result.ok)
         << "deep ternary chain must lower clean: "
         << (rep.all().empty() ? "" : rep.all()[0].actual);
@@ -11808,7 +11905,7 @@ TEST(MirLoweringC, IterativeDeepLogicalChainLowersFlatAndByteIdentical) {
     DiagnosticReporter rep;
     HirLiteralPool pool;
     auto result = lowerToMir(hir, pool, ti, rep, /*sourceMap=*/nullptr,
-                             MirLoweringConfig{});
+                             MirLoweringConfig{.dataModel = DataModel::Lp64, .argumentSlotBytes = 8});
     ASSERT_TRUE(result.ok)
         << "deep && chain must lower clean: "
         << (rep.all().empty() ? "" : rep.all()[0].actual);
@@ -11909,7 +12006,7 @@ TEST(MirLoweringC, IterativeDeepCallChainLowersFlatAndByteIdentical) {
 
     DiagnosticReporter rep;
     auto result = lowerToMir(hir, pool, ti, rep, /*sourceMap=*/nullptr,
-                             MirLoweringConfig{});
+                             MirLoweringConfig{.dataModel = DataModel::Lp64, .argumentSlotBytes = 8});
     ASSERT_TRUE(result.ok)
         << "deep Call chain must lower clean: "
         << (rep.all().empty() ? "" : rep.all()[0].actual);
@@ -12031,7 +12128,7 @@ TEST(MirLoweringC, IterativeDeepIfNestLowersFlatAndByteIdentical) {
     DiagnosticReporter rep;
     HirLiteralPool pool;
     auto result = lowerToMir(hir, pool, ti, rep, /*sourceMap=*/nullptr,
-                             MirLoweringConfig{});
+                             MirLoweringConfig{.dataModel = DataModel::Lp64, .argumentSlotBytes = 8});
     ASSERT_TRUE(result.ok)
         << "deep if nest must lower clean: "
         << (rep.all().empty() ? "" : rep.all()[0].actual);
@@ -16560,6 +16657,7 @@ constexpr char const* kSetjmpRoundTripSrc =
         };
     }
     MirLoweringConfig mirCfg = languageMirLoweringConfig(*schema);   // the pipeline's assembly
+    mirCfg.dataModel = DataModel::Lp64;   // a config states its unit's data model
     mirCfg.symbolIdSpace = MirSymbolIdSpace::endingAt(   // the unit's name table, as the driver states it
         static_cast<std::uint32_t>(model.symbols().size()));
     // A target that will not load is a STOP, never a fixture that quietly
@@ -16569,7 +16667,7 @@ constexpr char const* kSetjmpRoundTripSrc =
         mirCfg.aggregateLayout       = t->aggregateLayout();
         mirCfg.aggregateLayoutLoaded = t->aggregateLayoutLoaded();
         if (auto const* cc = t->callingConventionByName("sysv_amd64"))
-            takeCallingConvention(mirCfg, *cc);   // the one assembly the pipeline calls
+            takeCallingConvention(mirCfg, *t, *cc);   // the one assembly the pipeline calls
     }
     // The real pipeline's FFI-synthesis stage (compile_pipeline step 2.5) populates a
     // per-extern FfiMetadata (mangledName + importLibrary) BETWEEN HIR and MIR; the

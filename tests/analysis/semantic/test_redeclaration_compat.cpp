@@ -955,3 +955,38 @@ TEST(RedeclarationCompat, TheSixtyThreeLevelBitsetBoundIsAMissedDiagnosticNotARe
     EXPECT_FALSE(hasCode(above.diagnostics(),
                          DiagnosticCode::S_IncompatibleRedeclaration));
 }
+
+// ★ OF TWO UNITS THAT DECLARE ONE INCLUDED NAME, THE FIRST UNIT'S DECLARATION IS JUDGED (P69 fold 3f, lane `xa`).
+// The pass gathers every user declaration of the ordinary namespace over every tree's root scope, and a name two
+// trees declare keeps the FIRST tree's (`try_emplace`). It walked the trees in the order of an unordered map keyed
+// by tree id, so WHICH unit's declaration the C23 check judged against the included platform declaration was the
+// host library's. It walks them in ascending tree id: the units' own order. Both orders are asked: the verdict
+// follows the unit that comes first, the compatible declaration once and the incompatible one once.
+namespace {
+
+[[nodiscard]] SemanticModel analyzeElfUnits(std::vector<std::string> sources) {
+    auto schema = loadShippedSchema("c");
+    UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
+    builder.setActiveFormat(ObjectFormatKind::Elf);
+    for (std::size_t i = 0; i < sources.size(); ++i) {
+        builder.addInMemory(std::move(sources[i]), "unit" + std::to_string(i) + ".c");
+    }
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    assertNoBuilderErrors(*cu);
+    return analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, std::nullopt, std::nullopt,
+                   SelectableObjectFormatKind::of(ObjectFormatKind::Elf), "x86_64");
+}
+
+}  // namespace
+
+TEST(RedeclarationCompat, OfTwoUnitsDeclaringOneIncludedNameTheFirstUnitsIsJudged) {
+    std::string const compatible =
+        "#include <stdio.h>\nint puts(const char *s);\nint main(void){return 0;}\n";
+    std::string const incompatible = "int puts(double x);\n";
+    auto const compatibleFirst = analyzeElfUnits({compatible, incompatible});
+    EXPECT_FALSE(hasCode(compatibleFirst.diagnostics(), DiagnosticCode::S_IncompatibleRedeclaration))
+        << "the first unit's declaration is judged, and it is the platform's: " << firstMessage(compatibleFirst);
+    auto const incompatibleFirst = analyzeElfUnits({incompatible, compatible});
+    EXPECT_TRUE(hasCode(incompatibleFirst.diagnostics(), DiagnosticCode::S_IncompatibleRedeclaration))
+        << "the first unit's declaration is judged, and it contradicts the platform's";
+}

@@ -69,8 +69,9 @@ mode, a decoded source over MAX_SOURCE_BYTES, a compiler or dump tool spelled as
 outside DUMP_TOOLS, a `--dump` in asm or stdout mode (there is no product to dump), a `--keep` other than `yes`
 or empty, a `--keep` in asm or stdout mode (there is no product to keep) or with no `--step-dir` to keep it in, a
 batch item keeping under a name that is not one entry of the kept directory, an option placing a
-product among the flags, an unknown mode, extension or dialect, and an assembly source (`s`, `S`) for the
-msvc dialect (cl does not assemble). ★ AN EMPTY SOURCE IS A PROBE IN STDOUT MODE: an empty translation unit under
+product among the flags, an unknown mode, extension or dialect, an assembly source (`s`, `S`) for the
+msvc dialect (cl does not assemble), and a batch item's `inputs` outside run and link mode (INPUTS, below; a
+malformed `inputs` refuses the batch). ★ AN EMPTY SOURCE IS A PROBE IN STDOUT MODE: an empty translation unit under
 `-dM,-E` prints exactly the compiler's predefined macros. A single probe cannot carry one -- an empty
 `--src-b64` is no source at all -- so it travels as a batch item's `"src": ""` (or a shared source
 `""`), and an item that is empty in any other mode is refused as that item.
@@ -96,7 +97,7 @@ compiler's identity, each command with its exit code and output, then the witnes
 which the runner keeps, so `dssharness sync --pull` brings it back.
 
 A BATCH (`--batch-b64`, in place of `--src-b64`): the base64 of a UTF-8 JSON array of up to MAX_BATCH
-objects, each `{"name", "src"}` plus any of `ext`, `cc`, `flags`, `mode`, `dump`, `dialect`, `keep` (strings, the
+objects, each `{"name", "src"}` plus any of `ext`, `cc`, `flags`, `mode`, `dump`, `dialect`, `keep`, `archiver` (strings, the
 same rules as the options). Every item runs in turn inside ONE run, so ONE sync and ONE pull serve them all
 -- MEASURED 2026-09-23: the Mac fell asleep between two single-probe runs a minute apart, and its
 keep-awake lives only as long as a run. Each item's report follows a `=== probe <name>` line; an item
@@ -110,6 +111,25 @@ repeated the text sixteen times, past the Windows command line). The last line i
 `probe-reference-cc: OK batch=<n> measured=<m> absent=<a> refused=<r>`. The batch's base64 is bounded by
 MAX_BATCH_B64, because a run's inputs reach the orchestrating host's DssHarness on one Windows
 command line (32767 characters).
+
+INPUTS (a batch item in run or link mode): `"inputs"`, the LINK IN ORDER -- an array naming `"probe"` exactly once,
+where the item's own source stands, and around it the link's other inputs: a UNIT `{"name", "src"|"src_ref",
+"ext"?}`, compiled with the item's compiler and flags to `<name>.o` (`<name>.obj` under msvc) and linked as that
+object, or an ARCHIVE `{"archive": "<name>", "members": [unit, ...]}`, each member compiled so and archived by the
+dialect's archiver (`ar rcs lib<name>.a`, MSVC's `lib /nologo /OUT:<name>.lib`) or by the one the ITEM names in
+`"archiver"` (`ar` | `lib`), linked as that library. ✔ADDED 2026-11-16 (P69 lane xa, fold 3f, ledger 650): the key
+crosses an archiver with another dialect's linker -- link.exe took the LAST of two members defining `main` in lib.exe's
+archive and the three ar-archive linkers the FIRST, and only an ar archive linked by link.exe separates the archive's
+index from the linker's rule. An `archiver` on an item whose link holds no archive is refused: it would decide
+nothing (`archiver_for`). The driver
+links them in the order written, so a reference linker's answer to an ORDER question (which of two weak definitions,
+which archive member) and to a question no single source can ask (a program's entry defined only by an archive
+member) is measured on the host. Each unit's compile and each archive's step is reported in order, with its exit
+code; the first that fails ends the probe there (`units=<rc>` in the witness, and no link), and `units=0` says every
+one exited 0. A name is a bare file stem (ITEM_NAME, never `probe`), each once per item; at most MAX_INPUTS units and
+archives, members counted. An absent archiver is reported like an absent compiler (`archiver=absent`), and nothing
+is compiled. ✔ADDED 2026-11-05 (P69 lane xa, fold 3e): the Mac's ld64 had to be measured on a multi-object link and
+an archive member's entry, and this program compiled one source per item.
 
 `--selftest` runs the refusal, decoding, batch and redaction arms and each dialect's spelling of every
 mode as a pure argv, then the REAL arms: with the host's `cc`, `gcc` or `clang` and its `nm` or
@@ -180,7 +200,17 @@ MAX_BATCH = 32
 MAX_BATCH_B64 = 24000
 NL_CHAR = chr(10)
 ITEM_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
-ITEM_KEYS = ("name", "src", "ext", "cc", "flags", "mode", "dump", "dialect", "keep", "src_ref")
+ITEM_KEYS = ("name", "src", "ext", "cc", "flags", "mode", "dump", "dialect", "keep", "src_ref", "inputs",
+             "archiver")
+STRING_ITEM_KEYS = ("ext", "cc", "flags", "mode", "dump", "dialect", "keep", "archiver")
+# A batch item's OTHER LINK INPUTS (INPUTS, in the header): units compiled to objects, and archives of them.
+INPUT_MODES = ("run", "link")             # the modes that link: the only ones a link's other inputs belong to
+PROBE_SLOT = "probe"                      # names, in `inputs`, where the item's own source stands in the link
+UNIT_KEYS = ("name", "src", "src_ref", "ext")
+ARCHIVE_KEYS = ("archive", "members")
+ARCHIVERS = ("ar", "lib")                # the archive forms an item may name (`archiver`)
+ARCHIVER_OF = {"gnu": "ar", "msvc": "lib"}   # ... and each dialect's own, when it names none
+MAX_INPUTS = 16                           # units and archives of one item, members counted
 
 
 class Refusal(Exception):
@@ -318,27 +348,74 @@ def split_link(flags):
     return flags, []
 
 
-def compile_argv(dialect, cc, cc_path, mode, flags, src, scratch):
+def compile_argv(dialect, cc, cc_path, mode, flags, src, scratch, link_inputs=None):
     """(argv, the argv as the report shows it, the product's path or None) for one compile. A PURE function of its
     inputs, so the self-test pins every dialect's spelling of every mode without a compiler.
     msvc spells an output path `/Fe<path>` `/Fo<path>` `/Fa<path>`, with no colon and no space: the one form MSVC's
-    reference documents for all three (`/Fe:` and `/Fo:` also exist; `/Fa:` is not documented)."""
+    reference documents for all three (`/Fe:` and `/Fo:` also exist; `/Fa:` is not documented).
+    `link_inputs` (run and link modes): the link's inputs IN THE ORDER STATED, each a path, with None where the
+    probe's own source stands; they take the source's place on the command line, before the output path (and an msvc
+    `/link` tail), so the driver links them in that order."""
     base = os.path.basename(src)
+    ordered = [src] if link_inputs is None else [src if p is None else p for p in link_inputs]
+    shown_in = [base] if link_inputs is None else [base if p is None else os.path.basename(p) for p in link_inputs]
     if dialect == "msvc":
         head, link = split_link(flags)
         outputs = {"asm": [("/Fa", "probe.asm"), ("/Fo", "probe.obj")], "object": [("/Fo", "probe.obj")],
                    "stdout": []}.get(mode, [("/Fe", "probe.exe")])
         stage = {"asm": ["/c", "/FA"], "object": ["/c"]}.get(mode, [])
-        argv = ([cc_path, "/nologo"] + stage + head + [src] + [opt + os.path.join(scratch, name)
-                                                                for opt, name in outputs] + link)
-        shown = [cc, "/nologo"] + stage + head + [base] + [opt + name for opt, name in outputs] + link
+        argv = ([cc_path, "/nologo"] + stage + head + ordered + [opt + os.path.join(scratch, name)
+                                                                  for opt, name in outputs] + link)
+        shown = [cc, "/nologo"] + stage + head + shown_in + [opt + name for opt, name in outputs] + link
         return argv, shown, os.path.join(scratch, outputs[0][1]) if outputs else None
     if mode == "stdout":
         return [cc_path] + flags + [src], [cc] + flags + [base], None
     product = os.path.join(scratch, {"object": "probe.o", "asm": "probe.s"}.get(mode, "probe.exe"))
     stage = {"object": ["-c"], "asm": ["-S"]}.get(mode, [])
-    return ([cc_path] + stage + flags + [src, "-o", product],
-            [cc] + stage + flags + [base, "-o", os.path.basename(product)], product)
+    return ([cc_path] + stage + flags + ordered + ["-o", product],
+            [cc] + stage + flags + shown_in + ["-o", os.path.basename(product)], product)
+
+
+def unit_argv(dialect, cc, cc_path, flags, src, obj):
+    """(argv, shown) compiling one of a link's other units to its object: the item's own compiler and flags (less an
+    msvc `/link` tail, which belongs to the link), `-c` / `/c`. PURE, like compile_argv."""
+    if dialect == "msvc":
+        head, _ = split_link(flags)
+        return ([cc_path, "/nologo", "/c"] + head + [src, "/Fo" + obj],
+                [cc, "/nologo", "/c"] + head + [os.path.basename(src), "/Fo" + os.path.basename(obj)])
+    return ([cc_path, "-c"] + flags + [src, "-o", obj],
+            [cc, "-c"] + flags + [os.path.basename(src), "-o", os.path.basename(obj)])
+
+
+def archiver_for(dialect, value, archives):
+    """The archiver an item's archives are made by: the item's own `archiver` (ARCHIVERS) when it names one, else its
+    dialect's (ARCHIVER_OF). REFUSED: a value outside ARCHIVERS, and an `archiver` on an item whose link holds no
+    archive (`archives` false), which would decide nothing. PURE."""
+    if value and value not in ARCHIVERS:
+        raise Refusal("archiver %r is not one of %s" % (value, ", ".join(ARCHIVERS)))
+    if value and not archives:
+        raise Refusal("archiver %r names the maker of an archive this item's link does not hold, so it would decide "
+                      "nothing" % value)
+    return value or ARCHIVER_OF[dialect]
+
+
+def archive_argv(archiver, tool_path, archive, objects):
+    """(argv, shown) archiving `objects` into the static library `archive` with `archiver` (ARCHIVERS): `ar rcs` (its
+    index written, as ranlib would) or MSVC's `lib /nologo /OUT:`, whichever dialect compiled the objects. PURE, like
+    compile_argv."""
+    if archiver == "lib":
+        return ([tool_path, "/nologo", "/OUT:" + archive] + objects,
+                ["lib", "/nologo", "/OUT:" + os.path.basename(archive)] + [os.path.basename(o) for o in objects])
+    return ([tool_path, "rcs", archive] + objects,
+            ["ar", "rcs", os.path.basename(archive)] + [os.path.basename(o) for o in objects])
+
+
+def object_name(dialect, stem):
+    return stem + (".obj" if dialect == "msvc" else ".o")
+
+
+def archive_name(archiver, stem):
+    return (stem + ".lib") if archiver == "lib" else ("lib" + stem + ".a")
 
 
 def find_tool(name, what):
@@ -455,12 +532,15 @@ def block(lines, title, rc, out, err):
 
 
 def probe(tree, src_b64, ext, cc, flags_value, mode, dump_value, scratch_parent=None, dialect_value="",
-          shared=None, keep_value="", keep_dir=None, item="probe"):
+          shared=None, keep_value="", keep_dir=None, item="probe", inputs=None, archiver_value=""):
     """Return (exit code, report lines). A refusal is exit 2 with one explanatory line. `shared` is a batch's
     (redactor, directory) (`run_batch`): the batch built the one redactor ONCE, so the account is known nameable,
     and the probe runs in `directory`, which it creates and removes. `keep_value` `yes` keeps the product at
-    `keep_dir/<item>/` (KEEP, in the header)."""
+    `keep_dir/<item>/` (KEEP, in the header). `inputs` is a batch item's link, decoded (`decode_inputs`; INPUTS, in
+    the header). `archiver_value` is the item's `archiver` (`archiver_for`)."""
     try:
+        if inputs is not None and mode not in INPUT_MODES:
+            raise Refusal("a link's other inputs apply to --mode %s: the modes that link" % ", ".join(INPUT_MODES))
         if mode not in MODES:
             raise Refusal("--mode %r is not one of %s" % (mode, ", ".join(MODES)))
         if ext not in EXTENSIONS:
@@ -470,6 +550,11 @@ def probe(tree, src_b64, ext, cc, flags_value, mode, dump_value, scratch_parent=
             raise Refusal("--ext %r: the %s dialect compiles only %s (cl does not assemble; ml64 is MSVC's "
                           "assembler)" % (ext, dialect, ", ".join(DIALECT_EXTENSIONS[dialect])))
         data = decode_source(src_b64, allow_empty=(mode == "stdout"))
+        for entry in inputs or []:
+            for unit in ([] if entry is None else [entry] if entry[0] == "unit" else entry[2]):
+                if unit[2] not in DIALECT_EXTENSIONS[dialect]:
+                    raise Refusal("input %r: the %s dialect compiles only %s"
+                                  % (unit[1], dialect, ", ".join(DIALECT_EXTENSIONS[dialect])))
         flags = split_list(flags_value)
         check_flags(flags, dialect)
         dump = split_list(dump_value)
@@ -487,6 +572,9 @@ def probe(tree, src_b64, ext, cc, flags_value, mode, dump_value, scratch_parent=
             kept_child(keep_dir, item, "the kept item")
         cc_path = find_tool(cc, "--cc")
         dump_path = find_tool(dump[0], "--dump tool") if dump else None
+        archives = any(entry is not None and entry[0] == "archive" for entry in inputs or [])
+        archiver = archiver_for(dialect, archiver_value, archives)
+        archiver_path = find_tool(archiver, "the archiver") if archives else None
         # An account nobody can name is refused BEFORE the compiler is looked for: nothing this probe says may print
         # unredacted, an absent compiler's line included -- and so the refusal holds on a host with no compiler at
         # all (the P69 review's NIT 3: the arm passed there on `compiler=absent`, proving nothing). A batch asked
@@ -498,6 +586,10 @@ def probe(tree, src_b64, ext, cc, flags_value, mode, dump_value, scratch_parent=
     if cc_path is None:
         return 0, ["compiler: %s is not on this host's PATH; nothing was compiled" % cc,
                    "probe-reference-cc: OK mode=%s compiler=absent" % mode]
+    if archives and archiver_path is None:
+        # Like an absent compiler: a measurement of the HOST, and nothing was compiled.
+        return 0, ["archiver: %s is not on this host's PATH; nothing was compiled" % archiver,
+                   "probe-reference-cc: OK mode=%s archiver=absent" % mode]
 
     if shared is not None:
         red, scratch = shared
@@ -524,7 +616,53 @@ def probe(tree, src_b64, ext, cc, flags_value, mode, dump_value, scratch_parent=
     lines.append("source: probe.%s, %d byte(s)" % (ext, len(data)))
 
     witness = ["mode=" + mode]
-    argv, shown, product = compile_argv(dialect, cc, cc_path, mode, placed(flags, scratch), src, scratch)
+    # THE LINK'S OTHER INPUTS, each unit compiled to its object and each archive made, in the order stated; the
+    # first that fails ends the probe there (its block says how), and the link is not attempted.
+    link_inputs, u_rc = None, 0
+    if inputs is not None:
+        link_inputs = []
+
+        def compile_unit(unit):
+            _, stem, unit_ext, text = unit
+            unit_src = os.path.join(scratch, stem + "." + unit_ext)
+            with io.open(unit_src, "wb") as f:
+                f.write(text.encode("utf-8"))
+            lines.append("unit: %s.%s, %d byte(s)" % (stem, unit_ext, len(text.encode("utf-8"))))
+            obj = os.path.join(scratch, object_name(dialect, stem))
+            u_argv, u_shown = unit_argv(dialect, cc, cc_path, placed(flags, scratch), unit_src, obj)
+            rc, out, err = run_cmd(u_argv, scratch, COMPILE_SECONDS)
+            block(lines, "compile " + " ".join(u_shown), rc, out, err)
+            return rc, obj
+
+        for entry in inputs:
+            if entry is None:
+                link_inputs.append(None)
+                continue
+            if entry[0] == "unit":
+                u_rc, obj = compile_unit(entry)
+                link_inputs.append(obj)
+            else:
+                objects = []
+                for member in entry[2]:
+                    u_rc, obj = compile_unit(member)
+                    objects.append(obj)
+                    if u_rc != 0:
+                        break
+                if u_rc == 0:
+                    lib = os.path.join(scratch, archive_name(archiver, entry[1]))
+                    a_argv, a_shown = archive_argv(archiver, archiver_path, lib, objects)
+                    u_rc, out, err = run_cmd(a_argv, scratch, COMPILE_SECONDS)
+                    block(lines, "archive " + " ".join(a_shown), u_rc, out, err)
+                    link_inputs.append(lib)
+            if u_rc != 0:
+                break
+        witness.append("units=%s" % u_rc)
+    if u_rc != 0:
+        lines.append("probe-reference-cc: OK %s" % " ".join(witness))
+        shutil.rmtree(scratch, ignore_errors=True)
+        return 0, [red(ln) for ln in lines]
+    argv, shown, product = compile_argv(dialect, cc, cc_path, mode, placed(flags, scratch), src, scratch,
+                                        link_inputs)
     c_rc, out, err = run_cmd(argv, scratch, COMPILE_SECONDS)
     block(lines, "compile " + " ".join(shown), c_rc, out, err)
     witness.append("compile=%s" % c_rc)
@@ -611,10 +749,87 @@ def decode_batch(b64):
             item["src"] = sources[item["src_ref"]]
         if not isinstance(item.get("src"), str):
             raise Refusal("batch item %r has no source text (\"\" is the empty translation unit)" % name)
-        for key in ITEM_KEYS[2:-1]:
+        for key in STRING_ITEM_KEYS:
             if key in item and not isinstance(item[key], str):
                 raise Refusal("batch item %r: %s must be a string" % (name, key))
+        if "inputs" in item:
+            item["inputs"] = decode_inputs(name, item["inputs"], sources)
     return items
+
+
+def decode_inputs(name, value, sources):
+    """A batch item's `inputs` (INPUTS, in the header) -> the link, in order: None where the item's own source stands,
+    ("unit", stem, ext, text) for a unit compiled to its object, ("archive", stem, [unit, ...]) for an archive of
+    units. A malformed link refuses the BATCH, as any malformed item field does."""
+    def text_of(where, unit):
+        if ("src" in unit) == ("src_ref" in unit):
+            raise Refusal("batch item %r: %s gives exactly one of src and src_ref" % (name, where))
+        if "src_ref" in unit:
+            if unit["src_ref"] not in sources:
+                raise Refusal("batch item %r: %s's src_ref %r names no source in the batch"
+                              % (name, where, unit["src_ref"]))
+            return sources[unit["src_ref"]]
+        if not isinstance(unit["src"], str):
+            raise Refusal("batch item %r: %s's src must be source text" % (name, where))
+        return unit["src"]
+
+    stems = set()
+
+    def stem_of(where, stem):
+        if not isinstance(stem, str) or not ITEM_NAME.match(stem) or stem == PROBE_SLOT:
+            raise Refusal("batch item %r: %s's name %r must match %s and not be %r (the probe's own file)"
+                          % (name, where, stem, ITEM_NAME.pattern, PROBE_SLOT))
+        if stem in stems:
+            raise Refusal("batch item %r: the input name %r appears twice" % (name, stem))
+        stems.add(stem)
+        return stem
+
+    def unit_of(where, unit):
+        if not isinstance(unit, dict):
+            raise Refusal("batch item %r: %s is not an object" % (name, where))
+        unknown = sorted(set(unit) - set(UNIT_KEYS))
+        if unknown:
+            raise Refusal("batch item %r: %s carries unknown key(s) %s; a unit's keys are %s"
+                          % (name, where, unknown, ", ".join(UNIT_KEYS)))
+        ext = unit.get("ext", "c")
+        if ext not in EXTENSIONS:
+            raise Refusal("batch item %r: %s's ext %r is not one of %s" % (name, where, ext, ", ".join(EXTENSIONS)))
+        stem = stem_of(where, unit.get("name"))
+        text = text_of(where, unit)
+        if not text:
+            raise Refusal("batch item %r: %s's source is empty" % (name, where))
+        return ("unit", stem, ext, text)
+
+    if not isinstance(value, list) or not value:
+        raise Refusal("batch item %r: inputs must be a non-empty array, the link in order, naming %r once where "
+                      "the item's own source stands" % (name, PROBE_SLOT))
+    out, count = [], 0
+    for i, entry in enumerate(value):
+        where = "input %d" % i
+        if entry == PROBE_SLOT:
+            out.append(None)
+            continue
+        if isinstance(entry, dict) and "archive" in entry:
+            unknown = sorted(set(entry) - set(ARCHIVE_KEYS))
+            if unknown:
+                raise Refusal("batch item %r: %s carries unknown key(s) %s; an archive's keys are %s"
+                              % (name, where, unknown, ", ".join(ARCHIVE_KEYS)))
+            stem = stem_of(where, entry["archive"])
+            members = entry.get("members")
+            if not isinstance(members, list) or not members:
+                raise Refusal("batch item %r: archive %r needs a non-empty members array" % (name, stem))
+            out.append(("archive", stem, [unit_of("archive %r's member %d" % (stem, j), m)
+                                          for j, m in enumerate(members)]))
+            count += 1 + len(members)
+            continue
+        out.append(unit_of(where, entry))
+        count += 1
+    if out.count(None) != 1:
+        raise Refusal("batch item %r: inputs names %r %d time(s); it names the item's own source exactly once"
+                      % (name, PROBE_SLOT, out.count(None)))
+    if count > MAX_INPUTS:
+        raise Refusal("batch item %r: %d inputs, over the %d allowed" % (name, count, MAX_INPUTS))
+    return out
 
 
 def run_batch(tree, batch_b64, scratch_parent=None, keep_dir=None):
@@ -641,11 +856,14 @@ def run_batch(tree, batch_b64, scratch_parent=None, keep_dir=None):
                                    item.get("flags", ""), item.get("mode", "run"), item.get("dump", ""),
                                    dialect_value=item.get("dialect", ""),
                                    shared=(red, os.path.join(scratch, "%03d" % index)),
-                                   keep_value=item.get("keep", ""), keep_dir=keep_dir, item=item["name"])
+                                   keep_value=item.get("keep", ""), keep_dir=keep_dir, item=item["name"],
+                                   inputs=item.get("inputs"), archiver_value=item.get("archiver", ""))
             lines.append("=== probe %s" % item["name"])
             lines.extend(item_lines)
-            # An absent compiler is a measurement of the HOST, never of a compile: counted apart (the audit's PR-1).
-            kind = "refused" if rc != 0 else "absent" if item_lines[-1].endswith(" compiler=absent") else "measured"
+            # An absent compiler (or archiver) is a measurement of the HOST, never of a compile: counted apart (the
+            # audit's PR-1).
+            kind = "refused" if rc != 0 else "absent" if item_lines[-1].endswith(
+                (" compiler=absent", " archiver=absent")) else "measured"
             counts[kind] += 1
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
@@ -675,8 +893,8 @@ def run(a):
 # on the host (a reference compiler, a dump tool, a Visual Studio developer environment), so the expected total is
 # derived from the blocks that ran -- and a block that silently stopped running, or an arm lost from one, is a
 # failure, never a smaller green.
-EXPECTED_FIXED = 79
-EXPECTED_CC = 11
+EXPECTED_FIXED = 95   # P69 fold 3f (ledger 650): +4, the item's `archiver` (its rule, both crosses, two refusals)
+EXPECTED_CC = 13
 EXPECTED_DUMPER = 1
 EXPECTED_CL = 13
 EXPECTED_NO_CL = 1
@@ -773,6 +991,64 @@ def selftest(expect_cl=False):
             [compile_argv("gnu", "cc", "CC", m, ["-O2"], src, sc)[0] for m in ("run", "object", "asm", "stdout")]
             == [["CC", "-O2", src, "-o", exe], ["CC", "-c", "-O2", src, "-o", os.path.join(sc, "probe.o")],
                 ["CC", "-S", "-O2", src, "-o", os.path.join(sc, "probe.s")], ["CC", "-O2", src]])
+        # ── INPUTS: a link's other inputs, in the order stated, as pure argvs; a malformed link refused by name ──
+        a_o, lib_a = os.path.join(sc, "a.o"), os.path.join(sc, "libm.a")
+        got = compile_argv("gnu", "cc", "CC", "run", ["-O2"], src, sc, [a_o, None, lib_a])
+        arm("gnu: a link's inputs in order, the source in its place", got[0] == ["CC", "-O2", a_o, src, lib_a, "-o",
+                                                                                exe]
+            and got[1] == ["cc", "-O2", "a.o", "probe.c", "libm.a", "-o", "probe.exe"], repr(got))
+        a_obj = os.path.join(sc, "a.obj")
+        got = compile_argv("msvc", "cl", "CL", "link", ["/O2", "/link", "/X"], src, sc, [None, a_obj])
+        arm("msvc: a link's inputs in order, before /Fe and /link", got[0] == ["CL", "/nologo", "/O2", src, a_obj,
+                                                                               "/Fe" + exe, "/link", "/X"], repr(got))
+        arm("a unit's compile: the item's flags, -c or /c, its own object",
+            unit_argv("gnu", "cc", "CC", ["-O2"], os.path.join(sc, "a.c"), a_o)[0]
+            == ["CC", "-c", "-O2", os.path.join(sc, "a.c"), "-o", a_o]
+            and unit_argv("msvc", "cl", "CL", ["/O2", "/link", "/X"], os.path.join(sc, "a.c"), a_obj)[0]
+            == ["CL", "/nologo", "/c", "/O2", os.path.join(sc, "a.c"), "/Fo" + a_obj])
+        arm("an archive: ar rcs, or lib /OUT:",
+            archive_argv("ar", "AR", lib_a, [a_o])[0] == ["AR", "rcs", lib_a, a_o]
+            and archive_argv("lib", "LIB", os.path.join(sc, "m.lib"), [a_obj])[0]
+            == ["LIB", "/nologo", "/OUT:" + os.path.join(sc, "m.lib"), a_obj]
+            and (archive_name("ar", "m"), archive_name("lib", "m"), object_name("msvc", "a")) == ("libm.a", "m.lib",
+                                                                                                 "a.obj"))
+        # ── THE ITEM'S ARCHIVER (ledger 650): one dialect's objects archived by the other's archiver ──
+        arm("the item's archiver crosses its dialect, else the dialect's own",
+            (archiver_for("msvc", "ar", True), archiver_for("gnu", "lib", True), archiver_for("msvc", "", True),
+             archiver_for("gnu", "", False)) == ("ar", "lib", "lib", "ar"))
+        arm("msvc objects archived by ar, gnu objects by lib",
+            archive_argv("ar", "AR", lib_a, [a_obj])[1] == ["ar", "rcs", "libm.a", "a.obj"]
+            and archive_argv("lib", "LIB", os.path.join(sc, "m.lib"), [a_o])[1]
+            == ["lib", "/nologo", "/OUT:m.lib", "a.o"], repr(archive_argv("ar", "AR", lib_a, [a_obj])))
+        unit_a = {"name": "a", "src": "int a(void) { return 1; }\n"}
+        for name, inputs, want in (
+                ("inputs that are not an array refused", "probe", "non-empty array"),
+                ("inputs without the probe's place refused", [unit_a], "0 time(s)"),
+                ("the probe's place twice refused", ["probe", unit_a, "probe"], "2 time(s)"),
+                ("a unit's unknown key refused", ["probe", dict(unit_a, flags="-O2")], "unknown key(s) ['flags']"),
+                ("an archive with no members refused", ["probe", {"archive": "m", "members": []}],
+                 "non-empty members"),
+                ("an input name twice refused", ["probe", unit_a, {"archive": "a", "members": [
+                    {"name": "b", "src": "int b;\n"}]}], "appears twice"),
+                ("an input named probe refused", ["probe", dict(unit_a, name="probe")], "the probe's own file")):
+            rc, lines = run_batch(tree, b64json([{"name": "i", "src": "int main(void) { return 0; }\n",
+                                                  "cc": "no-such-cc-for-probe", "inputs": inputs}]))
+            arm(name, rc == 2 and want in lines[0], "\n".join(lines))
+        rc, lines = run_batch(tree, b64json([{"name": "i", "src": "int main(void) { return 0; }\n", "mode": "object",
+                                              "cc": "no-such-cc-for-probe", "inputs": ["probe", unit_a]}]))
+        arm("inputs outside run and link mode refused as the item", rc == 0
+            and any("apply to --mode run, link" in ln for ln in lines)
+            and lines[-1] == "probe-reference-cc: OK batch=1 measured=0 absent=0 refused=1", "\n".join(lines))
+        for name, extra, want in (
+                ("an archiver outside ar and lib refused as the item",
+                 dict(archiver="zip", inputs=["probe", {"archive": "m", "members": [unit_a]}]),
+                 "is not one of ar, lib"),
+                ("an archiver with no archive to make refused as the item",
+                 dict(archiver="ar", inputs=["probe", unit_a]), "would decide nothing")):
+            rc, lines = run_batch(tree, b64json([dict({"name": "i", "src": "int main(void) { return 0; }\n",
+                                                       "cc": "no-such-cc-for-probe"}, **extra)]))
+            arm(name, rc == 0 and any(want in ln for ln in lines)
+                and lines[-1] == "probe-reference-cc: OK batch=1 measured=0 absent=0 refused=1", "\n".join(lines))
         for name, flags_value in (("msvc /Fe:x refused", "/Fe:x"), ("msvc -Fox refused", "-Fox.obj"),
                                   ("msvc /Fa<path> refused", "/Fax.asm"), ("msvc /link /OUT: refused",
                                                                            "/link,/OUT:x.exe"),
@@ -940,6 +1216,21 @@ def selftest(expect_cl=False):
             arm("a batch item keeps under its own name", rc == 0
                 and os.path.isdir(os.path.join(keep_dir, "kept-in-batch"))
                 and any(ln.startswith("== kept kept-in-batch/") for ln in lines), "\n".join(lines))
+            # ── INPUTS, REAL: a unit after the probe's source, and an archive whose member the source calls, each
+            # linked in the order written and run to the exit the program computes. RED if disabled: an input left
+            # off the link line is an undefined reference, so neither links.
+            rc, lines = run_batch(tree, b64json([
+                {"name": "two-units", "src": "int helper(void);\nint main(void) { return helper() + 40; }\n",
+                 "cc": cc, "inputs": ["probe", {"name": "helper", "src": "int helper(void) { return 2; }\n"}]},
+                {"name": "archive-member", "src": "int app(void);\nint main(void) { return app(); }\n", "cc": cc,
+                 "inputs": ["probe", {"archive": "m", "members": [
+                     {"name": "member", "src": "int app(void) { return 42; }\n"}]}]}]), scratch_parent=tree)
+            ends = [ln for ln in lines if ln.startswith("probe-reference-cc: OK mode=")]
+            arm("a unit linked after the probe's source runs", rc == 0 and len(ends) == 2
+                and ends[0] == "probe-reference-cc: OK mode=run units=0 compile=0 run=42", "\n".join(lines))
+            arm("an archive's member is linked and runs", rc == 0 and len(ends) == 2
+                and ends[1] == "probe-reference-cc: OK mode=run units=0 compile=0 run=42"
+                and any(ln.startswith("== archive ar rcs libm.a member.o") for ln in lines), "\n".join(lines))
             dumper = next((d for d in ("nm", "llvm-nm") if shutil.which(d)), None)
         current[0] = "fixed"
         arm("a dump tool is on this host's PATH", cc is None or dumper is not None,

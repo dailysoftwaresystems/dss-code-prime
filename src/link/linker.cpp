@@ -128,7 +128,9 @@ moreConstrainingVisibility(SymbolVisibility a, SymbolVisibility b) noexcept {
         }
         return 3;
     };
-    return rank(a) >= rank(b) ? a : b;
+    int const rankA = rank(a);
+    int const rankB = rank(b);
+    return rankA >= rankB ? a : b;
 }
 
 // The exit mechanisms a format may actually DECLARE — `kExitMechanismTable`
@@ -2592,14 +2594,11 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
             conflict(e, field, std::to_string(kept), std::to_string(incoming));
         };
         auto const boolStr = [](bool b) { return std::string{b ? "true" : "false"}; };
-        // What a row of unit `i` states of its name's fallback (`standingFallback`): a weak external's own default,
-        // the absolute 0 included, or a directive's; none for a plain reference.
-        auto const fallbackStatementOf = [&](std::size_t i, ExternImport const& ext) -> std::optional<FallbackStatement> {
-            bool const weakDefault = ext.binding == SymbolBinding::Weak;
-            if (ext.fallbackName.empty() && !weakDefault) return std::nullopt;
-            return FallbackStatement{ext.fallbackName,
-                                     weakDefault ? FallbackSource::WeakDefault : FallbackSource::Directive,
-                                     linkPositionOf(modules[i], ext.symbol), "linked unit #" + std::to_string(i)};
+        // What a row of unit `i` states of its name's fallback (`standingFallback`), read by the one reading
+        // (`fallbackStatementOf`): a weak external's own default, the absolute 0 included, or a directive's; none for
+        // a plain reference.
+        auto const statementOfRow = [&](std::size_t i, ExternImport const& ext) {
+            return fallbackStatementOf(ext, linkPositionOf(modules[i], ext.symbol), "linked unit #" + std::to_string(i));
         };
         std::unordered_map<std::size_t, FallbackStatement> fallbackStatedAt;   // combined row -> its standing statement
 
@@ -2612,7 +2611,7 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
                     externIdxForKey.try_emplace(dedupKey(ext),
                                                 combined.externImports.size());
                 if (firstOfItsKind) {
-                    if (auto statement = fallbackStatementOf(i, ext); statement.has_value()) {
+                    if (auto statement = statementOfRow(i, ext); statement.has_value()) {
                         fallbackStatedAt.emplace(kit->second, std::move(*statement));
                     }
                     ExternImport out = ext;
@@ -2683,7 +2682,7 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
                 // rule (`standingFallback`, P69 H6c2): its final linker takes the
                 // first it reads (u8), so handing on the standing one gives what
                 // handing on both in the link's order would.
-                if (auto const candidate = fallbackStatementOf(i, ext); candidate.has_value()) {
+                if (auto const candidate = statementOfRow(i, ext); candidate.has_value()) {
                     auto const [st, fresh] = fallbackStatedAt.try_emplace(kit->second, *candidate);
                     if (!fresh) standingFallback(ext.mangledName, st->second, *candidate, reporter);
                     kept.fallbackName = st->second.fallback;
@@ -3452,20 +3451,32 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
     for (std::size_t i = 0; i < modules.size(); ++i) {
         AssembledModule const& m = modules[i];
         for (auto const& e : m.externImports) {
-            bool const weakDefault = e.binding == SymbolBinding::Weak;
-            if (e.fallbackName.empty() && !weakDefault) continue;
+            auto statement = fallbackStatementOf(e, linkPositionOf(m, e.symbol), "linked unit #" + std::to_string(i));
+            if (!statement.has_value()) continue;
             anyStated = anyStated || !e.fallbackName.empty();
-            FallbackStatement statement{e.fallbackName,
-                                        weakDefault ? FallbackSource::WeakDefault : FallbackSource::Directive,
-                                        linkPositionOf(m, e.symbol), "linked unit #" + std::to_string(i)};
-            auto const [it, fresh] = standingOf.try_emplace(e.mangledName, statement);
-            if (!fresh) standingFallback(e.mangledName, it->second, std::move(statement), reporter);
+            auto const [it, fresh] = standingOf.try_emplace(e.mangledName, *statement);
+            if (!fresh) standingFallback(e.mangledName, it->second, std::move(*statement), reporter);
         }
     }
     if (!anyStated) return true;
     std::unordered_map<std::string, std::string> fallbackOf;
     for (auto const& [name, statement] : standingOf) {
         if (!statement.fallback.empty()) fallbackOf.emplace(name, statement.fallback);
+    }
+    // ★ P69 fold 3f (ledger 549 (b), F9): THE FALLBACK'S IMAGE, where a statement carries it (the
+    // image link's statement of a written name the platform's link aliases, `close` -> `_close` in
+    // the C runtime's image: `ExternImport::fallbackLibraryPath`). Keyed by the fallback's name,
+    // from a row whose statement is the one that STANDS for its name, and applied below only where
+    // the fallback is TAKEN and no row of the link binds the fallback's name already -- so an image
+    // whose program defines `close` imports no `_close`.
+    std::unordered_map<std::string, ExternImport const*> imageOf;
+    for (auto const& m : modules) {
+        for (auto const& e : m.externImports) {
+            if (e.fallbackLibraryPath.empty()) continue;
+            auto const standing = fallbackOf.find(e.mangledName);
+            if (standing != fallbackOf.end() && standing->second == e.fallbackName)
+                imageOf.try_emplace(e.fallbackName, &e);
+        }
     }
     // What the link resolves with no fallback: a definition a linked unit
     // makes with external linkage, and a name a library binds — with the
@@ -3488,6 +3499,9 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
         for (std::size_t k = 0; k < m.externImports.size(); ++k) {
             ExternImport& e = m.externImports[k];
             e.fallbackName.clear();   // the standing fallback is the name's, below; a dropped one goes
+            e.fallbackLibraryPath.clear();
+            e.fallbackVersion.clear();
+            e.fallbackIsData = false;
             auto const fb = fallbackOf.find(e.mangledName);
             if (fb == fallbackOf.end()) continue;
             if (resolved.contains(e.mangledName)) continue;   // A answers for itself
@@ -3559,6 +3573,14 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
                     && b->second->kindOrigin != ExternKindOrigin::Pending) {
                     e.isData     = b->second->isData;
                     e.kindOrigin = b->second->kindOrigin;
+                }
+            } else if (auto const img = imageOf.find(target); img != imageOf.end()) {
+                // The fallback is taken and nothing binds it: its stated image (F9, above).
+                e.libraryPath = img->second->fallbackLibraryPath;
+                e.version     = img->second->fallbackVersion;
+                if (e.kindOrigin == ExternKindOrigin::Pending) {
+                    e.isData     = img->second->fallbackIsData;
+                    e.kindOrigin = ExternKindOrigin::FromLibrary;
                 }
             }
         }

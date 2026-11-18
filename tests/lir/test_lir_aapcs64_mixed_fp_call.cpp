@@ -119,6 +119,7 @@ enum class A : std::uint8_t { F128, F64, F32, I32, I64 };
     TypeId const calleeSig = in.fnSig(argTys, voidT, CallConv::CcSysV);
     TypeId const sig = in.fnSig(ptrTys, voidT, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(sig, SymbolId{1});
     mb.beginBlock(mb.createBlock(StructCfMarker::EntryBlock));
@@ -431,6 +432,7 @@ namespace {
     params.push_back(p128);
     TypeId const sig = in.fnSig(params, voidT, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(sig, SymbolId{1});
     mb.beginBlock(mb.createBlock(StructCfMarker::EntryBlock));
@@ -494,6 +496,7 @@ namespace {
     TypeId const sig = in.fnSig(std::vector<TypeId>{p128, p128}, voidT,
                                 CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(sig, SymbolId{1});
     mb.beginBlock(mb.createBlock(StructCfMarker::EntryBlock));
@@ -569,6 +572,7 @@ TEST(Aapcs64MixedFpCall, ARefusedResultPieceNamesTheRegisterItNeeds) {
     TypeId const calleeSig = in.fnSig(std::vector<TypeId>{}, f128, CallConv::CcSysV);
     TypeId const sig = in.fnSig(std::vector<TypeId>{p128}, voidT, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(sig, SymbolId{1});
     mb.beginBlock(mb.createBlock(StructCfMarker::EntryBlock));

@@ -1,0 +1,1 @@
+                if (format.name().empty()) break;   // an image link searches no library a unit names

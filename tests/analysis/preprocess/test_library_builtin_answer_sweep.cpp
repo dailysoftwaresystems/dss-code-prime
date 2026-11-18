@@ -51,17 +51,23 @@
 #include "link/object_format_schema.hpp"
 
 #include "repo_root.hpp"
+#include "scoped_env.hpp"
+#include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
 #include <cstddef>
 #include <filesystem>
+#include <fstream>
+#include <initializer_list>
 #include <map>
 #include <memory>
 #include <set>
+#include <sstream>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -227,4 +233,77 @@ TEST(LibraryBuiltinAnswerSweep, HasBuiltinAnswersWhereTheBinderBindsOnEveryRealP
     // deliberately.
     EXPECT_GE(refusedSomewhere, 1u)
         << "no listed builtin is refused on any pair: the sweep's 0-answer half checked nothing";
+}
+
+// ★ P69 fold 3f (ledger 563 (A)): THE SAME AGREEMENT FOR A ROW AVAILABLE ON ONE ARCH OF A FORMAT. A
+// symbol row's availability may name a format on one arch (`{"format": "elf", "arch": "arm64"}`), and
+// the binder reads the corpus on the PAIR -- format and arch -- so `__has_builtin` must ask on the pair
+// too. No shipped LIBRARY-BUILTIN row is arch-gated (the one arch-gated row, the stack protector's
+// guard, is an object), so the sweep above cannot see the arch: this cell hands both tiers a COPY of
+// the shipped config in which `abs`'s one row is gated to Mach-O, PE and ELF on arm64, and reads the two
+// ELF pairs. Driven through `DSS_CONFIG_ROOT`, so it runs under ctest.
+TEST(LibraryBuiltinAnswerSweep, ARowAvailableOnOneArchAnswersWhereTheBinderBindsOnEachPair) {
+    ASSERT_NE(cLanguage(), nullptr);
+    LibraryBuiltins const& builtins = cLanguage()->semantics().libraryBuiltins;
+    ASSERT_NE(std::find(builtins.functions.begin(), builtins.functions.end(), "abs"), builtins.functions.end())
+        << "`abs` is no longer a library builtin: pick another name with one function row";
+
+    auto const arm = TargetSchema::loadShipped("arm64");
+    auto const armElf = ObjectFormatSchema::loadShipped("elf64-aarch64-linux");
+    auto const x86 = TargetSchema::loadShipped("x86_64");
+    auto const x86Elf = ObjectFormatSchema::loadShipped("elf64-x86_64-linux");
+    ASSERT_TRUE(arm.has_value() && armElf.has_value() && x86.has_value() && x86Elf.has_value());
+
+    dss::test_support::ScratchDir dir{dss::test_support::Location::Temp, "builtin-arch-gate"};
+    std::filesystem::path const config = dir.path() / "src" / "dss-config";
+    std::filesystem::create_directories(config.parent_path());
+    std::error_code ec;
+    std::filesystem::copy(dss::test::configRoot(), config, std::filesystem::copy_options::recursive, ec);
+    ASSERT_FALSE(ec) << "the shipped config was not copied: " << ec.message();
+    std::filesystem::path const stdlib = config / "shippedLibs" / "stdlib.json";
+    std::string text;
+    {
+        std::ifstream in{stdlib, std::ios::binary};
+        std::ostringstream s;
+        s << in.rdbuf();
+        text = s.str();
+    }
+    std::string_view const row = R"("name": "abs",)";
+    std::string_view const tail = R"("linkage": "external" })";
+    auto const at = text.find(row);
+    ASSERT_NE(at, std::string::npos) << "stdlib.json declares no `abs` row";
+    ASSERT_EQ(text.find(row, at + 1), std::string::npos) << "stdlib.json declares `abs` twice";
+    auto const eol = text.find('\n', at);
+    auto const end = text.find(tail, at);
+    ASSERT_TRUE(end != std::string::npos && end < eol)
+        << "`abs`'s row no longer ends with its linkage on one line: restate the gate this cell writes";
+    text.replace(end, tail.size(),
+                 R"("linkage": "external", )"
+                 R"("availableObjectFormats": [ "macho", "pe", { "format": "elf", "arch": "arm64" } ] })");
+    {
+        std::ofstream out{stdlib, std::ios::binary};
+        out << text;
+        ASSERT_TRUE(out.good()) << "the gated copy did not reach disk";
+    }
+
+    dss::test_support::ScopedEnv const env{"DSS_CONFIG_ROOT", dir.path().string()};
+    struct Pair {
+        TargetSchema const*       target;
+        ObjectFormatSchema const* format;
+        bool                      binds;
+    };
+    for (Pair const& p : {Pair{arm->get(), armElf->get(), true}, Pair{x86->get(), x86Elf->get(), false}}) {
+        std::string const pair = std::string{p.target->name()} + ":" + std::string{p.format->name()};
+        SCOPED_TRACE(pair);
+        PairAnswers const a = answersFor(*p.target, *p.format, builtins);
+        EXPECT_EQ(a.strayErrors, "") << "errors that are not a library-builtin refusal";
+        bool const has = a.has.contains("abs");
+        bool const binds = !a.refused.contains("abs");
+        EXPECT_EQ(binds, p.binds) << "a use of `" << builtins.prefix << "abs` on " << pair
+                                  << (p.binds ? " must bind: the row's arch entry matches this pair"
+                                              : " must be refused: the row is on arm64 alone here");
+        EXPECT_EQ(has, binds) << "`__has_builtin(" << builtins.prefix << "abs)` answers " << (has ? 1 : 0)
+                              << " on " << pair << ", and a use of the builtin there "
+                              << (binds ? "BINDS" : "is REFUSED");
+    }
 }

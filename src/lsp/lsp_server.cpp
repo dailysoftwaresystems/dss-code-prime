@@ -4,6 +4,7 @@
 #include "analysis/semantic/semantic_analyzer.hpp"
 #include "analysis/semantic/semantic_model.hpp"
 #include "analysis/semantic/target_format_analysis.hpp"   // analyzeForTargetFormat
+#include "core/substrate/key_order.hpp"   // entriesInKeyOrder -- the completion items' order
 #include "core/types/source_buffer.hpp"
 #include "core/types/tree.hpp"
 #include "core/types/tree_cursor.hpp"
@@ -1490,7 +1491,11 @@ std::optional<std::string> LspServer::handleCompletion_(Request const& req) {
             scope = scopes[scope.v].parent;
         }
 
-        for (auto const& [name, symId] : visible) {
+        // ★ IN NAME ORDER (P69 fold 3f, lane `xa`): the items ARE the reply, so they
+        // come in the names' own order (`substrate::entriesInKeyOrder`), never the
+        // order the unordered map happens to iterate in.
+        for (auto const* entry : substrate::entriesInKeyOrder(visible)) {
+            auto const& [name, symId] = *entry;
             if (offered.contains(name)) continue;
             auto const* rec = model->recordFor(symId);
             if (rec == nullptr) continue;

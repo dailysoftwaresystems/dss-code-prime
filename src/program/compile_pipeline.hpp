@@ -21,6 +21,7 @@
 #include "hir/lowering/cst_to_hir.hpp"  // CstToHirResult (CuHirModule member, held by unique_ptr)
 #include "link/image_request.hpp"  // ImageRequest (linkAndWrite per-program knobs)
 #include "link/object_format_schema.hpp"
+#include "lir/lowering/mir_to_lir.hpp"  // JumpTableDescriptor (materializeJumpTable)
 #include "mir/merge/mir_merge.hpp"  // MergedMirModule (lowerMergedToAssembly arg)
 #include "mir/merge/synth_seh_funclets.hpp"  // MirSehScope (c116 D-WIN64-SEH-FUNCLETS)
 #include "mir/mir.hpp"  // Mir (CuMirModule member, move-only)
@@ -135,8 +136,8 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 // so `doc_census_guard` re-derives them on every ctest run and a drift is a RED
 // rather than a discovery. The PATTERN lives in that document, not here — a
 // pattern quoted in prose is prose, and rots exactly like the number did:
-//     <!--census:source:program.exportedDecls-->41 exported declarations
-// — <!--census:source:program.exportedFunctions-->31 exported functions plus
+//     <!--census:source:program.exportedDecls-->43 exported declarations
+// — <!--census:source:program.exportedFunctions-->33 exported functions plus
 // <!--census:source:program.exportedStructs-->10 exported structs (`CuMirModule`,
 // `CuHirModule`, `EntryCandidate`, `ResolvedEntry`, `EntryLinkName`, `ForeignEntryCandidate` -- declared
 // twice, ahead of its first use and where it is defined --, `ResolveLibraryPartition`).
@@ -327,8 +328,12 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 //   `memberNames` by `program/test_static_link`
 //   `StaticLink.ElfStaticLibDriverEmitsArchiveWithArmap`.
 //
-// `lowerMergedToAssembly` (1, merged) — SEVENTEEN driver-derived arguments,
-//   SIXTEEN with an observable consequence (`cuId` has none here: section C).
+// `lowerMergedToAssembly` (1, merged) — SIXTEEN driver-derived arguments,
+//   FIFTEEN with an observable consequence (`cuId` has none here: section C).
+//   ⚠ It said SEVENTEEN until P69 fold 3f, which retired `dataModel`: the module
+//   states the data model it is lowered for (`MirModuleFacts::dataModel`, from
+//   HIR→MIR's config, the format's), and the lower half reads it from the module.
+//   The `dataModel` row below names the pins that still guard that route.
 //   ⚠ This said NINE, with `cuId` "the TENTH", until P69 fold 3d. Six arguments
 //   had joined the call since and the count and the list moved with none of
 //   them — `unnamedBitFieldAlignment`, `atomicsRuntime`, `indirectSlotBindings`,
@@ -339,7 +344,7 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 //   pin is `program/test_driver_argument_supply`'s unless it names another
 //   file, and the CU route's twin of each is in section D's table:
 //     `bitFieldStrategy`              → `DriverArgumentSupply.MergedMultiCuRouteSuppliesTheFormatsBitFieldStrategy`
-//     `dataModel`                     → `…SuppliesTheFormatsDataModel`
+//     the module's `dataModel` fact   → `…SuppliesTheFormatsDataModel` (no argument since fold 3f)
 //     `callingConventionIndex`        → `…SuppliesTheCallingConventionIndex`
 //     `externCallDispatch`            → `…SuppliesTheFormatsExternCallDispatch`
 //     `dataImportBinding`             → `…SuppliesTheFormatsDataImportBinding`
@@ -425,7 +430,7 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 // static library, read back through the production member reader. ⓦ = the
 // discriminating arm needs a pe64 image to RUN (the two rows after the table).
 //   `bitFieldStrategy`: CU field, `Sole…TheFormatsBitFieldStrategy`; merged, its twin.
-//   `dataModel`: CU field, `Sole…TheFormatsDataModel`; merged, its twin.
+//   `dataModel`: the module's fact (no CU field since P69 fold 3f), `Sole…TheFormatsDataModel`; merged, its twin.
 //   `callingConventionIndex` ⓦ: CU field (from `buildCuMir`'s own argument, whose
 //     build-half use `EntryArgvRun.RealCommandLineReachesMainByteExact` pins),
 //     `Sole…TheCallingConventionIndex`; merged, its twin.
@@ -487,8 +492,8 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 // ── AND WHAT THE MERGED ROUTE COSTS TO REACH AT ALL ────────────────────────
 // ✔MEASURED — the merged route is reachable ONLY through
 // `Program::compileUnits` with ≥2 sources, and
-// <!--census:examples:top.sources-->51 of the
-// <!--census:examples:manifests-->1124 shipped corpus example manifests declare a
+// <!--census:examples:top.sources-->52 of the
+// <!--census:examples:manifests-->1128 shipped corpus example manifests declare a
 // multi-source `sources` array, so the corpus exercises it roughly 3% as often
 // as the single-CU route.
 // ⚠ THE RATIO IS THE ONE FIGURE HERE THAT IS **NOT** MACHINE-CHECKED — a census
@@ -991,15 +996,14 @@ struct DSS_EXPORT CuMirModule {
     // then fails loud K_FormatLacksThreadLocalSupport — never a silent
     // process-shared alias).
     std::optional<TlsAccessInfo> tlsAccess;
-    // D-LK4-RODATA-PRODUCER-AGGREGATE-GLOBAL: the active format's data model
-    // (pointer width), captured here for the SAME reason as `externCallDispatch`
-    // — the LOWER half sees only this struct, and the aggregate-global rodata
-    // encoder needs it (with the target's `aggregateLayout`) to compute byte
-    // layout. The target's alignment params are read from `*target` directly.
-    DataModel dataModel{};
+    // ★ P69 (lane `xa`, fold 3f -- review-xa3e F3, RF3.6): no data model is captured
+    // here. The module states the one it is lowered for (`MirModuleFacts::dataModel`,
+    // from HIR→MIR's config, the format's), and the LOWER half -- the aggregate-
+    // global rodata encoder and the MIR→LIR wall alike -- reads it from the module:
+    // a second capture is a second home a route could make disagree.
     // D-CSUBSET-BITFIELD-ABI-EXACT: the FORMAT-resolved bit-field packing strategy
     // (`effectiveBitFieldStrategy(target, format)`), captured here for the SAME
-    // reason as `dataModel` — the LOWER half sees only this struct, and the
+    // reason as `externCallDispatch` — the LOWER half sees only this struct, and the
     // aggregate-global rodata encoder must lay out a bit-field global byte-ABI-
     // exact for the active format. The target's alignment params come from
     // `*target`; this overlays the per-format bit-field rule onto them.
@@ -1097,7 +1101,31 @@ struct DSS_EXPORT CuMirModule {
     // defines. Every pe64 flavor states them, the relocatable and archive ones
     // included, because their objects end in an image too.
     std::vector<std::string> imageDefinedNames;
+
+    // ★★ WHAT THIS UNIT'S SOURCE ASKS OF ITS LINK (P69 fold 3f, lane `xa`) — each
+    // `#pragma comment` request the unit reached, in its format's form
+    // (`stateSourceLinkerRequests`): the libraries its final link is asked to
+    // search, where its objects name them, and the options it hands its linker,
+    // where its objects state them. Captured for the SAME reason as `commons`:
+    // the LOWER half sees only this struct, and states them on the module it
+    // assembles (`stateUnitLinkerOptions`).
+    UnitLinkerRequests linkerRequests;
+    // The document the unit's options are read through -- its family's OBJECT
+    // document (an image document states none: `objectDocumentOf`) -- set only
+    // when the unit states an option; `linkerOptionsDocumentOwner` keeps a
+    // document loaded for it alive.
+    ObjectFormatSchema const*                 linkerOptionsDocument = nullptr;
+    std::shared_ptr<ObjectFormatSchema const> linkerOptionsDocumentOwner;
 };
+
+// ★ P69 fold 3f: the options a module's units state (`UnitLinkerRequests::
+// linkerOptions`), applied to the module by the backend of `document` -- the
+// units' OBJECT document -- exactly as that backend's object reader applies an
+// object's (`ObjectFormatBackend::applyUnitLinkerOptions`). A module stating none
+// needs no document. False: refused, reported by name.
+[[nodiscard]] DSS_EXPORT bool
+stateUnitLinkerOptions(AssembledModule& module, ObjectFormatSchema const* document,
+                       DiagnosticReporter& reporter);
 
 // BUILD half: semantic analysis → HIR → FFI synthesis → MIR → optimize. Returns the
 // `CuMirModule` carrying the optimized MIR + the SemanticModel (interner owner) +
@@ -1512,18 +1540,19 @@ struct DSS_EXPORT ResolvedEntry {
 // Returns the resolved entry, or nullopt. `nullopt` with `ok == true` means "no
 // entry, and that is legitimate" (a library/object build); `nullopt` with
 // `ok == false` means a diagnostic was reported and the build must stop.
-// `restrictedBy` (P69 fold 3e, class C's N5): non-empty when a startup a linked
-// object STATES restricted `formatVerbs` and `precedence` to its own verbs
-// (`EntryElectionScope::restrictedBy`); the refusals then say so, and an empty
-// restricted set refuses rather than taking the "starts no program" arm.
+// `scope` (`entryElectionScope`): the verbs the election may elect and the
+// precedence it ranks them by. Its `restrictedBy` (P69 fold 3e, class C's N5)
+// is non-empty when a startup a linked object STATES restricted them to its
+// own verbs -- the refusals then say so, and an empty restricted set refuses
+// rather than taking the "starts no program" arm -- and its `rankedBy` (P69
+// fold 3f) when a stated subsystem ranked its startups' entries first, which
+// the precedence warning then names.
 [[nodiscard]] DSS_EXPORT std::optional<ResolvedEntry>
-resolveProgramEntry(std::span<EntryCandidate const>      candidates,
-                    std::span<EntryMaterialization const> formatVerbs,
-                    std::span<std::vector<EntryMaterialization> const> precedence,
-                    std::string_view                     formatName,
-                    DiagnosticReporter&                  reporter,
-                    bool&                                ok,
-                    std::string_view                     restrictedBy = {});
+resolveProgramEntry(std::span<EntryCandidate const> candidates,
+                    EntryElectionScope const&       scope,
+                    std::string_view                formatName,
+                    DiagnosticReporter&             reporter,
+                    bool&                           ok);
 
 // Collect this model's program-entry candidates in symbol-record order. Shared by
 // both driver paths so "what counts as a candidate" is also single-owner; the
@@ -1592,9 +1621,17 @@ entryLinkNames(GrammarSchema const& grammar, ObjectFormatSchema const& format,
 //   * a stated FUNCTION (no startup) starts the image there with no C runtime
 //     (66, beside `main` too): no C entry is elected (`electsNone`) and the link
 //     makes it the image's entry (`decideUnitLinkerRequests`).
-//   * a startup no DSS image provides (`unsupportedStartups`: the GUI ones) is
+//   * a startup no DSS image provides (`unsupportedStartups`; none since fold 3f) is
 //     refused by the link by name; no C entry is elected for it either, so that
 //     refusal is the one the build reports.
+//   * with no entry request standing, a stated SUBSYSTEM (`/SUBSYSTEM:`,
+//     `linker::standingSubsystemRequest`) RANKS the entries its C runtime
+//     startups call (`subsystemStartups`) above every other, the format's
+//     precedence ranking within each part (P69 fold 3f; ✔MEASURED 2026-11-17,
+//     cl 19.52 + link.exe 14.52: WINDOWS beside `main` and WinMain runs
+//     WinMain, CONSOLE runs `main`). A program defining none of them elects as
+//     with none stated: link.exe refuses it, gcc runs it, and acceptance is the
+//     union's.
 // A format that starts no program elects by name, unrestricted.
 struct DSS_EXPORT EntryElectionScope {
     std::vector<EntryMaterialization>              verbs;
@@ -1602,6 +1639,11 @@ struct DSS_EXPORT EntryElectionScope {
     // Who restricted it and to what, for the election's refusals; empty when
     // nothing did.
     std::string                                    restrictedBy;
+    // Who ranked its first verbs above the format's precedence, and those
+    // verbs, for the precedence warning; both empty when the format's own
+    // precedence stands.
+    std::string                                    rankedBy;
+    std::vector<EntryMaterialization>              rankedFirst;
     bool                                           electsNone = false;
 };
 [[nodiscard]] DSS_EXPORT EntryElectionScope
@@ -1665,7 +1707,6 @@ buildForeignEntryStartup(ForeignEntryCandidate const&    entry,
 lowerMergedToAssembly(MergedMirModule&    merged,
                       GrammarSchema const& grammar,
                       TargetSchema const&  target,
-                      DataModel            dataModel,
                       BitFieldStrategy     bitFieldStrategy,
                       UnnamedBitFieldAlignment unnamedBitFieldAlignment,
                       std::uint16_t        callingConventionIndex,
@@ -2008,20 +2049,26 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
 // archive search pulled anything.
 //
 // So the driver asks this ONLY when no NAMED input of the link defines an entry
-// the format realizes: each of `names` (`entryLinkNames`) seeds the search as
-// the startup's own reference, and the first member the archives' indexes list
-// for it, archives in the link's order, is read and returned -- each member
-// once. The caller links each as an input (its definitions then satisfy the
-// later lazy search, so it is never pulled twice) and elects among their
-// candidates, after the named inputs'. A member pulled here names no entry
+// the format realizes: `names` (`entryLinkNames` over the election's scope)
+// stand for the startup's own reference, and ONE member is returned -- the one
+// the election would elect (P69 fold 3f, F1): the best rank of `precedence`
+// (`EntryElectionScope::precedence`; empty: one rank) any archive's index lists
+// a name of, the first archive in the link's order that lists one, and that
+// archive's index's first entry of that rank, as every reference loads it. Each
+// archive is read once, in the link's order, until one lists a name of the top
+// rank; one that cannot be read is reported and the walk goes on, and the pull
+// fails after it. The caller links the member as an input (its definitions then
+// satisfy the later lazy search, so it is never pulled twice) and elects among
+// its candidates, after the named inputs'. A member pulled here names no entry
 // directive of its own, as one the lazy search pulls does not. Empty when no
 // archive lists any of the names; nullopt after reporting a read failure.
 [[nodiscard]] DSS_EXPORT std::optional<std::vector<AssembledModule>>
-pullEntryArchiveMembers(std::span<EntryLinkName const>         names,
-                        std::span<std::filesystem::path const> archivePaths,
-                        TargetSchema const&                    target,
-                        ObjectFormatSchema const&              format,
-                        DiagnosticReporter&                    reporter);
+pullEntryArchiveMembers(std::span<EntryLinkName const>                     names,
+                        std::span<std::vector<EntryMaterialization> const> precedence,
+                        std::span<std::filesystem::path const>             archivePaths,
+                        TargetSchema const&                                target,
+                        ObjectFormatSchema const&                          format,
+                        DiagnosticReporter&                                reporter);
 
 // ── PRE-ASSEMBLED OBJECT INPUTS
 // (D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION) ──────────────
@@ -2181,5 +2228,16 @@ linkAndWriteStaticArchive(std::span<AssembledModule const> modules,
                           std::filesystem::path const&     outPath,
                           DiagnosticReporter&              reporter,
                           ImageRequest const&              request = {});
+
+// ★ THE JUMP TABLE'S ONE WRITER (P69 fold 3f, review-xa3e F3-R1; D-OPT-SWITCH-JUMP-TABLE): the `.data` table
+// of a dense `switch` the lowering described (`JumpTableDescriptor`), written into `owner`'s module after
+// `assemble()` resolved its blocks' byte offsets. A slot per value in `[minCase, maxCase]`, each
+// `desc.slotBytes` wide -- the width the lowering scaled the index by, so the load and the table read ONE value --
+// and each an address relocation of that width (`addressSlotRelocationKind`) to the per-block symbol it binds
+// in `owner`. nullopt (reported, K_NoMatchingObjectFormat) where the descriptor states no slot width, the target
+// declares no address relocation of it, or a slot names a block `owner` published no offset for.
+[[nodiscard]] DSS_EXPORT std::optional<AssembledData>
+materializeJumpTable(JumpTableDescriptor const& desc, AssembledFunction& owner, TargetSchema const& target,
+                     DiagnosticReporter& reporter);
 
 } // namespace dss

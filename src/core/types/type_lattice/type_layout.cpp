@@ -32,13 +32,20 @@ namespace {
 
 // Pointer byte width under a data model (the one OS-dependent layout dimension —
 // every other scalar's width is already baked into its TypeKind by FC3).
-[[nodiscard]] std::uint64_t pointerBytes(DataModel dm) noexcept {
+// ★ NONE OUTSIDE THE TABLE (P69 fold 3f, review-xa3e F3): `DataModel` is an
+// `enum class : std::uint8_t`, so every value of its underlying type is a value
+// of it — the zero sentinel and any unlisted one among them — and such a value
+// names no model and states no pointer size. The answer is nullopt, which
+// `scalarByteSize` hands on and `dataModelTheBackEndCannotLower` refuses by
+// name. This used to be `return 8; // unreachable for a valid model`: the
+// class's fallback of none, decided inside its own home by a literal.
+[[nodiscard]] std::optional<std::uint64_t> pointerBytes(DataModel dm) noexcept {
     switch (dm) {
         case DataModel::Lp64:
         case DataModel::Llp64: return 8;
         case DataModel::Ilp32: return 4;
     }
-    return 8;  // unreachable for a valid model
+    return std::nullopt;   // no model, so no pointer size
 }
 
 // The alignment of a scalar/pointer of `size` bytes under the params. The bounded
@@ -797,6 +804,29 @@ std::optional<std::uint64_t> scalarByteSize(TypeKind kind, DataModel dm) noexcep
         default:
             return std::nullopt;
     }
+}
+
+// See the header: a data model in the operator's words.
+std::string dataModelSpelled(DataModel dm) {
+    std::string_view const name = dataModelName(dm);
+    return name.empty() ? "a data model no table row names (value " + std::to_string(static_cast<unsigned>(dm)) + ")"
+                        : "data model " + std::string{name};
+}
+
+// See the header: whether the back end can lower a data model's widths at all.
+std::optional<std::string> dataModelTheBackEndCannotLower(DataModel dm) {
+    std::string const spelled = dataModelSpelled(dm);
+    std::optional<std::uint64_t> const bytes = scalarByteSize(TypeKind::Ptr, dm);
+    if (!bytes.has_value()) {
+        return spelled + " states no pointer size, and every address the back end lowers has one";
+    }
+    if (*bytes != kBackEndAddressBytes) {
+        return spelled + " has " + std::to_string(*bytes) + "-byte pointers, and the back end lowers "
+             + std::to_string(kBackEndAddressBytes) + "-byte addresses only: its address arithmetic (lea, a "
+               "member's or an element's byte offset, the index products) carries "
+             + std::to_string(8 * kBackEndAddressBytes) + " bits";
+    }
+    return std::nullopt;
 }
 
 // ── The WIDE-INTEGER facade (D-CSUBSET-BITINT-C2-WIDE + D-CSUBSET-UINT128-TYPE) ──

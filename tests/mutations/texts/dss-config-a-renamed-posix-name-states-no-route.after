@@ -1,0 +1,1 @@
+    { "name": "close",  "signature": "fn(i32) -> i32",                            "kind": "function", "linkage": "external", "linkName": "_close"  },

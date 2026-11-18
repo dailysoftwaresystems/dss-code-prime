@@ -1,0 +1,3 @@
+    for (auto const* section : substrate::entriesInKeyOrder(funcIntervalsBySec)) {
+        std::uint16_t const secIdx = section->first;
+        std::vector<Interval> sorted = section->second;

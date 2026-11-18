@@ -1074,6 +1074,43 @@ round's close; each checkpoint's commit message says what was and was not run on
     and 700 against 692 at `f7754be6` (+8 disclosed).
   - Fold order now: f26e → U1 (hm: known defect (17)) → f26f → 3f → 3g → 3h → L2b4 → L2b3 → H6d → H7 → H7b1 →
     H7b2 → H7c, with f26g (SVE) placed where ready.
+- **Checkpoint 49 (2026-11-18) = the link lane's fold 3f, folded ahead of f26e and H6c3 (ready first; H6c3 builds on
+  it):**
+  - THE ORDER OF A WALK IS THE INPUT'S, NEVER THE HOST LIBRARY'S: every census site answers at ONE home,
+    `substrate::entriesInKeyOrder` (COFF and Mach-O slicing, the ELF overlap pass, the semantic analyzer's type ids,
+    hir_to_mir's 28 sites), or is named EMIT/BENIGN. The diagnostic render order is total.
+  - A SHIPPED NAME'S AVAILABILITY IS PER (FORMAT, ARCH): `__has_builtin` per pair, ONE flavour family
+    (`ObjectFormatSchema::inFlavourFamilyOf`), the program interpreter a role keyed by (kind, arch).
+  - ONE ANSWER PER WRITTEN NAME: the resolver `ffi::writtenNameRoutesOn`, read by all four binders through
+    `writtenNameRoutesByOnBinaryName`; a kept written name binds no image (`shippedRowBindsNoImage`, read by every
+    CST→HIR extern producer). D-LK-FOREIGN-OBJECT-NAMED-TO-THE-LINK-BINDS-NO-LIBRARY-IMPORT (P0): its 3f half is
+    folded; it closes when the sweep reads its arms `passed`.
+  - THE GUI STARTUPS: a DSS PE image starts WinMain/wWinMain as link.exe does, the stated subsystem choosing the
+    startup.
+  - `#pragma comment` is honoured where cl and clang honour it, on ELF (`.deplibs`), COFF (the directives' one home)
+    and Mach-O (LC_LINKER_OPTION, read as ld64 reads it). The Mach-O reader reads, steps over by a document's stated
+    reason, or refuses BY NAME every load command (✔MEASURED over 14 Apple clang objects, GP9).
+  - Also: PE-IMAGE item (2) (the embedded manifest), F8 (the archive search offers only the fallback that stands),
+    F1 (the entry pull elects ONE member over the archives), the merge's data model from the units' facts, and the
+    new action `check-row-truth`.
+  - Known defect (14)'s first half, `program/test_entry_envp_run`, is FIXED: green on all five legs in the lane's
+    scoped run d299 (run 20261117-233613-d11ac8ee: windows-x86_64-debug and -release 931/931, macos-arm64-debug and
+    linux-arm64-debug 926/926; linux-x86_64-debug 925/926, its one red known defect (17)).
+  - Main settled the lane's arms.registry, type_layout.{cpp,hpp} and examples/README.md as main's copy plus only
+    the lane's change (registry: 0 reverts, 90 of 92 main changes carried and the other 2 retired by main, every
+    non-arm line kept), then rewrote the census and citation inventories.
+  - Every lost cell was read: no run id and no ✔MEASURED clause is dropped. Two kinds of drop were sent back and
+    restored in history form: 4 Mac sweep runs in three closings, and two MEASURED clauses.
+  - Rows: 3 born closed (D-C-PRAGMA-COMMENT-REFUSED-WHERE-CL-AND-CLANG-HONOUR-IT and
+    D-LK-MACHO-READER-SKIPS-LOAD-COMMANDS-IN-SILENCE, HEAD's debt; D-MIR-MERGE-SIZES-ITS-UNITS-BY-THE-LINK-FORMATS-DATA-MODEL,
+    the cycle's own); D-CORE-OUTPUT-DEPENDS-ON-THE-HOST-TOOLCHAIN-THAT-BUILT-THE-COMPILER, disclosed 2026-11-16,
+    enters the pending registry (cs's fix); 25 rows restated. Balance: 701 open against 620 at `71648598`, and 701
+    against 700 at `31acdda3` (+1 disclosed).
+  - Arms: 142 new, 3 retired, 9 text-changed; 2093 arms. MAIN HAS NOT SWEPT THEM. Checkpoint 48's Windows sweep was
+    stopped by main (it reached 9 of 77 arms in 3.5 hours waiting for slots), because this fold moves its inputs; its
+    arms are swept with 3f's, --pending.
+  - Fold order now: f26e → H6c3 (with U1) → f26f → 3g → 3h → L2b4 → L2b3 → H6d → H7 → H7b1 → H7b2 → H7c, with
+    f26g (SVE) placed where ready. xa continues in 3f's tail: PE-IMAGE items (4), (7), (1).
 - **★ KNOWN DEFECTS ON THIS TREE — each a MERGE BLOCKER of this PR's own making, each in a lane's hands:**
   (1) `orphan_tests_guard` — FIXED by checkpoint 16;
   (2) the valid ELF link refused since checkpoint 12 — LINKS AGAIN since checkpoint 18 (above);
@@ -1136,8 +1173,8 @@ round's close; each checkpoint's commit message says what was and was not run on
     violated.
   (14) IN MAIN SINCE CHECKPOINTS 44 AND 45, ✔MEASURED by their five-leg suites and arm sweeps (ledgers 616, 618, 628,
   629, 676), each routed to a lane:
-  - `program/test_entry_envp_run` is red on both Windows legs and both Linux legs. It is a STALE TEST of 3e's, which
-    xa restates in 3f.
+  - `program/test_entry_envp_run` was red on both Windows legs and both Linux legs, a STALE TEST of 3e's. FIXED by
+    checkpoint 49 (3f), ✔MEASURED green on all five legs in the lane's run d299.
   - `examples/corpus-lints` (`ExamplesCorpusLint.LoaderSearchPathValueIsTheResolvedLibraryDirectories`) is red on
     macos-arm64 and both Linux legs. H6c's examples runner no longer resolves `a/sub/..` to `a` on POSIX. FIXED by
     checkpoint 48 (H6c2), ✔MEASURED by the lane on all five legs.
@@ -1151,8 +1188,11 @@ round's close; each checkpoint's commit message says what was and was not run on
     linux.
   - The Mac (AppleClang) differs further, through C++'s unspecified argument-evaluation order: 84 sites, most of
     them in `hir_to_mir.cpp`'s limb emitters.
-  - It closes in xa's 3f: the sorted walk, every argument-order site, the guard `check-evaluation-order` with no
-    allow-list, and a host-equality step across windows, linux and the Mac at the round close.
+  - Checkpoint 49 (3f) put every walk of the census at one home, `substrate::entriesInKeyOrder`: the kit image is
+    equal on windows and linux under the mem2reg experiment, and the Mac's third vertex differs in 2 functions
+    (xa's d237, d238). The row is D-CORE-OUTPUT-DEPENDS-ON-THE-HOST-TOOLCHAIN-THAT-BUILT-THE-COMPILER (disclosed,
+    pending registry since checkpoint 49). Its fix is cs's: mem2reg's step-4 walk and the argument-order sites. The
+    round close keeps the host-equality step across windows, linux and the Mac.
   (16) A REGRESSION OF CHECKPOINT 46, ✔MEASURED on both columns (compile-and-keep, windows-x86_64-release):
   - `typedef int T; _Generic(T, int: 42, default: 1)` was accepted at `ae057909`, exiting 42, the clangs' value. At
     `1eea9b3a` it is refused with S_TypeNameInValuePosition.
@@ -1160,12 +1200,17 @@ round's close; each checkpoint's commit message says what was and was not run on
     the clangs select 1.
   - Both close in lm's L2b4: the type-operand alternative of `genericExpr`, selected by the unconverted type.
   (17) FOUND BY THE NATIVE UBUNTU HOST (g++ 15.2.0), ✔MEASURED by main's five-leg suite of `f7754be6` (run
-  20261117-163612-b7e572c4), never red on WSL. Each is diagnosed by hm's U1 before its fix:
-  - `c23_formatted_io`, red in both runners: `sscanf("0b", "%i%n", …)` prints `1 0 2` on this host, where the
-    example expects `0 -1 -1`. It is the platform C library's answer, and the expectation names one library's.
+  20261117-163612-b7e572c4), never red on WSL. Each was diagnosed by hm's U1 before its fix:
+  - `c23_formatted_io`, red in both runners: `sscanf("0b", "%i%n", …)` prints `0 -1 -1` on this host (glibc 2.43),
+    where the example's literal held `1 0 2`, glibc 2.39's answer. It is the platform C library's answer, and the
+    expectation named one library's. U1 makes the program compare the platform's own `0b` and `0x` readings.
   - (`program/test_entry_envp_run`, red there too, is known defect (14)'s stale test, xa's in 3f.)
-  - `ConfigMemoHoldsATotalScan.AFormatScanDoesNotEvictTheLanguageDocument`: `GrammarSchema::loadShipped` of the
-    language the test names fails there.
+  - `ConfigMemoHoldsATotalScan.AFormatScanDoesNotEvictTheLanguageDocument`: the test took "the first shipped
+    `.lang.json`" in DIRECTORY order. ext4 lists `asm.lang.json` first, a core document that cannot load alone
+    (MEASURED by hm). U1 takes the subject from the production listing, sorted by name.
+  - U1 is GREEN on four legs on its own bytes (hm's runs 20261117-200238-9c849ed7 and 20261117-195406-9c49cc62) and
+    folds with H6c3. The class it opened (a test listing the shipped tree by itself) is a row of its own,
+    D-TEST-A-TESTS-SUBJECT-IS-TAKEN-FROM-THE-SHIPPED-TREE-BY-A-LISTING-OF-ITS-OWN, closed in H6c3.
 - **FOUND THIS ROUND, NOT YET IN MAIN — the BASE's debt each lane found while closing rows and is closing in its next
   fold** (each ✔MEASURED against the references; the lane's fold names its rows). IN MAIN SINCE CHECKPOINT 32 (the
   link lane's 3c): the 32-bit relocation range, arm64 `.long main`, the g++ `inline` variable kept as two objects, the

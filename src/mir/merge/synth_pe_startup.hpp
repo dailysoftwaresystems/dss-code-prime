@@ -91,7 +91,7 @@
 //
 // The environment vector follows argv's terminator on the entry stack, so its
 // address depends on the RUNTIME argc; the format declares the layout
-// (`envpFollowsArgvTerminator`, `vectorSlotBytes`) and this computes it — no
+// (`envpFollowsArgvTerminator`; each slot a pointer of the module's data model) and this computes it — no
 // per-architecture trampoline code, and the trampoline still hands over exactly
 // (argc, argv).
 //

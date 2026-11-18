@@ -884,7 +884,11 @@ AssembledModule assemble(Lir const&                 lir,
                                           patch.island});
         }
         if (!newSites.empty()) {
-            std::sort(newSites.begin(), newSites.end(), siteKeyLess);
+            // STABLE, so the site std::unique keeps of an equal run is the FIRST
+            // the patches asked for (their order is the function's own). An
+            // unstable sort let the host's library pick it among equals, and an
+            // equal key does not promise an equal body.
+            std::stable_sort(newSites.begin(), newSites.end(), siteKeyLess);
             newSites.erase(
                 std::unique(newSites.begin(), newSites.end(),
                             [&](IslandSite const& a, IslandSite const& b) {
@@ -1324,10 +1328,20 @@ bool validateInputSectionUnits(AssembledModule const& module,
         dataUnits[d.inputSection->section].push_back(DataMember{
             d.inputSection->offset, d.sizeInSection(), i, d.section});
     }
-    for (auto& [unit, members] : dataUnits) {
+    // In ascending unit, and each unit's members by (offset, item index): both
+    // orders decide which refusal is reported first and which two items it
+    // names, so both are the module's data. `dataUnits` is an unordered_map, and
+    // walking it directly reported a several-unit refusal in the host library's
+    // hash order.
+    std::vector<std::uint32_t> unitOrder;
+    unitOrder.reserve(dataUnits.size());
+    for (auto const& [unit, members] : dataUnits) unitOrder.push_back(unit);
+    std::sort(unitOrder.begin(), unitOrder.end());
+    for (std::uint32_t const unit : unitOrder) {
+        auto& members = dataUnits.at(unit);
         std::sort(members.begin(), members.end(),
                   [](DataMember const& a, DataMember const& b) {
-                      return a.offset < b.offset;
+                      return a.offset != b.offset ? a.offset < b.offset : a.index < b.index;
                   });
         for (std::size_t k = 0; k < members.size(); ++k) {
             if (members[k].kind != members.front().kind) {

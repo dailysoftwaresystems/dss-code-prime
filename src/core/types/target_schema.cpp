@@ -3859,4 +3859,89 @@ bool TargetSchema::callingConventionIsOrDerivesFrom(std::string_view active,
     return false;
 }
 
+
+// See the header. WHAT A MECHANISM PRODUCES, per value, stated once (P69 fold 3f, lane `xa`): the format's validate()
+// at load and the synthesized init's backstop each read it, where each used to state its own reading -- in two texts
+// that disagreed on a word and both counted values ("a mechanism produces at most 3"), which a WinMain verb's four
+// values would have failed though the C runtime produces every one.
+std::string processArgsCannotProduce(ProcessArgs const& pa, EntryArgumentValue value) {
+    bool const stackVector = pa.mechanism == ArgsMechanism::StackVector;
+    bool const crt         = pa.mechanism == ArgsMechanism::CrtArgvAccessors;
+    if (!stackVector && !crt) {
+        return std::format("the `{}` mechanism produces no value at all", argsMechanismName(pa.mechanism));
+    }
+    switch (value) {
+    case EntryArgumentValue::ArgumentCount:
+    case EntryArgumentValue::NarrowArgumentVector:
+        return {};   // both mechanisms: the entry stack holds them, and the CRT block requires their accessors
+    case EntryArgumentValue::WideArgumentVector:
+        return stackVector ? "the entry-stack vector holds narrow strings only -- no wide value exists in that "
+                             "layout"
+                           : std::string{};
+    case EntryArgumentValue::NarrowEnvironment:
+        if (stackVector) {
+            return pa.envpFollowsArgvTerminator
+                       ? std::string{}
+                       : "the block does not declare where the environment vector sits "
+                         "(`envpFollowsArgvTerminator`)";
+        }
+        return !pa.initializeNarrowEnvironmentFn.empty() && !pa.narrowEnvironmentAccessorFn.empty()
+                   ? std::string{}
+                   : "the block does not declare the narrow environment's `initializeNarrowEnvironmentFn` + "
+                     "`narrowEnvironmentAccessorFn` pair";
+    case EntryArgumentValue::WideEnvironment:
+        if (stackVector) {
+            return "the entry-stack vector holds narrow strings only -- no wide value exists in that layout";
+        }
+        return !pa.initializeWideEnvironmentFn.empty() && !pa.wideEnvironmentAccessorFn.empty()
+                   ? std::string{}
+                   : "the block does not declare the wide environment's `initializeWideEnvironmentFn` + "
+                     "`wideEnvironmentAccessorFn` pair";
+    case EntryArgumentValue::AppleVector:
+        return "no `processArgs` mechanism produces Darwin's apple vector; only a format whose LOADER delivers the "
+               "arguments itself (no `processArgs` block) realizes it";
+    case EntryArgumentValue::PreviousInstance:
+        // A null pointer, the Win32 contract: nothing to fetch. It is a GUI startup's, so it rides with the other
+        // three -- a block that cannot produce them is refused by them.
+        return stackVector ? "the entry stack holds the argument and environment vectors only -- no module "
+                             "instance, command line or show-window value"
+                           : std::string{};
+    case EntryArgumentValue::ModuleInstance:
+    case EntryArgumentValue::ShowWindow:
+        if (stackVector) {
+            return "the entry stack holds the argument and environment vectors only -- no module instance, command "
+                   "line or show-window value";
+        }
+        return pa.winMainStartupRoutines.has_value()
+                   ? std::string{}
+                   : "the block declares no `winMainStartupRoutines` (the routines that compute the module instance "
+                     "and the show-window value)";
+    case EntryArgumentValue::NarrowCommandLine:
+        if (stackVector) {
+            return "the entry stack holds the argument and environment vectors only -- no module instance, command "
+                   "line or show-window value";
+        }
+        return pa.narrowWinMainCommandLineFn.empty()
+                   ? "the block declares no `narrowWinMainCommandLineFn`"
+                   : std::string{};
+    case EntryArgumentValue::WideCommandLine:
+        if (stackVector) {
+            return "the entry-stack vector holds narrow strings only -- no wide value exists in that layout";
+        }
+        return pa.wideWinMainCommandLineFn.empty()
+                   ? "the block declares no `wideWinMainCommandLineFn`"
+                   : std::string{};
+    }
+    return "an argument value this function does not know";
+}
+
+std::uint32_t argumentSlotBytes(TargetSchema const& target) noexcept {
+    std::uint32_t widest = 0;
+    for (TargetRegisterInfo const& info : target.registers()) {
+        if (info.regClass == TargetRegClass::GPR && info.widthBytes > widest) widest = info.widthBytes;
+    }
+    return widest;
+}
+
+
 } // namespace dss

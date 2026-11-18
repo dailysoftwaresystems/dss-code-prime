@@ -224,4 +224,19 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                       DiagnosticReporter&            reporter,
                       CompilationUnitId              cuId = {});
 
+// ★ A COMPILED UNIT'S OWN LINKER DIRECTIVES (P69 fold 3f, `#pragma comment(linker, ...)`'s COFF half).
+//
+// The unit's directive texts (`UnitLinkerRequests::linkerOptions`, each one text as cl writes it into `.drectve`)
+// read against the OBJECT document's vocabulary and applied to the unit's module through the ONE home the reader's
+// (3b) steps go through (`foldCoffLinkerDirectives`, `completeCoffLinkerDirectives`): the module a link is handed
+// is the one the unit's object would read back as -- a hide makes the unit's own definition Hidden, an include or
+// an export's internal name a required row, an alternate name a fallback, a common's alignment its alignment, and
+// the exports, image requests, libraries and hand-on tokens the link's (decided by a link that makes an image,
+// restated by a relocatable writer). The texts leave `linkerOptions` empty. false: refused by name
+// (`K_LinkerDirectiveUnhonourable`, or the id door's refusal), the module as it was -- the work is done on a copy.
+[[nodiscard]] DSS_EXPORT bool
+applyUnitLinkerDirectives(AssembledModule&          module,
+                          ObjectFormatSchema const& objectFormatSchema,
+                          DiagnosticReporter&       reporter);
+
 } // namespace dss::pe

@@ -458,7 +458,8 @@ TEST(HirTextAggregateLiteral, AUnionValueNamesItsMemberAndReadsBackWithIt) {
     // the value that was READ is the one the static-data encoder walks against the
     // union's type. A member lost anywhere on the way is a value with no encoding.
     DiagnosticReporter mr;
-    HirToMirResult const mir = lowerToMir(back->hir, back->literalPool, back->interner, mr);
+    HirToMirResult const mir = lowerToMir(back->hir, back->literalPool, back->interner, mr, /*sourceMap=*/nullptr,
+                                          MirLoweringConfig{.dataModel = DataModel::Lp64});
     ASSERT_TRUE(mir.ok) << allDiagText(mr);
     std::vector<std::optional<std::uint32_t>> lowered;
     for (std::uint32_t i = 0; i < mir.mir.moduleGlobalCount(); ++i) {

@@ -320,6 +320,8 @@ struct Lowerer {
     // delegates to the same `computeLayout`, so this is invariant within the CU
     // and never cleared, exactly like its twin.
     std::unordered_map<std::uint32_t, StructLayout> operandLayoutCache_;
+    // Whether `stackSlotBytes` has refused an unstated argument-slot quantum (once).
+    mutable bool argumentSlotRefused_ = false;
     // FC17.5 F2 (D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER): per-MODULE byte-content
     // memo for `materializeStringLiteralGlobal` — (interned array TypeId.v,
     // exact byte content) → the already-minted rodata global's SymbolId. C
@@ -2313,8 +2315,9 @@ struct Lowerer {
         MirInstId const geB = mir.addInst(MirOpcode::ICmpSge, ge, boolTy);
         std::array<MirInstId, 2> lt{idxVal, ci64(limbCount)};
         MirInstId const ltB = mir.addInst(MirOpcode::ICmpSlt, lt, boolTy);
-        MirInstId const inRange =
-            i64bin(MirOpcode::And, zextBoolToI64(geB), zextBoolToI64(ltB));   // 0/1
+        MirInstId const geI     = zextBoolToI64(geB);   // MIR in source order
+        MirInstId const ltI     = zextBoolToI64(ltB);
+        MirInstId const inRange = i64bin(MirOpcode::And, geI, ltI);   // 0/1
         MirInstId const clamped = i64bin(MirOpcode::Mul, idxVal, inRange);    // in-range idx
         MirInstId const loaded  = loadLimb(limbAddrRuntime(src, clamped));
         MirInstId const mask    = i64un(MirOpcode::Neg, inRange);             // 0 or ~0
@@ -2338,9 +2341,10 @@ struct Lowerer {
         MirInstId const sh63      = i64bin(MirOpcode::Sub,  ci64(63), bitShift);
         // Right-shift fill for a source limb at/above the top: sign fill (arith) or 0.
         MirInstId fill = ci64(0);
-        if (isArith)
-            fill = i64bin(MirOpcode::AShr,
-                          loadLimb(limbAddrConst(aAddr, limbCount - 1)), ci64(63));
+        if (isArith) {
+            MirInstId const topLimb = loadLimb(limbAddrConst(aAddr, limbCount - 1));   // MIR in source order
+            fill = i64bin(MirOpcode::AShr, topLimb, ci64(63));
+        }
         return emitLimbLoop(limbCount, [&](MirInstId j) {
             MirInstId lo, hi;
             if (isLeft) {
@@ -2350,7 +2354,8 @@ struct Lowerer {
                 MirInstId const hs = loadLimbOrFill(aAddr, hiIdx, limbCount, ci64(0));
                 MirInstId const ls = loadLimbOrFill(aAddr, loIdx, limbCount, ci64(0));
                 lo = i64bin(MirOpcode::Shl, hs, bitShift);
-                hi = i64bin(MirOpcode::LShr, i64bin(MirOpcode::LShr, ls, sh63), ci64(1));
+                MirInstId const lsShifted = i64bin(MirOpcode::LShr, ls, sh63);   // MIR in source order
+                hi = i64bin(MirOpcode::LShr, lsShifted, ci64(1));
             } else {
                 // dst[j] = (a[j+word] >> bit) | (a[j+word+1] << (64-bit))
                 MirInstId const loIdx = i64bin(MirOpcode::Add, j, wordShift);
@@ -2358,7 +2363,8 @@ struct Lowerer {
                 MirInstId const ls = loadLimbOrFill(aAddr, loIdx, limbCount, fill);
                 MirInstId const hs = loadLimbOrFill(aAddr, hiIdx, limbCount, fill);
                 lo = i64bin(MirOpcode::LShr, ls, bitShift);
-                hi = i64bin(MirOpcode::Shl, i64bin(MirOpcode::Shl, hs, sh63), ci64(1));
+                MirInstId const hsShifted = i64bin(MirOpcode::Shl, hs, sh63);   // MIR in source order
+                hi = i64bin(MirOpcode::Shl, hsShifted, ci64(1));
             }
             MirInstId const r = i64bin(MirOpcode::Or, lo, hi);
             if (!r.valid()) return false;
@@ -2446,11 +2452,17 @@ struct Lowerer {
         std::int64_t const srcLimbs = wideLimbCount(srcTy);
         std::int64_t const dstLimbs = wideLimbCount(dstTy);
         std::int64_t const common   = std::min(srcLimbs, dstLimbs);
-        MirInstId const fill = wideIntIsSigned(interner, srcTy)
-            ? i64bin(MirOpcode::AShr, loadLimb(limbAddrConst(srcAddr, srcLimbs - 1)), ci64(63))
-            : ci64(0);
-        for (std::int64_t li = 0; li < common; ++li)
-            storeLimb(loadLimb(limbAddrConst(srcAddr, li)), limbAddrConst(dst, li));
+        MirInstId fill = InvalidMirInst;
+        if (wideIntIsSigned(interner, srcTy)) {
+            MirInstId const topLimb = loadLimb(limbAddrConst(srcAddr, srcLimbs - 1));   // MIR in source order
+            fill = i64bin(MirOpcode::AShr, topLimb, ci64(63));
+        } else {
+            fill = ci64(0);
+        }
+        for (std::int64_t li = 0; li < common; ++li) {
+            MirInstId const limb = loadLimb(limbAddrConst(srcAddr, li));   // MIR in source order
+            storeLimb(limb, limbAddrConst(dst, li));
+        }
         for (std::int64_t li = common; li < dstLimbs; ++li)
             storeLimb(fill, limbAddrConst(dst, li));
         return maskTopLimb(dst, dstTy);
@@ -2626,14 +2638,16 @@ struct Lowerer {
     // Temp allocas are NOT zero-initialized).
     [[nodiscard]] bool zeroWide(MirInstId dst, std::int64_t limbCount) {
         return emitLimbLoop(limbCount, [&](MirInstId i) {
-            storeLimb(ci64(0), limbAddrRuntime(dst, i));
+            MirInstId const zero = ci64(0);   // MIR in source order
+            storeLimb(zero, limbAddrRuntime(dst, i));
             return true;
         });
     }
     // dst[i] = src[i] for all limbs (limb-wise copy; src/dst distinct).
     [[nodiscard]] bool copyWide(MirInstId dst, MirInstId src, std::int64_t limbCount) {
         return emitLimbLoop(limbCount, [&](MirInstId i) {
-            storeLimb(loadLimb(limbAddrRuntime(src, i)), limbAddrRuntime(dst, i));
+            MirInstId const limb = loadLimb(limbAddrRuntime(src, i));   // MIR in source order
+            storeLimb(limb, limbAddrRuntime(dst, i));
             return true;
         });
     }
@@ -2642,8 +2656,8 @@ struct Lowerer {
     [[nodiscard]] MirInstId signBitI64(MirInstId addr, TypeId bitIntTy) {
         std::int64_t const n = wideIntWidthBits(interner, bitIntTy);
         MirInstId const top = loadLimb(limbAddrConst(addr, (n - 1) / 64));
-        return i64bin(MirOpcode::And,
-                      i64bin(MirOpcode::LShr, top, ci64((n - 1) % 64)), ci64(1));
+        MirInstId const topShifted = i64bin(MirOpcode::LShr, top, ci64((n - 1) % 64));   // MIR in source order
+        return i64bin(MirOpcode::And, topShifted, ci64(1));
     }
 
     // dst = `signBit ? (-src mod 2^N) : src`, BRANCHLESS (a 0/~0 select mask). Used for
@@ -2662,9 +2676,9 @@ struct Lowerer {
         return emitLimbLoop(limbCount, [&](MirInstId i) {
             MirInstId const ni = loadLimb(limbAddrRuntime(scratch, i));
             MirInstId const si = loadLimb(limbAddrRuntime(srcAddr, i));
-            MirInstId const sel = i64bin(MirOpcode::Or,
-                                         i64bin(MirOpcode::And, ni, mask),
-                                         i64bin(MirOpcode::And, si, notMask));
+            MirInstId const niMasked = i64bin(MirOpcode::And, ni, mask);   // MIR in source order
+            MirInstId const siMasked = i64bin(MirOpcode::And, si, notMask);
+            MirInstId const sel      = i64bin(MirOpcode::Or, niMasked, siMasked);
             if (!sel.valid()) return false;
             storeLimb(sel, limbAddrRuntime(dst, i));
             return true;
@@ -2799,8 +2813,8 @@ struct Lowerer {
             MirInstId const kLimb = i64bin(MirOpcode::LShr, k, ci64(6));   // k/64
             MirInstId const kBit  = i64bin(MirOpcode::And,  k, ci64(63));  // k%64
             MirInstId const dv    = loadLimb(limbAddrRuntime(divA, kLimb));
-            MirInstId const bitk  = i64bin(MirOpcode::And,
-                                       i64bin(MirOpcode::LShr, dv, kBit), ci64(1));
+            MirInstId const dvShifted = i64bin(MirOpcode::LShr, dv, kBit);   // MIR in source order
+            MirInstId const bitk      = i64bin(MirOpcode::And, dvShifted, ci64(1));
             // rem = ((rem << 1) | bitk) mod 2^N.
             if (!emitWideShl1InPlace(rem, bitk, limbCount)) return false;
             if (!maskTopLimb(rem, uType)) return false;
@@ -2909,7 +2923,9 @@ struct Lowerer {
     [[nodiscard]] MirInstId i64ClampHigh(MirInstId v, std::int64_t hi) {
         MirInstId const diff = i64bin(MirOpcode::Sub, v, ci64(hi));  // v - hi
         MirInstId const m    = i64bin(MirOpcode::AShr, diff, ci64(63));
-        return i64bin(MirOpcode::Add, ci64(hi), i64bin(MirOpcode::And, diff, m));
+        MirInstId const hiConst = ci64(hi);   // MIR in source order
+        MirInstId const masked  = i64bin(MirOpcode::And, diff, m);
+        return i64bin(MirOpcode::Add, hiConst, masked);
     }
 
     // `2^k` as a float of kind `fk` (F64 or F32), for a RUNTIME k ≥ 0, EXACT. One
@@ -3027,8 +3043,9 @@ struct Lowerer {
         if (!d.valid()) return InvalidMirInst;
         if (!signd) return d;
         // ±1.0 from an INTEGER `1 - 2·signBit`, then one exact multiplication.
-        MirInstId const sgnI =
-            i64bin(MirOpcode::Sub, ci64(1), i64bin(MirOpcode::Mul, ci64(2), sgn));
+        MirInstId const oneI    = ci64(1);   // MIR in source order
+        MirInstId const twoSgnI = i64bin(MirOpcode::Mul, ci64(2), sgn);
+        MirInstId const sgnI    = i64bin(MirOpcode::Sub, oneI, twoSgnI);
         if (!sgnI.valid()) return InvalidMirInst;
         std::array<MirInstId, 1> sv{sgnI};
         MirInstId const sgnF = mir.addInst(MirOpcode::SIToFP, sv, fty);
@@ -3078,8 +3095,9 @@ struct Lowerer {
         if (!fzero.valid()) return false;
         MirInstId const isNeg = zextCmp(MirOpcode::FCmpOlt, srcVal, fzero);
         if (!isNeg.valid()) return false;
-        MirInstId const sgnI =
-            i64bin(MirOpcode::Sub, ci64(1), i64bin(MirOpcode::Mul, ci64(2), isNeg));
+        MirInstId const oneI    = ci64(1);   // MIR in source order
+        MirInstId const twoNegI = i64bin(MirOpcode::Mul, ci64(2), isNeg);
+        MirInstId const sgnI    = i64bin(MirOpcode::Sub, oneI, twoNegI);
         MirInstId const sgnF = toF64(MirOpcode::SIToFP, sgnI);
         if (!sgnF.valid()) return false;
         MirInstId cur = f64bin(MirOpcode::FMul, srcVal, sgnF);   // |d|, exact
@@ -3288,7 +3306,8 @@ struct Lowerer {
             for (std::int64_t i = 0; i < count; ++i) {
                 std::uint64_t const limbVal =
                     (static_cast<std::size_t>(i) < limbs.size()) ? limbs[i] : 0ull;
-                storeLimb(ci64(static_cast<std::int64_t>(limbVal)), limbAddrConst(dst, i));
+                MirInstId const limb = ci64(static_cast<std::int64_t>(limbVal));   // MIR in source order
+                storeLimb(limb, limbAddrConst(dst, i));
             }
             return dst;
         }
@@ -3345,8 +3364,8 @@ struct Lowerer {
         TypeKind const srcK =
             wideIntIsSigned(interner, t) ? TypeKind::I64 : TypeKind::U64;
         // `ci64` mints the canonical i64 row, so the declared type IS `i64Ty()`.
-        return emitWideFromScalar(dst, ci64(payload), srcK, t, i64Ty())
-                   ? dst : InvalidMirInst;
+        MirInstId const payloadValue = ci64(payload);
+        return emitWideFromScalar(dst, payloadValue, srcK, t, i64Ty()) ? dst : InvalidMirInst;
     }
 
     [[nodiscard]] MirInstId materializeWideCast(HirNodeId node) {
@@ -3587,8 +3606,9 @@ struct Lowerer {
         MirInstId const rc = icmp(cmp, ar, br);
         MirInstId const ic = icmp(cmp, ai, bi);
         if (!rc.valid() || !ic.valid()) return InvalidMirInst;
-        MirInstId const comb = i64bin(isNe ? MirOpcode::Or : MirOpcode::And,
-                                      zextBoolToI64(rc), zextBoolToI64(ic));
+        MirInstId const rcI  = zextBoolToI64(rc);   // MIR in source order
+        MirInstId const icI  = zextBoolToI64(ic);
+        MirInstId const comb = i64bin(isNe ? MirOpcode::Or : MirOpcode::And, rcI, icI);
         if (!comb.valid()) return InvalidMirInst;
         return icmp(MirOpcode::ICmpNe, comb, ci64(0));
     }
@@ -3624,8 +3644,9 @@ struct Lowerer {
         }
         MirInstId re = InvalidMirInst, im = InvalidMirInst;
         if (!loadComplex(addr, *cp, re, im)) return InvalidMirInst;
-        return complexEqFromParts(/*isNe=*/!zeroIsTrue, re, im,
-                                  elementZero(cp->elemTy), elementZero(cp->elemTy));
+        MirInstId const reZero = elementZero(cp->elemTy);   // MIR in source order
+        MirInstId const imZero = elementZero(cp->elemTy);
+        return complexEqFromParts(/*isNe=*/!zeroIsTrue, re, im, reZero, imZero);
     }
     // Convert a scalar value from `fromTy` to `toTy` (float<->float, int->float),
     // or return it unchanged when the kinds already match. Fails loud on a pair with
@@ -3936,8 +3957,9 @@ struct Lowerer {
                     // through the ONE atomic-load verb, so a floating pointee loads
                     // its representation exactly as the scalar funnel does.
                     std::array<MirInstId, 1> const ld{operands[0]};
-                    return emitAtomicLoadOf(ld, t, foldAtomicOrder(kids[1]),
-                                            atomicPointerAlignPayload(kids[0]));
+                    auto const atomicOrder = foldAtomicOrder(kids[1]);
+                    auto const atomicAlign = atomicPointerAlignPayload(kids[0]);
+                    return emitAtomicLoadOf(ld, t, atomicOrder, atomicAlign);
                 }
                 case BuiltinLowering::AtomicStore: {
                     // FC17.9(d) (D-CSUBSET-ATOMIC): atomic_store_explicit(ptr, val,
@@ -3953,9 +3975,9 @@ struct Lowerer {
                     // D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
                     // the store twin — the value's own type picks the representation.
                     std::array<MirInstId, 2> const st{operands[1], operands[0]};
-                    return emitAtomicStoreOf(st, hir.typeId(kids[1]),
-                                             foldAtomicOrder(kids[2]),
-                                             atomicPointerAlignPayload(kids[0]));
+                    auto const atomicOrder = foldAtomicOrder(kids[2]);
+                    auto const atomicAlign = atomicPointerAlignPayload(kids[0]);
+                    return emitAtomicStoreOf(st, hir.typeId(kids[1]), atomicOrder, atomicAlign);
                 }
                 // ── D-CSUBSET-ATOMIC-RMW: C11 §7.17.7 read-modify-write ──
                 // `atomic_<op>_explicit(obj, operand, order)` → the AtomicCas
@@ -3979,11 +4001,12 @@ struct Lowerer {
                             "3 arguments (object, operand, memory_order)");
                         return InvalidMirInst;
                     }
+                    auto const atomicOrder = foldAtomicOrder(kids[2]);
+                    auto const atomicAlign = atomicPointerAlignPayload(kids[0]);
                     return emitAtomicRmw(
                         static_cast<BuiltinLowering>(hir.payload(node)),
                         operands[0], operands[1], t, hir.typeId(kids[1]),
-                        foldAtomicOrder(kids[2]),
-                        atomicPointerAlignPayload(kids[0]), node);
+                        atomicOrder, atomicAlign, node);
                 }
                 // `atomic_compare_exchange_{strong,weak}_explicit(obj, expected,
                 // desired, succ_order, fail_order)`. The object's value type is
@@ -5829,8 +5852,18 @@ struct Lowerer {
         // driven (`config.dataModel`), signedness rides the ONE `isSignedIntKind`
         // chokepoint (so a `char*` cast honors `config.charIsUnsigned`) — no arch branch.
         if (mop == MirOpcode::IntToPtr) {
-            std::uint64_t const ptrBytes =
-                scalarByteSize(TypeKind::Ptr, config.dataModel).value_or(8);
+            // ★ P69 (lane `xa`, fold 3f -- review-xa3e F3 P8): the pointer width is the
+            // data model's, and a model stating none is refused by name -- it was 8 in
+            // silence (`.value_or(8)`).
+            std::optional<std::uint64_t> const statedPtrBytes =
+                scalarByteSize(TypeKind::Ptr, config.dataModel);
+            if (!statedPtrBytes.has_value()) {
+                unsupported(node, std::format(
+                    "int→pointer conversion: {} states no pointer size",
+                    dataModelSpelled(config.dataModel)));
+                return InvalidMirInst;
+            }
+            std::uint64_t const ptrBytes = *statedPtrBytes;
             bool const srcSigned = isSignedIntKind(fromResolved);
             TypeKind ptrIntKind{};
             switch (ptrBytes) {
@@ -8102,8 +8135,9 @@ struct Lowerer {
         // (uP)(uW)~x — the W-bit complement: flip all P bits, keep the low W.
         std::uint64_t const allOnesW = (W >= 64) ? ~0ull : ((1ull << W) - 1);
         auto complementW = [&]() {
-            return bin(MirOpcode::And, un(MirOpcode::Not, vP),
-                       konst(static_cast<std::int64_t>(allOnesW)));
+            MirInstId const notP  = un(MirOpcode::Not, vP);   // MIR in source order
+            MirInstId const onesW = konst(static_cast<std::int64_t>(allOnesW));
+            return bin(MirOpcode::And, notP, onesW);
         };
         // branchless select: cond ? a : b (a,b already-computed pTy SSA values →
         // single-eval). mask = 0 − (uP)cond (all-ones iff cond, else 0).
@@ -8111,8 +8145,9 @@ struct Lowerer {
             MirInstId const condP   = un(MirOpcode::ZExt, condBool);
             MirInstId const mask    = bin(MirOpcode::Sub, konst(0), condP);
             MirInstId const notMask = un(MirOpcode::Not, mask);
-            return bin(MirOpcode::Or, bin(MirOpcode::And, a, mask),
-                                      bin(MirOpcode::And, b, notMask));
+            MirInstId const aMasked = bin(MirOpcode::And, a, mask);   // MIR in source order
+            MirInstId const bMasked = bin(MirOpcode::And, b, notMask);
+            return bin(MirOpcode::Or, aMasked, bMasked);
         };
         // cast the pTy compute value to the builtin result type t (a Trunc for a
         // U64 compute → U32 count / a narrow bit_floor result; else a no-op).
@@ -8169,10 +8204,15 @@ struct Lowerer {
             }
             case BuiltinLowering::StdcHasSingleBit:   // popcount(x)==1 (result IS Bool == t)
                 return cmp(MirOpcode::ICmpEq, pop(vP), ONE);
-            case BuiltinLowering::StdcBitWidth:       // P − clz(x)  (clz(0)=P → 0; no guard)
-                return toResult(bin(MirOpcode::Sub, konst(P), clz(vP)));
+            case BuiltinLowering::StdcBitWidth: {     // P − clz(x)  (clz(0)=P → 0; no guard)
+                MirInstId const pConst = konst(P);   // MIR in source order
+                MirInstId const lz     = clz(vP);
+                return toResult(bin(MirOpcode::Sub, pConst, lz));
+            }
             case BuiltinLowering::StdcBitFloor: {      // x==0 ? 0 : 1 << (bit_width(x)−1)
-                MirInstId const bw      = bin(MirOpcode::Sub, konst(P), clz(vP));
+                MirInstId const pConst  = konst(P);   // MIR in source order
+                MirInstId const lz      = clz(vP);
+                MirInstId const bw      = bin(MirOpcode::Sub, pConst, lz);
                 MirInstId const neZero  = cmp(MirOpcode::ICmpNe, vP, ZERO);
                 MirInstId const neZeroP = un(MirOpcode::ZExt, neZero);
                 // amt = bit_width − (x≠0) ∈ [0, W−1] on EVERY branch (x==0 → 0−0=0).
@@ -8183,7 +8223,9 @@ struct Lowerer {
             case BuiltinLowering::StdcBitCeil: {       // x<=1 ? 1 : bw(x−1)==W ? 0 : 1<<bw(x−1)
                 MirInstId const isLe1   = cmp(MirOpcode::ICmpUle, vP, ONE);
                 MirInstId const xm1     = bin(MirOpcode::Sub, vP, ONE);
-                MirInstId const bwm1    = bin(MirOpcode::Sub, konst(P), clz(xm1));
+                MirInstId const pConst  = konst(P);   // MIR in source order
+                MirInstId const lzm1    = clz(xm1);
+                MirInstId const bwm1    = bin(MirOpcode::Sub, pConst, lzm1);
                 MirInstId const isOvf   = cmp(MirOpcode::ICmpEq, bwm1, WK);
                 // amt = bw(x−1) & (W−1) ∈ [0, W−1] (bw(x−1)==W → 0, but the overflow
                 // arm discards the shift result anyway) — never an unguarded Shl.
@@ -10692,7 +10734,7 @@ struct Lowerer {
     // differently for the two). nullopt ⇒ the strategy is not implemented for this
     // CC (the guard then fails loud) OR the type is un-sizeable.
     [[nodiscard]] std::optional<AbiPassing> byValueClassify(TypeId aggTy,
-                                                            AggregatePosition position) {
+                                                            AggregatePosition position) const {
         if (!config.aggregateLayoutLoaded) return std::nullopt;
         return classifyAggregate(config.aggregate, aggTy, interner,
                                  config.aggregateLayout, config.dataModel, position);
@@ -10708,7 +10750,10 @@ struct Lowerer {
     // read `StructLayout::align` — the type's — which is AAPCS64's answer for no
     // composite with a 16-aligned member and Apple's for no over-aligned HFA
     // (✔MEASURED, lane `cs` probe f14: DSS placed all of them at +8).
-    [[nodiscard]] std::uint32_t argumentOwnAlignment(TypeId aggTy, StructLayout const& layout) {
+    // A `const` question, as `byValueClassify` is: it reads the convention and the type and
+    // writes nothing, so an argument list that asks it beside an emitter holds ONE effect,
+    // whose order no host compiler chooses (P69 fold 3f, the evaluation-order census).
+    [[nodiscard]] std::uint32_t argumentOwnAlignment(TypeId aggTy, StructLayout const& layout) const {
         std::uint32_t element = 0;
         if (auto const abi = byValueClassify(aggTy, AggregatePosition::Argument);
             abi.has_value() && abi->homogeneousElementBytes != 0)
@@ -10785,7 +10830,8 @@ struct Lowerer {
         if (!sz.has_value()
             || *sz > std::numeric_limits<std::uint32_t>::max())
             return InvalidMirInst;
-        return mir.addInst(MirOpcode::Alloca, {}, interner.pointer(aggTy),
+        TypeId const tempType = interner.pointer(aggTy);
+        return mir.addInst(MirOpcode::Alloca, {}, tempType,
                            static_cast<std::uint32_t>(*sz), MirInstFlags::None,
                            /*payload2=*/frameSlotAlignment(aggTy, HirNodeId{}));
     }
@@ -10898,9 +10944,10 @@ struct Lowerer {
         // asks the same alignment (`receiveStackedAggregateParam`). ★ P69 (fold
         // f26c2 — review-csf26c F14): the alignment the CONVENTION places it by
         // (`argumentOwnAlignment`), which is not always the type's.
+        TypeId const    carrierType = interner.pointer(aggTy);
         MirInstId const carrier =
             mir.addInst(MirOpcode::ByValueStackArg, carrierOps,
-                        interner.pointer(aggTy), payload, MirInstFlags::None,
+                        carrierType, payload, MirInstFlags::None,
                         /*payload2=*/argumentOwnAlignment(aggTy, *layout));
         if (!carrier.valid()) return false;
         operands.push_back(carrier);
@@ -11062,12 +11109,26 @@ struct Lowerer {
     }
 
     // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: the incoming/outgoing
-    // stack-arg slot quantum = the GPR / pointer width (8 on the shipped LP64/LLP64
-    // targets). The same value lir_callconv uses for `outgoingSlotSize`; derived
-    // agnostically from the data model so a future ILP32 ABI is a config change.
+    // stack-arg slot quantum -- the CONVENTION's (Q2), the value lir_callconv's
+    // `outgoingSlotSize` is, stated in the config by `takeCallingConvention` from its
+    // home (`argumentSlotBytes`). ★ P69 (lane `xa`, fold 3f -- review-xa3e F3 P12b):
+    // it read the data model's POINTER width with `.value_or(8)` -- the other
+    // quantity (Q1), equal on every shipped pair and separated by an x32-shaped
+    // model, and a third home of this one. A config stating none is refused by
+    // name, once, at the first read; the lowering then fails.
     [[nodiscard]] std::uint32_t stackSlotBytes() const {
-        return static_cast<std::uint32_t>(
-            scalarByteSize(TypeKind::Ptr, config.dataModel).value_or(8));
+        if (config.argumentSlotBytes == 0 && !argumentSlotRefused_) {
+            argumentSlotRefused_ = true;
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::H_UnsupportedLoweringForKind;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = "a stacked parameter or `va_start`: the configuration states no "
+                         "argument-slot quantum (`MirLoweringConfig::argumentSlotBytes`, the "
+                         "convention's; `takeCallingConvention` states it), so no stacked "
+                         "argument has a slot";
+            reporter.report(std::move(d));
+        }
+        return config.argumentSlotBytes;
     }
     [[nodiscard]] static std::uint32_t roundUpToSlot(std::uint32_t bytes,
                                                      std::uint32_t slot) {
@@ -18631,7 +18692,10 @@ MirLoweringConfig languageMirLoweringConfig(GrammarSchema const& language) {
     return cfg;
 }
 
-void takeCallingConvention(MirLoweringConfig& cfg, TargetCallingConvention const& cc) {
+void takeCallingConvention(MirLoweringConfig& cfg, TargetSchema const& target,
+                           TargetCallingConvention const& cc) {
+    // The argument-slot quantum, at its one home (Q2): the stride of every stacked argument.
+    cfg.argumentSlotBytes         = argumentSlotBytes(target);
     // The by-value aggregate rules, WHOLE (`AggregateConventionRules`), so a key the row
     // gains reaches the classifier with no second edit here (P69 fold f26c, ledger 455).
     cfg.aggregate                 = cc.aggregate;
@@ -18682,6 +18746,24 @@ HirToMirResult lowerToMir(Hir const&               hir,
                           HirEnclosingFunctionMap const* enclosingFunctionMap,
                           std::span<HirSymbolAlias const> symbolAliases) {
     std::size_t const errorsBefore = reporter.errorCount();
+    // ★ P69 (lane `xa`, fold 3f -- review-xa3e F3): the data model is STATED by the
+    // config, never defaulted (`MirLoweringConfig::dataModel`'s zero is "none"), and
+    // one with no pointer size is refused here, by name, before anything is lowered:
+    // every size, alignment and pointer width this tier reads is the model's.
+    if (!scalarByteSize(TypeKind::Ptr, config.dataModel).has_value()) {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::S_UnsupportedDataModel;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = std::format(
+            "lowerToMir: the configuration states no data model with a pointer size ({}) -- every "
+            "size, alignment and pointer width this lowering reads is the model's, so none is "
+            "assumed",
+            dataModelSpelled(config.dataModel));
+        reporter.report(std::move(d));
+        HirToMirResult refused;
+        refused.ok = false;
+        return refused;
+    }
     // Designated initializers (code-simplifier REQUIRED fold, LK6
     // cycle 2d post-fold review): a future field addition or
     // reorder is a compile error rather than a silent position
@@ -18729,6 +18811,9 @@ HirToMirResult lowerToMir(Hir const&               hir,
     // slot where the convention aligns arguments to slots (Win64), one per register class
     // otherwise. The MIR verifier holds every function dense under it.
     lwr.mir.stateArgCounting(argCountingOf(config.argSlotAligned));
+    // ★ P69 (lane `xa`, fold 3f): the data model this unit is lowered for, STATED from its config -- the model
+    // every pointer width below MIR is read from (`MirModuleFacts::dataModel`).
+    lwr.mir.stateDataModel(config.dataModel);
     // The END of the id space this unit was analysed in — its name table's end,
     // or the unit's own symbols where it is its own table. Stated ONCE, here,
     // where the module is made from the model; every minter of the module asks

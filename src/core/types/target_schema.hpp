@@ -4218,8 +4218,8 @@ struct DSS_EXPORT ProcessExit {
 //                     `argc-argv-envp` verb a synthesized init
 //                     computes it from (argc, argv), where the
 //                     format declares the layout
-//                     (`envpFollowsArgvTerminator` +
-//                     `vectorSlotBytes`, below).
+//                     (`envpFollowsArgvTerminator`, below; each
+//                     slot a pointer of the data model).
 //   * `None`        — default-constructed sentinel. "No mechanism"
 //                     is encoded by `optional<ProcessArgs>` empty
 //                     (exactly the ProcessExit discipline); the
@@ -4329,14 +4329,18 @@ static_assert(kArgsMechanismTable.rows.size()
 //                         argc). The trampoline LEAs this address
 //                         into the second argument register; it
 //                         never dereferences it.
-//   * `envpFollowsArgvTerminator` + `vectorSlotBytes`
+//   * `envpFollowsArgvTerminator`
 //                         (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE) — the
 //                         environment vector's place in the SAME
 //                         entry-stack layout: it starts one slot past
-//                         argv's NULL terminator, each slot
-//                         `vectorSlotBytes` wide (8 on both LP64
-//                         Linux ABIs — SysV AMD64 psABI §3.4.1,
-//                         AAPCS64 Linux). DECLARED, never derived from
+//                         argv's NULL terminator, each slot a POINTER of
+//                         the module's data model (8 on both LP64 Linux
+//                         ABIs — SysV AMD64 psABI §3.4.1, AAPCS64 Linux).
+//                         P69 fold 3f (review-xa3e F3 P16): the slot's width
+//                         was a key of its own, `vectorSlotBytes`, a second
+//                         statement of the pointer width a document could
+//                         make disagree; it is retired, and the loader
+//                         refuses it by name. DECLARED, never derived from
 //                         the offsets above; declared only by a format
 //                         that realizes an environment verb. The
 //                         trampoline still materializes (argc, argv);
@@ -4354,7 +4358,6 @@ struct DSS_EXPORT ProcessArgs {
     std::uint32_t argcStackOffset = 0;
     std::uint32_t argvStackOffset = 0;
     bool          envpFollowsArgvTerminator = false;
-    std::uint32_t vectorSlotBytes = 0;
 
     // ── CrtArgvAccessors arm (UCRT-P4) ────────────────────────────────────
     //
@@ -4419,6 +4422,33 @@ struct DSS_EXPORT ProcessArgs {
     std::string   narrowEnvironmentAccessorFn;     // "_get_initial_narrow_environment"
     std::string   initializeWideEnvironmentFn;     // "_initialize_wide_environment"
     std::string   wideEnvironmentAccessorFn;       // "_get_initial_wide_environment"
+    //   * the GUI startups' values (P69 fold 3f, lane `xa`; the C runtime's
+    //     WinMainCRTStartup / wWinMainCRTStartup), declared only by a format
+    //     realizing a WinMain verb (`entry_shape.hpp`: the module instance, the
+    //     previous instance, the command line, the show-window value). The
+    //     COMMAND LINE past the program's name is the C library's own answer,
+    //     one zero-argument routine per width -- MSVC's GUI startup imports
+    //     `_get_narrow_winmain_command_line` / `_get_wide_winmain_command_line`
+    //     (✔MEASURED 2026-11-17, probe-reference-cc run 20261117-082204-1f9ca84b: `dumpbin /imports` of cl
+    //     19.52's WinMain and wWinMain images), and the UCRT answers both in an
+    //     image with NO C runtime startup, DSS's situation, with or without the
+    //     argv configure call first (✔MEASURED, probe-reference-cc run 20261117-082330-5dacf534). The MODULE INSTANCE
+    //     and the SHOW-WINDOW value are what a C runtime's own STATIC startup
+    //     computes (MSVC: `&__ImageBase`, and STARTUPINFOW's `wShowWindow` when
+    //     its flags state STARTF_USESHOWWINDOW, else SW_SHOWDEFAULT -- the same
+    //     facts MinGW-w64's startup gives, MEASURED in both references' runs),
+    //     so the format names the routines of ITS runtime that compute them and
+    //     the role whose row realizes those routines. The previous instance is
+    //     null by the Win32 contract: nothing declares it.
+    std::string   narrowWinMainCommandLineFn;      // "_get_narrow_winmain_command_line"
+    std::string   wideWinMainCommandLineFn;        // "_get_wide_winmain_command_line"
+    struct WinMainStartupRoutines {
+        RuntimeLibraryRole role = RuntimeLibraryRole::None;   // declared in JSON
+        std::string libraryPath;   // DERIVED: resolved from `role` at load ("" for a role its sources realize)
+        std::string moduleInstanceFn;   // "__dss_pe_module_instance"
+        std::string showWindowFn;       // "__dss_pe_show_window_mode"
+    };
+    std::optional<WinMainStartupRoutines> winMainStartupRoutines;
 
     // The import library the CRT entry-point names resolve from. The JSON
     // declares `role`; `crtLibraryPath` is the DERIVED copy the loader resolved
@@ -4426,6 +4456,15 @@ struct DSS_EXPORT ProcessArgs {
     RuntimeLibraryRole role = RuntimeLibraryRole::None;
     std::string crtLibraryPath;   // "ucrtbase.dll"
 };
+
+// WHAT A `processArgs` MECHANISM CAN HAND AN ENTRY, per VALUE (`entry_shape.hpp`'s
+// slots) -- the ONE statement of it (P69 fold 3f, lane `xa`). The format's
+// validate() asks it at load of every value of every declared verb, and the
+// synthesized init's backstop asks it of a hand-built block. Empty when the
+// mechanism produces `value`; otherwise the reason it cannot, a clause both
+// callers quote verbatim.
+[[nodiscard]] DSS_EXPORT std::string processArgsCannotProduce(ProcessArgs const& pa,
+                                                              EntryArgumentValue value);
 
 // ── UCRT-P4 (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE): the program-entry
 //    vocabulary MOVED OUT of this header ───────────────────────────
@@ -6608,5 +6647,16 @@ private:
 
     detail::TargetSchemaData d_;
 };
+
+// ★ Q2'S HOME (P69 lane `xa`, fold 3f -- review-xa3e F3, the argument-slot quantum): the size of one stacked-argument
+// slot -- the unit an outgoing argument area is reserved and aligned in, a stacked aggregate is copied in, and a
+// callee's incoming overflow area is walked by: the widest GENERAL register the target declares. It equals the data
+// model's pointer width on every shipped pair and is a different question (an x32-shaped model separates them), so a
+// site states which one it reads: the frame layout's `outgoingSlotSize`, both stack cursors, the wide-call pass's
+// chunk and HIR->MIR's stacked-parameter and `va_start` arithmetic (through `MirLoweringConfig::argumentSlotBytes`,
+// stated by `takeCallingConvention`) read THIS, where the LIR tier's own `widthForClass(GPR)`, a literal 8 in the
+// wide-call pass and HIR->MIR's pointer width stood. 0 when the target declares no general register: a reader
+// refuses that by name.
+[[nodiscard]] DSS_EXPORT std::uint32_t argumentSlotBytes(TargetSchema const& target) noexcept;
 
 } // namespace dss

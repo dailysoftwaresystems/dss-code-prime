@@ -20,6 +20,7 @@
 #include "core/types/entry_shape.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
+#include "core/types/type_lattice/type_layout.hpp"   // scalarByteSize: the vector slot is a pointer of the model
 #include "format_reject_support.hpp"   // countAtPath / errorCount / rejectSummary
 #include "link/object_format_schema.hpp"
 #include "repo_root.hpp"
@@ -130,8 +131,8 @@ TEST(EntryEnvironmentVerbs, ShippedElfFormatsRealizeTheStackEnvironment) {
         ASSERT_TRUE(pa.has_value());
         EXPECT_EQ(pa->mechanism, ArgsMechanism::StackVector);
         EXPECT_TRUE(pa->envpFollowsArgvTerminator);
-        EXPECT_EQ(pa->vectorSlotBytes, 8u)
-            << "one machine word per vector slot on both LP64 Linux ABIs";
+        EXPECT_EQ(scalarByteSize(TypeKind::Ptr, (*r)->dataModel()), std::optional<std::uint64_t>{8})
+            << "one pointer of the document's data model per vector slot on both LP64 Linux ABIs";
     }
 }
 
@@ -164,7 +165,9 @@ TEST(EntryEnvironmentVerbs, ShippedPeFormatNamesTheUcrtEnvironmentPairs) {
               (std::vector<EntryMaterialization>{
                   EntryMaterialization::None, EntryMaterialization::ArgcArgv,
                   EntryMaterialization::ArgcWargv, EntryMaterialization::ArgcArgvEnvp,
-                  EntryMaterialization::ArgcWargvWenvp}));
+                  EntryMaterialization::ArgcWargvWenvp,
+                  EntryMaterialization::InstancePrevCmdlineShow,
+                  EntryMaterialization::InstancePrevWcmdlineShow}));
     auto const& pa = (*r)->processArgs();
     ASSERT_TRUE(pa.has_value());
     EXPECT_EQ(pa->initializeNarrowEnvironmentFn, "_initialize_narrow_environment");
@@ -186,15 +189,14 @@ TEST(EntryEnvironmentVerbs, AVerbTheMechanismCannotRealizeIsRefused) {
         {"stack env verb without the declared layout", "elf64-x86_64-linux-exec",
          [](nlohmann::json& d) {
              d.at("processArgs").erase("envpFollowsArgvTerminator");
-             d.at("processArgs").erase("vectorSlotBytes");
          },
          "does not declare where the environment vector sits"},
         {"a wide verb on the entry stack", "elf64-x86_64-linux-exec",
          [](nlohmann::json& d) { addVerb(d, "argc-wargv"); },
-         "NARROW strings only"},
+         "narrow strings only"},
         {"the four-value verb on the entry stack", "elf64-aarch64-linux-exec",
          [](nlohmann::json& d) { addVerb(d, "argc-argv-envp-apple"); },
-         "produces at most 3"},
+         "produces Darwin's apple vector"},
         {"the narrow env verb without its CRT pair", "pe64-x86_64-windows-exec",
          [](nlohmann::json& d) {
              d.at("processArgs").erase("initializeNarrowEnvironmentFn");
@@ -209,7 +211,24 @@ TEST(EntryEnvironmentVerbs, AVerbTheMechanismCannotRealizeIsRefused) {
          "wide environment's"},
         {"the four-value verb through a CRT", "pe64-x86_64-windows-exec",
          [](nlohmann::json& d) { addVerb(d, "argc-argv-envp-apple"); },
-         "produces at most 3"},
+         "produces Darwin's apple vector"},
+        // P69 fold 3f (lane `xa`): the GUI startups' values, asked per value as every other.
+        {"the narrow GUI verb without its command line", "pe64-x86_64-windows-exec",
+         [](nlohmann::json& d) { d.at("processArgs").erase("narrowWinMainCommandLineFn"); },
+         "declares no `narrowWinMainCommandLineFn`"},
+        {"the wide GUI verb without its command line", "pe64-x86_64-windows-exec",
+         [](nlohmann::json& d) { d.at("processArgs").erase("wideWinMainCommandLineFn"); },
+         "declares no `wideWinMainCommandLineFn`"},
+        {"a GUI verb without the routines", "pe64-x86_64-windows-exec",
+         [](nlohmann::json& d) {
+             dropVerb(d, "instance-prev-wcmdline-show");
+             d.at("processArgs").erase("wideWinMainCommandLineFn");
+             d.at("processArgs").erase("winMainStartupRoutines");
+         },
+         "declares no `winMainStartupRoutines`"},
+        {"a GUI verb on the entry stack", "elf64-x86_64-linux-exec",
+         [](nlohmann::json& d) { addVerb(d, "instance-prev-cmdline-show"); },
+         "no module instance, command line or show-window value"},
     };
     for (auto const& c : cases) {
         SCOPED_TRACE(c.name);
@@ -239,6 +258,10 @@ TEST(EntryEnvironmentVerbs, AnEnvironmentDeclarationNoVerbReadsIsRefused) {
          "/processArgs/initializeNarrowEnvironmentFn"},
         {"the wide CRT pair", "pe64-x86_64-windows-exec", "argc-wargv-wenvp",
          "/processArgs/initializeWideEnvironmentFn"},
+        {"the narrow WinMain command line", "pe64-x86_64-windows-exec", "instance-prev-cmdline-show",
+         "/processArgs/narrowWinMainCommandLineFn"},
+        {"the wide WinMain command line", "pe64-x86_64-windows-exec", "instance-prev-wcmdline-show",
+         "/processArgs/wideWinMainCommandLineFn"},
     };
     for (auto const& c : cases) {
         SCOPED_TRACE(c.name);
@@ -251,6 +274,20 @@ TEST(EntryEnvironmentVerbs, AnEnvironmentDeclarationNoVerbReadsIsRefused) {
     }
 }
 
+// The GUI startups' routines no listed verb reads are dead config too: both GUI verbs dropped, with the command
+// lines only they read, leave the routines alone to be refused.
+TEST(EntryEnvironmentVerbs, TheGuiStartupRoutinesNoVerbReadsAreRefused) {
+    auto const r = loadEdited("pe64-x86_64-windows-exec", [](nlohmann::json& d) {
+        dropVerb(d, "instance-prev-cmdline-show");
+        dropVerb(d, "instance-prev-wcmdline-show");
+        d.at("processArgs").erase("narrowWinMainCommandLineFn");
+        d.at("processArgs").erase("wideWinMainCommandLineFn");
+    });
+    ASSERT_FALSE(r.has_value()) << "dead config must be refused at load";
+    EXPECT_EQ(countAtPath(r, "/processArgs/winMainStartupRoutines"), 1u) << rejectSummary(r);
+    EXPECT_EQ(errorCount(r), 1u) << "refused ONLY for this edit: " << rejectSummary(r);
+}
+
 // ── the loader: each environment declaration is WHOLE or absent ─────────────
 
 TEST(EntryEnvironmentVerbs, EachEnvironmentDeclarationIsWholeOrAbsent) {
@@ -261,11 +298,10 @@ TEST(EntryEnvironmentVerbs, EachEnvironmentDeclarationIsWholeOrAbsent) {
         char const* path;
     };
     std::vector<Case> const cases{
-        {"a position with no slot width", "elf64-x86_64-linux-exec",
-         [](nlohmann::json& d) { d.at("processArgs").erase("vectorSlotBytes"); },
-         "/processArgs"},
-        {"a zero slot width", "elf64-x86_64-linux-exec",
-         [](nlohmann::json& d) { d.at("processArgs")["vectorSlotBytes"] = 0; },
+        // P69 fold 3f (F3 P16): the slot's width is the data model's pointer, never a key -- a document stating
+        // `vectorSlotBytes` is refused by name, whatever its value.
+        {"a slot width stated a second time", "elf64-x86_64-linux-exec",
+         [](nlohmann::json& d) { d.at("processArgs")["vectorSlotBytes"] = 8; },
          "/processArgs/vectorSlotBytes"},
         // An EXEC document, not a PIE one: on an ET_DYN document `processArgs` is a
         // member of the entry cluster, so a REFUSED block also trips the partial-
@@ -282,6 +318,16 @@ TEST(EntryEnvironmentVerbs, EachEnvironmentDeclarationIsWholeOrAbsent) {
              d.at("processArgs").erase("narrowEnvironmentAccessorFn");
          },
          "/processArgs/narrowEnvironmentAccessorFn"},
+        {"a routines block with no show routine", "pe64-x86_64-windows-exec",
+         [](nlohmann::json& d) {
+             d.at("processArgs").at("winMainStartupRoutines").erase("showWindowFn");
+         },
+         "/processArgs/winMainStartupRoutines/showWindowFn"},
+        {"an empty command line routine", "pe64-x86_64-windows-exec",
+         [](nlohmann::json& d) {
+             d.at("processArgs")["narrowWinMainCommandLineFn"] = "";
+         },
+         "/processArgs/narrowWinMainCommandLineFn"},
         {"an empty export name", "pe64-x86_64-windows-exec",
          [](nlohmann::json& d) {
              d.at("processArgs")["initializeWideEnvironmentFn"] = "";

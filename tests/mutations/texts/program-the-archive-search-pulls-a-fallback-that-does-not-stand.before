@@ -1,0 +1,3 @@
+                if (standing == standingOf.end() || standing->second.fallback.empty()) continue;
+                if (!fallbacksSearched.insert(standing->second.fallback).second) continue;
+                worklist.push_back(standing->second.fallback);

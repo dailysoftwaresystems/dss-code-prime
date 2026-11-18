@@ -1,1 +1,1 @@
-                        if (dwEhPeHandlerFieldWidth(enc) == 0) {
+                        if (dwEhPeHandlerFieldWidth(enc, addressBytes) == 0) {

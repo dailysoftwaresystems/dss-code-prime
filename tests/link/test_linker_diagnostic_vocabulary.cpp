@@ -55,6 +55,11 @@ namespace {
     data.version = "0.1";
     data.backend = dss::link::objectFormatBackendByConfigName("elf");
     data.elf.objectType = ElfObjectType::Exec;
+    // The one field ahead of the gate the link DOES read: it sizes its pointer slots
+    // from the format's data model before it reaches the entry, and a value no row
+    // names states no pointer size (refused there by name since P69 fold 3f). A
+    // format that states a model reaches the gate this pin reads.
+    data.dataModel = DataModel::Lp64;
     return data;
 }
 

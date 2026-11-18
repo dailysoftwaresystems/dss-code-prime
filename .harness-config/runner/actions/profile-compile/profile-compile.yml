@@ -43,6 +43,21 @@ steps:
     successPattern: 'PROFILE-LEG-OK '
     requireInputsUnmoved: true
 
+  # THE HOST-EQUALITY GATE, run only where a run names it, at a round's close: after `profile` has run on every leg
+  # it names and each other leg's image is back (`dssharness sync --legs <leg> --pull build/perf/<leg>/image/`),
+  # `dssharness run profile-compile --legs <this machine's leg> --manual-step host-equality --input labels=<a>,<b>`.
+  # Every leg compiled the same kit for the same target, so every leg's image must be the same bytes.
+  - name: host-equality
+    manual: true
+    workingDirectoryRoot: action
+    inputs:
+      labels:
+        description: 'the legs whose images must be the same bytes, comma-separated: each one profiled, and a remote one pulled back'
+        required: true
+    run: |
+      python3 ./profile-compile.py --host-equality {labels}
+    successPattern: '^HOST-EQUALITY-OK '
+
   # The KIT a profile compiles: a relocatable copy of a real manifest's sources, kept as this step's output
   # (a directory, kept whole). Run at the tree's root, so the manifest and every root are tree paths.
   - name: kit

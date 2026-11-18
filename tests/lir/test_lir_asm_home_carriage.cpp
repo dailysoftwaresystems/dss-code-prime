@@ -102,6 +102,7 @@ namespace {
     std::array<TypeId, 1> const params{ty};
     TypeId const fnSig = interner.fnSig(params, ty, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
@@ -127,6 +128,7 @@ namespace {
     std::array<TypeId, 3> const params{f128, f128, ptr};
     TypeId const fnSig = interner.fnSig(params, f128, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
@@ -174,6 +176,7 @@ namespace {
     std::array<TypeId, 3> const params{f128, i64, ptr};
     TypeId const fnSig = interner.fnSig(params, voidT, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);

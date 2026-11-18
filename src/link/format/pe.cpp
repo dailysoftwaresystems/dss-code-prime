@@ -11,6 +11,7 @@
 #include "link/format/exec_reloc_apply.hpp"
 #include "link/format/interior_block_symbol_va.hpp"
 #include "link/format/object_symbol_names.hpp"
+#include "link/format/pe_resources.hpp"   // the manifest an image embeds (P69 fold 3f)
 #include "link/format/relocation_addend.hpp"
 #include "link/format/string_table.hpp"
 // The ONE scanner that answers "which relocation row patches an unwind table's
@@ -2427,23 +2428,37 @@ encode(AssembledModule const&    module,
     // refused or an ignored option, a hide of another unit's definition), so its
     // final linker is asked what the unit asked.
     std::vector<std::string> const& handedOn = module.linkerRequests.handOn;
+    // ...and the libraries the unit asks its final linker to search (P69 fold 3f: a read object's `/DEFAULTLIB:`,
+    // a compiled unit's `#pragma comment(lib, ...)`), each once, quoted as cl writes it.
+    std::vector<std::string> const& dependentLibraries = module.linkerRequests.dependentLibraries;
+    // A unit's own options are applied to its module before it is written (`pe::applyUnitLinkerDirectives`); one
+    // left here was read by no vocabulary, and writing the object without it would drop the request.
+    if (!module.linkerRequests.linkerOptions.empty()) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("pe::encode (Obj): the module carries the linker option '{}', which no directive "
+                         "vocabulary read -- writing the object without it would drop the request.",
+                         spelledLinkerOption(module.linkerRequests.linkerOptions.front())));
+        return {};
+    }
     std::string directiveText;
     if (!hiddenDefinitions.empty() || !requiredImports.empty() || !fallbackImports.empty()
-        || !commonAlignments.empty() || !handedOn.empty()) {
+        || !commonAlignments.empty() || !handedOn.empty() || !dependentLibraries.empty()) {
         auto const& vocab = fmt.pe().linkerDirectives;
         if (!vocab.has_value()) {
             emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
                  hiddenDefinitions.empty()
                      ? std::format("pe::encode (Obj): '{}' carries a linker directive of the "
                                    "object it was read from (an `/INCLUDE:`, an "
-                                   "`/alternatename:`, a common's `-aligncomm:` or a request "
-                                   "handed on verbatim), and format '{}' declares no "
+                                   "`/alternatename:`, a common's `-aligncomm:`, a library to "
+                                   "search or a request handed on verbatim), and format '{}' "
+                                   "declares no "
                                    "'pe.linkerDirectives' to state it with — writing the object "
                                    "without it would drop the request.",
                                    !requiredImports.empty()    ? requiredImports.front()
                                    : !fallbackImports.empty()  ? fallbackImports.front().name
                                    : !commonAlignments.empty() ? commonAlignments.front().name
-                                                               : handedOn.front(),
+                                   : !handedOn.empty()         ? handedOn.front()
+                                                               : dependentLibraries.front(),
                                    fmt.name())
                      : std::format("pe::encode (Obj): '{}' is an external definition its "
                                    "visibility keeps out of the image's exports, and format '{}' "
@@ -2455,7 +2470,7 @@ encode(AssembledModule const&    module,
         }
         auto text = pe::coffLinkerDirectiveText(
             pe::CoffDirectiveStatements{hiddenDefinitions, requiredImports, fallbackImports,
-                                        commonAlignments, handedOn},
+                                        commonAlignments, handedOn, dependentLibraries},
             *vocab);
         if (!text.has_value()) {
             emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
@@ -5514,12 +5529,14 @@ encodeExec(AssembledModule const&    module,
     // gets NONE (a reloc on 0 → the loader adds the slide → a non-null garbage
     // callback pointer).
     std::vector<std::uint8_t> tlsBytes;
-    std::uint64_t const tlsDirOffset = alignUp(tlsBlockMemsz, 8);  // dir past block
+    // The directory's VA fields and the callback array's entries are
+    // addresses, so both are aligned to the writer's class word.
+    std::uint64_t const tlsDirOffset = alignUp(tlsBlockMemsz, kPe32PlusAddressBytes);  // dir past block
     std::uint64_t const tlsIndexOffset = tlsDirOffset + 40;     // dir is 40 B
     // P69 review M1 (a)/(b): the TLS CALLBACK array — the residue runner, then
     // the null that ends the array — after the index, pointer-aligned. Only an
     // image with a runner has one; every other image is byte-identical.
-    std::uint64_t const tlsCallbacksOffset = alignUp(tlsIndexOffset + 4, 8);
+    std::uint64_t const tlsCallbacksOffset = alignUp(tlsIndexOffset + 4, kPe32PlusAddressBytes);
     std::uint64_t const tlsFileSize =
         residueRunner.has_value() ? tlsCallbacksOffset + 2 * kThunkSize
                                   : tlsIndexOffset + 4;     // + 4-byte index
@@ -7349,6 +7366,45 @@ encodeExec(AssembledModule const&    module,
         sectionHeaders.push_back(hIData);
         idata = iLayout;
     }
+    // .rsrc (P69 fold 3f, D-LK-PE-IMAGE-CANNOT-HONOUR-EVERY-LINKER-DIRECTIVE item
+    // (2)): the manifest the image embeds for the side-by-side assemblies its
+    // units depend on (`/MANIFESTDEPENDENCY:`, decided as a link-wide set) -- one
+    // RT_MANIFEST resource whose coordinates and text are the document's
+    // (`pe.embeddedManifest`), placed after .idata and before .reloc, as link.exe
+    // places it (✔MEASURED 2026-11-17). An image whose units state none carries
+    // none, as neither reference embeds one by default.
+    std::vector<std::uint8_t> rsrcBytes;
+    std::optional<DataSectionLayout> rsrc;
+    if (!request.directives.manifestDependencies.empty()) {
+        auto const& manifest = fmt.pe().embeddedManifest;
+        if (!manifest.has_value()) {
+            std::string named;
+            for (auto const& identity : request.directives.manifestDependencies) {
+                named += (named.empty() ? "'" : ", '") + identity + "'";
+            }
+            emit(reporter, DiagnosticCode::K_LinkerDirectiveUnhonourable,
+                 std::format("pe::encodeExec: the linked objects depend on the side-by-side assemblies {}, and "
+                             "format '{}' declares no 'pe.embeddedManifest' to embed the manifest that names them",
+                             named, fmt.name()));
+            return {};
+        }
+        std::uint32_t const prevVaEnd =
+            idata.has_value() ? idata->rva + idata->virtualSize : dataChainRva;
+        std::uint32_t const rsrcRva = static_cast<std::uint32_t>(alignUp(prevVaEnd, sectionAlign));
+        rsrcBytes = encodeEmbeddedManifestSection(*manifest, request.directives.manifestDependencies, rsrcRva);
+        PeSectionHeader hRsrc{};
+        hRsrc.name            = encodeSectionName(manifest->section, 0);
+        hRsrc.virtualSize     = static_cast<std::uint32_t>(rsrcBytes.size());
+        hRsrc.virtualAddress  = rsrcRva;
+        hRsrc.characteristics = manifest->characteristics;
+        // sizeOfRawData / pointerToRawData filled below.
+        DataSectionLayout sLayout;
+        sLayout.rva         = rsrcRva;
+        sLayout.virtualSize = static_cast<std::uint32_t>(alignUp(rsrcBytes.size(), sectionAlign));
+        sLayout.headerIndex = sectionHeaders.size();
+        sectionHeaders.push_back(hRsrc);
+        rsrc = sLayout;
+    }
     // .reloc section header (when the image carries absolute fixups — cross-CU thunk
     // slots). Placed in VA space after .idata (or .rdata, or .text). Characteristics =
     // IMAGE_SCN_CNT_INITIALIZED_DATA (0x40) | IMAGE_SCN_MEM_DISCARDABLE (0x02000000) |
@@ -7357,12 +7413,14 @@ encodeExec(AssembledModule const&    module,
     constexpr std::uint32_t kRelocCharacteristics = 0x42000040u;
     std::optional<DataSectionLayout> reloc;
     if (hasBaseRelocs) {
-        // `.reloc` follows everything: .idata end when present, else the end of
-        // the data-section chain (`dataChainRva` was advanced past .rdata/.data/
-        // .bss; it equals text-end when no data sections exist).
+        // `.reloc` follows everything: .rsrc end when present, else .idata end,
+        // else the end of the data-section chain (`dataChainRva` was advanced
+        // past .rdata/.data/.bss; it equals text-end when no data sections
+        // exist).
         std::uint32_t const prevVaEnd =
-            idata.has_value() ? idata->rva + idata->virtualSize
-                              : dataChainRva;
+            rsrc.has_value()    ? rsrc->rva + rsrc->virtualSize
+            : idata.has_value() ? idata->rva + idata->virtualSize
+                                : dataChainRva;
         std::uint32_t const relocRva =
             static_cast<std::uint32_t>(alignUp(prevVaEnd, sectionAlign));
         PeSectionHeader hReloc{};
@@ -7493,6 +7551,16 @@ encodeExec(AssembledModule const&    module,
         sectionHeaders[idata->headerIndex].pointerToRawData = idata->rawPointer;
         nextRawPointer += idata->rawSize;
     }
+    // .rsrc (P69 fold 3f): file-backed, after .idata and before .reloc (its
+    // section-header and VA-chain order).
+    if (rsrc.has_value()) {
+        rsrc->rawSize = static_cast<std::uint32_t>(
+            alignUp(rsrcBytes.size(), fileAlign));
+        rsrc->rawPointer = nextRawPointer;
+        sectionHeaders[rsrc->headerIndex].sizeOfRawData = rsrc->rawSize;
+        sectionHeaders[rsrc->headerIndex].pointerToRawData = rsrc->rawPointer;
+        nextRawPointer += rsrc->rawSize;
+    }
     // .reloc raw size + file pointer: file-aligned, immediately after the last
     // prior file-backed section.
     if (reloc.has_value()) {
@@ -7537,6 +7605,9 @@ encodeExec(AssembledModule const&    module,
     }
     if (idata.has_value()) {
         lastSectionVaEnd = idata->rva + idata->virtualSize;
+    }
+    if (rsrc.has_value()) {   // P69 fold 3f — .rsrc RVA is after .idata
+        lastSectionVaEnd = rsrc->rva + rsrc->virtualSize;
     }
     if (reloc.has_value()) {
         lastSectionVaEnd = reloc->rva + reloc->virtualSize;
@@ -7609,6 +7680,7 @@ encodeExec(AssembledModule const&    module,
         + (tls.has_value() ? tls->rawSize : 0u)   // TLS C3 — CNT_INITIALIZED_DATA
         + (edata.has_value() ? edata->rawSize : 0u)  // c152 — dll exports
         + (idata.has_value() ? idata->rawSize : 0u)
+        + (rsrc.has_value() ? rsrc->rawSize : 0u)   // P69 fold 3f — the embedded manifest
         + (reloc.has_value() ? reloc->rawSize : 0u);
     std::uint32_t const sizeOfUninitializedData =
         bss.has_value()
@@ -7733,6 +7805,11 @@ encodeExec(AssembledModule const&    module,
             static_cast<std::uint64_t>(idata->rawPointer)
             + idata->rawSize;
     }
+    if (rsrc.has_value()) {   // P69 fold 3f — .rsrc is file-backed, pre-.reloc
+        sectionsEndFileOff =
+            static_cast<std::uint64_t>(rsrc->rawPointer)
+            + rsrc->rawSize;
+    }
     if (reloc.has_value()) {
         sectionsEndFileOff =
             static_cast<std::uint64_t>(reloc->rawPointer)
@@ -7795,6 +7872,12 @@ encodeExec(AssembledModule const&    module,
     std::uint32_t const exportDirSize =
         edata.has_value() ? static_cast<std::uint32_t>(edataBytes.size())
                           : 0u;
+    // IMAGE_DIRECTORY_ENTRY_RESOURCE (index 2, P69 fold 3f): RVA + byte size of
+    // the resource tree and its data -- the whole `.rsrc` section, as link.exe
+    // and lld-link state it (✔MEASURED 2026-11-17: 0x2E0 for a 734-byte span).
+    std::uint32_t const resourceDirRva = rsrc.has_value() ? rsrc->rva : 0u;
+    std::uint32_t const resourceDirSize =
+        rsrc.has_value() ? static_cast<std::uint32_t>(rsrcBytes.size()) : 0u;
     for (std::size_t i = 0; i < kNumberOfRvaAndSizes; ++i) {
         if (i == 0u) {
             appendU32LE(bytes, exportDirRva);
@@ -7802,6 +7885,9 @@ encodeExec(AssembledModule const&    module,
         } else if (i == 1u) {
             appendU32LE(bytes, importDirRva);
             appendU32LE(bytes, importDirSize);
+        } else if (i == 2u) {
+            appendU32LE(bytes, resourceDirRva);
+            appendU32LE(bytes, resourceDirSize);
         } else if (i == 3u) {
             appendU32LE(bytes, pdataDirRva);
             appendU32LE(bytes, pdataDirSize);
@@ -8006,6 +8092,16 @@ encodeExec(AssembledModule const&    module,
         while (bytes.size()
                 < static_cast<std::size_t>(idata->rawPointer)
                     + idata->rawSize) {
+            bytes.push_back(0);
+        }
+    }
+
+    // .rsrc body (P69 fold 3f): the resource tree and the manifest's text, laid
+    // out at its RVA above; padded to fileAlignment.
+    if (rsrc.has_value()) {
+        bytes.insert(bytes.end(), rsrcBytes.begin(), rsrcBytes.end());
+        while (bytes.size()
+                < static_cast<std::size_t>(rsrc->rawPointer) + rsrc->rawSize) {
             bytes.push_back(0);
         }
     }

@@ -52,6 +52,7 @@ namespace {
     TypeId const params[] = {i32p, i32, i32};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.stateArgCounting(MirArgCounting::PerClass);
     // This hand-built module is its own table: nothing beside it names an id it
     // does not define (the under-aligned arms mint the runtime entry's import).
@@ -244,6 +245,7 @@ constexpr std::uint32_t kGuardedPersonalityV = 500;
     TypeId const params[] = {i32p, i32, i32};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
     mb.stateArgCounting(MirArgCounting::PerClass);
     mb.stateSelfContainedSymbolIds();   // its own table, as `buildCasFnMir`'s
     mb.addFunction(fnSig, SymbolId{100});

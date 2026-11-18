@@ -1,0 +1,1 @@
+        return "\"" + name + std::string(name.size() - kept, '\\') + "\"";

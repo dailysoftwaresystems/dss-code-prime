@@ -278,9 +278,28 @@ constexpr std::uint8_t kEntryBody[] = {0xB8, 0x0D, 0x00, 0x00, 0x00, 0xC3};   //
     return m;
 }
 
-// The requests a directive text states, as the reader hands them to its unit.
-[[nodiscard]] UnitLinkerRequests requestsOf(std::string_view text) {
-    auto const parsed = pe::parseCoffLinkerDirectives(text, vocabulary());
+// The shipped vocabulary with ONE runtime startup no DSS image provides: the shipped one lists none since its GUI
+// startups joined `runtimeStartups` (P69 fold 3f), and the rule a format's `unsupportedStartups` states -- an entry
+// request like any other, refused only where it stands -- stays pinned for the next startup a format lists there.
+constexpr char const* kUnprovidedStartup = " /ENTRY:DssUnprovidedCRTStartup";
+[[nodiscard]] PeLinkerDirectives const& unprovidedStartupVocabulary() {
+    static PeLinkerDirectives const listing = [] {
+        PeLinkerDirectives v = vocabulary();
+        for (auto& row : v.directives) {
+            if (row.meaning != LinkerDirectiveMeaning::EntryPoint) continue;
+            row.unsupportedStartups.push_back(PeDirectiveNamedValue{
+                "DssUnprovidedCRTStartup", 0, "a startup the test lists, which calls `DssUnprovidedMain(`"});
+        }
+        return v;
+    }();
+    return listing;
+}
+
+// The requests a directive text states, as the reader hands them to its unit -- read with the shipped vocabulary,
+// or the one a cell names.
+[[nodiscard]] UnitLinkerRequests requestsOf(std::string_view text,
+                                            PeLinkerDirectives const& under = vocabulary()) {
+    auto const parsed = pe::parseCoffLinkerDirectives(text, under);
     EXPECT_TRUE(parsed.has_value()) << (parsed.has_value() ? std::string{} : parsed.error());
     UnitLinkerRequests r;
     if (!parsed.has_value()) return r;
@@ -387,24 +406,25 @@ TEST(CoffDirectiveImageRequests, WhatLinkExeReplacesWithItsDefaultIsWarnedAndRep
     EXPECT_EQ(r->handOn.size(), 3u) << "all three are handed on as written";
 }
 
-// What a DSS IMAGE cannot carry is a request the image link refuses — `/MERGE:`, `/MANIFESTDEPENDENCY:`, a runtime
-// startup DSS provides no counterpart of, a subsystem no DSS image starts under, an ordinal, NONAME or forwarder
-// export — and the parse reads on, so a relocatable artifact can hand each on to a final linker that can.
+// What a DSS IMAGE cannot carry is a request the image link refuses — `/MERGE:`, a runtime startup DSS provides no
+// counterpart of, a subsystem no DSS image starts under, an ordinal, NONAME or forwarder export — and the parse reads
+// on, so a relocatable artifact can hand each on to a final linker that can. (`/MANIFESTDEPENDENCY:` left this list in
+// P69 fold 3f: the image embeds the manifest, tests/link/test_manifest_dependency.cpp.)
 TEST(CoffDirectiveImageRequests, WhatADssImageCannotCarryIsARequestTheImageLinkRefuses) {
     auto const r = pe::parseCoffLinkerDirectives(
-        " /MERGE:.rdata=.text \"/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls'\""
-        " /ENTRY:WinMainCRTStartup /SUBSYSTEM:NATIVE /EXPORT:f,@3 /EXPORT:g,@4,NONAME /EXPORT:h=otherdll.h",
-        vocabulary());
+        " /MERGE:.rdata=.text"
+        " /ENTRY:DssUnprovidedCRTStartup /SUBSYSTEM:NATIVE /EXPORT:f,@3 /EXPORT:g,@4,NONAME /EXPORT:h=otherdll.h",
+        unprovidedStartupVocabulary());
     ASSERT_TRUE(r.has_value()) << r.error();
-    ASSERT_EQ(r->image.size(), 7u);
+    ASSERT_EQ(r->image.size(), 6u);
     // A runtime startup or a subsystem no DSS image provides is still an ENTRY or a SUBSYSTEM request (send-back 5,
     // review-xa4 NIT 7): settled by the option's precedence like any other, refused where it would stand. The rest
     // are requests no DSS image can carry at all.
     std::vector<std::string> reasons;
     for (auto const& req : r->image) {
         if (auto const* entry = std::get_if<UnitEntryRequest>(&req.value)) {
-            EXPECT_EQ(req.spelled, "/ENTRY:WinMainCRTStartup");
-            EXPECT_EQ(entry->symbol, "WinMainCRTStartup");
+            EXPECT_EQ(req.spelled, "/ENTRY:DssUnprovidedCRTStartup");
+            EXPECT_EQ(entry->symbol, "DssUnprovidedCRTStartup");
             EXPECT_FALSE(entry->runtimeStartup);
             reasons.push_back(entry->unsupported);
         } else if (auto const* subsystem = std::get_if<UnitSubsystemRequest>(&req.value)) {
@@ -418,14 +438,13 @@ TEST(CoffDirectiveImageRequests, WhatADssImageCannotCarryIsARequestTheImageLinkR
     }
     EXPECT_NE(reasons[0].find("changes what a program MEANS"), std::string::npos) << reasons[0];
     EXPECT_NE(reasons[0].find("D-LK-PE-IMAGE-CANNOT-HONOUR-EVERY-LINKER-DIRECTIVE"), std::string::npos);
-    EXPECT_NE(reasons[1].find("manifest"), std::string::npos) << reasons[1];
-    EXPECT_NE(reasons[2].find("calls `WinMain("), std::string::npos) << reasons[2];
-    EXPECT_NE(reasons[3].find("NtProcessStartup"), std::string::npos) << reasons[3];
-    EXPECT_NE(reasons[4].find("ORDINAL or NONAME ('@3')"), std::string::npos) << reasons[4];
-    EXPECT_NE(reasons[5].find("ORDINAL or NONAME"), std::string::npos) << reasons[5];
-    EXPECT_NE(reasons[6].find("FORWARDER"), std::string::npos) << reasons[6];
+    EXPECT_NE(reasons[1].find("calls `DssUnprovidedMain("), std::string::npos) << reasons[1];
+    EXPECT_NE(reasons[2].find("NtProcessStartup"), std::string::npos) << reasons[2];
+    EXPECT_NE(reasons[3].find("ORDINAL or NONAME ('@3')"), std::string::npos) << reasons[3];
+    EXPECT_NE(reasons[4].find("ORDINAL or NONAME"), std::string::npos) << reasons[4];
+    EXPECT_NE(reasons[5].find("FORWARDER"), std::string::npos) << reasons[5];
     EXPECT_TRUE(r->exports.empty()) << "an export the image cannot carry is no export of it";
-    EXPECT_EQ(r->handOn.size(), 7u);
+    EXPECT_EQ(r->handOn.size(), 6u);
 }
 
 // `/SECTION:name,attributes` read as link.exe reads the letters (✔MEASURED 2026-10-07, link.exe 14.44, 28 arms):
@@ -1117,11 +1136,12 @@ TEST(CoffDirectiveImageRequests, TheDecisionReadsEachRequestsSharedLibraryAnswer
 // pulls loses it with the warning, a later one loses to the first — and it is refused only where it would stand. The
 // same holds for a subsystem no DSS image starts under: one a later `/SUBSYSTEM:` replaces links, as link.exe's does.
 TEST(CoffDirectiveImageRequests, AnUnsupportedStartupOrSubsystemIsRefusedOnlyWhereItStands) {
-    UnitLinkerRequests pulled = statedBy(requestsOf(" /ENTRY:WinMainCRTStartup"), "lib.a(gui.obj)");
+    UnitLinkerRequests pulled = statedBy(requestsOf(kUnprovidedStartup, unprovidedStartupVocabulary()), "lib.a(gui.obj)");
     linker::dropPulledMemberEntryRequests(pulled);
     EXPECT_TRUE(pulled.image.empty()) << "a pulled member names no entry, whatever it names";
     ASSERT_EQ(pulled.warnings.size(), 1u);
-    EXPECT_NE(pulled.warnings[0].find("'lib.a(gui.obj)': the directive '/ENTRY:WinMainCRTStartup' names the image's "
+    EXPECT_NE(pulled.warnings[0].find("'lib.a(gui.obj)': the directive '/ENTRY:DssUnprovidedCRTStartup' names the "
+                                      "image's "
                                       "entry, and the archive search pulled that member"),
               std::string::npos)
         << pulled.warnings[0];
@@ -1133,17 +1153,18 @@ TEST(CoffDirectiveImageRequests, AnUnsupportedStartupOrSubsystemIsRefusedOnlyWhe
     }
     {   // Named to the link, it stands: refused by name with the row's reason.
         auto const l =
-            linkExe({programUnit(), requestingUnit(2, statedBy(requestsOf(" /ENTRY:WinMainCRTStartup"), "gui.obj"))});
+            linkExe({programUnit(), requestingUnit(2, statedBy(requestsOf(kUnprovidedStartup, unprovidedStartupVocabulary()), "gui.obj"))});
         EXPECT_TRUE(l->image.bytes.empty());
         EXPECT_EQ(countCode(l->rep, DiagnosticCode::K_LinkerDirectiveUnhonourable), 1u) << diagnosticsOf(l->rep);
-        EXPECT_TRUE(sawText(l->rep, "'gui.obj': the directive '/ENTRY:WinMainCRTStartup' cannot be honoured by this "
+        EXPECT_TRUE(sawText(l->rep, "'gui.obj': the directive '/ENTRY:DssUnprovidedCRTStartup' cannot be honoured by "
+                                    "this "
                                     "image"))
             << diagnosticsOf(l->rep);
-        EXPECT_TRUE(sawText(l->rep, "calls `WinMain(")) << diagnosticsOf(l->rep);
+        EXPECT_TRUE(sawText(l->rep, "calls `DssUnprovidedMain(")) << diagnosticsOf(l->rep);
     }
     {   // After another unit's entry it loses to the first, as link.exe keeps the first: warned, and the image links.
         auto const l = linkExe({programUnit(), requestingUnit(2, requestsOf(" /ENTRY:dss_entry")),
-                                extraUnit(3, requestsOf(" /ENTRY:WinMainCRTStartup"))});
+                                extraUnit(3, requestsOf(kUnprovidedStartup, unprovidedStartupVocabulary()))});
         ASSERT_TRUE(l->pe.has_value()) << diagnosticsOf(l->rep);
         EXPECT_EQ(l->pe->bytesAt(l->pe->entry(), 6),
                   (std::vector<std::uint8_t>{std::begin(kEntryBody), std::end(kEntryBody)}));

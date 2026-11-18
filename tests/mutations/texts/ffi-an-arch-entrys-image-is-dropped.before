@@ -1,0 +1,1 @@
+            if (!role.empty()) images.emplace_back(fmt, role);

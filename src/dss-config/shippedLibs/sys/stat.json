@@ -8,6 +8,7 @@
   "includes": [
     { "header": "io.h", "when": { "format": "pe" } }
   ],
+  "$writtenNameRouteComment": "P69 fold 3f (lane xa; ledger 549 (b)): `chmod` and `mkdir` state the linker alias on pe -- oldnames.lib and mingw-w64's import library alias the written plain name to the underscored UCRT export (MEASURED; io.json's `$writtenNameRouteComment` holds the measurement).",
   "symbols": [
     { "name": "fstat", "signature": "fn(i32, ptr<stat>) -> i32",      "kind": "function", "linkage": "external" , "availableObjectFormats": ["elf", "macho"], "linkName": { "variants": [ { "when": { "format": "macho", "arch": "x86_64" }, "value": "fstat$INODE64" } ] } },
     { "name": "lstat", "signature": "fn(ptr<char>, ptr<stat>) -> i32", "kind": "function", "linkage": "external" , "availableObjectFormats": ["elf", "macho"], "linkName": { "variants": [ { "when": { "format": "macho", "arch": "x86_64" }, "value": "lstat$INODE64" } ] } },
@@ -20,8 +21,8 @@
     { "name": "_fstat64", "signature": "fn(i32, ptr<_stat64>) -> i32", "kind": "function", "linkage": "external", "availableObjectFormats": ["pe"] },
     { "name": "fstat", "signature": "fn(i32, ptr<stat>) -> i32", "kind": "function", "linkage": "external", "availableObjectFormats": ["pe"], "linkName": "_fstat64i32" },
     { "name": "stat",  "signature": "fn(ptr<char>, ptr<stat>) -> i32", "kind": "function", "linkage": "external", "availableObjectFormats": ["pe"], "linkName": "_stat64i32" },
-    { "name": "chmod", "signature": "fn(ptr<char>, i32) -> i32",       "kind": "function", "linkage": "external", "availableObjectFormats": ["pe"], "linkName": "_chmod"     },
-    { "name": "mkdir", "signature": "fn(ptr<char>) -> i32",            "kind": "function", "linkage": "external", "availableObjectFormats": ["pe"], "linkName": "_mkdir"     },
+    { "name": "chmod", "signature": "fn(ptr<char>, i32) -> i32",       "kind": "function", "linkage": "external", "availableObjectFormats": ["pe"], "linkName": "_chmod", "writtenNameRoute": { "pe": "linkerAlias" } },
+    { "name": "mkdir", "signature": "fn(ptr<char>) -> i32",            "kind": "function", "linkage": "external", "availableObjectFormats": ["pe"], "linkName": "_mkdir", "writtenNameRoute": { "pe": "linkerAlias" } },
     { "name": "_wstat64",   "signature": "fn(ptr<u16>, ptr<_stat64>) -> i32",  "kind": "function", "linkage": "external", "availableObjectFormats": ["pe"] },
     { "name": "_stat64i32", "signature": "fn(ptr<char>, ptr<_stat>) -> i32", "kind": "function", "linkage": "external", "availableObjectFormats": ["pe"] }
   ],

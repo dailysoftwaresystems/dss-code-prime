@@ -841,6 +841,11 @@ TEST(DriverArgumentSupply, SingleCuRouteSuppliesTheFormatsBitFieldStrategy) { su
 // (correct) → `EF BE AD DE | <8-byte pointer overwriting the 4-byte slot AND
 // the tag>`, i.e. the 8-byte absolute relocation was written into a 4-byte
 // pointer slot and ate the following field.
+//
+// ✔MEASURED 2026-11-16 (P69 fold 3f, the mutation arm's sweep, macos-arm64-debug): the same mutant on the
+// sole-CU route now FAILS THE BUILD -- the 4-byte slot takes an abs32 relocation of an address above
+// 4 GiB, which the pe64 writer refuses (K_RelocationKindMismatch) -- so the reading above is history and
+// this pin reds at its build assertion.
 namespace {
 void suppliesTheFormatsDataModel(Route const route) {
     SCOPED_TRACE(routeName(route));
@@ -860,8 +865,10 @@ void suppliesTheFormatsDataModel(Route const route) {
                   "int main(void) { return dm_read_tag() + 41; }\n",
                   kPeExecSpec, out, rep),
               0)
-        << "the pe64 pointer-global build must succeed; a red here means "
-           "the FIXTURE is broken, not the pin\n"
+        << "the pe64 pointer-global build must succeed. A red here is a broken "
+           "fixture OR a data model whose pointer is not the format's: a 4-byte "
+           "pointer slot takes an abs32 relocation of an address above 4 GiB, "
+           "which the pe64 writer refuses\n"
         << allDiagnosticText(rep);
 
     auto const img = readAllBytes(out / "datamodel_a.exe");
@@ -882,8 +889,9 @@ void suppliesTheFormatsDataModel(Route const route) {
         << "`tag` must sit 16 bytes after `head`: 4 bytes of `head`, 4 of "
            "alignment padding, and an EIGHT-byte pointer. Anything else means "
            "the route handed the globals layout a data model whose "
-           "pointer width is not the format's — and the artifact still builds, "
-           "still runs, and answers wrong. Window from `head`: "
+           "pointer width is not the format's — and where every relocation fits "
+           "the narrower slot, the artifact still builds, still runs, and answers "
+           "wrong. Window from `head`: "
         << hexWindow(img, hits[0], 24);
 }
 } // namespace
@@ -1109,13 +1117,17 @@ void suppliesTheFormatsDataImportBinding(Route const route) {
 TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheFormatsDataImportBinding) { suppliesTheFormatsDataImportBinding(Route::MergedUnits); }
 TEST(DriverArgumentSupply, SingleCuRouteSuppliesTheFormatsDataImportBinding) { suppliesTheFormatsDataImportBinding(Route::SoleUnit); }
 
-// ★ THE TWIN WHERE THE BINDING IS THE ONLY ROUTE (P69 fold 3e, lane `xa`). On pe64 the `indirect-slot` dispatch puts
-// EVERY extern import in a slot whatever `dataImportBinding` says (READ, mir_to_lir.cpp's P54 arm), so the pe64 image
-// above cannot tell a dropped binding: ✔MEASURED, the sole-CU route's mutant SURVIVED checkpoint 39's
-// windows-x86_64-debug sweep. A Mach-O executable reaches a call through a stub, never through a data slot, so its
-// `got-indirect` binding is the one road to an extern DATUM's value: `stdout` (`__stdoutp` on Mach-O) read through its
-// `__got` slot is the C library's FILE, whose descriptor `fileno` reports as 1. One indirection short, the program
-// holds the SLOT's address instead, and `fileno` of that is not the standard output's.
+// ★ THE MACH-O TWIN (P69 fold 3e, lane `xa`). On pe64 the `indirect-slot` dispatch puts EVERY extern import in a slot
+// whatever `dataImportBinding` says (READ, mir_to_lir.cpp's P54 arm), so the pe64 image above cannot tell a dropped
+// binding: ✔MEASURED, the sole-CU route's mutant SURVIVED checkpoint 39's windows-x86_64-debug sweep. `stdout`
+// (`__stdoutp` on Mach-O) read through its `__got` slot is the C library's FILE, whose descriptor `fileno` reports as
+// 1; one indirection short, the program would hold the SLOT's address instead. Fold 3e took this binding for the one
+// road to an extern DATUM's value on Mach-O. It is not: every Mach-O exec and dylib document also states
+// `externAddrBinding: "got"`, which reaches an extern address through its slot whatever `dataImportBinding` says
+// (READ, the documents), and ✔MEASURED, the same mutant SURVIVED checkpoint 44's macos-arm64-debug sweep here too.
+// These cases still pin that a Mach-O image reads its extern datum right on each route; the cell where the binding IS
+// the only road -- an ELF image, whose documents state no `externAddrBinding` -- is
+// program/test_extern_data_binding_run.cpp's (P69 fold 3f).
 namespace {
 constexpr std::string_view kMachoArm64ExecSpec = "arm64:macho64-arm64-darwin-exec";
 

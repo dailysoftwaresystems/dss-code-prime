@@ -239,13 +239,13 @@ struct Image {
 }
 
 // The checks, one image at a time.
-void expectHandlersStated(Image const& img, TargetSchema const& target) {
+void expectHandlersStated(Image const& img, TargetSchema const& target, ObjectFormatSchema const& format) {
     auto const b = std::span<std::uint8_t const>{img.bytes};
     ASSERT_LE(img.ehOff + img.ehSize, img.bytes.size());
     DiagnosticReporter rep;
     auto const         decoded = link::format::decodeEhFrame(
         b.subspan(static_cast<std::size_t>(img.ehOff), static_cast<std::size_t>(img.ehSize)),
-        link::format::dwarfRegisterMappingOf(target), "the test's read", rep);
+        link::format::dwarfRegisterMappingOf(target), format.dataModel(), "the test's read", rep);
     ASSERT_TRUE(decoded.has_value()) << "the image's .eh_frame does not decode:" << diagnosticsOf(rep);
     ASSERT_EQ(decoded->fdes.size(), 4u) << "one FDE per function";
     auto const& fdes  = decoded->fdes;
@@ -308,7 +308,7 @@ TEST(EhFrameHandlerWriters, TheDynamicElfImageStatesEachHandler) {
     ASSERT_FALSE(bytes.empty()) << diagnosticsOf(rep);
     auto const img = readElf(std::move(bytes));
     ASSERT_TRUE(img.has_value());
-    expectHandlersStated(*img, *t);
+    expectHandlersStated(*img, *t, *f);
 }
 
 // The dynamic Mach-O image states every handler the same way, in `__eh_frame`.
@@ -324,7 +324,7 @@ TEST(EhFrameHandlerWriters, TheDynamicMachOImageStatesEachHandler) {
     ASSERT_FALSE(bytes.empty()) << diagnosticsOf(rep);
     auto const img = readMachO(std::move(bytes));
     ASSERT_TRUE(img.has_value());
-    expectHandlersStated(*img, *t);
+    expectHandlersStated(*img, *t, *f);
 }
 
 // A REFERENCE object's handler reaches the image: gcc -fPIC's `run` and its cold part, read by the ELF reader (the
@@ -405,7 +405,7 @@ TEST(EhFrameHandlerWriters, AReferenceObjectsHandlerReachesTheImage) {
     auto const b       = std::span<std::uint8_t const>{img->bytes};
     auto const decoded = link::format::decodeEhFrame(
         b.subspan(static_cast<std::size_t>(img->ehOff), static_cast<std::size_t>(img->ehSize)),
-        link::format::dwarfRegisterMappingOf(*t), "the test's read", rep);
+        link::format::dwarfRegisterMappingOf(*t), dyn->dataModel(), "the test's read", rep);
     ASSERT_TRUE(decoded.has_value()) << diagnosticsOf(rep);
     std::vector<std::uint64_t> areas;
     for (auto const& fde : decoded->fdes) {

@@ -1,0 +1,3 @@
+    for (auto const* section : substrate::entriesInKeyOrder(defsBySection)) {
+        std::uint8_t const ordinal = section->first;
+        std::vector<DefSym> const& defs = section->second;

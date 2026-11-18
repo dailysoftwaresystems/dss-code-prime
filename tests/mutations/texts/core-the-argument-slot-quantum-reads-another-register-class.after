@@ -1,0 +1,1 @@
+        if (info.regClass == TargetRegClass::FPR && info.widthBytes > widest) widest = info.widthBytes;

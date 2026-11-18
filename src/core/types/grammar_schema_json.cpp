@@ -4,6 +4,7 @@
 #include "core/substrate/checked_file_read.hpp"   // the ONE checked whole-file read
 #include "core/substrate/diagnostic_collector.hpp"
 #include "core/substrate/fixpoint_passes.hpp"       // a monotone fixpoint's bound is its lattice (P69 L2)
+#include "core/substrate/key_order.hpp"             // entriesInKeyOrder -- the suffix claims' refusal order
 #include "core/substrate/mint_monotonic_id.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/operator_table.hpp"
@@ -3499,13 +3500,14 @@ void checkReferencedDocumentBlocks(json const& refDoc,
                                    std::string_view hostLabel,
                                    Collector& coll) {
     for (auto it = refDoc.begin(); it != refDoc.end(); ++it) {
-        if (isDocumentationKey(it.key())) continue;
-        if (std::ranges::find(kReferencedDocumentKeys, it.key())
+        std::string const blockKey = it.key();   // named once: every test and report reads it
+        if (isDocumentationKey(blockKey)) continue;
+        if (std::ranges::find(kReferencedDocumentKeys, blockKey)
             != kReferencedDocumentKeys.end()) continue;
-        if (std::ranges::find(kStandaloneOnlyDocumentKeys, it.key())
+        if (std::ranges::find(kStandaloneOnlyDocumentKeys, blockKey)
             != kStandaloneOnlyDocumentKeys.end()) continue;   // deliberate
-        if (it.key() == "languageReferences") continue;   // its own refusal
-        if (std::ranges::find(kDocumentKeys, it.key()) == kDocumentKeys.end()) {
+        if (blockKey == "languageReferences") continue;   // its own refusal
+        if (std::ranges::find(kDocumentKeys, blockKey) == kDocumentKeys.end()) {
             continue;                                     // already a typo
         }
         // ★★ THE SENTENCE IS A PROJECTION OF THE TWO TABLES THIS LOOP WALKS,
@@ -3530,7 +3532,7 @@ void checkReferencedDocumentBlocks(json const& refDoc,
         // standalone surface and is NEVER merged. A union would advertise the
         // right set of keys while erasing why each one is allowed.
         coll.emit(DiagnosticCode::C_ConflictingField,
-                  std::format("{}/{}", docLabel, it.key()),
+                  std::format("{}/{}", docLabel, blockKey),
                   std::format("referenced document '{}' declares a '{}' block, "
                               "which the merge into '{}' does NOT consume — it "
                               "would load clean and then be SILENTLY DISCARDED, "
@@ -3541,10 +3543,10 @@ void checkReferencedDocumentBlocks(json const& refDoc,
                               "deliberately leaves alone ({}). "
                               "Either teach mergeLanguageReferences to consume "
                               "'{}', or declare it in '{}' instead",
-                              docLabel, it.key(), hostLabel, hostLabel, docLabel,
+                              docLabel, blockKey, hostLabel, hostLabel, docLabel,
                               renderAllowedList(kReferencedDocumentKeys),
                               renderAllowedList(kStandaloneOnlyDocumentKeys),
-                              it.key(), hostLabel));
+                              blockKey, hostLabel));
     }
 }
 
@@ -8608,7 +8610,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     // `kEffectVerbs` precedent, which was written after exactly
                     // that drift was MEASURED in the attribute loader).
                     static constexpr std::array<
-                        std::pair<std::string_view, PragmaEffect>, 9>
+                        std::pair<std::string_view, PragmaEffect>, 10>
                         kPragmaVerbs{{
                             {"diagnosticsOnly", PragmaEffect::DiagnosticsOnly},
                             {"annotationOnly",  PragmaEffect::AnnotationOnly},
@@ -8630,10 +8632,20 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             {"standardFloatState",
                              PragmaEffect::StandardFloatState},
                             {"standardFloatStateDiverges",
-                             PragmaEffect::StandardFloatStateDiverges}}};
+                             PragmaEffect::StandardFloatStateDiverges},
+                            // P69 fold 3f: a request to the program's link, by
+                            // kind (`kinds`, required on this verb alone).
+                            {"linkerComment", PragmaEffect::LinkerComment}}};
                     DSS_CHECK_KEY_VOCABULARY(kPragmaVerbs);
-                    static constexpr std::array<std::string_view, 2>
-                        kPragmaRowKeys{"prefix", "effect"};
+                    static constexpr std::array<
+                        std::pair<std::string_view, PragmaCommentRequest>, 3>
+                        kCommentRequests{{
+                            {"dependentLibrary", PragmaCommentRequest::DependentLibrary},
+                            {"linkerDirective",  PragmaCommentRequest::LinkerDirective},
+                            {"nothing",          PragmaCommentRequest::Nothing}}};
+                    DSS_CHECK_KEY_VOCABULARY(kCommentRequests);
+                    static constexpr std::array<std::string_view, 3>
+                        kPragmaRowKeys{"prefix", "effect", "kinds"};
                     DSS_CHECK_KEY_VOCABULARY(kPragmaRowKeys);
 
                     // Every prefix seen so far (joined by ' ') → the verb it was
@@ -8713,6 +8725,41 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             continue;
                         }
                         out.effect = arm->second;
+                        // `kinds` (P69 fold 3f): required on a `linkerComment` row --
+                        // the kinds it reads and each one's request -- and refused on
+                        // any other, where it would read as configured and never fire.
+                        bool const linkerComment = out.effect == PragmaEffect::LinkerComment;
+                        if (row.contains("kinds") != linkerComment) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess, rowPath + "/kinds",
+                                      linkerComment
+                                          ? "a 'linkerComment' row states the kinds it reads "
+                                            "('kinds': {kind: request})"
+                                          : "'kinds' is read on a 'linkerComment' row alone");
+                            continue;
+                        }
+                        if (linkerComment) {
+                            json const& kinds = row.at("kinds");
+                            bool badKind = !kinds.is_object() || kinds.empty();
+                            if (!badKind) {
+                                for (auto const& [name, request] : kinds.items()) {
+                                    auto const req = std::ranges::find(
+                                        kCommentRequests,
+                                        request.is_string() ? request.get<std::string>() : std::string{},
+                                        &std::pair<std::string_view, PragmaCommentRequest>::first);
+                                    if (name.empty() || req == kCommentRequests.end()) {
+                                        badKind = true;
+                                        break;
+                                    }
+                                    out.commentKinds.push_back(PragmaCommentKind{name, req->second});
+                                }
+                            }
+                            if (badKind) {
+                                coll.emit(DiagnosticCode::C_InvalidPreprocess, rowPath + "/kinds",
+                                          "'kinds' must map each non-empty kind name to one of "
+                                          "dependentLibrary | linkerDirective | nothing");
+                                continue;
+                            }
+                        }
                         std::string key;
                         for (auto const& w : out.prefix) {
                             if (!key.empty()) key += ' ';
@@ -13729,7 +13776,11 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             data.numberStyle.has_value()
                                 ? &data.numberStyle->integerSuffixes
                                 : nullptr;
-                        for (auto const& [sfx, count] : claims) {
+                        // ★ IN ASCENDING SUFFIX ORDER (P69 fold 3f, lane `xa`): every
+                        // refusal below is reported, so the walk is the suffixes' own
+                        // order (`substrate::entriesInKeyOrder`), never the table's.
+                        for (auto const* integerClaim : substrate::entriesInKeyOrder(claims)) {
+                            auto const& [sfx, count] = *integerClaim;
                             if (count > 1) {
                                 coll.emit(DiagnosticCode::C_InvalidSemantics,
                                           "/semantics/integerLiteralTyping",
@@ -13896,7 +13947,11 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             data.numberStyle.has_value()
                                 ? &data.numberStyle->floatSuffixes
                                 : nullptr;
-                        for (auto const& [sfx, count] : claims) {
+                        // ★ IN ASCENDING SUFFIX ORDER (P69 fold 3f, lane `xa`): every
+                        // refusal below is reported, so the walk is the suffixes' own
+                        // order (`substrate::entriesInKeyOrder`), never the table's.
+                        for (auto const* floatClaim : substrate::entriesInKeyOrder(claims)) {
+                            auto const& [sfx, count] = *floatClaim;
                             if (count > 1) {
                                 coll.emit(DiagnosticCode::C_InvalidSemantics,
                                           "/semantics/floatLiteralTyping",

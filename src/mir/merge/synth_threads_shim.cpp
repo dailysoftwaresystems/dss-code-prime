@@ -1019,7 +1019,13 @@ bool synthesizeThreadsShim(
             // ── condition variable ──
             } else if (recipe == "cnd_init") {   // pthread_cond_init(c, NULL); ret success
                 begin(sym, rSigP_i32_pV);
-                call2("pthread_cond_init", phSig_i32_pVpV, i32Ty, builder.addArg(0, pVoid), nullPtr());
+                // In source order: both operands append to the function, and a
+                // call's arguments are evaluated in an order the host compiler
+                // picks, so the shim's instructions would follow the compiler
+                // that built DSS.
+                auto const cond = builder.addArg(0, pVoid);
+                auto const attr = nullPtr();
+                call2("pthread_cond_init", phSig_i32_pVpV, i32Ty, cond, attr);
                 builder.addReturn(i32c(0));
             } else if (recipe == "cnd_signal") { // pthread_cond_signal(c); ret success
                 begin(sym, rSigP_i32_pV);

@@ -1,0 +1,1 @@
+        if (s.binding != SymbolBinding::Local && directives.hiddenSet.contains(s.name)) {

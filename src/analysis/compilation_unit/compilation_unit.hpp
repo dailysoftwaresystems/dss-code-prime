@@ -23,6 +23,7 @@
 #include "core/types/include_path_resolve.hpp"  // HeaderSearchCache — this build's one view of the include tree
 #include "core/types/line_map.hpp"           // LineMap (D-LSP-POSITIONS-RESOLVED-IN-SYNTHESIZED-PREPROCESSOR-COORDINATES)
 #include "core/types/object_format_kind.hpp"
+#include "core/types/preprocess_config.hpp"   // PragmaLinkRequest (P69 fold 3f)
 #include "core/types/source_buffer.hpp"
 #include "core/types/source_span.hpp"
 #include "core/types/strong_ids.hpp"
@@ -164,7 +165,10 @@ public:
                     // "not computed" rather than as a value.
                     std::string inputDigest = {},
                     // The probes every parse of the unit opened. See `speculationProbeCount()`.
-                    std::uint64_t speculationProbeCount = 0);
+                    std::uint64_t speculationProbeCount = 0,
+                    // P69 fold 3f: the trees' `#pragma comment` requests, in tree
+                    // order. See `pragmaLinkRequests()`.
+                    std::vector<PragmaLinkRequest> pragmaLinkRequests = {});
 
     ~CompilationUnit();  // out-of-line; mirrors Tree's discipline.
 
@@ -407,6 +411,14 @@ public:
     [[nodiscard]] std::unordered_set<std::uint32_t> const&
     pragmaNoOptimizeFor(std::size_t treeIndex) const noexcept;
 
+    // ★ P69 (lane `xa`, fold 3f): what the unit's SOURCE asks of its link -- each
+    // reached `#pragma comment` that asks something (`PragmaLinkRequest`), in tree
+    // order and, within a tree, in reach order. Unlike the two side tables above it
+    // concerns the UNIT, not a token: the compile pipeline turns each into the
+    // active object format's form (`CuMirModule::linkerRequests`). Empty for a unit
+    // that states none.
+    [[nodiscard]] std::span<PragmaLinkRequest const> pragmaLinkRequests() const noexcept;
+
     // ★★★ REWRITE ONE (buffer, span) OUT OF THIS CU'S SYNTHESIZED PREPROCESSOR
     // COORDINATES ONTO THE ORIGIN FILE IT CAME FROM.
     // ([[D-PP-SEMANTIC-DIAGNOSTIC-POSITION-UNREMAPPED]])
@@ -494,6 +506,8 @@ private:
     std::vector<std::unordered_map<std::uint32_t, std::uint32_t>> pragmaPackMaps_;
     // TF-C85: index-parallel to `trees_`, on the same by-construction terms.
     std::vector<std::unordered_set<std::uint32_t>> pragmaNoOptimizeSets_;
+    // P69 fold 3f: every tree's `#pragma comment` requests, in tree order.
+    std::vector<PragmaLinkRequest> pragmaLinkRequests_;
     // One entry per PREPROCESSED tree — deliberately NOT index-parallel, because
     // the question every consumer asks is "does this POSITION belong to a synth
     // buffer", which is answered by scanning the maps, never by a tree index.
@@ -836,6 +850,8 @@ private:
         // `#pragma optimize("", off)` region. Same sidecar, same
         // index-alignment-by-construction argument as `pragmaPack`.
         std::unordered_set<std::uint32_t> pragmaNoOptimize;
+        // P69 fold 3f: the tree's `#pragma comment` requests, in reach order.
+        std::vector<PragmaLinkRequest> pragmaLinkRequests;
     };
 
     CompilationUnitId                    id_;

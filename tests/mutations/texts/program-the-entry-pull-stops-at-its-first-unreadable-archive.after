@@ -1,0 +1,2 @@
+        if (!arch) { end = ai + 1; return false; }   // corrupt archive: the walk ends at it
+        ParsedArchive const& pa = archives[ai].emplace(ParsedArchive{std::move(bytes), std::move(*arch)});

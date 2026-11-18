@@ -78,7 +78,9 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
+#include <cctype>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -707,4 +709,80 @@ TEST(ShippedRealizationOracle, ANonShimRequestDoesNotHoldTheWholeSurface) {
            "read only because it declares 'agreed', was refused — the "
            "hand-declared path is now STRICTER than `#include`, which is this "
            "defect re-introduced by its own fix: " << r.firstMessage;
+}
+
+// ★ THE RECIPES' COMPANION REFUSALS COME IN RECIPE-NAME ORDER (P69 fold 3f). Step (4) walks the names
+// it answered and reports each recipe's companion disagreement as the walk meets it; the answer is a
+// hash table, so walking it put the refusals in the order the C++ library that built DSS hashes the
+// names. Every pe recipe row the shipped threads.json declares is mirrored by two descriptors of its
+// own that disagree on one companion of its own; the names are asked in an order that is neither
+// ascending nor descending, and the refusals must name the companions in the recipes' ascending order.
+TEST(ShippedRealizationOracle, ShimCompanionRefusalsComeInRecipeNameOrder) {
+    auto const cfg = dss::test::findConfigRoot();
+    ASSERT_TRUE(cfg.has_value()) << dss::test::configRootDiagnostic();
+    nlohmann::json threads;
+    {
+        std::ifstream in{*cfg / "shippedLibs" / "threads.json", std::ios::binary};
+        ASSERT_TRUE(in.good()) << "threads.json, the recipes' corpus, was not found";
+        threads = nlohmann::json::parse(in, nullptr, false);
+    }
+    ASSERT_FALSE(threads.is_discarded());
+    ASSERT_TRUE(threads.contains("symbols") && threads.at("symbols").is_array());
+    std::vector<nlohmann::json> recipes;   // the pe recipe rows, as the corpus writes them
+    for (auto const& row : threads.at("symbols")) {
+        if (!row.is_object() || !row.contains("synthesize")) continue;
+        nlohmann::json const formats = row.value("availableObjectFormats", nlohmann::json::array());
+        if (std::find(formats.begin(), formats.end(), nlohmann::json("pe")) == formats.end()) continue;
+        recipes.push_back(row);
+    }
+    ASSERT_GE(recipes.size(), 3u) << "too few pe recipes for a walk's order to be seen";
+
+    ScratchDir dir{Location::Temp, "oracle-shim-recipe-order"};
+    fs::path const libs = shippedLibsDirOf(dir);
+    std::vector<std::string> ascending;
+    for (auto const& row : recipes) {
+        std::string const name = row.at("name").get<std::string>();
+        ascending.push_back(name);
+        for (std::string const side : {"alpha", "beta"}) {
+            nlohmann::json companion = nlohmann::json::object();
+            companion["name"] = "companion_" + name;
+            companion["signature"] = "fn(i32) -> i32";
+            companion["availableObjectFormats"] = nlohmann::json::array({"pe"});
+            companion["library"] = nlohmann::json::object({{"pe", "core-" + side + ".dll"}});
+            nlohmann::json doc = nlohmann::json::object();
+            doc["header"] = name + "_" + side + ".h";
+            doc["library"] = nlohmann::json::object({{"pe", "shared.dll"}});
+            doc["symbols"] = nlohmann::json::array({row, companion});
+            writeDesc(libs, (name + "_" + side + ".json").c_str(), doc.dump(2));
+            if (::testing::Test::HasFatalFailure()) return;
+        }
+    }
+    std::sort(ascending.begin(), ascending.end());
+    // Asked from the middle outward, alternating: neither ascending nor descending, so neither a walk
+    // in the order asked nor one in its reverse reads as the order wanted.
+    std::vector<std::string> asked;
+    std::size_t const mid = ascending.size() / 2;
+    for (std::size_t k = 0; asked.size() < ascending.size(); ++k) {
+        if (mid + k < ascending.size()) asked.push_back(ascending[mid + k]);
+        if (k < mid) asked.push_back(ascending[mid - 1 - k]);
+    }
+
+    DiagnosticReporter rep;
+    OracleRun const r = ask(dir.path(), asked, ObjectFormatKind::Pe, DataModel::Llp64, rep);
+    ASSERT_TRUE(r.located) << "the synthetic corpus was not located at all";
+    std::string const lead = "companion_";
+    std::vector<std::string> refused;   // the recipe whose companion each refusal names, in report order
+    for (auto const& d : rep.all()) {
+        if (d.code != DiagnosticCode::F_ShippedCorpusInvariantBroken) continue;
+        auto const at = d.actual.find(lead);
+        if (at == std::string::npos) continue;
+        auto end = at + lead.size();
+        while (end < d.actual.size()
+               && (std::isalnum(static_cast<unsigned char>(d.actual[end])) != 0 || d.actual[end] == '_'))
+            ++end;
+        std::string const recipe = d.actual.substr(at + lead.size(), end - at - lead.size());
+        if (refused.empty() || refused.back() != recipe) refused.push_back(recipe);
+    }
+    EXPECT_EQ(refused, ascending)
+        << "the recipes' companion refusals are not reported in ascending recipe name";
 }

@@ -113,6 +113,7 @@ struct Lowered {
     }
     // The language's policy through the pipeline's ONE assembly (`languageMirLoweringConfig`).
     MirLoweringConfig mirCfg = languageMirLoweringConfig(**loaded);
+    mirCfg.dataModel = DataModel::Lp64;   // a config states its unit's data model
     mirCfg.symbolIdSpace = MirSymbolIdSpace::endingAt(   // the unit's name table, as the driver states it
         static_cast<std::uint32_t>(model.symbols().size()));
     // VLA C1a (D-CSUBSET-VLA): thread the target's aggregate-layout params so a VLA
@@ -130,6 +131,7 @@ struct Lowered {
     }
     mirCfg.aggregateLayout       = tgt->aggregateLayout();
     mirCfg.aggregateLayoutLoaded = tgt->aggregateLayoutLoaded();
+    mirCfg.argumentSlotBytes     = argumentSlotBytes(*tgt);   // the target's argument-slot quantum, at its home
     HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
                                     model.lattice().interner(), mirReporter,
                                     &hir->sourceMap, mirCfg, /*ffiMap=*/nullptr,
@@ -399,6 +401,7 @@ TEST(MirToLir, UnsignedDivisionLowersToXorPlusDivNotCqoIDiv) {
     TypeId const params[] = {i32, i32};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
@@ -474,6 +477,7 @@ TEST(MirToLir, GotIndirectExternDataGlobalAddrEmitsLeaThenDeref) {
     TypeId const params[]   = {i8};                        // one ignored param
     TypeId const fnSig      = interner.fnSig(params, filePtr, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
     mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
@@ -556,6 +560,7 @@ TEST(MirToLir, IndirectSlotExternFunctionAddressValueDerefsTheSlot) {
     SymbolId const fnSym{200};
     auto buildMir = [&] {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(callerSig, SymbolId{100});
         MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(entry);
@@ -688,6 +693,7 @@ TEST(MirToLir, GotExternAddrValueEmitsGotMacroNotAbsoluteLea) {
     TypeId const callerSig =
         interner.fnSig(std::span<TypeId const>{}, ptrT, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.addFunction(callerSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(entry);
@@ -765,6 +771,7 @@ TEST(MirToLir, NoExternAddrBindingKeepsAbsoluteLeaForExternValue) {
     TypeId const callerSig =
         interner.fnSig(std::span<TypeId const>{}, ptrT, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.addFunction(callerSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(entry);
@@ -839,6 +846,7 @@ TEST(MirToLir, BothBindingsKeepADatumOnItsSlotAndSendAFunctionAddressToTheGot) {
         // Two functions: `void *d(void) { return &datum; }` and
         // `void *f(void) { return &func; }`, each GlobalAddr used as a VALUE.
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         SymbolId const datumSym{201};
         SymbolId const funcSym{200};
         mb.addFunction(sig, SymbolId{100});
@@ -962,6 +970,7 @@ namespace {
     TypeId const params[] = {i32, i32};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
@@ -1200,6 +1209,7 @@ namespace {
     auto const fnSig = interner.fnSig(std::span<TypeId const>{}, ty,
                                       CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(entry);
@@ -1448,6 +1458,7 @@ TEST(MirToLir, Arm64GlobalAddrLoadKeepsLeaPlusBaseFormLoad) {
     auto const sig = interner.fnSig(std::span<TypeId const>{}, f64,
                                     CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     MirLiteralValue quarter; quarter.value = 0.25;
     quarter.core = TypeKind::F64;
     mb.addFunction(sig, SymbolId{1});
@@ -1704,6 +1715,7 @@ namespace {
     TypeId const params[] = {i32p};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
@@ -1724,6 +1736,7 @@ namespace {
     TypeId const params[] = {i32p, i32};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
@@ -1743,6 +1756,7 @@ namespace {
     TypeId const i32   = interner.primitive(TypeKind::I32);
     TypeId const fnSig = interner.fnSig(std::span<TypeId const>{}, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(entry);
@@ -2038,6 +2052,7 @@ struct ShiftProbe {
     ShiftProbe probe;
     if (schema == nullptr) { return probe; }
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     if (countConst.has_value()) {
         std::array<::dss::TypeId, 1> params{ty};
         mb.addFunction(interner.fnSig(params, ty, ::dss::CallConv::CcSysV),
@@ -2310,6 +2325,7 @@ TEST(MirToLir, SehOpcodesFailLoudCitingC116Anchor) {
     // try: SehTryEnd + Br(join); filter: SehFilterReturn(v) -> handler;
     // handler: Br(join); join: return.
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Llp64);
     mb.addFunction(fnSig, ::dss::SymbolId{1});
     ::dss::MirBlockId const entry   = mb.createBlock(::dss::StructCfMarker::EntryBlock);
     ::dss::MirBlockId const tryBB   = mb.createBlock(::dss::StructCfMarker::Linear);
@@ -2360,6 +2376,7 @@ TEST(MirToLir, UnsupportedMirOpcodeFailsLoud) {
     auto const fnSig = interner.fnSig(std::span<::dss::TypeId const>{}, i32, ::dss::CallConv::CcSysV);
 
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.addFunction(fnSig, ::dss::SymbolId{1});
     ::dss::MirBlockId const bb = mb.createBlock(::dss::StructCfMarker::EntryBlock);
     mb.beginBlock(bb);
@@ -2837,6 +2854,7 @@ TEST(MirToLir, WideLiteralRoutesThroughLiteralPool) {
     auto const fnSig  = interner.fnSig(std::span<::dss::TypeId const>{}, i64, ::dss::CallConv::CcSysV);
     (void)voidT;
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     ::dss::MirLiteralValue lv;
     lv.value = static_cast<std::int64_t>(0x1234567890ABCDEF);  // > INT32_MAX
     lv.core  = ::dss::TypeKind::I64;
@@ -3194,6 +3212,7 @@ TEST_P(MirToLirCastMapping, EmitsExpectedMnemonicAndRegClass) {
     auto const fnSig = interner.fnSig(params, dstT, ::dss::CallConv::CcSysV);
 
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.addFunction(fnSig, ::dss::SymbolId{1});
     ::dss::MirBlockId const bb = mb.createBlock(::dss::StructCfMarker::EntryBlock);
     mb.beginBlock(bb);
@@ -3325,6 +3344,7 @@ lowerOneCast(::dss::TargetSchema const& sch, ::dss::MirOpcode mirOp,
     std::array<::dss::TypeId, 1> params{srcT};
     auto const fnSig = interner.fnSig(params, dstT, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.addFunction(fnSig, ::dss::SymbolId{1});
     ::dss::MirBlockId const bb = mb.createBlock(::dss::StructCfMarker::EntryBlock);
     mb.beginBlock(bb);
@@ -3526,6 +3546,7 @@ TEST(MirToLir, GepDynamicIndexEmitsFourOperandLea) {
     auto const fnSig = interner.fnSig(params, ptrT, ::dss::CallConv::CcSysV);
 
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.addFunction(fnSig, ::dss::SymbolId{1});
     ::dss::MirBlockId const bb = mb.createBlock(::dss::StructCfMarker::EntryBlock);
     mb.beginBlock(bb);
@@ -3584,6 +3605,7 @@ TEST(MirToLir, GepCharRuntimeIndexWidenIsTargetKeyed) {
         std::array<::dss::TypeId, 2> params{ptrT, idxT};
         auto const fnSig = interner.fnSig(params, ptrT, ::dss::CallConv::CcSysV);
         ::dss::MirBuilder mb;
+        mb.stateDataModel(::dss::DataModel::Lp64);
         mb.addFunction(fnSig, ::dss::SymbolId{1});
         ::dss::MirBlockId const bb =
             mb.createBlock(::dss::StructCfMarker::EntryBlock);
@@ -3742,6 +3764,7 @@ TEST(MirToLir, SwitchCharDiscriminantJumpTableWidenIsTargetKeyed) {
         auto const fnSig =
             interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
         ::dss::MirBuilder mb;
+        mb.stateDataModel(::dss::DataModel::Lp64);
         mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
         mb.addFunction(fnSig, ::dss::SymbolId{1});
         ::dss::MirBlockId const entry =
@@ -3897,6 +3920,7 @@ TEST(MirToLir, PhiResolutionUsesFprClassForFloatPhi) {
     // with a Phi at the join). The Phi is F64-typed; the lowering must
     // place it in FPR-class.
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.addFunction(fnSig, ::dss::SymbolId{1});
     ::dss::MirBlockId const entry = mb.createBlock(::dss::StructCfMarker::EntryBlock);
     ::dss::MirBlockId const thenB = mb.createBlock(::dss::StructCfMarker::IfThen);
@@ -3994,6 +4018,7 @@ TEST(MirToLir, MultiSuccessorBlockDoesNotCarryItsPhiEdgeCopies) {
     //        c = i32 iNext < n;            condbr c -> loop, exit
     // exit:  ret i                         ← the LAGGING value the defect ate
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.addFunction(fnSig, ::dss::SymbolId{1});
     ::dss::MirBlockId const entry = mb.createBlock(::dss::StructCfMarker::EntryBlock);
     ::dss::MirBlockId const loop  = mb.createBlock(::dss::StructCfMarker::Linear);
@@ -4088,6 +4113,7 @@ TEST(MirToLir, WideLiteralStringRoutesThroughLiteralPool) {
     auto const ptrT  = interner.pointer(interner.primitive(::dss::TypeKind::Void));
     auto const fnSig = interner.fnSig(std::span<::dss::TypeId const>{}, ptrT, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     ::dss::MirLiteralValue lv;
     lv.value = std::string{"hello world"};
     lv.core  = ::dss::TypeKind::Ptr;
@@ -4126,6 +4152,7 @@ TEST(MirToLir, FprConstAtMirToLirFailsLoudPointingAtPromotion) {
     auto const f64   = interner.primitive(::dss::TypeKind::F64);
     auto const fnSig = interner.fnSig(std::span<::dss::TypeId const>{}, f64, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     ::dss::MirLiteralValue lv;
     lv.value = 3.14;
     lv.core  = ::dss::TypeKind::F64;
@@ -4251,6 +4278,7 @@ buildF64StoreMir() {
     ::dss::TypeId const params[] = {f64, ptrT};
     auto const sig = interner.fnSig(params, i32, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.addFunction(sig, ::dss::SymbolId{1});
     ::dss::MirBlockId const bb =
         mb.createBlock(::dss::StructCfMarker::EntryBlock);
@@ -4352,6 +4380,7 @@ TEST(MirToLir, StrippedClassOpsTableFailsLoudOnFprLoad) {
     ::dss::TypeId const params[] = {ptrT};
     auto const sig = interner.fnSig(params, f64, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.addFunction(sig, ::dss::SymbolId{1});
     ::dss::MirBlockId const bb =
         mb.createBlock(::dss::StructCfMarker::EntryBlock);
@@ -4559,6 +4588,7 @@ TEST(MirToLir, ExternCallEmitsCallIndirectViaExternOpcode) {
     constexpr std::uint32_t kCallerSym = 102u;
 
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
 
     // Internal function: just returns 0.
     mb.addFunction(internalSig, ::dss::SymbolId{kInternalSym});
@@ -4697,6 +4727,7 @@ lowerStdExternFixture(::dss::TargetSchema const& sch,
     constexpr std::uint32_t kCallerSym   = 102u;
 
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.addFunction(internalSig, ::dss::SymbolId{kInternalSym});
     {
         auto const bb = mb.createBlock(::dss::StructCfMarker::EntryBlock);
@@ -5008,6 +5039,7 @@ TEST(MirToLir, ExtractValueZeroIndexLowersToLoad) {
     auto const fnSig = interner.fnSig(params, i32, ::dss::CallConv::CcSysV);
 
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.addFunction(fnSig, ::dss::SymbolId{1});
     ::dss::MirBlockId const bb = mb.createBlock(::dss::StructCfMarker::EntryBlock);
     mb.beginBlock(bb);
@@ -5048,6 +5080,7 @@ TEST(MirToLir, ExtractValueNonZeroIndexDefersWithDiagnostic) {
     std::array<::dss::TypeId, 1> params{ptrT};
     auto const fnSig = interner.fnSig(params, i32, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.addFunction(fnSig, ::dss::SymbolId{1});
     ::dss::MirBlockId const bb = mb.createBlock(::dss::StructCfMarker::EntryBlock);
     mb.beginBlock(bb);
@@ -5089,6 +5122,7 @@ TEST(MirToLir, ExtractValueZeroIndexAcceptsUintLiteralVariant) {
     std::array<::dss::TypeId, 1> params{ptrT};
     auto const fnSig = interner.fnSig(params, i32, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.addFunction(fnSig, ::dss::SymbolId{1});
     ::dss::MirBlockId const bb = mb.createBlock(::dss::StructCfMarker::EntryBlock);
     mb.beginBlock(bb);
@@ -5118,6 +5152,7 @@ TEST(MirToLir, IntrinsicCallLowersToIntrinsicCallOpcode) {
     std::array<::dss::TypeId, 1> params{i32};
     auto const fnSig = interner.fnSig(params, i32, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.addFunction(fnSig, ::dss::SymbolId{1});
     ::dss::MirBlockId const bb = mb.createBlock(::dss::StructCfMarker::EntryBlock);
     mb.beginBlock(bb);
@@ -5260,6 +5295,7 @@ struct GuardProbe {
     std::array<::dss::TypeId, 2> params{ty, ty};
     auto const fnSig = interner.fnSig(params, ty, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.addFunction(fnSig, ::dss::SymbolId{1});
     ::dss::MirBlockId const bb =
         mb.createBlock(::dss::StructCfMarker::EntryBlock);
@@ -5378,6 +5414,7 @@ TEST(MirToLir, U32CompareLowersWithThirtyTwoBitCmpWidth) {
     std::array<::dss::TypeId, 2> params{u32, u32};
     auto const fnSig = interner.fnSig(params, b1, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.addFunction(fnSig, ::dss::SymbolId{1});
     ::dss::MirBlockId const bb =
         mb.createBlock(::dss::StructCfMarker::EntryBlock);
@@ -5557,6 +5594,7 @@ namespace {
     std::array<::dss::TypeId, 1> params{srcTy};
     auto const fnSig = interner.fnSig(params, dstTy, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.addFunction(fnSig, ::dss::SymbolId{1});
     ::dss::MirBlockId const bb =
         mb.createBlock(::dss::StructCfMarker::EntryBlock);
@@ -5952,6 +5990,7 @@ namespace {
     std::array<::dss::TypeId, 1> params{f80};
     auto const sig = interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.addFunction(sig, ::dss::SymbolId{1});
     mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
     (void)mb.addArg(0, f80);
@@ -5981,6 +6020,7 @@ namespace {
     std::array<::dss::TypeId, 2> params{ptrT, ptrT};
     auto const sig = interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.addFunction(sig, ::dss::SymbolId{1});
     mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
     ::dss::MirInstId const pv = mb.addArg(0, ptrT);
@@ -6012,6 +6052,7 @@ namespace {
     auto const sig = interner.fnSig(std::span<::dss::TypeId const>{}, voidT,
                                     ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.addFunction(sig, ::dss::SymbolId{1});
     mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
     ::dss::MirInstId const callee = mb.addGlobalAddr(::dss::SymbolId{2}, ptrT);
@@ -6036,6 +6077,7 @@ namespace {
     std::array<::dss::TypeId, 1> params{f80};
     auto const sig = interner.fnSig(params, f80, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.addFunction(sig, ::dss::SymbolId{1});
     mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
     ::dss::MirInstId const x = mb.addArg(0, f80);
@@ -6201,6 +6243,7 @@ namespace {
     std::array<::dss::TypeId, 2> params{f80, f80};
     auto const sig = interner.fnSig(params, interner.complex(f80), ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.addFunction(sig, ::dss::SymbolId{1});
     mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
     ::dss::MirInstId const re = mb.addArg(0, f80);
@@ -6227,6 +6270,7 @@ namespace {
     auto const ptrT  = interner.pointer(voidT);
     auto const sig = interner.fnSig(std::span<::dss::TypeId const>{}, voidT, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.addFunction(sig, ::dss::SymbolId{1});
     mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
     ::dss::MirInstId const callee = mb.addGlobalAddr(::dss::SymbolId{2}, ptrT);
@@ -6342,6 +6386,7 @@ TEST(MirToLir, F80PhiControlMergeLowersToMemoryHomeCopy) {
     std::array<::dss::TypeId, 1> params{boolT};
     auto const fnSig = interner.fnSig(params, i32, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.addFunction(fnSig, ::dss::SymbolId{1});
     ::dss::MirBlockId const entry = mb.createBlock(::dss::StructCfMarker::EntryBlock);
     ::dss::MirBlockId const thenB = mb.createBlock(::dss::StructCfMarker::IfThen);
@@ -6475,6 +6520,7 @@ TEST(MirToLir, F80PhiSwapOnABackEdgeStagesEveryIncomingBeforeAnyHomeWrite) {
     std::array<::dss::TypeId, 3> params{boolT, ptrF80, ptrF80};
     auto const fnSig = interner.fnSig(params, i32, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.addFunction(fnSig, ::dss::SymbolId{1});
     ::dss::MirBlockId const entry  = mb.createBlock(::dss::StructCfMarker::EntryBlock);
     ::dss::MirBlockId const header = mb.createBlock(::dss::StructCfMarker::LoopHeader);
@@ -6584,6 +6630,7 @@ TEST(MirToLir, F80ArithmeticAndStoreLowerToX87Sequence) {
     std::array<::dss::TypeId, 3> params{ptrT, ptrT, ptrT};
     auto const sig = interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.addFunction(sig, ::dss::SymbolId{1});
     mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
     ::dss::MirInstId const pa = mb.addArg(0, ptrT);
@@ -6730,6 +6777,7 @@ buildF128BinaryArith(::dss::TypeInterner& interner, ::dss::MirOpcode op) {
     std::array<::dss::TypeId, 3> params{ptrT, ptrT, ptrT};
     auto const sig = interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, ::dss::SymbolId{1});
     mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
@@ -6851,6 +6899,7 @@ TEST(MirToLir, F128FixTfsiLowersToSoftcallSequence) {
     std::array<::dss::TypeId, 1> params{ptrT};
     auto const sig = interner.fnSig(params, i32, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, ::dss::SymbolId{1});
     mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
@@ -6914,6 +6963,7 @@ TEST(MirToLir, F128ExtendFromDoubleLowersToSoftcallSequence) {
     std::array<::dss::TypeId, 2> params{f64, ptrT};
     auto const sig = interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, ::dss::SymbolId{1});
     mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
@@ -6981,6 +7031,7 @@ TEST(MirToLir, F128SoftcallInjectsExternImportOnce) {
     std::array<::dss::TypeId, 3> params{ptrT, ptrT, ptrT};
     auto const sig = interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, ::dss::SymbolId{1});
     mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
@@ -7065,6 +7116,7 @@ namespace {
     std::array<::dss::TypeId, 1> params{f128};
     auto const sig = interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.addFunction(sig, ::dss::SymbolId{1});
     mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
     (void)mb.addArg(0, f128);
@@ -7086,6 +7138,7 @@ namespace {
     auto const sig = interner.fnSig(std::span<::dss::TypeId const>{}, voidT,
                                     ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.addFunction(sig, ::dss::SymbolId{1});
     mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
     ::dss::MirInstId const callee = mb.addGlobalAddr(::dss::SymbolId{2}, ptrT);
@@ -7107,6 +7160,7 @@ namespace {
     std::array<::dss::TypeId, 1> params{f128};
     auto const sig = interner.fnSig(params, f128, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.addFunction(sig, ::dss::SymbolId{1});
     mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
     ::dss::MirInstId const x = mb.addArg(0, f128);
@@ -7265,6 +7319,7 @@ TEST(MirToLir, F128CallArgsMarshalIntoV0V1BeforeCall) {
     std::array<::dss::TypeId, 3> params{ptrT, ptrT, ptrT};
     auto const sig = interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.addFunction(sig, ::dss::SymbolId{1});
     mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
     ::dss::MirInstId const pa = mb.addArg(0, ptrT);
@@ -7362,6 +7417,7 @@ TEST(MirToLir, DoubleArgDoesNotAliasF128ArgVRegisterAtEntry) {
     std::array<::dss::TypeId, 4> params{f64, f128, pdT, pldT};
     auto const sig = interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.addFunction(sig, ::dss::SymbolId{1});
     mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
     ::dss::MirInstId const d   = mb.addArg(0, f64);    // FPR NSRN 0 → d0
@@ -7442,6 +7498,7 @@ TEST(MirToLir, LongDoubleUserCallComposesWithSoftcall) {
     std::array<::dss::TypeId, 4> params{ptrT, ptrT, ptrT, ptrT};
     auto const sig = interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, ::dss::SymbolId{1});
     mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
@@ -7504,6 +7561,7 @@ TEST(MirToLir, F128PhiControlMergeLowersToMemoryHomeCopy) {
     std::array<::dss::TypeId, 3> params{boolT, ptrF128, ptrF128};
     auto const fnSig = interner.fnSig(params, i32, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(fnSig, ::dss::SymbolId{1});
     ::dss::MirBlockId const entry = mb.createBlock(::dss::StructCfMarker::EntryBlock);
@@ -7603,6 +7661,7 @@ TEST(MirToLir, F128StoreLowersToGprPairCopy) {
     std::array<::dss::TypeId, 2> params{ptrT, ptrT};
     auto const sig = interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.addFunction(sig, ::dss::SymbolId{1});
     mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
     ::dss::MirInstId const pv = mb.addArg(0, ptrT);
@@ -7678,6 +7737,7 @@ TEST(MirToLir, F128SoftcallDoesNotClobberDoubleLiveAcrossCall) {
     std::array<::dss::TypeId, 4> params{ptrT, ptrT, ptrT, f64};
     auto const sig = interner.fnSig(params, f64, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, ::dss::SymbolId{1});
     mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
@@ -7815,6 +7875,7 @@ TEST(MirToLir, LongDoubleComplexArithmeticLowersOnX87Axis) {
     ASSERT_TRUE(lowered.lowersToMir) << "the pipeline's gates pass the clean unit on to MIR";
     DiagnosticReporter mirReporter;
     MirLoweringConfig mirCfg = languageMirLoweringConfig(**loaded);   // the pipeline's assembly
+    mirCfg.dataModel = DataModel::Lp64;   // a config states its unit's data model
     mirCfg.symbolIdSpace = MirSymbolIdSpace::endingAt(   // the unit's name table, as the driver states it
         static_cast<std::uint32_t>(model.symbols().size()));
     auto target = TargetSchema::loadShipped("x86_64");
@@ -7891,6 +7952,7 @@ struct TlsLoweredModule {
     auto const sig = interner.fnSig(std::span<::dss::TypeId const>{}, f64,
                                     ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     ::dss::MirLiteralValue quarter; quarter.value = 0.25;
     quarter.core = ::dss::TypeKind::F64;
     ::dss::MirLiteralValue half; half.value = 0.5;
@@ -9069,6 +9131,7 @@ TEST(MirToLir, Int128MemoryAccessFailsLoud) {
         interner.fnSig(std::span<::dss::TypeId const>{}, i32, ::dss::CallConv::CcSysV);
 
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.addFunction(fnSig, ::dss::SymbolId{1});
     ::dss::MirBlockId const bb = mb.createBlock(::dss::StructCfMarker::EntryBlock);
     mb.beginBlock(bb);
@@ -9133,6 +9196,7 @@ namespace {
     TypeId const params[] = {i32p};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.stateArgCounting(MirArgCounting::PerClass);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(fnSig, SymbolId{100});
@@ -9154,6 +9218,7 @@ namespace {
     TypeId const params[] = {i32p, i32};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.stateArgCounting(MirArgCounting::PerClass);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(fnSig, SymbolId{100});
@@ -9552,6 +9617,7 @@ buildWideFloatCompare(::dss::TypeInterner& interner, ::dss::TypeKind kind,
     std::array<::dss::TypeId, 2> params{ptrT, ptrT};
     auto const sig = interner.fnSig(params, boolT, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Llp64);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, ::dss::SymbolId{1});
     mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
@@ -9579,6 +9645,7 @@ buildWideFloatCompareBranch(::dss::TypeInterner& interner, ::dss::TypeKind kind,
     std::array<::dss::TypeId, 2> params{ptrT, ptrT};
     auto const sig = interner.fnSig(params, i32, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Llp64);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, ::dss::SymbolId{1});
     ::dss::MirBlockId const entry =
@@ -10031,6 +10098,7 @@ buildWideFloatNeg(::dss::TypeInterner& interner, ::dss::TypeKind kind) {
     std::array<::dss::TypeId, 2> params{ptrT, ptrT};
     auto const sig = interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, ::dss::SymbolId{1});
     mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
@@ -10060,6 +10128,7 @@ buildWideFloatConvert(::dss::TypeInterner& interner, ::dss::TypeKind srcK,
     std::array<::dss::TypeId, 2> params{pSrcT, pDstT};
     auto const sig = interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
     ::dss::MirBuilder mb;
+    mb.stateDataModel(::dss::DataModel::Lp64);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, ::dss::SymbolId{1});
     mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
@@ -11371,6 +11440,7 @@ TEST(MirToLir, TheRowLeavesStatingWhetherItsCodeReadsThroughASlot) {
         TypeId const params[] = {i32};
         TypeId const fnSig    = interner.fnSig(params, i32, CallConv::CcSysV);
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.stateArgCounting(MirArgCounting::PerClass);
         mb.addFunction(fnSig, SymbolId{100});
         MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);

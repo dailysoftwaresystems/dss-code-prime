@@ -4,11 +4,12 @@
   "standard": "msvcrt",
   "availableObjectFormats": ["pe"],
   "library": { "pe": { "role": "cLibrary" } },
+  "$writtenNameRouteComment": "P69 fold 3f (lane xa; ledger 549 (b)): `getpid` states the linker alias on pe -- oldnames.lib and mingw-w64's import library alias the written plain name to the underscored UCRT export (MEASURED; io.json's `$writtenNameRouteComment` holds the measurement).",
   "symbols": [
     { "name": "_beginthreadex", "signature": "fn(ptr<void>, u32, ptr<fn(ptr<void>) -> u32>, ptr<void>, u32, ptr<u32>) -> u64", "kind": "function", "linkage": "external" },
     { "name": "_endthreadex",   "signature": "fn(u32) -> void",                                                                "kind": "function", "linkage": "external" },
     { "name": "_beginthread",   "signature": "fn(ptr<fn(ptr<void>) -> void>, u32, ptr<void>) -> u64",                         "kind": "function", "linkage": "external" },
     { "name": "_endthread",     "signature": "fn() -> void",                                                                   "kind": "function", "linkage": "external" },
-    { "name": "getpid",         "signature": "fn() -> i32",                                                                    "kind": "function", "linkage": "external", "linkName": "_getpid" }
+    { "name": "getpid",         "signature": "fn() -> i32",                                                                    "kind": "function", "linkage": "external", "linkName": "_getpid", "writtenNameRoute": { "pe": "linkerAlias" } }
   ]
 }

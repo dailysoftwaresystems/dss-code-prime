@@ -93,6 +93,7 @@ TestCu makeLink(std::uint32_t cuIdx, std::string self, std::string callee,
     TypeId const sig = cu.lattice->interner().fnSig({}, i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.addFunction(sig, SymbolId{100});
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(e);
@@ -467,6 +468,7 @@ TEST(LazyImportEdge, RefusesABodyThatReferencesItsOwnModulePrivateGlobal) {
     TypeId const ptr = cu1.lattice->interner().pointer(i32);
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addGlobal(i32, SymbolId{60}, UINT32_MAX, MirFuncId{},
                      SymbolBinding::Local, SymbolVisibility::Default,
                      /*isConst=*/false, MirThreadStorage::Shared, 0);
@@ -578,6 +580,7 @@ TEST(LazyImportEdge, TheImportBoundIsReturnedAndNothingIsReportedAtThisTier) {
         TypeId const i32 = cu.lattice->interner().primitive(TypeKind::I32);
         TypeId const sig = cu.lattice->interner().fnSig({}, i32, CallConv::CcSysV);
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(sig, SymbolId{100});
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -647,6 +650,7 @@ TEST(LazyImportEdge, TheImportBoundIsReturnedAndNothingIsReportedAtThisTier) {
         }
         if (ret == InvalidType) return false;
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.carryModuleFactsOf(m);
         mb.addFunction(sig, SymbolId{100});
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);

@@ -1,1 +1,1 @@
-            if (commonsRefused.contains(name)) return false;   // reported by an earlier round, once
+            if (commonsRefused.contains(name) || commonRuleUnknown) return true;   // an earlier unit's, reported

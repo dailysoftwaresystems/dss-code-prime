@@ -2178,7 +2178,9 @@ class _FakePosix:
 
     @staticmethod
     def argv(args):
-        return ["wsl.exe", "-e"] + [str(a) for a in args]
+        # As PosixSide's on a Windows host: the declared distribution is named, never
+        # the machine's default (the review of checkpoint 48, W2).
+        return ["wsl.exe", "-d", "a-fake-distro", "-e"] + [str(a) for a in args]
 
     def python_argv(self, script, *args):
         """As sqlite_common.PosixSide's on a Windows host: the distribution's own `python3`."""
@@ -2221,7 +2223,7 @@ def _st_carriage(A, fx):
     doc = wsl_derive(posix, fx.root, out, facts, log, run=half)
     A.arm("ps01 the POSIX derivation driver is present: it is THIS program (the hop runs this file's "
           "--derive-only --path-style windows) and its result is read back",
-          lambda: (seen["argv"][2:7] == ["python3", posix.to_posix(THIS), "--derive-only",
+          lambda: (seen["argv"][4:9] == ["python3", posix.to_posix(THIS), "--derive-only",
                                          "--path-style", "windows"]
                    and doc["manifest"] == os.path.join(out, MANIFEST_FILE), "argv %r" % seen.get("argv")))
     r = C.capture([fx.py, C.BENCH_CORE, "--help"], timeout=120, env_=C.child_env(python=True))

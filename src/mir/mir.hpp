@@ -3,6 +3,7 @@
 #include "core/export.hpp"
 #include "core/substrate/arena_attribute.hpp"
 #include "core/substrate/arena_container.hpp"
+#include "core/types/data_model.hpp"   // MirModuleFacts::dataModel
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/type_id.hpp"
 #include "mir/mir_asm_descriptor.hpp"
@@ -82,10 +83,17 @@ enum class MirAliasingMode : std::uint8_t { Permissive, StrictTBAA };
 // dropped the rest; the merge read the aliasing mode and the char-types rule from unit 0 alone; the text wrote
 // neither. A fact added here is a binding added to each structured binding over the list (the join, the text
 // writer), which do not compile until it is read.
+// ★ P69 (lane `xa`, fold 3f — review-xa3e F3, its Lowerer half): the DATA MODEL the module was lowered for, the
+// one home every pointer width below MIR is read from (`scalarByteSize(TypeKind::Ptr, dataModel)`). HIR→MIR
+// states its unit's, the startup module of a link that compiles nothing its format's, the merge its units'
+// joined, the `.dssir` reader its text's header. The zero value names no model (data_model.hpp's table has no row
+// for it): a module stating none is refused by the join and by the MIR→LIR lowering, each by name -- the width
+// of every address the lowering writes is never a default.
 struct MirModuleFacts {
     MirAliasingMode aliasingMode      = MirAliasingMode::Permissive;
     bool            charTypesAliasAll = true;
     MirArgCounting  argCounting       = MirArgCounting::Unstated;
+    DataModel       dataModel{};
 
     friend constexpr bool operator==(MirModuleFacts const&, MirModuleFacts const&) = default;
 };
@@ -130,20 +138,25 @@ joinMustAgreeFact(char const* fact, T a, T b, T unstated, MirUnstatedFact rule) 
 // Each function's own counting crosses with the function, not through this. ★ A FACT ADDED to the list is a
 // binding added below (the structured bindings do not compile until it is), joined either by a rule like the
 // first two or, when it must be equal, by ONE `joinMustAgreeFact` line stating its own unstated rule — the
-// record stays a plain list joined field by field.
+// record stays a plain list joined field by field. The data model must be equal AND stated by every unit
+// (`IsRefused`, ledger 639): units lowered for two models were lowered for two pairs, and a unit stating none
+// would take another's in silence.
 [[nodiscard]] constexpr std::expected<MirModuleFacts, MirFactsDisagreement>
 joinUnitFacts(MirModuleFacts a, MirModuleFacts b) noexcept {
-    auto const& [aAliasing, aCharTypes, aCounting] = a;   // every fact of the list is joined below
-    auto const& [bAliasing, bCharTypes, bCounting] = b;
+    auto const& [aAliasing, aCharTypes, aCounting, aModel] = a;   // every fact of the list is joined below
+    auto const& [bAliasing, bCharTypes, bCounting, bModel] = b;
     auto const counting = joinMustAgreeFact("argCounting", aCounting, bCounting, MirArgCounting::Unstated,
                                             MirUnstatedFact::AddsNothing);
     if (!counting.has_value()) return std::unexpected(counting.error());
+    auto const model = joinMustAgreeFact("dataModel", aModel, bModel, DataModel{}, MirUnstatedFact::IsRefused);
+    if (!model.has_value()) return std::unexpected(model.error());
     MirModuleFacts joined;
     joined.aliasingMode = aAliasing == MirAliasingMode::StrictTBAA && bAliasing == MirAliasingMode::StrictTBAA
                               ? MirAliasingMode::StrictTBAA
                               : MirAliasingMode::Permissive;
     joined.charTypesAliasAll = aCharTypes || bCharTypes;
     joined.argCounting = *counting;
+    joined.dataModel = *model;
     return joined;
 }
 
@@ -716,6 +729,10 @@ public:
     // `stateFunctionArgCounting`: a function's OWN counting — one of another convention, or a clone's copy.
     void stateArgCounting(MirArgCounting counting) noexcept { facts_.argCounting = counting; }
     [[nodiscard]] MirArgCounting argCounting() const noexcept { return facts_.argCounting; }
+    // The data model the module is lowered for (`MirModuleFacts::dataModel`), stated where the module is MADE,
+    // as the counting is: HIR→MIR from its config, the startup module of a link that compiles nothing from its
+    // format, the `.dssir` reader from the text's header, a unit test by hand. A rebuild copies it.
+    void stateDataModel(DataModel model) noexcept { facts_.dataModel = model; }
     void stateFunctionArgCounting(MirFuncId function, MirArgCounting counting);
     // The module's facts, whole (`MirModuleFacts`): stated at once by the merge (its units' joined).
     void stateModuleFacts(MirModuleFacts const& facts) noexcept { facts_ = facts; }

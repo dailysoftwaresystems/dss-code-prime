@@ -1,0 +1,3 @@
+                if (standing == standingOf.end() || ext.fallbackName.empty()) continue;
+                if (!fallbacksSearched.insert(ext.fallbackName).second) continue;
+                worklist.push_back(ext.fallbackName);

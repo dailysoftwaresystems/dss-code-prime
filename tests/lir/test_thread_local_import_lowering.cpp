@@ -69,6 +69,7 @@ struct Lowered {
     TypeId const params[] = {i32};
     TypeId const fnSig    = interner.fnSig(params, i32, cc);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.stateArgCounting(argCountingOf(cc == CallConv::CcMS64));
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);

@@ -356,7 +356,7 @@ TEST(LinkVocabularyProjection, FormatBitFieldStrategySentinelIsRefusedByName) {
 
 TEST(LinkVocabularyProjection, TlsAccessShapeNamesEveryKey) {
     static constexpr std::string_view kKeys[] = {
-        "model", "segmentPrefixByte", "baseDisplacement", "tlsIndexSlotName"};
+        "model", "segmentPrefixByte", "baseDisplacement", "tlsIndexSlotName", "bootstrap"};
     constexpr char const* kIgnore[] = {"tlsAccess", "model"};
     auto doc = shippedFormatDoc(kPeExecFormat);
     ASSERT_TRUE(doc.is_object());
@@ -551,6 +551,7 @@ void runExternGateProbe(ExternGateProbe&                       probe,
                                            dss::CallConv::CcMS64);
 
     dss::MirBuilder mb;
+    mb.stateDataModel(dss::DataModel::Llp64);
     mb.addFunction(sig, dss::SymbolId{kCallerSym});
     {
         auto const bb = mb.createBlock(dss::StructCfMarker::EntryBlock);

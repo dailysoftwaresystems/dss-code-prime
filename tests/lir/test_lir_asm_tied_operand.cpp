@@ -299,6 +299,7 @@ TEST(LirAsmTiedOperand, ReadWriteOutputWithNoTiedInputIsRefused) {
     TypeId const fnSig = interner.fnSig({}, voidT, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(entry);
@@ -347,6 +348,7 @@ TEST(LirAsmTiedOperand, ReadWriteInputWithNoTieIsRefused) {
     TypeId const fnSig = interner.fnSig({}, voidT, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(entry);

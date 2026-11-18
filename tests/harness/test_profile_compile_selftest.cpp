@@ -42,7 +42,18 @@ namespace {
     X(ABrokenRunsReportShowsTheViolationBannerEachLineAndTheMemoAndBatchRowsAfterThem,                                 \
       "a broken run's report shows the violation banner, each `!` line, and the memo and batch rows after them")       \
     X(ABrokenRunsReportStillEndsAtTheFirstLineOfNeitherPrefixTheControl,                                               \
-      "a broken run's report still ends at the first line of neither prefix (the control)")
+      "a broken run's report still ends at the first line of neither prefix (the control)")                            \
+    X(HostEqualityTwoLegsWhoseImageIsTheSameBytesPassNamingTheFilesMd5,                                                \
+      "host-equality: two legs whose image is the same bytes pass, naming the file's md5")                             \
+    X(HostEqualityTwoLegsWhoseImageDiffersFailEachLegsMd5Said,                                                         \
+      "host-equality: two legs whose image differs FAIL, each leg's md5 said")                                         \
+    X(HostEqualityALegThatLeftAnotherFileBesideTheSameImageFails,                                                      \
+      "host-equality: a leg that left another file beside the same image FAILS")                                       \
+    X(HostEqualityOneLabelIsRefusedBeforeAnyImageIsRead,                                                               \
+      "host-equality: one label is REFUSED before any image is read")                                                  \
+    X(HostEqualityALabelNamedTwiceIsRefused, "host-equality: a label named twice is REFUSED")                          \
+    X(HostEqualityALegWhoseImageDirectoryHoldsNoFileIsRefusedByNameWithThePullToRun,                                   \
+      "host-equality: a leg whose image directory holds no file is REFUSED by name, with the pull to run")
 
 #define DSS_PROFILE_COMPILE_SELFTEST_ARM_NAME(caseName, armName) armName,
 constexpr std::string_view kArmNames[] = {DSS_PROFILE_COMPILE_SELFTEST_ARMS(DSS_PROFILE_COMPILE_SELFTEST_ARM_NAME)};

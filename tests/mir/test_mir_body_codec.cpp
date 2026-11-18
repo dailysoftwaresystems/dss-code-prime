@@ -64,6 +64,7 @@ TestCu makeLink(std::uint32_t cuIdx, std::string self, std::string callee,
     TypeId const i32 = cu.lattice->interner().primitive(TypeKind::I32);
     TypeId const sig = cu.lattice->interner().fnSig({}, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.addFunction(sig, SymbolId{100});
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(e);

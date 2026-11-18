@@ -1984,10 +1984,14 @@ TEST(ArchiveMemberLibraryImport, MachOMemberRebindsToTheImageTheDirectPathBinds)
 // itself declared: `write`→`_write`, `lseek`→`_lseek`, `getpid`→`_getpid`,
 // `_setjmp`→`__intrinsic_setjmp`, and the five Darwin suffixed ones
 // (`opendir` / `readdir` / `statfs` / `fstatfs` → `…$INODE64`, `realpath` →
-// `realpath$DARWIN_EXTSN`). Those nine are the ONLY witnesses of the reverse
-// arm, so this test uses one of them — `write`. ✔MEASURED with the reverse arm
-// mutated out (shipped CLI, pe64-x86_64): the archived TU`s exec link failed
-// with `undefined symbol '_write'`.
+// `realpath$DARWIN_EXTSN`). Those nine were the ONLY witnesses of the reverse
+// arm, and this test used one of them — `write` (✔MEASURED with the reverse arm
+// mutated out, shipped CLI, pe64-x86_64: the archived TU`s exec link failed with
+// `undefined symbol '_write'`). Since P69 fold 3f `write`, `lseek` and `getpid`
+// are the platform link's ALIASES on pe (`writtenNameRoute: linkerAlias`): a DSS
+// unit keeps the written name and the image link states the alias, so its object
+// no longer holds `_write`. The pe witness is now `_setjmp`→`__intrinsic_setjmp`,
+// an image's export the corpus declares under no other row.
 //
 // pe64 is used because the arm64 Darwin family (the Mach-O leg this suite can
 // build everywhere) carries none of the suffixed rows — they are x86_64-gated.
@@ -2002,8 +2006,9 @@ TEST(ArchiveMemberLibraryImport, MachOMemberRebindsToTheImageTheDirectPathBinds)
 // `UnitBuilder::addInMemory` with no system include search path, so the include
 // form fails to preprocess here for reasons unrelated to the property under test.
 constexpr std::string_view kLinkNameLibSrc =
-    "extern int write(int fd, const void *buf, unsigned n);\n"
-    "int dss_lib_answer(void){ write(1, \"\", 0); return 42; }\n";
+    "extern int _setjmp(void *env, void *frame);\n"
+    "static char dss_env[256];\n"
+    "int dss_lib_answer(void){ return _setjmp(dss_env, 0) == 0 ? 42 : 1; }\n";
 
 TEST(ArchiveMemberLibraryImport, CoffMemberBindsARowCarryingAPlatformLinkName) {
     Schemas s = loadCoffSchemas();
@@ -2018,9 +2023,9 @@ TEST(ArchiveMemberLibraryImport, CoffMemberBindsARowCarryingAPlatformLinkName) {
         *s.exec, directRep);
     ASSERT_TRUE(directMod) << "direct assemble failed; errs="
                            << directRep.errorCount();
-    auto const linkedName = onBinaryNameEndingIn(*directMod, "write");
+    auto const linkedName = onBinaryNameEndingIn(*directMod, "setjmp");
     ASSERT_TRUE(linkedName)
-        << "the direct build must import the platform's link name for write() — "
+        << "the direct build must import the platform's link name for _setjmp() — "
            "if this stops holding, the corpus row changed and this test is "
            "asserting the wrong thing";
     auto const referenceLibrary = importLibraryOf(*directMod, *linkedName);

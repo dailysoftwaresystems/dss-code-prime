@@ -255,9 +255,14 @@ writeArArchive(std::span<ArMemberInput const> members,
     if (coff) {
         sortedOrder.resize(symbolCount);
         std::iota(sortedOrder.begin(), sortedOrder.end(), std::size_t{0});
+        // ★ A TOTAL ORDER (P69 fold 3f, lane `xa`): two members that export one
+        // name tie on it, and the entry that comes first for a name is the member
+        // a linker pulls. std::sort is not stable, so the tie was the library's;
+        // the 1st armap's position -- the members' own order -- breaks it.
         std::sort(sortedOrder.begin(), sortedOrder.end(),
                   [&](std::size_t a, std::size_t b) {
-                      return symbolName[a] < symbolName[b];
+                      if (symbolName[a] != symbolName[b]) return symbolName[a] < symbolName[b];
+                      return a < b;   // the 1st armap's order: member order
                   });
         // The sorted name blob is the SAME bytes as armapNameBlob (same names +
         // NUL terminators, reordered), so its size is armapNameBlob.size().

@@ -1,0 +1,6 @@
+    std::vector<std::uint32_t> unitOrder;
+    unitOrder.reserve(dataUnits.size());
+    for (auto const& [unit, members] : dataUnits) unitOrder.push_back(unit);
+    std::sort(unitOrder.begin(), unitOrder.end());
+    for (std::uint32_t const unit : unitOrder) {
+        auto& members = dataUnits.at(unit);

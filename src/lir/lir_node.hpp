@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/data_model.hpp"   // kBackEndAddressBytes: what flags 0 decodes to
 #include "core/types/strong_ids.hpp"
 #include "core/types/target_schema.hpp"
 #include "lir/lir_reg.hpp"
@@ -216,6 +217,11 @@ lirInstWidthBits(std::uint8_t flags) noexcept {
     return (flags & kLirInstFlagWidth32) != 0 ? std::uint8_t{32}
                                               : std::uint8_t{64};
 }
+
+// The width-default operation (flags 0) IS the back end's address width
+// (data_model.hpp's `kBackEndAddressBytes`, the one the admissibility predicate
+// admits a data model by): a change of either without the other fails the BUILD.
+static_assert(lirInstWidthBits(0) == 8 * kBackEndAddressBytes);
 
 // ── THE INVERSE, AND IT IS PARTIAL ON PURPOSE ────────────────────────────────
 //

@@ -5069,6 +5069,8 @@ enum class DiagnosticCode : std::uint16_t {
     //   `LinkedImage::resolvedCrossCuRefs`). Reserved for any future genuinely-
     //   unsupported merge interaction so callers keep a code distinct from the
     //   resolution diagnostics (K_SymbolRedefinedAcrossUnits / K_CrossCuImageEmitDeferred).
+    //   P69 fold 3f: and units lowered for a data model the link's format does
+    //   not state -- every size they hold was taken under theirs.
     K_CrossCuMergeUnsupported      = 0x8010,
     // K_SymbolRedefinedAcrossUnits: two or more STRONG (Global) definitions of the
     //   same symbol NAME across CUs. The cross-CU analog of K_DuplicateDataSymbol
@@ -5669,7 +5671,10 @@ enum class DiagnosticCode : std::uint16_t {
     //   another symbol (LNK4258), a second `/EXPORT:` of one name (LNK4197), a
     //   `/SECTION:` naming a section the image lacks (LNK4039), a
     //   `/FAILIFMISMATCH:` disagreement (GNU ld links it), and a stack or heap
-    //   request in a link whose image the loader reads neither from (a DLL).
+    //   request in a link whose image the loader reads neither from (a DLL);
+    //   and a unit's `#pragma comment` request its object format has no place
+    //   for (P69 fold 3f: a library where the document names none, a directive
+    //   where it reads none -- clang on ELF warns "ignored").
     //   Suppressible: the build proceeds with the meaning the references give it.
     K_LinkerDirectiveIgnored       = 0x802C,
     // K_CommonSymbolUnallocatable (D-LK-OBJECT-READERS-MISREAD-COMMON-SYMBOLS,

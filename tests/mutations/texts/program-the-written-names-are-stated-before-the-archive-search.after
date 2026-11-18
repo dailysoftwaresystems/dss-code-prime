@@ -1,0 +1,5 @@
+    if (auto early = stateWrittenNameRoutes(combined, target, format, reporter);
+        early.has_value() && !early->empty()) {
+        combined = std::move(*early);
+    }
+    auto pulled = pullStaticArchiveMembers(

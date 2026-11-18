@@ -314,6 +314,7 @@ std::string goldenModule() {
     TypeId const hSig = in.fnSig({}, in.primitive(TypeKind::Void), CallConv::CcSysV);
 
     MirBuilder b;
+    b.stateDataModel(DataModel::Llp64);
     b.stateArgCounting(MirArgCounting::PerClass);
     (void)b.addGlobal(i32, SymbolId{4}, b.literalPoolAdd(intLit(7)), MirFuncId{},
                       SymbolBinding::Global, SymbolVisibility::Default, /*isConst=*/true,
@@ -508,6 +509,7 @@ TEST(MirTextReaderNeverAborts, TheBuilderAnswersWhetherABlockIsOfTheOpenFunction
     TypeInterner in{CompilationUnitId{1}};
     TypeId const sig = in.fnSig({}, in.primitive(TypeKind::Void), CallConv::CcSysV);
     MirBuilder b;
+    b.stateDataModel(DataModel::Lp64);
     EXPECT_FALSE(b.isBlockOfOpenFunction(MirBlockId{1, 0})) << "no function is open";
     (void)b.addFunction(sig, SymbolId{1});
     MirBlockId const f1 = b.createBlock(StructCfMarker::EntryBlock);
@@ -536,6 +538,7 @@ TEST(MirTextReaderNeverAborts, TheBuilderAbortsOnABlockAddressOfAnotherFunctions
             TypeInterner in{CompilationUnitId{1}};
             TypeId const sig = in.fnSig({}, in.primitive(TypeKind::Void), CallConv::CcSysV);
             MirBuilder b;
+            b.stateDataModel(DataModel::Lp64);
             (void)b.addFunction(sig, SymbolId{1});
             MirBlockId const f1 = b.createBlock(StructCfMarker::EntryBlock);
             b.beginBlock(f1);
@@ -807,6 +810,7 @@ Mir blockAddressModule(TypeInterner& ti, std::uint32_t sym, std::uint32_t tableE
     TypeId const vptr  = ti.pointer(ti.primitive(TypeKind::Void));
     TypeId const fnSig = ti.fnSig(std::span<TypeId const>{}, i32, CallConv::CcSysV);
     MirBuilder b;
+    b.stateDataModel(DataModel::Lp64);
     stateIdSpace(b, tableEnd);
     b.addFunction(fnSig, SymbolId{sym});
     MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
@@ -833,6 +837,7 @@ Mir denseSwitchModule(TypeInterner& ti, std::uint32_t sym, std::uint32_t tableEn
     std::array<TypeId, 1> params{i32};
     TypeId const fnSig = ti.fnSig(params, voidT, CallConv::CcSysV);
     MirBuilder b;
+    b.stateDataModel(DataModel::Lp64);
     b.stateArgCounting(MirArgCounting::PerClass);
     stateIdSpace(b, tableEnd);
     b.addFunction(fnSig, SymbolId{sym});
@@ -1040,6 +1045,7 @@ Mir exportedBlockAddressModule(TypeInterner& ti, std::uint32_t exported) {
     TypeId const vptr  = ti.pointer(ti.primitive(TypeKind::Void));
     TypeId const fnSig = ti.fnSig(std::span<TypeId const>{}, i32, CallConv::CcSysV);
     MirBuilder b;
+    b.stateDataModel(DataModel::Lp64);
     stateIdSpace(b, 0);   // made from nothing but itself: its end is one past what it defines, the export's symbol too
     b.addFunction(fnSig, SymbolId{1});
     MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
@@ -1321,6 +1327,7 @@ TEST(MirTextLiteralTwins, AWideFloatWidthIsOneTheModelDefines) {
     WideFloatValue const v80  = WideFloatValue::fromDouble(1.5, TypeKind::F80);
     WideFloatValue const v128 = WideFloatValue::fromDouble(-0.1, TypeKind::F128);
     MirBuilder b;
+    b.stateDataModel(DataModel::Lp64);
     MirLiteralValue l80;  l80.value = v80;   l80.core = TypeKind::F80;
     MirLiteralValue l128; l128.value = v128; l128.core = TypeKind::F128;
     b.addGlobal(f80, SymbolId{1}, b.literalPoolAdd(std::move(l80)), MirFuncId{},
@@ -1365,6 +1372,7 @@ TEST(MirTextLiteralTwins, AWideFloatKindWithNoWidthIsRefusedByTheWriter) {
     TypeInterner ti{CompilationUnitId{1}};
     TypeId const f80 = ti.primitive(TypeKind::F80);
     MirBuilder b;
+    b.stateDataModel(DataModel::Lp64);
     MirLiteralValue lit; lit.value = WideFloatValue{}; lit.core = TypeKind::F80;
     b.addGlobal(f80, SymbolId{1}, b.literalPoolAdd(std::move(lit)), MirFuncId{},
                 SymbolBinding::Global, SymbolVisibility::Default, false, MirThreadStorage::Shared);
@@ -1386,6 +1394,7 @@ TEST(MirTextLiteralTwins, ABitIntInitializerIsWrittenAndRoundTrips) {
     TypeId const bt = ti.bitInt(70, /*isSigned=*/true);
     BitIntValue const value(std::vector<std::uint64_t>{12345u, 0u}, 70u, true);
     MirBuilder b;
+    b.stateDataModel(DataModel::Lp64);
     MirLiteralValue lit;
     lit.value = value;
     lit.core  = TypeKind::BitInt;

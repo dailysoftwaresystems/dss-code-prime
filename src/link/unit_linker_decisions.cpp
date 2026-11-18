@@ -119,6 +119,22 @@ decideUnitLinkerRequests(UnitLinkerRequests const& requests,
     if (requests.empty() || !format.isImageFlavor()) return out;
     // What the readers dropped as the reference linkers drop it, said by the link that drops it.
     for (auto const& message : requests.warnings) warn(reporter, message);
+    // A unit built for a NEWER OS than this image is linked for (`UnitMinimumOs`): warned, as ld64 warns, and linked
+    // on, as ld64 links on (✔MEASURED P69 fold 3f, run 20261117-192243-260e95c2). An image that states no build version judges none.
+    if (auto const& built = format.machoImage().buildVersion; built.has_value()) {
+        auto const spelled = [](std::uint32_t v) {
+            return (v & 0xFFu) == 0u ? std::format("{}.{}", v >> 16, (v >> 8) & 0xFFu)
+                                     : std::format("{}.{}.{}", v >> 16, (v >> 8) & 0xFFu, v & 0xFFu);
+        };
+        for (auto const& m : requests.minimumOs) {
+            if (m.version <= built->minOs) continue;
+            report(reporter, DiagnosticCode::K_NoMatchingObjectFormat, DiagnosticSeverity::Warning,
+                   std::format("linker: {} was built for a newer '{}' version ({}) than this image is linked for ({}, "
+                               "format '{}'), as ld64 warns of it",
+                               who(m.unit), machoBuildVersionPlatformName(built->platform), spelled(m.version),
+                               spelled(built->minOs), format.name()));
+        }
+    }
     // A program the OS starts, or a library a program loads.
     bool const program = format.isExecFlavor();
     bool refused = false;
@@ -232,6 +248,14 @@ decideUnitLinkerRequests(UnitLinkerRequests const& requests,
                     settled(settle(imageBase, r.address, request, "preferred base", format, reporter));
                 } else if constexpr (std::is_same_v<R, UnitSectionAlignmentRequest>) {
                     settled(settle(sectionAlignment, r.bytes, request, "section alignment", format, reporter));
+                } else if constexpr (std::is_same_v<R, UnitManifestDependencyRequest>) {
+                    // A LINK-WIDE SET (✔MEASURED 2026-11-17, link.exe and lld-link alike): each distinct identity
+                    // once, at its first statement's place in unit order; a repeat -- the same text, byte for byte --
+                    // adds nothing, and one more space or another case is another identity.
+                    auto& dependencies = out.image.manifestDependencies;
+                    if (std::find(dependencies.begin(), dependencies.end(), r.identity) == dependencies.end()) {
+                        dependencies.push_back(r.identity);
+                    }
                 } else if constexpr (std::is_same_v<R, UnitMismatchCheck>) {
                     // link.exe and lld-link refuse a disagreement and GNU ld links it (✔MEASURED 2026-10-06/07):
                     // acceptance is the union's, so a DSS link links it and says so.
@@ -327,7 +351,8 @@ decideUnitLinkerRequests(UnitLinkerRequests const& requests,
         for (auto const& unit : units) stated += (stated.empty() ? "" : ", ") + who(unit);
         refuse(reporter, std::format(
             "the directives of {} ask the image for a stack, heap, subsystem, version, base, alignment, checksum, "
-            "section attributes or exports, and the writer of format '{}' realizes none of them: link the objects "
+            "section attributes, exports or manifest dependencies, and the writer of format '{}' realizes none of "
+            "them: link the objects "
             "into a format whose writer does, or drop the directives.",
             stated, format.name()));
         return std::nullopt;
@@ -418,18 +443,19 @@ void dropPulledMemberEntryRequests(UnitLinkerRequests& requests) {
     requests.image = std::move(kept);
 }
 
-std::optional<StandingEntryRequest> standingEntryRequest(std::span<AssembledModule const> namedUnits) {
+std::optional<StandingImageRequest> standingImageRequest(std::span<AssembledModule const> namedUnits,
+                                                         bool (*holds)(UnitImageRequestValue const&)) {
     // WHICH request stands, by the precedence each request's own vocabulary row states, in the named units' order.
     // Two requests of two precedences have no order between them: the decision refuses that link by name.
-    std::optional<StandingEntryRequest> standing;
+    std::optional<StandingImageRequest> standing;
     for (std::size_t u = 0; u < namedUnits.size(); ++u) {
         for (auto const& request : namedUnits[u].linkerRequests.image) {
-            if (std::get_if<UnitEntryRequest>(&request.value) == nullptr) continue;
+            if (!holds(request.value)) continue;
             if (standing.has_value()) {
                 if (standing->request->precedence != request.precedence) return std::nullopt;
                 if (request.precedence == UnitRequestPrecedence::First) continue;
             }
-            standing = StandingEntryRequest{u, &request};
+            standing = StandingImageRequest{u, &request};
         }
     }
     return standing;

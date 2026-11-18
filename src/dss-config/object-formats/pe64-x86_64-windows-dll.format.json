@@ -62,7 +62,7 @@
   "runtimeLibraries": [
     { "role": "unwindPersonality", "image": "ucrtbase.dll" },
     { "role": "atomicsRuntime",    "source": "runtime/platform/src/atomic.c" },
-    { "role": "compilerSupport", "sources": ["runtime/platform/src/pe_compiler_support.c", "runtime/platform/src/pe_compiler_support_x86_64.s", "runtime/platform/src/pe_gcc_unwind.c"] }
+    { "role": "compilerSupport", "sources": ["runtime/platform/src/pe_compiler_support.c", "runtime/platform/src/pe_compiler_support_x86_64.s", "runtime/platform/src/pe_gcc_unwind.c", "runtime/platform/src/pe_gui_startup.c"] }
   ],
 
   "$atomicsRuntimeComment": "D-CSUBSET-PACKED-ATOMIC-MEMBER (P54): the GENERIC C11 atomics entry points an UNDER-ALIGNED `_Atomic` scalar access lowers to a CALL of. The measurement that chose `libatomic-1.dll`, the reason the union REQUIRES the libcall here rather than gcc's inline pair, and the honest note that this is the one NON-in-box image this format's tables name, are all argued in pe64-x86_64-windows-exec.format.json's copy of this key and are deliberately NOT restated — duplicated prose rots independently of its original. WHAT IS SPECIFIC TO THE .dll: this row joins `unwindPersonality` as the SECOND row on a format that still declares no `cLibrary`, and the two absences documented in $runtimeLibrariesComment above are UNAFFECTED by it. A DLL cannot honestly name the image that terminates a process, but it can certainly CONTAIN an under-aligned `_Atomic` access — the same argument $sehPersonalityComment makes for `__try`, that much of Windows is written as DLLs and a format-level refusal is a wrong-reject a USER finds rather than one we find. ⚠ The names are UNDECORATED because this format's `cSymbolDecoration` is `none`. ★★★ P54 LANE `la` — THE ROLE NO LONGER NAMES AN IMAGE, AND EVERY MEASUREMENT ABOVE STILL STANDS. Nothing above is refuted; what changed is the OPERATOR'S RULING on what to do about it. `libatomic-1.dll` really does export the generic entries, ucrtbase really exports none, and the union really does require the libcall route — but depending on a NON-IN-BOX, third-party image was ruled a workaround, and the row above now reads `source` instead of `image`: DSS SHIPS THE BODY, at `runtime/platform/src/atomic.c`, compiled by DSS for this very target and pulled out of the shipped runtime archive by the linker's ordinary unresolved-symbol walk. ⓘ THE PAY-PER-USE PROPERTY IS UNCHANGED AND STILL MEASURED: the archive member is pulled BY NAME, so a program that never lowers an under-aligned `_Atomic` never mentions `__atomic_load` and never links a byte of it. ⚠ AND THE DEPENDENCY-FLOOR PARAGRAPH ABOVE IS NOW HISTORY RATHER THAN A LIVE COST — it is preserved verbatim because it is the argument the ruling overturned, not because it still describes this format: a DSS pe64 program touching a packed `_Atomic` now imports `ucrtbase.dll` and nothing else. ⚠⚠ THE elf64 AND macho64 SIBLINGS DELIBERATELY KEEP THEIR `image` ROWS, and the reason is CORRECTNESS rather than inertia: `libatomic.so.1` and `libSystem.B.dylib` are those platforms' OWN atomics runtimes, so a gcc-built and a DSS-built translation unit touching the same under-aligned object reach the SAME arbiter. On aarch64 that arbiter is an address-hashed LOCK TABLE (the ISA has no bus lock — every aarch64 atomic primitive faults on an unaligned address), and a lock table arbitrates only between its own users, so shipping a private one there would be strictly WORSE than using the platform's. x86-64 has no such problem: DSS's body uses `lock`-prefixed read-modify-writes, which the ISA makes atomic against EVERY accessor regardless of alignment, so our body and mingw's libatomic interoperate. ⚠⚠ P66 LANE `bl` (D-C-ATOMICS-RUNTIME-PE64-BUS-LOCKS-EVERY-ACCESS-TO-A-CACHE-LINE-STRADDLING-OBJECT) — TWO SENTENCES ABOVE ARE NOW FALSE; the correction is argued in pe64-x86_64-windows-exec.format.json's copy of this key and in `runtime/platform/src/atomic.c`. In short: a locked operand that crosses a cache line is a split lock whose bus lock stalls every core, so the body copies a line-crossing object under the process lock, `HeapLock(GetProcessHeap())`, and a program linking it also imports those names from `kernel32.dll`. ★ WHAT IS SPECIFIC TO THE .dll: a DLL links its OWN copy of the body, which is exactly why that lock must be the process heap's and not a table in the body — the heap is ONE per process, so this image and the exe that loads it lock the same arbiter. ★ D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE: `compareExchangeMangledName` names the compare-exchange entry an under-aligned `_Atomic` compound assignment or increment commits through; the same body defines it under the same arbiter as its load and store, as argued in pe64-x86_64-windows-exec.format.json's copy of this key.",
@@ -110,7 +110,38 @@
     "$comment": "IMAGE_FILE_HEADER identity. machine = IMAGE_FILE_MACHINE_AMD64 (0x8664). characteristics = IMAGE_FILE_EXECUTABLE_IMAGE (0x0002) | IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) | IMAGE_FILE_DLL (0x2000) = 0x2022 -- byte-identical to `cl /LD` ground truth (dumpbin: 'Executable / Application can handle large addresses / DLL'). EXECUTABLE_IMAGE is required on DLLs too (PE COFF: absent means 'linker error'; the loader refuses the file); IMAGE_FILE_DLL is what makes CreateProcess reject it and LoadLibrary accept it. type = dll routes the walker's Dll arm.",
     "machine": 34404,
     "characteristics": 8226,
-    "type": "dll"
+    "type": "dll",
+    "$embeddedManifestComment": "P69 fold 3f (lane `xa`; D-LK-PE-IMAGE-CANNOT-HONOUR-EVERY-LINKER-DIRECTIVE item (2)): the manifest this DLL embeds when its units depend on side-by-side assemblies -- the exec document's block (its comment states the measurement), with the resource id a DLL takes: 2 (ISOLATIONAWARE_MANIFEST_RESOURCE_ID), MEASURED 2026-11-17 on link.exe 14.52 (/LD /MANIFEST:EMBED) and lld-link 18.1.3 (/dll /manifest:embed).",
+    "embeddedManifest": {
+      "section": ".rsrc",
+      "characteristics": 1073741888,
+      "resourceType": 24,
+      "resourceId": 2,
+      "language": 1033,
+      "codePage": 0,
+      "lineEnd": "\r\n",
+      "head": [
+        "<?xml version='1.0' encoding='UTF-8' standalone='yes'?>",
+        "<assembly xmlns='urn:schemas-microsoft-com:asm.v1' manifestVersion='1.0'>",
+        "  <trustInfo xmlns=\"urn:schemas-microsoft-com:asm.v3\">",
+        "    <security>",
+        "      <requestedPrivileges>",
+        "        <requestedExecutionLevel level='asInvoker' uiAccess='false' />",
+        "      </requestedPrivileges>",
+        "    </security>",
+        "  </trustInfo>"
+      ],
+      "dependency": [
+        "  <dependency>",
+        "    <dependentAssembly>",
+        "      <assemblyIdentity {identity} />",
+        "    </dependentAssembly>",
+        "  </dependency>"
+      ],
+      "tail": [
+        "</assembly>"
+      ]
+    }
   },
 
   "$overAlignedObjectPlacementComment": "D-CSUBSET-THREAD-LOCAL-PE-OVERALIGN (P64): the same answer the exec sibling gives, restated here rather than cross-referenced only, because a reader of THIS document asking 'where is the maximum object alignment declared?' must not have to find the other one. It is not declared, deliberately. An over-aligned static and an over-aligned `thread_local` are both PLACED by `pe.cpp` (the dll arm shares `encodeExec`), up to 8192 and no further, and 8192 is what the CONTAINER can express: PE/COFF's FOUR-BIT IMAGE_SCN_ALIGN_* field, whose largest defined value is IMAGE_SCN_ALIGN_8192BYTES, in a section header and in IMAGE_TLS_DIRECTORY64.Characteristics alike. A document declaring more would state a falsehood about the file format, so the bound lives in the format writer beside its u32 wire guards. `sectionAlignment` below is the image's VA granularity and is NOT that ceiling -- P63 briefly treated it as one and was measured wrong in both directions; `ld` leaves it at 0x1000 and pads WITHIN the section instead, which is what `alignSectionHeadToItems` now does.",

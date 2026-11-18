@@ -83,8 +83,14 @@ struct Unit {
     Mir                                            mir;
     std::vector<ExternImport>                      imports;
     std::unordered_map<std::uint32_t, std::string> names;
-    explicit Unit(std::uint32_t cu) : interner{CompilationUnitId{cu}} {}
+    // The data model the unit is lowered for -- the model of the document it is merged under, which the merge
+    // requires (P69 fold 3f): LP64 for the ELF and Mach-O cells, `kPeModel` for the PE ones.
+    DataModel                                      model;
+    explicit Unit(std::uint32_t cu, DataModel lowered = DataModel::Lp64)
+        : interner{CompilationUnitId{cu}}, model{lowered} {}
 };
+// The data model of the PE image document the PE cells merge under (`pe64-x86_64-windows-exec`: LLP64).
+constexpr DataModel kPeModel = DataModel::Llp64;
 
 struct Fn {
     std::uint32_t symbol;
@@ -105,6 +111,7 @@ struct Ref {
 void build(Unit& u, std::vector<Fn> const& fns, std::vector<Alias> const& aliases, std::vector<Ref> const& refs) {
     TypeId const sig = u.interner.fnSig({}, u.interner.primitive(TypeKind::Void), CallConv::CcSysV);
     MirBuilder   b;
+    b.stateDataModel(u.model);
     for (Fn const& f : fns) {
         (void)b.addFunction(sig, SymbolId{f.symbol}, f.linkage);
         MirBlockId const e = b.createBlock(StructCfMarker::EntryBlock);
@@ -147,6 +154,7 @@ void buildData(Unit& u, std::vector<Datum> const& data, std::vector<Alias> const
     TypeId const i32 = u.interner.primitive(TypeKind::I32);
     TypeId const sig = u.interner.fnSig({}, u.interner.primitive(TypeKind::Void), CallConv::CcSysV);
     MirBuilder   b;
+    b.stateDataModel(u.model);
     for (Datum const& d : data) {
         MirLiteralValue lit;
         lit.value = d.value;
@@ -566,7 +574,7 @@ TEST(MirMergeAlias, AnAliasOfACopyDiscardedWholeNamesTheWinnerAndAnotherUnitsUse
     {
         // Only its own unit uses the alias: each alias names the winning copy, module-private, and the
         // unit's own read of the external one reaches the winner directly — no name `m` is left outside.
-        Unit a{1}, b{2};
+        Unit a{1, kPeModel}, b{2, kPeModel};
         buildData(a, {Datum{1, "w", kSelectAny, 7}}, {}, {}, {});
         losing(b);
         Merged m;
@@ -599,7 +607,7 @@ TEST(MirMergeAlias, AnAliasOfACopyDiscardedWholeNamesTheWinnerAndAnotherUnitsUse
     }
     {
         // ANOTHER unit uses the alias's name: no definition of `m` is left, refused by name.
-        Unit a{1}, b{2};
+        Unit a{1, kPeModel}, b{2, kPeModel};
         buildData(a, {Datum{1, "w", kSelectAny, 7}}, {}, {Ref{5, "m"}}, {User{6, "use_m", 5}});
         losing(b);
         Merged m;
@@ -612,7 +620,7 @@ TEST(MirMergeAlias, AnAliasOfACopyDiscardedWholeNamesTheWinnerAndAnotherUnitsUse
     }
     {
         // CONTROL: the other unit DECLARES `m` and uses it nowhere — every reference takes the link.
-        Unit a{1}, b{2};
+        Unit a{1, kPeModel}, b{2, kPeModel};
         buildData(a, {Datum{1, "w", kSelectAny, 7}}, {}, {Ref{5, "m"}}, {});
         losing(b);
         Merged m;
@@ -658,7 +666,7 @@ TEST(MirMergeAlias, AnAliasOfALosingCopyLeavesTheElectionOfItsName) {
     };
     auto const thirdReadingM = [](Unit& u) { buildData(u, {}, {}, {Ref{1, "m"}}, {User{2, "main_m", 1}}); };
     for (bool const third : {false, true}) {
-        Unit a{1}, b{2}, c{3};
+        Unit a{1, kPeModel}, b{2, kPeModel}, c{3, kPeModel};
         unitA(a, kSelectAny);
         unitB(b, kSelectAny);
         thirdReadingM(c);
@@ -716,7 +724,7 @@ TEST(MirMergeAlias, TwoAliasesOfTheirOwnCopiesAreOneDefinitionOfTheirName) {
     };
     char const* const pe = "pe64-x86_64-windows-exec";
     {
-        Unit a{1}, b{2}, c{3};
+        Unit a{1, kPeModel}, b{2, kPeModel}, c{3, kPeModel};
         withAlias(a, 7, "read_a");
         withAlias(b, 9, "read_b");
         buildData(c, {}, {}, {Ref{1, "m"}}, {User{2, "main_m", 1}});
@@ -745,7 +753,7 @@ TEST(MirMergeAlias, TwoAliasesOfTheirOwnCopiesAreOneDefinitionOfTheirName) {
     }
     {
         // (ii'): a third unit's strong `m` beside them — two definitions, refused.
-        Unit a{1}, b{2}, c{3};
+        Unit a{1, kPeModel}, b{2, kPeModel}, c{3, kPeModel};
         withAlias(a, 7, "read_a");
         withAlias(b, 9, "read_b");
         buildData(c, {Datum{1, "m", kStrong, 1}}, {}, {}, {});
@@ -764,7 +772,7 @@ TEST(MirMergeAlias, TwoAliasesOfTheirOwnCopiesAreOneDefinitionOfTheirName) {
 // nothing is built on them afterwards (before the fix the merge went on to name an alias by another alias and
 // failed its own verification).
 TEST(MirMergeAlias, AliasesWhoseCopiesWaitOnEachOtherAreRefusedAsTwiceDefinedNames) {
-    Unit a{1}, b{2};
+    Unit a{1, kPeModel}, b{2, kPeModel};
     buildData(a, {Datum{1, "y", kSelectAny, 1}}, {Alias{2, "x", 1, kStrong}}, {Ref{2, "x"}}, {User{3, "ua", 2}});
     buildData(b, {Datum{1, "x", kSelectAny, 2}}, {Alias{2, "y", 1, kStrong}}, {Ref{2, "y"}}, {User{3, "ub", 2}});
     Merged m;
@@ -782,7 +790,7 @@ TEST(MirMergeAlias, AliasesWhoseCopiesWaitOnEachOtherAreRefusedAsTwiceDefinedNam
 TEST(MirMergeAlias, AnAliasOfACopyWhoseFateTheDocumentDoesNotStateIsRefusedByName) {
     auto const unstated = peImageDocumentStatingNoSupersededDefinition();
     ASSERT_NE(unstated, nullptr);
-    Unit a{1}, b{2};
+    Unit a{1, kPeModel}, b{2, kPeModel};
     buildData(a, {Datum{1, "w", kSelectAny, 7}}, {}, {}, {});
     buildData(b, {Datum{1, "w", kSelectAny, 9}}, {Alias{2, "m", 1, kStrong}}, {Ref{2, "m"}}, {User{3, "read_m", 2}});
     Merged m;
@@ -854,7 +862,7 @@ TEST(MirMergeAlias, AWeakAliasOfACopyIsAWeakDefinitionOfItsOwnName) {
             std::vector<std::unique_ptr<Unit>> units;
             std::vector<Unit const*>           in;
             for (std::size_t i = 0; i < order.size(); ++i) {
-                units.push_back(std::make_unique<Unit>(static_cast<std::uint32_t>(i + 1)));
+                units.push_back(std::make_unique<Unit>(static_cast<std::uint32_t>(i + 1), kPeModel));
                 order[i](*units.back());
                 in.push_back(units.back().get());
             }

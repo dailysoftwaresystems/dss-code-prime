@@ -1244,6 +1244,31 @@ enum class PragmaEffect : std::uint8_t {
     //     implementation-defined here and cannot be defined into conformance.
     StandardFloatState,
     StandardFloatStateDiverges,
+    // ★ P69 (lane `xa`, fold 3f): a REQUEST TO THE PROGRAM'S LINK, by kind
+    // (`#pragma comment(kind[, "text"])`). APPENDED LAST, as the two above were.
+    // The row states each kind it reads and what that kind asks
+    // (`PragmaCommentRequest`: a library to search, a linker directive, or
+    // nothing), so the engine holds no kind's name; what the request BECOMES
+    // is the active object format's data (ELF's dependent-libraries section,
+    // COFF's directive vocabulary, Mach-O's linker options). ✔MEASURED (P69 fold
+    // 3f): cl honours `linker` and `lib` (`.drectve`); clang on its windows-msvc
+    // target the same; clang on ELF `lib` (`.deplibs`, ld.lld honours it) and
+    // warns on the rest; gcc ignores every form; `exestr` means nothing to any
+    // linker (link.exe LNK4229), `compiler` and `user` write nothing anywhere.
+    LinkerComment,
+};
+
+// ★ P69 (lane `xa`, fold 3f): what one `#pragma comment` KIND asks of the link.
+enum class PragmaCommentRequest : std::uint8_t {
+    DependentLibrary,   // a library the link searches (`lib`)
+    LinkerDirective,    // a directive the link reads as an object's own (`linker`)
+    Nothing,            // accepted, and nothing is written (`exestr`, `compiler`, `user`)
+};
+
+// One kind a `linkerComment` row reads, and its request.
+struct DSS_EXPORT PragmaCommentKind {
+    std::string          name;
+    PragmaCommentRequest request = PragmaCommentRequest::Nothing;
 };
 
 // One registry row: the leading WORD(S) that identify a pragma, and what DSS
@@ -1251,6 +1276,19 @@ enum class PragmaEffect : std::uint8_t {
 struct DSS_EXPORT PragmaEffectRow {
     std::vector<std::string> prefix;   // e.g. {"clang","diagnostic"} or {"pack"}
     PragmaEffect             effect = PragmaEffect::Unsupported;
+    // `linkerComment` rows only (the loader requires it there and refuses it on any
+    // other): the kinds the pragma reads, each with its request.
+    std::vector<PragmaCommentKind> commentKinds;
+};
+
+// ★ P69 (lane `xa`, fold 3f): one REACHED `#pragma comment` that asks something of
+// the link, in reach order -- its request and its text (the string literal(s),
+// escapes decoded and concatenated). The preprocessor's product; the compile
+// pipeline turns each into the active format's form.
+struct DSS_EXPORT PragmaLinkRequest {
+    PragmaCommentRequest request = PragmaCommentRequest::Nothing;
+    std::string          text;
+    friend bool operator==(PragmaLinkRequest const&, PragmaLinkRequest const&) = default;
 };
 
 // ── D-LANG-PE64-DEFINES-BOTH-MSC-VER-AND-GNUC: one MUTUALLY EXCLUSIVE group ──

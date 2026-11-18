@@ -126,7 +126,8 @@ CompilationUnit::CompilationUnit(PrivateTag,
                                  std::vector<PreprocessedPositionMap>
                                      preprocessedPositionMaps,
                                  std::string                          inputDigest,
-                                 std::uint64_t                        speculationProbeCount)
+                                 std::uint64_t                        speculationProbeCount,
+                                 std::vector<PragmaLinkRequest>       pragmaLinkRequests)
     : id_(id)
     , schema_(std::move(schema))
     , trees_(std::move(trees))
@@ -138,7 +139,8 @@ CompilationUnit::CompilationUnit(PrivateTag,
     , pragmaNoOptimizeSets_(std::move(pragmaNoOptimizeSets))
     , preprocessedPositionMaps_(std::move(preprocessedPositionMaps))
     , inputDigest_(std::move(inputDigest))
-    , speculationProbeCount_(speculationProbeCount) {}
+    , speculationProbeCount_(speculationProbeCount)
+    , pragmaLinkRequests_(std::move(pragmaLinkRequests)) {}
 
 CompilationUnit::~CompilationUnit()                                            = default;
 CompilationUnit::CompilationUnit(CompilationUnit&&) noexcept                   = default;
@@ -188,6 +190,10 @@ CompilationUnit::pragmaNoOptimizeFor(std::size_t treeIndex) const noexcept {
     static std::unordered_set<std::uint32_t> const kEmpty;
     if (treeIndex >= pragmaNoOptimizeSets_.size()) return kEmpty;
     return pragmaNoOptimizeSets_[treeIndex];
+}
+
+std::span<PragmaLinkRequest const> CompilationUnit::pragmaLinkRequests() const noexcept {
+    return pragmaLinkRequests_;
 }
 
 bool CompilationUnit::isSynthesizedPreprocessorBuffer(
@@ -546,6 +552,14 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
         {
             std::unordered_set<std::string> seen;
             std::unordered_set<std::string> seenValues;
+            // P69 fold 3f (ledger 563 (A)): the unit's ARCH beside its format -- the pair's
+            // target name, the fact a symbol row's arch entry is decided by -- so the value
+            // seed below names the rows the semantic tier declares on this pair. A unit with
+            // a format and no target leaves an arch entry undecided, and the seed drops it.
+            std::optional<std::string_view> const unitArch =
+                predefinedTypeFacts_.has_value() && !predefinedTypeFacts_->targetName.empty()
+                    ? std::optional<std::string_view>{predefinedTypeFacts_->targetName}
+                    : std::nullopt;
             for (std::filesystem::path const& desc :
                  pp.resolvedShippedDescriptors) {
                 DiagnosticReporter scratch{budget_.withoutDedup().asConfig()};
@@ -559,10 +573,11 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
                 }
                 // P69 L2b2 (ruling 516): and its VALUE names — the functions, objects and
                 // constants the semantic read binds — so a name the sketch does not know is
-                // one nothing declares. The format the analyzer gates them by, when the unit
-                // has one; every format's otherwise (a superset: a name the sketch knows is
-                // never called undeclared).
-                if (auto names = ffi::readShippedLibValueNames(desc, activeFormat_, scratch)) {
+                // one nothing declares. The pair the analyzer gates them by -- its format and
+                // its arch -- when the unit has one; every format's otherwise (a superset: a
+                // name the sketch knows is never called undeclared).
+                if (auto names = ffi::readShippedLibValueNames(desc, activeFormat_, scratch,
+                                                               unitArch)) {
                     for (auto& n : *names) {
                         if (seenValues.insert(n).second) {
                             cfg.seedGlobalValueNames.push_back(std::move(n));
@@ -622,6 +637,8 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
         sidecar.pragmaPack      = std::move(pp.pragmaPackByOffset);
         // TF-C85: same hop for the `#pragma optimize` stamps.
         sidecar.pragmaNoOptimize = std::move(pp.pragmaNoOptimizeByOffset);
+        // P69 fold 3f: and for what the tree's `#pragma comment`s ask of the link.
+        sidecar.pragmaLinkRequests = std::move(pp.pragmaLinkRequests);
         return trees_.back().id();
     }
     // c105 (D-PP-USER-DEFINE): `--define` macros can ONLY be consumed by a
@@ -1263,6 +1280,23 @@ CompilationUnit UnitBuilder::finish() && {
                 doc += '\n';
             }
         }
+        // P69 fold 3f: the THIRD pragma product, removed from the token stream
+        // like the two above -- what the tree's `#pragma comment`s ask of the
+        // link, each request with its text's length and the text.
+        if (i < sidecars_.size()) {
+            auto const& requests = sidecars_[i].pragmaLinkRequests;
+            doc += "pragma-link-requests ";
+            doc += std::to_string(requests.size());
+            doc += '\n';
+            for (PragmaLinkRequest const& r : requests) {
+                doc += std::to_string(static_cast<unsigned>(r.request));
+                doc += ' ';
+                doc += std::to_string(r.text.size());
+                doc += ' ';
+                doc += r.text;
+                doc += '\n';
+            }
+        }
     }
     // The angle-`#include` half: a neutral JSON descriptor is never spliced and
     // never tokenized, so it is invisible to every term above while deciding the
@@ -1296,6 +1330,13 @@ CompilationUnit UnitBuilder::finish() && {
     }
     std::string const inputDigest = crypto::sha256Hex(doc);
 
+    // P69 fold 3f: the trees' `#pragma comment` requests, in tree order (each
+    // tree's in reach order) -- read into the digest above, then handed on.
+    std::vector<PragmaLinkRequest> pragmaLinkRequests;
+    for (auto& sc : sidecars_) {
+        for (auto& r : sc.pragmaLinkRequests) pragmaLinkRequests.push_back(std::move(r));
+    }
+
     finished_ = true;
     CompilationUnit unit{
         CompilationUnit::PrivateTag{},
@@ -1311,6 +1352,7 @@ CompilationUnit UnitBuilder::finish() && {
         std::move(preprocessedPositionMaps),
         inputDigest,
         speculationProbes_,
+        std::move(pragmaLinkRequests),
     };
     // Every unit any builder finishes is heard by every registered observer — the one
     // place a consumer sees them all, whoever built it (unit_finished_observer.hpp).

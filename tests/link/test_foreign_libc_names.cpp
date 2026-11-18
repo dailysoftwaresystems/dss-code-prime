@@ -7,9 +7,9 @@
 //   points, its <ctype.h> the table accessors `__ctype_b_loc` and two more, its strict <signal.h> `__sysv_signal`;
 //   the macOS SDK's checked entry points `___*_chk`, its inline <ctype.h> `__DefaultRuneLocale` (a DATUM) and
 //   `___maskrune`; MinGW-w64's <stdlib.h> `_exit` for `_Exit`. Each such name was left unbound, or bound to a DSS
-//   row's OTHER realization (a C17 object's `strtol` to the C23 body), by both binders. The one home is
-//   `realizePlatformExternsByOnBinaryName` (compile_pipeline.cpp): a corpus row realizing to ANOTHER name than the
-//   one asked is held back, the reverse index is asked, and a row realizing to the name exactly answers -- each
+//   row's OTHER realization (a C17 object's `strtol` to the C23 body), by both binders. The one home is the
+//   reader's route of a written name (`ffi::writtenNameRoutesOn`, P69 fold 3f): a row whose link name here IS the
+//   name asked answers it before the row of its C spelling, whose link name is another -- each
 //   such row named by the platform's export, unversioned (stdlib.json, stdio.json, string.json, ctype.json,
 //   signal.json, unistd.json, fcntl.json, inttypes.json).
 //
@@ -77,10 +77,11 @@ struct Cell {
 };
 
 // aarch64 ELF's stack-protector canary is exported by the program interpreter (ld-linux-aarch64.so.1), not by the C
-// library, and x86_64 glibc exports none (MEASURED 2026-11-13, readelf --dyn-syms): the corpus states availability per
-// object format only, so no row can say "aarch64 ELF, the interpreter" yet (ledger 563: fold 3f, an arch selector on
-// a row's availability entry carrying its providing image).
-constexpr char const* kGuardOwedTo = "fold 3f (ledger 563): aarch64 ELF's canary is the interpreter's export";
+// library, and x86_64 glibc exports none (MEASURED 2026-11-13, readelf --dyn-syms; P69 fold 3f, readelf -V of gcc's
+// aarch64 PIE: `__stack_chk_guard@GLIBC_2.17` filed under the interpreter): stdlib.json's row names it through an
+// arch entry, `{"format": "elf", "arch": "arm64", "image": {"role": "programInterpreter"}}` (ledger 563 (A)),
+// so an aarch64 image of a guarded unit imports it and NEEDS that image.
+constexpr char const* kArm64Interpreter = "ld-linux-aarch64.so.1";
 // gcc's x86_64 code names glibc's `stdout` directly (`stdout(%rip)`, R_X86_64_PC32), which a link binds only through a
 // copy relocation; DSS binds library data through a loader-filled slot and refuses the direct reference by name
 // (MEASURED 2026-11-13, K_ImportReferenceUnbindable). The disclosed row of a library datum named directly owes it.
@@ -98,11 +99,15 @@ std::vector<std::string> const kStrtoC2x{"__isoc23_strtol", "__isoc23_strtoul", 
 std::vector<std::string> const kStrtoClang{"strtol", "strtoimax", "strtoumax", "wcstoimax", "wcstoumax"};
 std::vector<std::string> const kScanfC17{"__isoc99_scanf", "__isoc99_fscanf", "__isoc99_sscanf",
                                          "__isoc99_vscanf", "__isoc99_vfscanf", "__isoc99_vsscanf"};
+// gcc's fortify unit names no `__strcat_chk` (MEASURED P69 fold 3f, 2026-11-17: the undefined symbols of both gcc
+// fixtures' `.symtab` -- 42 names on x86_64, 43 on aarch64 with the canary -- hold `__stpcpy_chk` and
+// `__strncat_chk`, and `__strcat_chk` in neither). The list was the x86_64 cell's, which its copy-relocation
+// refusal never compares; the aarch64 cell, which links since the canary row, is the first to.
 std::vector<std::string> const kFortifyGlibc{
     "__printf_chk", "__fprintf_chk", "__sprintf_chk", "__snprintf_chk", "__vfprintf_chk", "__vsprintf_chk",
     "__vsnprintf_chk", "__fgets_chk", "__fread_chk", "__getcwd_chk", "__gethostname_chk", "__open_2",
     "__read_chk", "__pread_chk", "__readlink_chk", "__realpath_chk", "__mbstowcs_chk", "__wcstombs_chk",
-    "__strcat_chk", "__strncat_chk", "__strcpy_chk", "__strncpy_chk", "__stpcpy_chk", "__memcpy_chk",
+    "__strncat_chk", "__strcpy_chk", "__strncpy_chk", "__stpcpy_chk", "__memcpy_chk",
     "__memmove_chk", "__memset_chk", "__strlcpy_chk", "__strlcat_chk"};
 std::vector<std::string> const kCtypeGlibc{"__ctype_b_loc", "__ctype_tolower_loc", "__ctype_toupper_loc"};
 
@@ -112,16 +117,14 @@ std::vector<std::string> const kCtypeGlibc{"__ctype_b_loc", "__ctype_tolower_loc
     };
     // gcc's stack protector (Ubuntu's gcc enables it) guards each of these four units' frames (MEASURED 2026-11-13, the
     // fixtures' symbol tables): on x86_64 the frame calls glibc's reporter, `__stack_chk_fail`, exported by libc.so.6;
-    // on aarch64 it also reads the canary, `__stack_chk_guard`, which only the interpreter exports, so those four
-    // aarch64 links are refused naming it, owed to fold 3f.
+    // on aarch64 it also reads the canary, `__stack_chk_guard`, which only the interpreter exports (above): the image
+    // imports it too.
+    bool const arm64 = std::string_view{arch} == "arm64";
     auto const guarded = [&](std::vector<std::string> names) {
         names.push_back("__stack_chk_fail");
+        if (arm64) names.push_back("__stack_chk_guard");
         return names;
     };
-    bool const arm64 = std::string_view{arch} == "arm64";
-    std::vector<std::string> const refused = arm64 ? std::vector<std::string>{"__stack_chk_guard"}
-                                                   : std::vector<std::string>{};
-    char const* const owedTo = arm64 ? kGuardOwedTo : nullptr;
     // The scanf units point a standard stream at their file with POSIX's `dup2`, the fortify unit makes its file with
     // `mkstemp` (MEASURED, the fixtures' undefined symbols): unistd.json's and stdlib.json's rows.
     auto const with = [](std::vector<std::string> names, char const* more) {
@@ -129,15 +132,14 @@ std::vector<std::string> const kCtypeGlibc{"__ctype_b_loc", "__ctype_tolower_loc
         return names;
     };
     // x86_64 gcc's fortify unit names glibc's `stdout` directly (above): refused for it alone.
-    Cell const fortify = arm64 ? Cell{f("fortify", "gcc_gnu17"), exec, with(guarded(kFortifyGlibc), "mkstemp"), {},
-                                      refused, owedTo}
+    Cell const fortify = arm64 ? Cell{f("fortify", "gcc_gnu17"), exec, with(guarded(kFortifyGlibc), "mkstemp"), {}}
                                : Cell{f("fortify", "gcc_gnu17"), exec, with(guarded(kFortifyGlibc), "mkstemp"), {},
                                       {"stdout"}, kCopyRelocationOwedTo, DiagnosticCode::K_ImportReferenceUnbindable};
     return {
-        {f("strto", "gcc_c17"), exec, guarded(kStrtoC17), {"__isoc23_strtol"}, refused, owedTo},
-        {f("strto", "gcc_gnu2x"), exec, guarded(kStrtoC2x), {"strtol"}, refused, owedTo},
+        {f("strto", "gcc_c17"), exec, guarded(kStrtoC17), {"__isoc23_strtol"}},
+        {f("strto", "gcc_gnu2x"), exec, guarded(kStrtoC2x), {"strtol"}},
         {f("strto", "clang_c17"), exec, kStrtoClang, {"__isoc23_strtol"}},
-        {f("scanf", "gcc_c17"), exec, with(guarded(kScanfC17), "dup2"), {"__isoc23_sscanf"}, refused, owedTo},
+        {f("scanf", "gcc_c17"), exec, with(guarded(kScanfC17), "dup2"), {"__isoc23_sscanf"}},
         {f("scanf", "clang_c17"), exec, with(kScanfC17, "dup2"), {"__isoc23_sscanf"}},
         fortify,
         {f("ctype", "gcc_c17"), exec, kCtypeGlibc, {}},
@@ -343,9 +345,10 @@ std::vector<std::string> const kTfRoutines{"__extenddftf2", "__multf3", "__trunc
 // object references for the C library EXACTLY ONCE, under the object's own spelling, and none of the names a wrong
 // binding of the same calls would give. A cell owed to a later fold is refused, naming exactly the one name it owes.
 // Every cell is judged, whatever an earlier one did: a failing cell reports and the next one runs.
-// RED-ON-DISABLE: hold no forward row back in `realizePlatformExternsByOnBinaryName` -> the C17 strto objects'
-// `strtol` is answered by the C23 row, and the image imports `__isoc23_strtol` (ELF) or defines DSS's body (PE,
-// Mach-O) in its place; drop a row (`__ctype_b_loc`) -> the link refuses that name undefined.
+// RED-ON-DISABLE: drop the resolver's step 2 (the row whose link name is the name asked, `ffi::writtenNameRoutesOn`)
+// -> the C17 strto objects' `strtol` is answered by no row that binds it (`Header`, its C23 row riding along), and
+// the link refuses it undefined (INFERRED, the sweep reads it); drop a row (`__ctype_b_loc`) -> the link refuses
+// that name undefined.
 TEST(ForeignLibcNames, EachForeignObjectImportsTheLibraryNamesItReferences) {
     test_support::ScratchDir scratch{test_support::Location::InsideRepo, "foreign-libc-names"};
     std::size_t k = 0;
@@ -371,7 +374,16 @@ TEST(ForeignLibcNames, EachForeignObjectImportsTheLibraryNamesItReferences) {
             ADD_FAILURE() << "the reference links this object beside a main:" << diagnosticsOf(rep);
             continue;
         }
-        auto const imports = importsOf(bytesOf(image));
+        auto const bytes = bytesOf(image);
+        auto const imports = importsOf(bytes);
+        // The canary's image (above): an aarch64 ELF image that imports it NEEDS the program interpreter.
+        if (std::find(cell.imports.begin(), cell.imports.end(), "__stack_chk_guard") != cell.imports.end()
+            && bytes.size() >= 4u && bytes[0] == 0x7F && bytes[1] == 'E') {
+            auto const needed = test_support::elfNeededLibraries(bytes);
+            EXPECT_EQ(test_support::dependencyOccurrences(needed, kArm64Interpreter), 1u)
+                << "the image imports the canary from the program interpreter, so it NEEDS "
+                << kArm64Interpreter << "; it needs: " << test_support::joinDependencies(needed);
+        }
         for (auto const& name : cell.imports) {
             EXPECT_EQ(test_support::dependencyOccurrences(imports, name), 1u)
                 << "the image imports `" << name << "` once; it imports: " << test_support::joinDependencies(imports);

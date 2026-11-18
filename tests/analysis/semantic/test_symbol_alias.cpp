@@ -37,6 +37,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 using namespace dss;
 using namespace dss::sem_test;
@@ -286,6 +287,29 @@ TEST(SymbolAlias, CommonAndNocommonStateWhatATentativeDefinitionMayBe) {
         EXPECT_FALSE(m.hasErrors()) << everyDiagnostic(m);
         EXPECT_FALSE(neverCommon(m, "t"));
     }
+}
+
+TEST(SymbolAlias, AliasRefusalsComeInTheOrderTheAliasesAreWritten) {
+    // P69 fold 3f (lane `xa`, the host-order class): each alias's target is judged, and a refusal reported, in
+    // the order the aliases are WRITTEN -- never in the order a hash table of them iterates, which is the C++
+    // library's that built DSS (libstdc++ walks such a table newest first). Eight aliases, each naming no
+    // definition: eight refusals, each naming its alias, in source order.
+    std::string src;
+    std::vector<std::string> aliases;
+    for (char const c : std::string_view{"abcdefgh"}) {
+        std::string const name = std::string{"alias_"} + c;
+        aliases.push_back(name);
+        src += "int " + name + "(void) __attribute__((alias(\"missing_" + c + "\")));\n";
+    }
+    SemanticModel const m = analyzeC(src);
+    std::vector<std::string> refused;
+    for (auto const& d : m.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_SymbolAliasTargetInvalid) continue;
+        std::string const head = d.actual.substr(0, d.actual.find(' '));
+        refused.push_back(head.size() > 2 ? head.substr(1, head.size() - 2) : head);   // '<name>' quoted
+    }
+    EXPECT_EQ(refused, aliases) << "the alias refusals are not in the order the aliases are written"
+                                << everyDiagnostic(m);
 }
 
 TEST(SymbolAlias, ANamedSectionIsRefusedByName) {

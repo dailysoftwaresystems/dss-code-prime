@@ -127,6 +127,7 @@ namespace {
     auto const sig = interner.fnSig(params, boolT, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
     mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(sig, SymbolId{1});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);

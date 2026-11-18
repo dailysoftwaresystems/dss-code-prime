@@ -994,11 +994,49 @@ dss_strict_arm_verdicts(link/test_object_entry_archive)
 
 # P69 fold 3e (lane `xa`) — class C: an object that STATES the image's entry (`/ENTRY:` in its `.drectve`, cl's
 # objects of tests/link/data/object_entry_startup.source.c): a C runtime startup elects among the functions it calls
-# (`wmain` beside `main`, pulled from an archive too), a function starts the image with no C entry, and a startup the
-# document does not support is refused by name; each program runs on Windows x86_64 hosts as link.exe's and lld-link's.
+# (`wmain` beside `main`, pulled from an archive too), a function starts the image with no C entry, and the GUI
+# startups enter at `WinMain` / `wWinMain` (fold 3f); each program runs on Windows x86_64 hosts as link.exe's and
+# lld-link's.
 dss_add_test(NAME link/test_object_entry_startup
              SOURCES test_object_entry_startup.cpp)
 target_link_libraries(dss_link_test_object_entry_startup PRIVATE nlohmann_json::nlohmann_json)
+
+# P69 fold 3f (lane `xa`; D-LK-PE-IMAGE-CANNOT-HONOUR-EVERY-LINKER-DIRECTIVE item (6)) -- THE GUI STARTUPS: a C
+# program whose entry is `WinMain` / `wWinMain` is a pe64 program, handed the four values both references hand it
+# (each run on Windows x86_64 hosts, with a stated show value too), ranked below `main` and `wmain`, and no entry
+# on ELF and Mach-O; the one shape <-> type correspondence and the per-slot verb table; and a stated subsystem
+# ranks its startups' entries first (cl's objects of tests/link/data/object_subsystem.source.c).
+dss_add_test(NAME link/test_gui_startups
+             SOURCES test_gui_startups.cpp)
+target_link_libraries(dss_link_test_gui_startups PRIVATE nlohmann_json::nlohmann_json)
+
+# P69 fold 3f (lane `xa`; D-LK-PE-IMAGE-CANNOT-HONOUR-EVERY-LINKER-DIRECTIVE item (2)) -- THE MANIFEST AN IMAGE
+# EMBEDS: a unit's `/MANIFESTDEPENDENCY:` is a link-wide set, and the pe64 image embeds the manifest that names it --
+# link.exe's tree and text, byte for byte -- for cl's objects of tests/link/data/manifest_dependency.source.c; each
+# image runs on Windows x86_64 hosts, where the loader reads the resource back, and one depending on an assembly no
+# Windows installs is not started.
+dss_add_test(NAME link/test_manifest_dependency
+             SOURCES test_manifest_dependency.cpp)
+target_link_libraries(dss_link_test_manifest_dependency PRIVATE nlohmann_json::nlohmann_json)
+
+# P69 fold 3f (lane `xa`) — `#pragma comment(lib, ...)`'s ELF half: the DEPENDENT-LIBRARIES section
+# (`elf.dependentLibraries`, clang's `.deplibs`). The relocatable and static-library documents state it and an
+# image document none; the relocatable writer names each library once, in order; the reader reads the section
+# back; a document stating none refuses a unit naming a library; the loader refuses an unbuilt verdict, a missing
+# reason and the block on an image document; two units naming one library name it once; and, on a Linux x86_64
+# host with ld.lld, ld.lld searches the library a DSS object names and the image runs.
+dss_add_test(NAME link/test_elf_dependent_libraries
+             SOURCES test_elf_dependent_libraries.cpp)
+target_link_libraries(dss_link_test_elf_dependent_libraries PRIVATE nlohmann_json::nlohmann_json)
+
+# P69 fold 3f (lane `xa`) — `#pragma comment`'s Mach-O half: LC_LINKER_OPTION (`macho.linkerOptions`). The
+# relocatable and static-library documents state it and an image document none; the loader refuses the block on an
+# image document, an empty field, an unbuilt verdict and an unknown key; the writer writes each library and option as
+# its own command, byte for byte clang's; the reader reads each as ld64 does and refuses a command whose strings run
+# past it; a document stating none refuses a unit that asks for one.
+dss_add_test(NAME link/test_macho_linker_options
+             SOURCES test_macho_linker_options.cpp)
+target_link_libraries(dss_link_test_macho_linker_options PRIVATE nlohmann_json::nlohmann_json)
 
 # P69 fold 3e (lane `xa`) — a FOREIGN object's references to the C library bind to the functions the platform
 # exports, under the names the object references (tests/link/data/foreign_libc_names.source.c's units, built by
@@ -1006,6 +1044,30 @@ target_link_libraries(dss_link_test_object_entry_startup PRIVATE nlohmann_json::
 # image's imports; each image runs to 42 where the host runs its format.
 dss_add_test(NAME link/test_foreign_libc_names
              SOURCES test_foreign_libc_names.cpp)
+
+# P69 fold 3f (lane `xa`, ledger 549 (b)) -- a name WRITTEN without the platform's rename (the corpus's
+# `linkerAlias` route on pe: `write` for the UCRT's `_write`) binds as the platform's link binds it: the image
+# imports the link name, a program's own definition of the written name wins, a user archive never answers
+# the alias, a unit's own fallback loses to it, and a name no image exports is refused by name
+# (tests/link/data/written_name.source.c's units, by cl /MT, cl /MD and MinGW-w64 gcc). Every leg links
+# in-process; the images run where the host runs pe.
+dss_add_test(NAME link/test_written_name_binding
+             SOURCES test_written_name_binding.cpp)
+target_link_libraries(dss_link_test_written_name_binding PRIVATE nlohmann_json::nlohmann_json)
+
+# P69 fold 3f (lane `xa`, ledger 716) -- a FOREIGN object reaching a thread-local through the access model a
+# reference compiler writes for position-independent code (tests/link/data/foreign_thread_local.source.c's unit, by
+# gcc, clang and Apple clang): every leg links each beside a DSS `main`; each is refused at READ by name today (the
+# disclosed row of the foreign object's thread-local relocations), pinned so the day DSS reads it the cell moves to
+# the image keeping exactly the reference image's loader names.
+dss_add_test(NAME link/test_foreign_thread_local_objects
+             SOURCES test_foreign_thread_local_objects.cpp)
+
+# P69 fold 3f (lane `xa`) -- ledger 563 (A): the program interpreter as a runtime role. Every ELF flavour answers
+# it with its own arch's interpreter (the exec and pie documents from their row, the others from their (kind,
+# arch) family), and a document's role row stands beside its `elf.interpreter` path, naming its last component.
+dss_add_test(NAME link/test_program_interpreter_role
+             SOURCES test_program_interpreter_role.cpp)
 
 # P69 fold 3e (lane `xa`) — [[D-LK-MACHO-STATIC-SECTION-RELATIVE-RELOC]]: an input section a reference toolchain emits
 # is mapped to its output kind by the format's data (`inputSectionNames`), and a writer never meets a reader-only row.
@@ -1229,3 +1291,9 @@ target_link_libraries(dss_link_test_cross_unit_fold_doors
 # function's body name its default record, never its weak name (the review of fold 3a, F1).
 dss_add_test(NAME link/test_weak_default_record
              SOURCES test_weak_default_record.cpp)
+
+# P69 fold 3f (lane `xa`, review-xa3e F3): an absptr field of `.eh_frame` is one address of the object being read --
+# 8 bytes under LP64 and LLP64, 4 under ILP32 -- and a DWARF 4 CIE's own address size is read where the standard
+# puts it and held to the reading object's.
+dss_add_test(NAME link/test_eh_frame_address_width
+             SOURCES test_eh_frame_address_width.cpp)

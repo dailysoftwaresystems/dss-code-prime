@@ -472,6 +472,66 @@ TEST(CoffObjectReader, MultiItemSectionSlicesEachAtomValueCorrect) {
     EXPECT_EQ(nameOf(*got, rd1->relocations[0].target), "f");
 }
 
+// -- 1c. Atoms in the order of their sections (P69 fold 3f, lane `xa`) ----
+//
+// An object's atoms are read in the order of its SECTIONS, by ordinal: the
+// object's own data, never the order a hash table keyed by the ordinal happens
+// to iterate in. The writer lays the data sections out in the format's row
+// order (`.rdata`, then `.data`, then the relocation-carrying `.rdata`), so the
+// data items must come back in that order. The module meets the three sections
+// in neither that order nor its reverse, so a walk in the order the reader met
+// them and one in its reverse are both told apart from the sorted walk.
+TEST(CoffObjectReader, AtomsAreReadInTheOrderOfTheirSections) {
+    auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction f;
+    f.symbol = SymbolId{1};
+    f.bytes  = {0xC3};   // x86_64 RET
+    mod.functions.push_back(f);
+    struct Item { std::uint32_t id; DataSectionKind kind; char const* name; };
+    Item const items[] = {
+        {11, DataSectionKind::Data,       "data_item"},
+        {12, DataSectionKind::RelRoConst, "relro_item"},
+        {10, DataSectionKind::Rodata,     "rodata_item"},
+    };
+    for (Item const& it : items) {
+        AssembledData d;
+        d.symbol    = SymbolId{it.id};
+        d.section   = it.kind;
+        d.bytes     = {0, 0, 0, 0, 0, 0, 0, 0};
+        d.alignment = Alignment::of<8>();
+        // The relocation-carrying `.rdata` is told from the plain one by its
+        // relocation table alone, so the relro item carries one.
+        if (it.kind == DataSectionKind::RelRoConst) {
+            d.relocations.push_back(Relocation{0u, SymbolId{1}, RelocationKind{2}, 0});   // ADDR64 -> f
+        }
+        mod.dataItems.push_back(d);
+    }
+    mod.symbols = {
+        ModuleSymbol{SymbolId{11}, "data_item",   SymbolBinding::Global, SymbolVisibility::Default},
+        ModuleSymbol{SymbolId{12}, "relro_item",  SymbolBinding::Global, SymbolVisibility::Default},
+        ModuleSymbol{SymbolId{10}, "rodata_item", SymbolBinding::Global, SymbolVisibility::Default},
+        ModuleSymbol{SymbolId{1},  "f",           SymbolBinding::Global, SymbolVisibility::Default},
+    };
+
+    DiagnosticReporter wrep;
+    auto objBytes = pe::encode(mod, *loaded.target, *loaded.format, wrep);
+    ASSERT_EQ(wrep.errorCount(), 0u) << "writer must accept the module";
+    ASSERT_FALSE(objBytes.empty());
+    DiagnosticReporter rrep;
+    auto got = pe::readRelocatableObject(objBytes, *loaded.target, *loaded.format, rrep);
+    ASSERT_TRUE(got.has_value()) << "errors=" << rrep.errorCount();
+    ASSERT_EQ(rrep.errorCount(), 0u);
+
+    std::vector<std::string> order;
+    for (AssembledData const& d : got->dataItems) order.push_back(nameOf(*got, d.symbol));
+    EXPECT_EQ(order, (std::vector<std::string>{"rodata_item", "data_item", "relro_item"}))
+        << "the data items come back in the order of their sections' ordinals";
+}
+
 // -- 2. Truncation fuzz ----------------------------------------------
 
 TEST(CoffObjectReader, TruncationAtEveryLengthFailsLoudNeverCrashes) {

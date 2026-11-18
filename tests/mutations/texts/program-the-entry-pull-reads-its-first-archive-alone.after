@@ -1,0 +1,1 @@
+        cursor, [&] { return std::min<std::size_t>(end, 1); },

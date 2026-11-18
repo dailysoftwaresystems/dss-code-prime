@@ -37,7 +37,7 @@
 
 #include "link/object_format_identity_doc.hpp"
 
-#include <algorithm>   // std::find — a startup's verbs are distinct
+#include <algorithm>   // std::find — a startup's verbs are distinct; std::any_of
 #include <array>
 #include <cctype>    // std::tolower — directive options compare without regard to case
 #include <cstdint>
@@ -155,10 +155,10 @@ void readLinkerDirectives(nlohmann::json const&           block,
              "vocabulary of nothing would refuse every directive of every object");
         ok = false;
     } else {
-        static constexpr std::array<std::string_view, 12> kRowKeys{
+        static constexpr std::array<std::string_view, 13> kRowKeys{
             "option", "meaning", "reason", "subsystems", "unsupportedSubsystems", "minimumVersion",
-            "runtimeStartups", "unsupportedStartups", "runtimeSymbols", "unitPrecedence",
-            "inSharedLibrary", "inSharedLibraryReason"};
+            "subsystemStartups", "runtimeStartups", "unsupportedStartups", "runtimeSymbols",
+            "unitPrecedence", "inSharedLibrary", "inSharedLibraryReason"};
         // The declared extent against the initializer, at compile time: an extent one too large zero-fills and
         // whitelists the empty key, and two lanes that each add a key merge to a wrong one without a marker.
         DSS_CHECK_KEY_VOCABULARY(kRowKeys);
@@ -168,7 +168,7 @@ void readLinkerDirectives(nlohmann::json const&           block,
             auto const& r = rows[i];
             if (!r.is_object()) {
                 emit(at, "a directive row must be an object with keys 'option', 'meaning' and, "
-                         "for an 'ignored' or 'refused' one, 'reason'");
+                         "for an 'ignored', 'refused' or 'dependentLibrary' one, 'reason'");
                 ok = false;
                 continue;
             }
@@ -198,11 +198,13 @@ void readLinkerDirectives(nlohmann::json const&           block,
                 row.meaning = *meaning;
                 // An `ignored` or `refused` row says WHY — a request dropped or
                 // refused with no stated reason is the silent drop (or the
-                // unexplained refusal) the vocabulary exists to end — and a row
-                // the reader APPLIES needs none, so a reason there is a stale or
-                // misplaced one.
+                // unexplained refusal) the vocabulary exists to end — and so does
+                // a `dependentLibrary` row, which a link that makes an IMAGE drops
+                // (P69 fold 3f); a row the reader APPLIES needs none, so a reason
+                // there is a stale or misplaced one.
                 bool const excused = *meaning == LinkerDirectiveMeaning::Ignored
-                                  || *meaning == LinkerDirectiveMeaning::Refused;
+                                  || *meaning == LinkerDirectiveMeaning::Refused
+                                  || *meaning == LinkerDirectiveMeaning::DependentLibrary;
                 bool const hasReason = r.contains("reason");
                 if (hasReason && (!r.at("reason").is_string()
                                   || r.at("reason").get<std::string>().empty())) {
@@ -213,13 +215,15 @@ void readLinkerDirectives(nlohmann::json const&           block,
                          std::format("option '{}' is '{}' and states no 'reason': say why "
                                      "dropping or refusing the request is right for a DSS link "
                                      "(what satisfies it instead, why it changes no program's "
-                                     "meaning, or which row carries the work)",
+                                     "meaning, or which row carries the work; for a library, why "
+                                     "an image link ignores it)",
                                      row.option, kLinkerDirectiveMeaningTable.name(*meaning)));
                     ok = false;
                 } else if (!excused && hasReason) {
                     emit(at + "/reason",
                          std::format("option '{}' has the meaning '{}', which the reader applies, "
-                                     "and a 'reason' only an 'ignored' or 'refused' row states",
+                                     "and a 'reason' only an 'ignored', 'refused' or "
+                                     "'dependentLibrary' row states",
                                      row.option, kLinkerDirectiveMeaningTable.name(*meaning)));
                     ok = false;
                 } else if (hasReason) {
@@ -307,6 +311,80 @@ void readLinkerDirectives(nlohmann::json const&           block,
                         row.minimumVersion = *parsed;
                     }
                 }
+                if (onlyOn("subsystemStartups", LinkerDirectiveMeaning::Subsystem)) {
+                    // {"<subsystem>": ["<startup>", ...]} -- the C runtime startups the vendor's linker starts a
+                    // program at under each subsystem when no `/ENTRY:` stands (P69 fold 3f): a standing
+                    // subsystem request ranks the entries they call first in the program's entry election. Each
+                    // name of `subsystems` states them once; each startup is a `runtimeStartups` row, resolved to
+                    // its verbs once every row is read.
+                    auto const& t = r.at("subsystemStartups");
+                    if (!t.is_object() || t.empty()) {
+                        emit(at + "/subsystemStartups",
+                             "'subsystemStartups' must be a non-empty object of subsystem name -> the C runtime "
+                             "startups a program starts at under it");
+                        ok = false;
+                    } else {
+                        bool everyOne = true;
+                        for (auto it = t.begin(); it != t.end(); ++it) {
+                            std::string const subsystem = it.key();   // named once: every report reads it
+                            PeSubsystemStartups entry{subsystem, {}, {}};
+                            bool good = it.value().is_array() && !it.value().empty();
+                            for (std::size_t k = 0; good && k < it.value().size(); ++k) {
+                                auto const& v = it.value()[k];
+                                good = v.is_string() && !v.get<std::string>().empty()
+                                    && std::find(entry.startups.begin(), entry.startups.end(),
+                                                 v.get<std::string>()) == entry.startups.end();
+                                if (good) entry.startups.push_back(v.get<std::string>());
+                            }
+                            if (!good) {
+                                emit(std::format("{}/subsystemStartups/{}", at, subsystem),
+                                     "each subsystem must name a non-empty array of distinct, non-empty "
+                                     "startup names");
+                                ok       = false;
+                                everyOne = false;
+                                continue;
+                            }
+                            bool const named =
+                                std::any_of(row.subsystems.begin(), row.subsystems.end(),
+                                            [&](PeDirectiveNamedValue const& s) {
+                                                return ::dss::pe::detail::equalsIgnoringCase(s.name, subsystem);
+                                            });
+                            if (!named) {
+                                emit(std::format("{}/subsystemStartups/{}", at, subsystem),
+                                     std::format("'{}' is no name of 'subsystems': only a subsystem a DSS "
+                                                 "image starts under has startups",
+                                                 subsystem));
+                                ok       = false;
+                                everyOne = false;
+                                continue;
+                            }
+                            row.subsystemStartups.push_back(std::move(entry));
+                        }
+                        // Every subsystem a DSS image starts under states its startups exactly once (a
+                        // malformed entry above is the one report of its subsystem).
+                        for (auto const& s : row.subsystems) {
+                            auto const stated = std::count_if(
+                                row.subsystemStartups.begin(), row.subsystemStartups.end(),
+                                [&](PeSubsystemStartups const& e) {
+                                    return ::dss::pe::detail::equalsIgnoringCase(e.subsystem, s.name);
+                                });
+                            if (everyOne && stated != 1) {
+                                emit(at + "/subsystemStartups",
+                                     std::format("the subsystem '{}' states its startups {} times: every name "
+                                                 "of 'subsystems' states the startups a program starts at "
+                                                 "under it once",
+                                                 s.name, stated));
+                                ok = false;
+                            }
+                        }
+                    }
+                } else if (*meaning == LinkerDirectiveMeaning::Subsystem) {
+                    emit(at + "/subsystemStartups",
+                         std::format("option '{}' is 'subsystem' and names no 'subsystemStartups': a stated "
+                                     "subsystem's startups would rank no entry of the program's election",
+                                     row.option));
+                    ok = false;
+                }
                 if (onlyOn("runtimeStartups", LinkerDirectiveMeaning::EntryPoint)) {
                     // {"<startup>": ["<verb>", ...]} — each startup with the materialization verbs it calls an
                     // entry with (P69 fold 3e, class C's N5): an object that states it restricts the program's
@@ -353,6 +431,22 @@ void readLinkerDirectives(nlohmann::json const&           block,
                 }
                 if (onlyOn("unsupportedStartups", LinkerDirectiveMeaning::EntryPoint)) {
                     readReasons("unsupportedStartups", row.unsupportedStartups);
+                    // A startup a DSS image provides (`runtimeStartups`) or one it refuses by name -- never
+                    // both: the parse asks the refused list first, so a name in both would be refused while
+                    // its row stated the verbs an image starts it with (P69 fold 3f, lane `xa`: the GUI
+                    // startups moved from the one list to the other).
+                    for (auto const& u : row.unsupportedStartups) {
+                        bool const provided =
+                            std::any_of(row.runtimeStartups.begin(), row.runtimeStartups.end(),
+                                        [&](PeRuntimeStartup const& s) { return s.name == u.name; });
+                        if (provided) {
+                            emit(std::format("{}/unsupportedStartups/{}", at, u.name),
+                                 std::format("'{}' is also a 'runtimeStartups' row: a startup is one a DSS "
+                                             "image provides or one it refuses by name, never both",
+                                             u.name));
+                            ok = false;
+                        }
+                    }
                 }
                 if (onlyOn("runtimeSymbols", LinkerDirectiveMeaning::IncludeSymbol)) {
                     readReasons("runtimeSymbols", row.runtimeSymbols);
@@ -455,8 +549,134 @@ void readLinkerDirectives(nlohmann::json const&           block,
                 }
             }
         }
+        // A subsystem's startups are `runtimeStartups` rows of this vocabulary (P69 fold 3f): each resolved here,
+        // once every row is read, to the verbs it calls an entry with -- what a standing subsystem request ranks
+        // first in the program's entry election. Read when every row was read (each then at its own index).
+        if (ok) {
+            std::vector<PeRuntimeStartup const*> provided;
+            for (auto const& d : out.directives) {
+                for (auto const& s : d.runtimeStartups) provided.push_back(&s);
+            }
+            for (std::size_t i = 0; i < out.directives.size(); ++i) {
+                for (auto& e : out.directives[i].subsystemStartups) {
+                    for (std::size_t k = 0; k < e.startups.size(); ++k) {
+                        auto const startup = std::find_if(provided.begin(), provided.end(),
+                                                          [&](PeRuntimeStartup const* s) {
+                                                              return s->name == e.startups[k];
+                                                          });
+                        if (startup == provided.end()) {
+                            emit(std::format("{}/directives/{}/subsystemStartups/{}/{}", kPath, i, e.subsystem, k),
+                                 std::format("'{}' is no 'runtimeStartups' row of this vocabulary: a subsystem "
+                                             "starts a program at a C runtime startup whose verbs the "
+                                             "vocabulary states",
+                                             e.startups[k]));
+                            ok = false;
+                            continue;
+                        }
+                        for (auto const v : (*startup)->verbs) {
+                            if (std::find(e.verbs.begin(), e.verbs.end(), v) == e.verbs.end()) e.verbs.push_back(v);
+                        }
+                    }
+                }
+            }
+        }
     }
     if (ok) data.pe.linkerDirectives = std::move(out);
+}
+
+// ── `pe.embeddedManifest` — the manifest an image embeds (P69 fold 3f) ──────
+// See `PeEmbeddedManifest` (object_format_schema.hpp). The key set is CLOSED and every key REQUIRED: a resource with
+// no coordinates or no text has nothing to fall back to. Where the block may appear (an image document only) is
+// `validateIdentity`'s.
+void readEmbeddedManifest(nlohmann::json const&           block,
+                          detail::ObjectFormatData&       data,
+                          substrate::DiagnosticCollector& coll) {
+    static constexpr std::string_view kPath = "/pe/embeddedManifest";
+    auto const emit = [&](std::string const& path, std::string message) {
+        coll.emit(DiagnosticCode::C_MalformedJson, path, std::move(message));
+    };
+    if (!block.is_object()) {
+        emit(std::string{kPath}, "'embeddedManifest' must be an object");
+        return;
+    }
+    static constexpr std::array<std::string_view, 10> kKeys{
+        "section", "characteristics", "resourceType", "resourceId", "language", "codePage", "lineEnd", "head",
+        "dependency", "tail"};
+    DSS_CHECK_KEY_VOCABULARY(kKeys);
+    ::dss::detail::rejectUnknownKeys(block, kKeys, "the 'embeddedManifest' block",
+        [&](std::string_view key, std::string message) {
+            emit(std::format("{}/{}", kPath, key), std::move(message));
+        });
+    PeEmbeddedManifest out;
+    bool ok = true;
+    auto const text = [&](char const* key, std::string& into) {
+        if (!block.contains(key) || !block.at(key).is_string() || block.at(key).get<std::string>().empty()) {
+            emit(std::format("{}/{}", kPath, key), std::format("'{}' must be a non-empty string", key));
+            ok = false;
+            return;
+        }
+        into = block.at(key).get<std::string>();
+    };
+    // An integer in [lo, hi], or nullopt (reported).
+    auto const integer = [&](char const* key, std::int64_t lo, std::int64_t hi) -> std::optional<std::int64_t> {
+        if (!block.contains(key) || !block.at(key).is_number_integer() || block.at(key).get<std::int64_t>() < lo
+            || block.at(key).get<std::int64_t>() > hi) {
+            emit(std::format("{}/{}", kPath, key), std::format("'{}' must be an integer in [{}, {}]", key, lo, hi));
+            ok = false;
+            return std::nullopt;
+        }
+        return block.at(key).get<std::int64_t>();
+    };
+    // The lines of one part of the text, with how many hold the identity's place.
+    auto const lines = [&](char const* key, std::vector<std::string>& into, bool mayBeEmpty) -> std::size_t {
+        bool good = block.contains(key) && block.at(key).is_array() && (mayBeEmpty || !block.at(key).empty());
+        if (good) {
+            for (auto const& l : block.at(key)) good = good && l.is_string();
+        }
+        if (!good) {
+            emit(std::format("{}/{}", kPath, key),
+                 std::format("'{}' must be {} array of strings, one line of the text each", key,
+                             mayBeEmpty ? "an" : "a non-empty"));
+            ok = false;
+            return 0;
+        }
+        std::size_t places = 0;
+        for (auto const& l : block.at(key)) {
+            into.push_back(l.get<std::string>());
+            for (std::size_t at = into.back().find(kEmbeddedManifestIdentity); at != std::string::npos;
+                 at = into.back().find(kEmbeddedManifestIdentity, at + 1)) {
+                ++places;
+            }
+        }
+        return places;
+    };
+    text("section", out.section);
+    if (auto const v = integer("characteristics", 0, 0xFFFFFFFFLL)) {
+        out.characteristics = static_cast<std::uint32_t>(*v);
+    }
+    if (auto const v = integer("resourceType", 1, 0xFFFF)) out.resourceType = static_cast<std::uint16_t>(*v);
+    if (auto const v = integer("resourceId", 1, 0xFFFF)) out.resourceId = static_cast<std::uint16_t>(*v);
+    if (auto const v = integer("language", 0, 0xFFFF)) out.language = static_cast<std::uint16_t>(*v);
+    if (auto const v = integer("codePage", 0, 0xFFFFFFFFLL)) out.codePage = static_cast<std::uint32_t>(*v);
+    text("lineEnd", out.lineEnd);
+    std::size_t const inHead = lines("head", out.head, true);
+    std::size_t const inDependency = lines("dependency", out.dependency, false);
+    std::size_t const inTail = lines("tail", out.tail, true);
+    if (out.section.size() > 8) {
+        emit(std::format("{}/section", kPath),
+             std::format("section name '{}' exceeds the 8 bytes an image's section header holds", out.section));
+        ok = false;
+    }
+    // Every identity is named once, where a dependency's lines name it.
+    if (ok && (inDependency != 1 || inHead != 0 || inTail != 0)) {
+        emit(std::format("{}/dependency", kPath),
+             std::format("'{}' must appear exactly once, in one line of 'dependency', and in no line of 'head' or "
+                         "'tail': each identity is named once, by its own dependency (found {} in 'dependency', {} "
+                         "in 'head', {} in 'tail')",
+                         kEmbeddedManifestIdentity, inDependency, inHead, inTail));
+        ok = false;
+    }
+    if (ok) data.pe.embeddedManifest = std::move(out);
 }
 
 // ── `IMAGE_FILE_HEADER` geometry the BYTE PROBE reads (PE/COFF §3.3) ──────
@@ -658,8 +878,8 @@ public:
                 // D-CONFIG-FORMAT-IDENTITY-BLOCKS-ACCEPTED-ANY-KEY): until the
                 // directive vocabulary joined it, a misspelled key here loaded
                 // clean and left the field it names at its default.
-                static constexpr std::array<std::string_view, 4> kPeBlockKeys{
-                    "machine", "characteristics", "type", "linkerDirectives"};
+                static constexpr std::array<std::string_view, 5> kPeBlockKeys{
+                    "machine", "characteristics", "type", "linkerDirectives", "embeddedManifest"};
                 DSS_CHECK_KEY_VOCABULARY(kPeBlockKeys);
                 ::dss::detail::rejectUnknownKeys(
                     p, kPeBlockKeys, "the 'pe' block",
@@ -671,6 +891,9 @@ public:
                 readU16("characteristics", data.pe.characteristics, 0xFFFF);
                 if (p.contains("linkerDirectives")) {
                     readLinkerDirectives(p.at("linkerDirectives"), data, coll);
+                }
+                if (p.contains("embeddedManifest")) {
+                    readEmbeddedManifest(p.at("embeddedManifest"), data, coll);
                 }
                 // `type`: closed-enum PeObjectType (obj/exec/dll).
                 // Default Obj keeps LK2 cycle 1 schemas unchanged.
@@ -908,6 +1131,16 @@ public:
                      "the vocabulary declares no 'hideSymbols' option, so the writer could not "
                      "state a definition whose visibility keeps it out of the image's exports");
             }
+        }
+        // P69 fold 3f: the manifest an image embeds (`PeEmbeddedManifest`).
+        // An IMAGE document's alone: a relocatable object embeds no resource
+        // -- the image its final linker writes does -- so there it would be
+        // inert.
+        if (pe.embeddedManifest.has_value() && pe.objectType == PeObjectType::Obj) {
+            fail("/pe/embeddedManifest",
+                 "'embeddedManifest' is declared on a relocatable PE document: an object embeds no "
+                 "resource (the image its final linker writes does), so the declaration would never "
+                 "be read");
         }
         // PE encodes section alignment in Characteristics bits
         // IMAGE_SCN_ALIGN_*BYTES (which live in the substrate `type`
@@ -1261,6 +1494,15 @@ public:
     // into the image (its optional header, its section headers, its export
     // table).
     [[nodiscard]] bool realizesDirectiveImageSettings() const noexcept override { return true; }
+
+    // P69 fold 3f: a compiled unit's `#pragma comment(linker, ...)` texts, folded and completed through the ONE home
+    // the object reader's (3b) steps go through (`pe::applyUnitLinkerDirectives`).
+    [[nodiscard]] std::optional<bool>
+    applyUnitLinkerOptions(AssembledModule&          module,
+                           ObjectFormatSchema const& objectFormatSchema,
+                           DiagnosticReporter&       reporter) const override {
+        return pe::applyUnitLinkerDirectives(module, objectFormatSchema, reporter);
+    }
 
     // D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES: the read counterpart of
     // `encode` above. `compile_pipeline.cpp::readArchiveMemberModule` used to

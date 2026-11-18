@@ -72,8 +72,11 @@ TEST(ObjectEntry, EveryRouteLinksAnObjectsEntryForItsFormat) {
 }
 
 // Every leg: an entry an object defines beside one a source defines is refused as two entries are, and so are two
-// objects' entries; neither build writes an image. RED-ON-DISABLE: leave the objects' entries out of the units'
-// election -> the source's `main` is elected and the build links with two definitions of the entry's name.
+// objects' entries; neither build writes an image. Each pair is ONE name defined twice, so the refusal states the
+// duplicate definition and its count, never the advice to build for a target that realizes fewer verbs (no target
+// resolves a name defined twice). RED-ON-DISABLE: leave the objects' entries out of the units' election -> the
+// source's `main` is elected and the build links with two definitions of the entry's name; take every ambiguity for
+// a choice between startups -> the text names no count.
 TEST(ObjectEntry, AnObjectsEntryBesideAnotherEntryIsAmbiguous) {
     test_support::ScratchDir scratch{test_support::Location::InsideRepo, "object-entry-ambiguous"};
     std::size_t k = 0;
@@ -94,7 +97,7 @@ TEST(ObjectEntry, AnObjectsEntryBesideAnotherEntryIsAmbiguous) {
         for (auto const& c : cases) {
             SCOPED_TRACE(labelOf(family) + ": " + c.label);
             refusedCell(scratch.path() / std::to_string(k++), family, c.inputs,
-                        DiagnosticCode::K_ProgramEntryAmbiguous, "c");
+                        DiagnosticCode::K_ProgramEntryAmbiguous, "c", "'main' is defined 2 times in this program");
         }
     }
 }

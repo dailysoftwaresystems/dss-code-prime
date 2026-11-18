@@ -1,7 +1,9 @@
 #pragma once
 
+#include "core/types/extern_import.hpp"         // ExternImport -- the rows a unit's directives complete
 #include "core/types/unit_linker_requests.hpp"   // UnitImageRequest, UnitExportRequest
 #include "link/object_format_schema.hpp"         // PeLinkerDirectives, LinkerDirectiveMeaning
+#include "link/standing_fallback.hpp"             // standingFallback -- which of a name's fallbacks stands
 
 #include <algorithm>
 #include <cctype>
@@ -10,11 +12,14 @@
 #include <cstdint>
 #include <expected>
 #include <format>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // ── A COFF OBJECT'S LINKER DIRECTIVES, BOTH DIRECTIONS ─────────────────────
@@ -89,6 +94,7 @@ struct CoffDirectiveRequests {
     std::vector<CoffAlternateName>   alternates;        // `alternateName`
     std::vector<CoffCommonAlignment> commonAlignments;  // `commonAlignment`
     std::vector<UnitImageRequest>    image;             // the IMAGE requests, in directive order
+    std::vector<std::string>         dependentLibraries;   // `dependentLibrary`: a library to search (P69 fold 3f)
     // One message per option no reference honours in a directive: the reader
     // reports each as a warning (`K_LinkerDirectiveIgnored`) and links.
     std::vector<std::string>         warnings;
@@ -137,6 +143,8 @@ inline constexpr std::uint8_t kMaxCoffCommonAlignmentLog2 = 13;
         case LinkerDirectiveMeaning::CommonAlignment:
         case LinkerDirectiveMeaning::MismatchCheck:
         case LinkerDirectiveMeaning::DllImage:
+        case LinkerDirectiveMeaning::ManifestDependency:   // a link-wide set: nothing is dropped
+        case LinkerDirectiveMeaning::DependentLibrary:     // a library to search: an image ignores it
         case LinkerDirectiveMeaning::Refused:
         case LinkerDirectiveMeaning::Ignored:
             return false;
@@ -409,6 +417,17 @@ parseCoffLinkerDirectives(std::string_view text, PeLinkerDirectives const& vocab
             case LinkerDirectiveMeaning::Ignored:
                 out.handOn.push_back(handOnText);
                 break;
+            case LinkerDirectiveMeaning::DependentLibrary:
+                // A library to search (P69 fold 3f): the unit's, restated by the relocatable writer from the field
+                // (`CoffDirectiveStatements::dependentLibraries`), so it is not handed on as well. One that names
+                // no library asks nothing a final linker could search: handed on as it stands (clang writes
+                // `/DEFAULTLIB:.lib` for `comment(lib)` with no string, ✔MEASURED P69 fold 3f).
+                if (value.empty()) {
+                    out.handOn.push_back(handOnText);
+                    break;
+                }
+                out.dependentLibraries.emplace_back(value);
+                break;
             case LinkerDirectiveMeaning::Refused:
                 // Refused by the link that makes an IMAGE (`linker::link`); a relocatable artifact hands it on to
                 // its final linker, which honours it.
@@ -563,7 +582,13 @@ parseCoffLinkerDirectives(std::string_view text, PeLinkerDirectives const& vocab
                         setting.version = *version;
                     }
                 }
-                image(UnitSubsystemRequest{setting});
+                // The startups this subsystem starts a program at, by their verbs (`subsystemStartups`, P69 fold
+                // 3f): what the request ranks first in the program's entry election where it stands.
+                std::vector<EntryMaterialization> verbs;
+                for (auto const& s : row->subsystemStartups) {
+                    if (detail::equalsIgnoringCase(s.subsystem, known->name)) verbs = s.verbs;
+                }
+                image(UnitSubsystemRequest{setting, {}, std::move(verbs)});
                 break;
             }
             case LinkerDirectiveMeaning::EntryPoint: {
@@ -666,6 +691,17 @@ parseCoffLinkerDirectives(std::string_view text, PeLinkerDirectives const& vocab
                 image(UnitSectionAlignmentRequest{static_cast<std::uint32_t>(*bytes)});
                 break;
             }
+            case LinkerDirectiveMeaning::ManifestDependency:
+                // `<identity>`: the attributes of the manifest's `assemblyIdentity`, which link.exe and lld-link copy
+                // verbatim (✔MEASURED 2026-11-17); cl writes the value, or the whole directive, quoted, which the
+                // tokenizer has already unwrapped.
+                if (value.empty()) {
+                    return std::unexpected(std::format(
+                        "directive '{}' must read '{}<identity>': the attributes of the assembly the image depends on",
+                        tok, spelled));
+                }
+                image(UnitManifestDependencyRequest{std::string{value}});
+                break;
             case LinkerDirectiveMeaning::MismatchCheck: {
                 std::size_t const eq = value.find('=');
                 if (eq == std::string_view::npos || eq == 0) {
@@ -770,11 +806,15 @@ struct CoffDirectiveStatements {
     std::span<CoffAlternateName const>   alternates;
     std::span<CoffCommonAlignment const> commonAlignments;
     std::span<std::string const>         handOn = {};
+    // P69 fold 3f: the libraries the object asks its final linker to search (`UnitLinkerRequests::
+    // dependentLibraries`), each written with the vocabulary's `dependentLibrary` option (`-defaultlib`), its name
+    // QUOTED as cl quotes it (`/DEFAULTLIB:"user32"`, ✔MEASURED P69 fold 3f, run 20261117-143416-a9be43b7).
+    std::span<std::string const>         dependentLibraries = {};
 };
 
 // The writer's directive text: ` <prefix><option>:<value>` per request, hidden
-// then included then alternates then common alignments, each in the order
-// given, with the FIRST declared prefix and the first option declared for the
+// then included then alternates then common alignments then libraries, each in
+// the order given, with the FIRST declared prefix and the first option declared for the
 // meaning, then each handed-on token as it was read (empty when there is
 // nothing to state). Every value reads back through `parseCoffLinkerDirectives`
 // as the request it states.
@@ -834,6 +874,26 @@ coffLinkerDirectiveText(CoffDirectiveStatements const& s, PeLinkerDirectives con
                              commonAlignment)) {
         return std::unexpected(*e);
     }
+    // A library, quoted as cl quotes it: the tokenizer reads `"..."` inside a token as the text between, so a name
+    // holding a space is one library. A backslash is a path's and stands as written, save the ones that END the name,
+    // doubled so the closing quote stays a quote (the Windows command-line rule `detail::requoteDirectiveToken`
+    // follows). An empty name, or one holding a quote or a NUL -- which no Windows file name holds -- has no
+    // spelling that reads back as itself.
+    auto const quotedLibrary = [](std::string_view what, std::string const& name,
+                                  std::string_view option) -> std::expected<std::string, std::string> {
+        if (name.empty() || name.find('"') != std::string::npos || name.find('\0') != std::string::npos) {
+            return std::unexpected(std::format(
+                "{} '{}' cannot be spelled in a '{}' directive: an empty name, or one holding a quote or a NUL, "
+                "reads back as another",
+                what, name, option));
+        }
+        std::size_t const kept = name.find_last_not_of('\\') + 1;   // 0 when the name is backslashes alone
+        return "\"" + name + std::string(name.size() - kept, '\\') + "\"";
+    };
+    if (auto const e = state(LinkerDirectiveMeaning::DependentLibrary, "library to search", s.dependentLibraries,
+                             quotedLibrary)) {
+        return std::unexpected(*e);
+    }
     for (auto const& tok : s.handOn) {
         if (tok.empty() || tok.find('\0') != std::string::npos) {
             return std::unexpected(std::string{"a handed-on directive is empty or holds a NUL"});
@@ -868,6 +928,254 @@ coffDirectiveToken(CoffDirectiveStatements const& one, PeLinkerDirectives const&
             std::format("the vocabulary spells it '{}', which is not ONE directive token", *text));
     }
     return text->substr(1);
+}
+
+// ── ONE UNIT'S DIRECTIVES, FOLDED AND APPLIED: THE ONE HOME (P69 fold 3f) ────
+//
+// What a unit's directives make of it is ONE rule however the directives reach a
+// link: an object's directive sections, read by the COFF object reader, and a
+// COMPILED unit's `#pragma comment(linker, ...)` texts, applied by the compile
+// pipeline (`pe::applyUnitLinkerDirectives`) -- so a unit compiled to an object
+// and the same unit compiled straight into a link carry one module. Two steps:
+//   * the FOLD: every text the unit states, parsed against the vocabulary
+//     (`parseCoffLinkerDirectives`) and gathered in order -- the requests the
+//     link decides across its units (exports, image requests, libraries, the
+//     tokens a relocatable artifact hands on, the warnings), and the ones judged
+//     against what the unit defines (hides, includes, alternate names, common
+//     alignments), each once in the order first stated;
+//   * the COMPLETION: the latter applied to the unit's rows (`ExternImport`), once
+//     what it defines is known.
+// What a hide makes of the unit's OWN definition is the caller's: the reader
+// reads the definition back Hidden as it reads its record, a compiled unit's is
+// stated on its `ModuleSymbol`.
+
+// One `/alternatename:` a unit states, and where it stated it -- named in the warning when another statement of the
+// name stands over it (`linker::standingFallback`).
+struct CoffStatedAlternate {
+    CoffAlternateName alternate;
+    std::string       statedBy;   // "the object's '.drectve'", "the unit's `#pragma comment(linker, ...)`"
+};
+
+// Every directive text one unit states, folded.
+struct CoffUnitDirectives {
+    std::vector<std::string>                      hidden;       // in directive order, once each
+    std::vector<std::string>                      included;     // in directive order, once each
+    std::vector<CoffStatedAlternate>              alternates;   // in directive order, once each: the one that stands
+    std::unordered_map<std::string, std::uint8_t> commonAlignmentLog2;   // the largest asked, per name
+    std::unordered_set<std::string>               hiddenSet;    // `hidden`, for lookup
+    // The requests the link decides across its units, and the ones a relocatable artifact hands on.
+    UnitLinkerRequests                            requests;
+};
+
+// Fold one directive text into `into`. `who` names the unit in a refusal ("the object's", "the unit's"),
+// `carrier` the text ("'.drectve'"), `warningPrefix` begins each warning the link that makes an image says;
+// `reporter` hears which of two fallbacks of one name stands. The error is the refusal's text: the directives cannot
+// be honoured.
+[[nodiscard]] inline std::expected<void, std::string>
+foldCoffLinkerDirectives(CoffUnitDirectives& into, std::string_view text, PeLinkerDirectives const& vocab,
+                         std::string_view who, std::string_view carrier, std::string_view warningPrefix,
+                         DiagnosticReporter& reporter) {
+    auto const requests = parseCoffLinkerDirectives(text, vocab);
+    if (!requests.has_value()) {
+        return std::unexpected(std::format("{} linker directives ({}) cannot be honoured: {}.", who, carrier,
+                                           requests.error()));
+    }
+    // Said by the link that makes an image (`decideUnitLinkerRequests`); a relocatable artifact hands the token on
+    // to its final linker instead.
+    for (auto const& warning : requests->warnings) {
+        into.requests.warnings.push_back(std::string{warningPrefix} + warning);
+    }
+    for (auto const& name : requests->hidden) {
+        if (into.hiddenSet.insert(name).second) into.hidden.push_back(name);
+    }
+    into.requests.image.insert(into.requests.image.end(), requests->image.begin(), requests->image.end());
+    into.requests.exports.insert(into.requests.exports.end(), requests->exports.begin(), requests->exports.end());
+    into.requests.handOn.insert(into.requests.handOn.end(), requests->handOn.begin(), requests->handOn.end());
+    // A library two directives name is searched once (link.exe searches a repeated `/DEFAULTLIB:` once).
+    for (auto const& lib : requests->dependentLibraries) {
+        auto& libs = into.requests.dependentLibraries;
+        if (std::find(libs.begin(), libs.end(), lib) == libs.end()) libs.push_back(lib);
+    }
+    for (auto const& name : requests->included) {
+        if (std::find(into.included.begin(), into.included.end(), name) == into.included.end()) {
+            into.included.push_back(name);
+        }
+    }
+    // ★ Of two directives of THIS unit for one name, the first in the order the unit states them stands (P69 H6c2,
+    // ✔MEASURED u8: link.exe takes the first of one object's directive section, silently) -- one statement each, at
+    // one place, so the one met first stands, and the other is warned about (`linker::standingFallback`).
+    std::string const statedBy = std::format("{} {}", who, carrier);
+    for (auto const& alt : requests->alternates) {
+        auto const prior = std::find_if(into.alternates.begin(), into.alternates.end(),
+                                        [&](CoffStatedAlternate const& a) { return a.alternate.name == alt.name; });
+        if (prior == into.alternates.end()) {
+            into.alternates.push_back({alt, statedBy});
+        } else if (prior->alternate.fallback != alt.fallback) {
+            linker::FallbackStatement standing{prior->alternate.fallback, linker::FallbackSource::Directive,
+                                               std::nullopt, prior->statedBy};
+            linker::standingFallback(alt.name, standing,
+                                     {alt.fallback, linker::FallbackSource::Directive, std::nullopt, statedBy},
+                                     reporter);
+            prior->alternate.fallback = standing.fallback;
+        }
+    }
+    for (auto const& c : requests->commonAlignments) {
+        auto& log2 = into.commonAlignmentLog2[c.name];
+        log2 = std::max(log2, c.log2);
+    }
+    // ⓘ One name both hidden and exported is EXPORTED: an explicit export wins over an exclusion, which only keeps
+    // a name out of the automatic exports (✔MEASURED 2026-10-07, lld-link -lldmingw and GNU ld 2.42 on one object
+    // stating both). The definition reads back Hidden and the image writer exports it by name all the same.
+    return {};
+}
+
+// What the completion asks of the unit: what it DEFINES, and its rows.
+struct CoffDirectiveRowsOf {
+    // Does the unit make an EXTERNAL definition of the name? A COMMON is one: it defines storage, though it is a row.
+    std::function<bool(std::string const&)> definesExternally;
+    // Was the name's hide answered by the unit's own definition (read back, or stated, Hidden)?
+    std::function<bool(std::string const&)> hideAnswered;
+    // The unit's reference rows, and a fresh id for a row no record of the unit owns (the unit's id space's door).
+    std::vector<ExternImport>*              rows = nullptr;
+    std::function<SymbolId()>               freshId;
+};
+
+// The folded requests applied against what the unit defines: the alternate names, the includes, the exports'
+// internal names, the hides of another unit's definitions. `requests` is the unit's (its exports are read, its
+// hides and hand-on tokens grow); `reporter` hears a directive a weak external's own default stands over. The error
+// is the refusal's text.
+[[nodiscard]] inline std::expected<void, std::string>
+completeCoffLinkerDirectives(CoffUnitDirectives const& d, CoffDirectiveRowsOf const& unit, UnitLinkerRequests& requests,
+                             PeLinkerDirectives const& vocab, std::string_view who, DiagnosticReporter& reporter) {
+    std::vector<ExternImport>& rows = *unit.rows;
+    auto const rowNamed = [&](std::string const& name) -> std::optional<std::size_t> {
+        for (std::size_t k = 0; k < rows.size(); ++k) {
+            if (rows[k].mangledName == name) return k;
+        }
+        return std::nullopt;
+    };
+    auto const freshRow = [&](std::string const& name) -> ExternImport& {
+        ExternImport row;
+        row.symbol      = unit.freshId();
+        row.mangledName = name;
+        // A directive states no code-vs-data kind; the definition the link finds decides it (the `__imp_X` fold's
+        // rule, `ExternKindOrigin`).
+        row.kindOrigin  = ExternKindOrigin::Pending;
+        rows.push_back(std::move(row));
+        return rows.back();
+    };
+
+    // `/alternatename:A=B` (`LinkerDirectiveMeaning::AlternateName`), judged as the reference linkers judge it --
+    // link-wide: ANY reference to A that nothing in the link defines resolves to B, and an A defined anywhere wins
+    // (✔MEASURED 2026-10-06, link.exe 14.51 and lld-link 18). Only the link knows which, so the unit STATES it
+    // rather than decides it: an A the unit defines makes the directive a no-op; otherwise A's reference -- its own
+    // row, or a row that carries the directive for the other units' references when no code here names A -- gets the
+    // fallback (`ExternImport::fallbackName`, decided by `linker::link`), and a B the unit does not define gets a row
+    // of its own, so B is bound to its library and its archive member is pulled like any name. ⚠ NOT a second name
+    // of B's body: that would bind THIS unit's own references to A to B even where another unit defines A, which no
+    // reference linker does.
+    for (auto const& [alt, statedBy] : d.alternates) {
+        if (unit.definesExternally(alt.name)) continue;
+        if (auto const row = rowNamed(alt.name); row.has_value()) {
+            ExternImport& named = rows[*row];
+            if (named.binding == SymbolBinding::Weak) {
+                // ★ A WEAK EXTERNAL'S OWN DEFAULT STANDS OVER THE DIRECTIVE (P69 H6c2, ✔MEASURED u11: a MinGW gcc
+                // object whose own `.drectve` gives its weak `aa` the fallback `cc` -- link.exe and GNU ld take the
+                // weak's default, a defined one and the absolute 0 alike; GNU ld does not read the directive). The
+                // row's default -- another undefined symbol, or none, the absolute 0 -- is kept, and the directive
+                // is dropped and warned about (`linker::standingFallback`). Nothing refers to the dropped fallback,
+                // so it gets no row of its own.
+                linker::FallbackStatement standing{named.fallbackName, linker::FallbackSource::WeakDefault,
+                                                   std::nullopt, "its weak external record"};
+                linker::standingFallback(alt.name, standing,
+                                         {alt.fallback, linker::FallbackSource::Directive, std::nullopt, statedBy},
+                                         reporter);
+                named.fallbackName = standing.fallback;
+                continue;
+            }
+            named.fallbackName = alt.fallback;
+        } else {
+            freshRow(alt.name).fallbackName = alt.fallback;
+        }
+        if (!unit.definesExternally(alt.fallback) && !rowNamed(alt.fallback).has_value()) {
+            (void)freshRow(alt.fallback);
+        }
+    }
+
+    // `/INCLUDE:X` (`LinkerDirectiveMeaning::IncludeSymbol`): a name the unit defines needs nothing more; any other
+    // is a REQUIRED reference of the unit -- its own row when it has one. A name the vocabulary lists among the
+    // platform C runtime's own symbols (`runtimeSymbols`: `_tls_used`, the TLS directory cl's TLS-CALLBACK idiom pulls
+    // in beside a `.CRT$XL*` callback pointer) is refused by name with the row's reason: no DSS link defines it, and
+    // the callback table it serves is one DSS does not carry, so neither an image nor a re-emitted object could keep
+    // the callback the unit asked to run.
+    PeLinkerDirectiveRow const* includeRow = nullptr;
+    for (auto const& r : vocab.directives) {
+        if (r.meaning == LinkerDirectiveMeaning::IncludeSymbol) includeRow = &r;
+    }
+    for (auto const& name : d.included) {
+        if (unit.definesExternally(name)) {
+            // The unit's OWN definition: the link needs nothing more of it, and no row states the request -- so a
+            // relocatable artifact restates it in the vocabulary's own spelling (`handOn`), or its final linker
+            // would never be asked to keep the definition the unit asked it to keep (P69 send-back 5, review-xa4
+            // NIT 9).
+            auto const token =
+                coffDirectiveToken(CoffDirectiveStatements{{}, std::span<std::string const>{&name, 1}, {}, {}}, vocab);
+            if (!token.has_value()) {
+                return std::unexpected(std::format(
+                    "{} include directive names its own definition '{}', and it cannot be handed on: {}.", who,
+                    name, token.error()));
+            }
+            requests.handOn.push_back(*token);
+            continue;
+        }
+        if (includeRow != nullptr) {
+            for (auto const& runtime : includeRow->runtimeSymbols) {
+                if (runtime.name == name) {
+                    return std::unexpected(std::format(
+                        "{} linker directive `/INCLUDE:{}` asks for a symbol of the platform's C runtime that no "
+                        "DSS link defines: {}",
+                        who, name, runtime.reason));
+                }
+            }
+        }
+        if (auto const row = rowNamed(name); row.has_value()) {
+            rows[*row].requiredByDirective = true;
+        } else {
+            freshRow(name).requiredByDirective = true;
+        }
+    }
+
+    // `/EXPORT:` is a reference too: link.exe and lld-link pull the archive member that defines an exported name
+    // nothing else names, and bind one only an import library defines (✔MEASURED 2026-10-07: `/EXPORT:fn` beside a
+    // member defining `fn`, and `/EXPORT:puts` alone, each exported by both). So the internal name of an export the
+    // unit does not define is a REQUIRED reference of it, as an `/INCLUDE:` makes one: the link's archive search and
+    // library binding reach it, and the export then finds it.
+    for (auto const& e : requests.exports) {
+        if (unit.definesExternally(e.internalName)) continue;
+        if (auto const row = rowNamed(e.internalName); row.has_value()) {
+            rows[*row].requiredByDirective = true;
+        } else {
+            freshRow(e.internalName).requiredByDirective = true;
+        }
+    }
+
+    // A hide directive naming what the unit does not define hides that name WHEREVER the link defines it --
+    // link-wide, as lld-link -lldmingw takes another object's `-exclude-symbols:` (✔MEASURED 2026-10-07); one that
+    // names nothing anywhere is silent there too. The link applies it (`UnitLinkerRequests::hides`), and a
+    // relocatable artifact restates it in the vocabulary's own spelling (`handOn`).
+    for (auto const& name : d.hidden) {
+        if (unit.hideAnswered(name)) continue;
+        auto const token =
+            coffDirectiveToken(CoffDirectiveStatements{std::span<std::string const>{&name, 1}, {}, {}, {}}, vocab);
+        if (!token.has_value()) {
+            return std::unexpected(std::format(
+                "{} hide directive names '{}', which another unit must define, and it cannot be handed on: {}.", who,
+                name, token.error()));
+        }
+        requests.hides.push_back(name);
+        requests.handOn.push_back(*token);
+    }
+    return {};
 }
 
 }  // namespace dss::pe

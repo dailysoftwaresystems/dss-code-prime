@@ -15,6 +15,7 @@
 #include <format>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -219,7 +220,12 @@ namespace {
 
 } // namespace
 
-// Every shipped flavour of this document's kind EXCEPT its namesake, merged. The
+bool ObjectFormatSchema::inFlavourFamilyOf(ObjectFormatSchema const& member) const noexcept {
+    return kind() == member.kind() && targetArch() == member.targetArch();
+}
+
+// Every shipped flavour of this document's FAMILY (`inFlavourFamilyOf`: one kind on
+// one target arch) EXCEPT its namesake, merged. The
 // scan is TOTAL and sorted by filename for the two reasons
 // `runtime::resolveArchiveSiblingFormat` gives: agreement cannot be proven by
 // a scan that stops early, and a disagreement message must not read
@@ -278,7 +284,11 @@ ObjectFormatSchema::assembleFlavourRuntimeLibraries() const {
                 document.generic_string(), member.name(), detail));
         }
         ObjectFormatSchema const& candidate = **loaded;
-        if (candidate.kind() != member.kind()) continue;
+        // ★ P69 fold 3f: the family is ONE KIND ON ONE TARGET ARCH (`inFlavourFamilyOf`, its
+        // one definition): a role may be played by a different image on each arch of a kind.
+        // No shipped family's answer changed under the arch (each role every other row
+        // declares is played by one image across the arches).
+        if (!candidate.inFlavourFamilyOf(member)) continue;
         if (candidate.name() == member.name()) continue;
         for (auto const& row : candidate.runtimeLibraries().bindings) {
             auto const* const existing = merged.rowForRole(row.role);
@@ -1358,7 +1368,9 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
     // matches none. The row's other decode-side declarations have no meaning
     // for a shared type, so a patterned row may not carry them.
     {
-        std::unordered_map<std::uint32_t, std::vector<std::size_t>> patterned;
+        // ASCENDING by wire type (P69 fold 3f): the refusals below come out in the
+        // order the groups are walked, and a hash map's order is the C++ library's.
+        std::map<std::uint32_t, std::vector<std::size_t>> patterned;
         for (std::size_t i = 0; i < relocations.size(); ++i) {
             auto const& r = relocations[i];
             if (r.decodeWhenInstruction.empty()) continue;
@@ -2127,79 +2139,69 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
     // produced are read from whatever the argument registers hold, which is the
     // MEASURED fault the entry-verb set exists to refuse (an envp observed as
     // `0x4`). What a mechanism can hand an entry is a property of the MECHANISM,
-    // stated here once and asked of every declared verb:
+    // asked PER VALUE of every slot of every declared verb (`entry_shape.hpp`'s
+    // slots), and stated ONCE, beside the block it describes
+    // (`processArgsCannotProduce`, target_schema.cpp) -- the synthesized init's
+    // backstop asks the same function of a hand-built block:
     //   * `stack-vector` — the entry-stack vector: argc and NARROW strings, and the
     //     environment vector only where this format DECLARES its position
-    //     (`envpFollowsArgvTerminator` + `vectorSlotBytes`). That layout holds no
-    //     wide vector.
+    //     (`envpFollowsArgvTerminator`; each slot a pointer of the data model). That layout holds no
+    //     wide value, and no module instance, command line or show-window value.
     //   * `crt-argv-accessors` — argc and argv in both widths (the loader requires
-    //     all five accessor names), and each width's environment only where this
-    //     format declares that width's initialize/accessor PAIR.
-    //   * both end at the environment: neither layout has a fourth value, so a
-    //     four-value verb (Darwin's `apple`) is realizable only where the LOADER
-    //     delivers the arguments itself — no `processArgs` block at all, where the
-    //     listed verbs ARE the declaration of what the loader hands over and there
-    //     is no model here to second-guess it with.
-    // And the converse: an environment position or pair that no listed verb
-    // consumes is dead config — nothing would ever read it — refused like the
-    // dead accessor names above.
+    //     all five accessor names), each width's environment only where this
+    //     format declares that width's initialize/accessor PAIR, and the GUI
+    //     startups' values only where it declares their routines (each width's
+    //     WinMain command line, and the module-instance and show-window routines).
+    //   * neither produces Darwin's `apple` vector: that verb is realizable only
+    //     where the LOADER delivers the arguments itself — no `processArgs` block
+    //     at all, where the listed verbs ARE the declaration of what the loader
+    //     hands over and there is no model here to second-guess it with.
+    // ★ PER VALUE, NOT PER COUNT (P69 fold 3f, lane `xa`): this rule used to say
+    // "a mechanism produces at most 3 values (argc, argv, envp)", which refused
+    // WinMain's four though the C runtime produces every one of them.
+    // And the converse: an environment position or pair, or a GUI declaration,
+    // that no listed verb consumes is dead config — nothing would ever read it —
+    // refused like the dead accessor names above.
     if (processArgs.has_value()) {
         ProcessArgs const& pa = *processArgs;
-        constexpr std::size_t kMechanismValuesMax = 3;   // (argc, argv, envp)
         bool const stackVector = pa.mechanism == ArgsMechanism::StackVector;
         bool const crt         = pa.mechanism == ArgsMechanism::CrtArgvAccessors;
-        bool const stackEnvDeclared =
-            pa.envpFollowsArgvTerminator && pa.vectorSlotBytes != 0;
-        bool const narrowPairDeclared = !pa.initializeNarrowEnvironmentFn.empty()
-                                     && !pa.narrowEnvironmentAccessorFn.empty();
-        bool const widePairDeclared = !pa.initializeWideEnvironmentFn.empty()
-                                   && !pa.wideEnvironmentAccessorFn.empty();
-        bool narrowEnvConsumed = false;
-        bool wideEnvConsumed   = false;
+        bool narrowEnvConsumed         = false;
+        bool wideEnvConsumed           = false;
+        bool narrowCommandLineConsumed = false;
+        bool wideCommandLineConsumed   = false;
+        bool winMainRoutinesConsumed   = false;
         for (auto const v : entryVerbs) {
-            auto const params = entryVerbParams(v);
-            if (params.empty()) continue;   // `none` — nothing to materialize
-            bool const wide = entryVerbIsWide(v);
-            bool const env  = entryVerbPassesEnvironment(v);
-            if (env && wide) wideEnvConsumed = true;
-            if (env && !wide) narrowEnvConsumed = true;
-            std::string why;
-            if (params.size() > kMechanismValuesMax) {
-                why = std::format(
-                    "it hands the entry {} values and this mechanism produces at "
-                    "most {} (argc, argv, envp); only a format whose LOADER "
-                    "delivers the arguments itself — no `processArgs` block — "
-                    "can realize more",
-                    params.size(), kMechanismValuesMax);
-            } else if (stackVector && wide) {
-                why = "the entry-stack vector holds NARROW strings only — no wide "
-                      "argument vector exists in that layout";
-            } else if (stackVector && env && !stackEnvDeclared) {
-                why = "`processArgs` does not declare where the environment "
-                      "vector sits (`envpFollowsArgvTerminator` + "
-                      "`vectorSlotBytes`)";
-            } else if (crt && env && !(wide ? widePairDeclared : narrowPairDeclared)) {
-                why = wide
-                    ? "`processArgs` does not declare the wide environment's "
-                      "`initializeWideEnvironmentFn` + `wideEnvironmentAccessorFn` "
-                      "pair"
-                    : "`processArgs` does not declare the narrow environment's "
-                      "`initializeNarrowEnvironmentFn` + "
-                      "`narrowEnvironmentAccessorFn` pair";
-            }
-            if (!why.empty()) {
+            narrowEnvConsumed = narrowEnvConsumed
+                || entryVerbHands(v, EntryArgumentValue::NarrowEnvironment);
+            wideEnvConsumed = wideEnvConsumed
+                || entryVerbHands(v, EntryArgumentValue::WideEnvironment);
+            narrowCommandLineConsumed = narrowCommandLineConsumed
+                || entryVerbHands(v, EntryArgumentValue::NarrowCommandLine);
+            wideCommandLineConsumed = wideCommandLineConsumed
+                || entryVerbHands(v, EntryArgumentValue::WideCommandLine);
+            winMainRoutinesConsumed = winMainRoutinesConsumed
+                || entryVerbHands(v, EntryArgumentValue::ModuleInstance)
+                || entryVerbHands(v, EntryArgumentValue::ShowWindow);
+            // The FIRST value of the verb the mechanism cannot produce names the
+            // refusal: one refusal per verb.
+            for (EntryVerbSlot const& slot : entryVerbSlots(v)) {
+                std::string const why = processArgsCannotProduce(pa, slot.value);
+                if (why.empty()) continue;
                 // Anchored: D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE.
                 fail("/entryVerbs",
                      std::format(
                          "declares the `{}` verb, which the `{}` mechanism cannot "
-                         "realize: {}. The verb would survive candidate selection "
-                         "and the entry would read the values nothing produced "
-                         "from uninitialized argument registers — the MEASURED "
-                         "fault this set exists to refuse (an envp observed as "
-                         "0x4). Declare what the mechanism needs, or drop the "
-                         "verb.",
+                         "realize -- its {}: {}. The verb would survive candidate "
+                         "selection and the entry would read the values nothing "
+                         "produced from uninitialized argument registers — the "
+                         "MEASURED fault this set exists to refuse (an envp "
+                         "observed as 0x4). Declare what the mechanism needs, or "
+                         "drop the verb.",
                          entryMaterializationName(v),
-                         argsMechanismName(pa.mechanism), why));
+                         argsMechanismName(pa.mechanism),
+                         entryArgumentValueName(slot.value), why));
+                break;
             }
         }
         if (stackVector && pa.envpFollowsArgvTerminator && !narrowEnvConsumed) {
@@ -2227,6 +2229,32 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                  "declares the wide environment's CRT exports but `entryVerbs` "
                  "names no wide environment verb — the names would never be "
                  "imported. Declare `argc-wargv-wenvp`, or drop the pair.");
+        }
+        // The GUI startups' declarations (P69 fold 3f, lane `xa`), dead the same way.
+        if (crt && !pa.narrowWinMainCommandLineFn.empty() && !narrowCommandLineConsumed) {
+            // Anchored: D-LK-PE-IMAGE-CANNOT-HONOUR-EVERY-LINKER-DIRECTIVE.
+            fail("/processArgs/narrowWinMainCommandLineFn",
+                 "declares the narrow WinMain command line's C library routine but "
+                 "`entryVerbs` names no verb that reads it — the name would never "
+                 "be imported. Declare `instance-prev-cmdline-show`, or drop the "
+                 "name.");
+        }
+        if (crt && !pa.wideWinMainCommandLineFn.empty() && !wideCommandLineConsumed) {
+            // Anchored: D-LK-PE-IMAGE-CANNOT-HONOUR-EVERY-LINKER-DIRECTIVE.
+            fail("/processArgs/wideWinMainCommandLineFn",
+                 "declares the wide WinMain command line's C library routine but "
+                 "`entryVerbs` names no verb that reads it — the name would never "
+                 "be imported. Declare `instance-prev-wcmdline-show`, or drop the "
+                 "name.");
+        }
+        if (crt && pa.winMainStartupRoutines.has_value() && !winMainRoutinesConsumed) {
+            // Anchored: D-LK-PE-IMAGE-CANNOT-HONOUR-EVERY-LINKER-DIRECTIVE.
+            fail("/processArgs/winMainStartupRoutines",
+                 "declares the GUI startups' module-instance and show-window "
+                 "routines but `entryVerbs` names no verb that reads either value "
+                 "— the routines would never be called. Declare "
+                 "`instance-prev-cmdline-show` or `instance-prev-wcmdline-show`, or "
+                 "drop the routines.");
         }
     }
 

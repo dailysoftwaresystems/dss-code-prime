@@ -693,6 +693,7 @@ TEST(X86Sse, FullPipelineDoubleAddToIntEncodesAddsdAndCvttsdsi) {
     TypeId const params[] = {f64, f64};
     auto const sig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(sig, SymbolId{1});
     MirBlockId const bb = mb.createBlock(StructCfMarker::EntryBlock);
@@ -737,6 +738,7 @@ TEST(X86Sse, FullPipelineDoublePlusRodataConstFoldsToRipRelMovsd) {
     TypeId const params[] = {f64};
     auto const sig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.stateArgCounting(MirArgCounting::PerClass);
     MirLiteralValue quarter; quarter.value = 0.25;
     quarter.core = TypeKind::F64;
@@ -807,6 +809,7 @@ TEST(X86Sse, FullPipelineRodataConstTwoLoadsKeepsLeaPlusBaseForm) {
     TypeId const params[] = {f64};
     auto const sig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.stateArgCounting(MirArgCounting::PerClass);
     MirLiteralValue quarter; quarter.value = 0.25;
     quarter.core = TypeKind::F64;
@@ -921,6 +924,7 @@ TEST(X86Sse, FullPipelineMsX64FprPrologueSpillsViaClassRoutedWholeRegisterStore)
     TypeId const params[] = {f64, f64};
     auto const sig = interner.fnSig(params, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
     mb.stateArgCounting(MirArgCounting::Flat);
     mb.addFunction(sig, SymbolId{1});
     MirBlockId const bb = mb.createBlock(StructCfMarker::EntryBlock);

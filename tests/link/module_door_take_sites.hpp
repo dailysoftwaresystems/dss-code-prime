@@ -22,6 +22,7 @@ struct LinkTakeSite {
 inline constexpr LinkTakeSite kLinkTakeSites[] = {
     {"src/link/branch_veneers.cpp", "branch-veneer: the {} veneer(s)"},
     {"src/link/entry_trampoline.cpp", "entry-trampoline: the {} id(s) of the trampoline and its exit"},
+    {"src/link/format/coff_object_reader.cpp", "pe: a reference row a unit's linker directive asks for"},
     {"src/link/format/pe.cpp", "pe::encodeExec: the address slot an import-slot fix-up reads"},
     {"src/link/format/pe.cpp", "pe::encodeExec: the import-slot residue runner"},
     {"src/link/format/pe.cpp", "pe::encodeExec: the residue runner's thread-template base"},

@@ -102,10 +102,12 @@ struct Lowered {
         };
     }
     MirLoweringConfig mirCfg = languageMirLoweringConfig(*loaded);
+    mirCfg.dataModel = DataModel::Lp64;   // a config states its unit's data model
     mirCfg.symbolIdSpace = MirSymbolIdSpace::endingAt(
         static_cast<std::uint32_t>(model.symbols().size()));
     mirCfg.aggregateLayout       = (*target)->aggregateLayout();
     mirCfg.aggregateLayoutLoaded = (*target)->aggregateLayoutLoaded();
+    mirCfg.argumentSlotBytes     = argumentSlotBytes(**target);   // the target's argument-slot quantum, at its home
     HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
                                     model.lattice().interner(), mirReporter,
                                     &hir->sourceMap, mirCfg, /*ffiMap=*/nullptr,

@@ -1535,3 +1535,41 @@ TEST(ReporterElision, RollbackRestoresTheElisionLedger) {
     ASSERT_NE(marker, nullptr);
     EXPECT_EQ(r.elisionFor(dss::DiagnosticCode::P_UnknownToken).coalesced, 3u);
 }
+
+// ── THE RENDER ORDER IS TOTAL (P69 fold 3f, lane xa) ───────────────────────────
+// Diagnostics of one buffer, span and severity render in the order they were
+// REPORTED. The sort's key used to stop at the severity, so such a run of ties
+// (every span-less refusal of a link or a config read) rendered in whatever
+// order the host's unstable sort leaves equal keys in: the C++ library's
+// choice, not the input's. 64 ties, more than any of the three libraries'
+// insertion-sort thresholds (libstdc++ 16, libc++ 30, MSVC 32), so a
+// partitioning pass meets them.
+TEST(ReporterFormat, DiagnosticsOfOneSpanRenderInTheOrderTheyWereReported) {
+    DiagnosticReporter::Config cfg;
+    cfg.maxDiagnostics = 1000;
+    cfg.maxPerCode     = 1000;
+    cfg.dedupWindow    = 0;
+    DiagnosticReporter r{cfg};
+
+    BufferRegistry bufs;
+    auto buf = SourceBuffer::fromString("int x = 1;\n", "<inline>");
+    bufs.add(buf);
+
+    constexpr int kTies = 64;
+    for (int i = 0; i < kTies; ++i) {
+        r.report(makeDiag(DiagnosticCode::D_FileNotFound, DiagnosticSeverity::Error,
+                          buf->id(), 0, 0, "'tie-" + std::to_string(i) + ".h'"));
+    }
+    ASSERT_EQ(r.all().size(), static_cast<std::size_t>(kTies));
+
+    auto const rendered = r.formatAll(bufs);
+    std::size_t at = 0;
+    for (int i = 0; i < kTies; ++i) {
+        auto const needle = "'tie-" + std::to_string(i) + ".h'";
+        auto const found = rendered.find(needle, at);
+        ASSERT_NE(found, std::string::npos)
+            << "the diagnostics of one span are not rendered in report order: report " << i
+            << " does not follow report " << (i - 1) << "\n" << rendered;
+        at = found + needle.size();
+    }
+}

@@ -1,0 +1,1 @@
+        if (!stateUnitLinkerOptions(*mod, optionsDocument, reporter)) return std::nullopt;

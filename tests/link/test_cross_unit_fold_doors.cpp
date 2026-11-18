@@ -253,9 +253,11 @@ struct MirUnit {
     explicit MirUnit(std::uint32_t cu) : interner{CompilationUnitId{cu}} {}
 };
 
-void buildMirUnit(MirUnit& unit, std::uint32_t cu, What what) {
+// `model`: the data model of the document the unit is merged under, which the merge requires (P69 fold 3f).
+void buildMirUnit(MirUnit& unit, std::uint32_t cu, What what, DataModel model) {
     TypeId const i32 = unit.interner.primitive(TypeKind::I32);
     MirBuilder   b;
+    b.stateDataModel(model);
     MirLinkage   linkage{bindingOf(what), SymbolVisibility::Default};
     if (auto const k = kindOf(what); k.has_value()) linkage.weakKind = *k;
     linkage.tentative = what == What::Tentative;
@@ -274,8 +276,8 @@ void buildMirUnit(MirUnit& unit, std::uint32_t cu, What what) {
 
 [[nodiscard]] Answer throughTheMirMerge(Loaded const& L, What first, What second) {
     MirUnit a{1}, b{2};
-    buildMirUnit(a, 1, first);
-    buildMirUnit(b, 2, second);
+    buildMirUnit(a, 1, first, L.format->dataModel());
+    buildMirUnit(b, 2, second, L.format->dataModel());
     std::vector<MergeCuInput> cus(2);
     MirUnit*                  units[2] = {&a, &b};
     for (int u = 0; u < 2; ++u) {
@@ -317,8 +319,8 @@ void buildMirUnit(MirUnit& unit, std::uint32_t cu, What what) {
 
 [[nodiscard]] Answer throughTheSummaryIndex(Loaded const& L, What first, What second) {
     MirUnit a{1}, b{2};
-    buildMirUnit(a, 1, first);
-    buildMirUnit(b, 2, second);
+    buildMirUnit(a, 1, first, L.format->dataModel());
+    buildMirUnit(b, 2, second, L.format->dataModel());
     std::vector<mirsum::ModuleSummary> summaries;
     for (MirUnit* unit : {&a, &b}) {
         mirsum::SummaryCuInput in;
@@ -445,8 +447,8 @@ TEST(CrossUnitFoldDoors, ASelectAnyDefinitionBesideAStrongOneIsRefusedByTheKeysN
         }
         {
             MirUnit a{1}, b{2};
-            buildMirUnit(a, 1, first);
-            buildMirUnit(b, 2, second);
+            buildMirUnit(a, 1, first, L.format->dataModel());
+            buildMirUnit(b, 2, second, L.format->dataModel());
             std::vector<MergeCuInput> cus(2);
             cus[0].mir = &a.mir; cus[0].interner = &a.interner; cus[0].nameOf = nameOfSeven;
             cus[1].mir = &b.mir; cus[1].interner = &b.interner; cus[1].nameOf = nameOfSeven;
@@ -575,8 +577,8 @@ TEST(WeakDefinitionBesideStrongKey, ADocumentThatDoesNotSayIsRefusedByTheKeysNam
             }
             {
                 MirUnit a{1}, b{2};
-                buildMirUnit(a, 1, first);
-                buildMirUnit(b, 2, second);
+                buildMirUnit(a, 1, first, L.format->dataModel());
+                buildMirUnit(b, 2, second, L.format->dataModel());
                 std::vector<MergeCuInput> cus(2);
                 cus[0].mir = &a.mir; cus[0].interner = &a.interner; cus[0].nameOf = nameOfSeven;
                 cus[1].mir = &b.mir; cus[1].interner = &b.interner; cus[1].nameOf = nameOfSeven;

@@ -79,6 +79,7 @@ dssharness run check-scripts-index-write
 | **`check-plan-citations`** | `check-plan-citations.py` | refuse a new `path:line` citation in the plans -- a citation names a stable reference, never a line number. |
 | **`check-repo-guard-label`** | `check-repo-guard-label.py` | refuse a configured build in which an entry labelled `self-test` carries the `repo-guard` label, or an entry whose command line asks a program for its self-test carries no `self-test` label -- a self-test's verdict reads its own fixtures, which can depend on the host, so every leg runs it. |
 | **`check-retyped-closed-sets`** | `check-retyped-closed-sets.py` | census the diagnostics that RETYPE a closed vocabulary instead of projecting it. |
+| **`check-row-truth`** | `check-row-truth.py` | refuse a registry row whose text a fold made untrue -- a reference claim with no carrier, or a name, key, path or decision the fold removed cited as current. |
 | **`check-scripts-index`** | `check-scripts-index.py` | refuse an action that no index documents, an index entry that no action backs, and an action no runner can start. |
 | **`check-stale-blockers`** | `check-stale-blockers.py` | list OPEN registry rows whose Closing-work cell waits on a blocker that has since CLOSED. |
 | **`check-stale-refusal-citations`** | `check-stale-refusal-citations.py` | refuse a new present-tense refusal sentence that cites an anchor row already marked CLOSED. |

@@ -273,6 +273,7 @@ TEST(InlineAsmRebuildCarriage, Site1SharedRebuildSubstrateReAddsTheDescriptor) {
     TypeId const fnSig = interner.fnSig({}, voidT, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(entry);
@@ -283,6 +284,7 @@ TEST(InlineAsmRebuildCarriage, Site1SharedRebuildSubstrateReAddsTheDescriptor) {
     ASSERT_EQ(src.asmDescriptorPool().size(), 1u);
 
     MirBuilder dstB;
+    dstB.stateDataModel(DataModel::Lp64);
     DiagnosticReporter rep;
     ASSERT_EQ(cloneGlobalsOrCarveOut(src, dstB, rep, "InlineAsmSite1"),
               GlobalClonePrelude::Cloned);
@@ -333,6 +335,7 @@ TEST(InlineAsmRebuildCarriage, Site2InlinedCalleeBodyCarriesItsDescriptor) {
     TypeId const fnSig = interner.fnSig({}, voidT, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     // callee: a single-block leaf holding the sentinel asm block.
     mb.addFunction(fnSig, SymbolId{50}, SymbolBinding::Global,
                    SymbolVisibility::Default);
@@ -392,6 +395,7 @@ TEST(InlineAsmRebuildCarriage, Site3MultiBlockInlinerHostKeepsItsOwnDescriptor) 
     TypeId const fnSig = interner.fnSig({}, voidT, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     // callee: TWO blocks (no asm) — the multi-block router.
     mb.addFunction(fnSig, SymbolId{50}, SymbolBinding::Global,
                    SymbolVisibility::Default);
@@ -475,6 +479,7 @@ TEST(InlineAsmRebuildCarriage, Site4CrossCuMergeReAddsTheDescriptor) {
     Mir mir0;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(sig0, SymbolId{100}, SymbolBinding::Global,
                        SymbolVisibility::Default);
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
@@ -493,6 +498,7 @@ TEST(InlineAsmRebuildCarriage, Site4CrossCuMergeReAddsTheDescriptor) {
     Mir mir1;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         addAsmCarryingFunc(mb, i64_1, sig1, SymbolId{50}, sentinelDescriptor());
         mir1 = std::move(mb).finish();
     }
@@ -541,6 +547,7 @@ TEST(InlineAsmRebuildCarriage, Site4CrossCuMergeKeepsEachCusDescriptorWithItsOwn
     Mir mir0;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(sig0, SymbolId{100}, SymbolBinding::Global,
                        SymbolVisibility::Default);
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
@@ -559,6 +566,7 @@ TEST(InlineAsmRebuildCarriage, Site4CrossCuMergeKeepsEachCusDescriptorWithItsOwn
     Mir mir1;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         addAsmCarryingFunc(mb, i64_1, sig1, SymbolId{50}, sentinelDescriptor());
         mir1 = std::move(mb).finish();
     }
@@ -627,6 +635,7 @@ TEST(InlineAsmRebuildCarriage, LoadMotionTreatsAnInlineAsmAsAnOpaqueClobber) {
 
     auto const build = [&](bool withAsm) {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(fnSig, SymbolId{100});
         MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(entry);
@@ -815,6 +824,7 @@ TEST(InlineAsmRebuildCarriage, AnchorSite1aSimplifyCfgKeepsTheAsmGotoPieceAnchor
     TypeId const fnSig = interner.fnSig({}, voidT, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const done  = mb.createBlock(StructCfMarker::Linear);
@@ -848,6 +858,7 @@ TEST(InlineAsmRebuildCarriage, AnchorSite1bDceKeepsTheAsmGotoPieceAnchor) {
     TypeId const fnSig = interner.fnSig({}, voidT, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const done  = mb.createBlock(StructCfMarker::Linear);
@@ -879,6 +890,7 @@ TEST(InlineAsmRebuildCarriage, AnchorSite2InlinedCalleeKeepsTheAsmGotoPieceAncho
     TypeId const fnSig = interner.fnSig({}, voidT, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     // callee: entry holds the asm goto; `done` is its landing target. The asm
     // goto seals its own block, so this is the MULTI-BLOCK splice — the path
     // that aborted.
@@ -969,6 +981,7 @@ TEST(InlineAsmRebuildCarriage, AnchorSite3MultiBlockHostKeepsTheAsmGotoPieceAnch
     TypeId const fnSig = interner.fnSig({}, voidT, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     // callee: TWO blocks, no asm — the multi-block router (site 3's precondition,
     // measured in test_inlining.cpp: a single-block callee would route the host
     // through MirFunctionRebuilder and silently re-test site 1).
@@ -1036,6 +1049,7 @@ TEST(InlineAsmRebuildCarriage, AnchorSite4CrossCuMergeKeepsTheAsmGotoPieceAnchor
     Mir mir0;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(sig0, SymbolId{100}, SymbolBinding::Global,
                        SymbolVisibility::Default);
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
@@ -1058,6 +1072,7 @@ TEST(InlineAsmRebuildCarriage, AnchorSite4CrossCuMergeKeepsTheAsmGotoPieceAnchor
     Mir mir1;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(sig1, SymbolId{50}, SymbolBinding::Global,
                        SymbolVisibility::Default);
         MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);

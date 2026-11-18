@@ -1,5 +1,6 @@
 #include "link/format/coff_object_reader.hpp"
-#include "link/format/coff_linker_directives.hpp"   // parseCoffLinkerDirectives — (3b)
+#include "core/substrate/key_order.hpp"   // entriesInKeyOrder -- the slicing walk's order
+#include "link/format/coff_linker_directives.hpp"   // foldCoffLinkerDirectives — (3b)
 #include "link/format/foreign_section_alignment.hpp"
 #include "link/format/input_section_names.hpp"   // inputSectionRow, isInputSubsectionOf
 #include "link/format/object_atom_coverage.hpp"
@@ -9,7 +10,7 @@
 #include "link/format/section_relative_target.hpp"
 #include "link/format/unwind_pointer_reloc.hpp"
 #include "link/format/win64_unwind_decode.hpp"   // (7.5) the unwind carry
-#include "link/standing_fallback.hpp"   // standingFallback -- which of a name's fallbacks stands (P69 H6c2)
+#include "link/fresh_symbol_ids.hpp"            // ModuleSymbolIds -- a compiled unit's directive rows
 
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/section_kind.hpp"
@@ -931,15 +932,18 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     //
     // The requests the object hands its final linker, as text in the section
     // the format names (`pe.linkerDirectives`, `.drectve`): EVERY one is read
-    // against the format's vocabulary (`pe::parseCoffLinkerDirectives`) —
-    // before this arm the section was skipped whole, so a `-exclude-symbols:`
-    // hid nothing and every other request passed in silence. A hide directive
-    // naming a definition of this object reads it back Hidden (COFF has no
-    // visibility field: clang's windows-gnu target and DSS's own writer state a
-    // hidden definition this way), and one naming another unit's is handed to
-    // the link; an include names a symbol the link must define; an alternate
-    // name gives a name its fallback; a common-alignment directive aligns a
-    // COMMON symbol; the exports and the IMAGE requests go to the link
+    // against the format's vocabulary and folded in order -- through the ONE
+    // home a compiled unit's `#pragma comment(linker, ...)` is folded through
+    // too (`foldCoffLinkerDirectives`, P69 fold 3f), so a directive means one
+    // thing however it reaches a link. Before this arm the section was skipped
+    // whole, so a `-exclude-symbols:` hid nothing and every other request passed
+    // in silence. A hide directive naming a definition of this object reads it
+    // back Hidden (COFF has no visibility field: clang's windows-gnu target and
+    // DSS's own writer state a hidden definition this way), and one naming
+    // another unit's is handed to the link; an include names a symbol the link
+    // must define; an alternate name gives a name its fallback; a
+    // common-alignment directive aligns a COMMON symbol; the exports, the IMAGE
+    // requests and the libraries to search go to the link
     // (`AssembledModule::linkerRequests`), which decides them across its units;
     // an `ignored` one is dropped for the reason the document's row states, and
     // an option the document does not list is WARNED (`K_LinkerDirectiveIgnored`,
@@ -950,79 +954,27 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // below), because each is judged against what this object defines.
     // ⓘ `K_LinkerDirectiveUnhonourable`, not `F_CorruptedBinary`: the object is
     // well-formed — it asks for something no DSS link can honour as written.
-    std::unordered_set<std::string> hiddenByDirective;
-    std::vector<std::string>        hiddenInOrder;         // in directive order, once each
-    std::vector<std::string>        includedByDirective;   // in directive order, once each
-    std::unordered_set<std::string> includedSeen;
-    std::vector<CoffAlternateName>  alternatesByDirective; // in directive order, once each
-    std::unordered_map<std::string, std::uint8_t> commonAlignmentLog2;   // the largest asked
-    UnitLinkerRequests              unitRequests;          // the module's, once it exists
+    CoffUnitDirectives directives;   // the object's, folded; its requests go to the module once it exists
     if (auto const& vocab = objectFormatSchema.pe().linkerDirectives; vocab.has_value()) {
         for (auto const& sec : sections) {
             if (sec.name != vocab->section || sec.zeroFill || sec.rawSize == 0u) continue;
             std::string_view const text{
                 reinterpret_cast<char const*>(bytes.data()) + sec.rawPtr,
                 static_cast<std::size_t>(sec.rawSize)};
-            auto const requests = parseCoffLinkerDirectives(text, *vocab);
-            if (!requests.has_value()) {
+            if (auto const folded = foldCoffLinkerDirectives(
+                    directives, text, *vocab, "the object's", "'" + sec.name + "'",
+                    "a linked object's linker directives ('" + sec.name + "'): ", reporter);
+                !folded.has_value()) {
                 return fail(DiagnosticCode::K_LinkerDirectiveUnhonourable,
-                    "pe::readRelocatableObject: the object's linker directives ('"
-                    + sec.name + "') cannot be honoured: " + requests.error() + ".");
-            }
-            // Said by the link that makes an image (`decideUnitLinkerRequests`); a
-            // relocatable artifact hands the token on to its final linker instead.
-            for (auto const& warning : requests->warnings) {
-                unitRequests.warnings.push_back("a linked object's linker directives ('" + sec.name + "'): "
-                                                + warning);
-            }
-            for (auto const& name : requests->hidden) {
-                if (hiddenByDirective.insert(name).second) hiddenInOrder.push_back(name);
-            }
-            unitRequests.image.insert(unitRequests.image.end(), requests->image.begin(),
-                                      requests->image.end());
-            unitRequests.exports.insert(unitRequests.exports.end(), requests->exports.begin(),
-                                        requests->exports.end());
-            unitRequests.handOn.insert(unitRequests.handOn.end(), requests->handOn.begin(),
-                                       requests->handOn.end());
-            for (auto const& name : requests->included) {
-                if (includedSeen.insert(name).second) includedByDirective.push_back(name);
-            }
-            // ★ Of two directives of THIS object for one name, the first in the
-            // section's order stands (P69 H6c2, ✔MEASURED u8: link.exe takes it,
-            // silently) -- one statement each, at one place, so the one met first
-            // stands, and the other is warned about (`standingFallback`).
-            for (auto const& alt : requests->alternates) {
-                auto const prior = std::find_if(
-                    alternatesByDirective.begin(), alternatesByDirective.end(),
-                    [&](CoffAlternateName const& a) { return a.name == alt.name; });
-                if (prior == alternatesByDirective.end()) {
-                    alternatesByDirective.push_back(alt);
-                } else if (prior->fallback != alt.fallback) {
-                    linker::FallbackStatement standing{prior->fallback, linker::FallbackSource::Directive,
-                                                       std::nullopt, "this object's directive section"};
-                    linker::standingFallback(alt.name, standing,
-                                             {alt.fallback, linker::FallbackSource::Directive, std::nullopt,
-                                              "this object's directive section"},
-                                             reporter);
-                    prior->fallback = standing.fallback;
-                }
-            }
-            for (auto const& c : requests->commonAlignments) {
-                auto& log2 = commonAlignmentLog2[c.name];
-                log2 = std::max(log2, c.log2);
+                            "pe::readRelocatableObject: " + folded.error());
             }
         }
-        // ⓘ One name both hidden and exported is EXPORTED: an explicit export
-        // wins over an exclusion, which only keeps a name out of the automatic
-        // exports (✔MEASURED 2026-10-07, lld-link -lldmingw and GNU ld 2.42 on one
-        // object stating both). The definition reads back Hidden and the image
-        // writer exports it by name all the same.
     }
     // What the directives make of an EXTERNAL definition's visibility, and the
     // hidden names a definition below answered.
     std::unordered_set<std::string> directiveNamesDefined;
     auto const directiveVisibility = [&](std::string const& name) {
-        if (hiddenByDirective.contains(name)) {
+        if (directives.hiddenSet.contains(name)) {
             directiveNamesDefined.insert(name);
             return SymbolVisibility::Hidden;
         }
@@ -1569,7 +1521,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // -- (6) Reconstruct externs, then stage defined symbols per section --
     AssembledModule mod;
     mod.cuId = cuId;
-    mod.linkerRequests = std::move(unitRequests);   // (3b)'s: the exports, the image requests, the hand-on
+    mod.linkerRequests = std::move(directives.requests);   // (3b)'s: the exports, the image requests, the hand-on
     // GATE 3's section groups: a member section is named by its ordinal, the key
     // every atom cut from it carries (`sliceOf`, below -- a COFF object declares
     // no subsections, so its sections are always units of placement).
@@ -1881,8 +1833,8 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 }
                 std::uint64_t alignment = *fromSize;
                 std::uint64_t stated    = 0;   // the object states none but by a directive
-                if (auto const asked = commonAlignmentLog2.find(s.name);
-                    asked != commonAlignmentLog2.end()) {
+                if (auto const asked = directives.commonAlignmentLog2.find(s.name);
+                    asked != directives.commonAlignmentLog2.end()) {
                     stated    = std::uint64_t{1} << asked->second;
                     alignment = std::max(alignment, stated);
                 }
@@ -2137,7 +2089,8 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         }
     }
 
-    // (3b), completed — the requests applied against what this object DEFINES.
+    // (3b), completed — the requests applied against what this object DEFINES, through the one home a compiled
+    // unit's directives are completed through too (`completeCoffLinkerDirectives`, P69 fold 3f).
     //
     // A fresh SymbolId for a row or an alias no record of this object owns:
     // `symbolIds.fresh()`, past every id a record takes.
@@ -2159,160 +2112,18 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         }
         return false;
     };
-    auto const rowNamed = [&](std::string const& name) -> std::optional<std::size_t> {
-        for (std::size_t k = 0; k < mod.externImports.size(); ++k) {
-            if (mod.externImports[k].mangledName == name) return k;
-        }
-        return std::nullopt;
-    };
-    auto const freshRow = [&](std::string const& name) -> ExternImport& {
-        ExternImport row;
-        row.symbol      = symbolIds.fresh();
-        row.mangledName = name;
-        // A directive states no code-vs-data kind; the definition the link
-        // finds decides it (the `__imp_X` fold's rule, `ExternKindOrigin`).
-        row.kindOrigin  = ExternKindOrigin::Pending;
-        mod.externImports.push_back(std::move(row));
-        return mod.externImports.back();
-    };
-
-    // `/alternatename:A=B` (`LinkerDirectiveMeaning::AlternateName`), judged as
-    // the reference linkers judge it — link-wide: ANY reference to A that
-    // nothing in the link defines resolves to B, and an A defined anywhere wins
-    // (✔MEASURED 2026-10-06, link.exe 14.51 and lld-link 18). Only the link
-    // knows which, so the reader STATES it rather than decides it: an A this
-    // object defines makes the directive a no-op; otherwise A's reference — its
-    // own undefined record's row, or a row that carries the directive for the
-    // other objects' references when no code here names A — gets the fallback
-    // (`ExternImport::fallbackName`, decided by `linker::link`), and a B this
-    // object does not define gets a row of its own, so B is bound to its library
-    // and its archive member is pulled like any name. ⚠ NOT a second name of
-    // B's body: that would bind THIS object's own references to A to B even
-    // where another object defines A, which no reference linker does.
-    for (auto const& alt : alternatesByDirective) {
-        if (definesExternally(alt.name)) continue;
-        if (auto const row = rowNamed(alt.name); row.has_value()) {
-            ExternImport& named = mod.externImports[*row];
-            if (named.binding == SymbolBinding::Weak) {
-                // ★ A WEAK EXTERNAL'S OWN DEFAULT STANDS OVER THE DIRECTIVE (P69
-                // H6c2, ✔MEASURED u11: a MinGW gcc object whose own `.drectve`
-                // gives its weak `aa` the fallback `cc` -- link.exe and GNU ld take
-                // the weak's default, a defined one and the absolute 0 alike; GNU
-                // ld does not read the directive). The record arm above made this
-                // row; its default -- another undefined symbol, or none, the
-                // absolute 0 -- is kept, and the directive is dropped and warned
-                // about (`standingFallback`). Nothing refers to the dropped
-                // fallback, so it gets no row of its own.
-                linker::FallbackStatement standing{named.fallbackName, linker::FallbackSource::WeakDefault,
-                                                   std::nullopt, "its weak external record"};
-                linker::standingFallback(alt.name, standing,
-                                         {alt.fallback, linker::FallbackSource::Directive, std::nullopt,
-                                          "its linker directive"},
-                                         reporter);
-                named.fallbackName = standing.fallback;
-                continue;
-            }
-            named.fallbackName = alt.fallback;
-        } else {
-            freshRow(alt.name).fallbackName = alt.fallback;
-        }
-        if (!definesExternally(alt.fallback) && !rowNamed(alt.fallback).has_value()) {
-            (void)freshRow(alt.fallback);
-        }
-    }
-
-    // `/INCLUDE:X` (`LinkerDirectiveMeaning::IncludeSymbol`): a name this object
-    // defines needs nothing more; any other is a REQUIRED reference of the
-    // object — its own undefined record's row when it has one. A name the
-    // vocabulary lists among the platform C runtime's own symbols
-    // (`runtimeSymbols`: `_tls_used`, the TLS directory cl's TLS-CALLBACK idiom
-    // pulls in beside a `.CRT$XL*` callback pointer) is refused by name with the
-    // row's reason: no DSS link defines it, and the callback table it serves is
-    // one this reader does not carry, so neither an image nor a re-emitted
-    // object could keep the callback the object asked to run.
-    PeLinkerDirectiveRow const* includeRow = nullptr;
     if (auto const& vocab = objectFormatSchema.pe().linkerDirectives; vocab.has_value()) {
-        for (auto const& r : vocab->directives) {
-            if (r.meaning == LinkerDirectiveMeaning::IncludeSymbol) includeRow = &r;
-        }
-    }
-    for (auto const& name : includedByDirective) {
-        if (definesExternally(name)) {
-            // The object's OWN definition: the link needs nothing more of it, and
-            // no row states the request -- so a relocatable artifact restates it
-            // in the vocabulary's own spelling (`handOn`), or its final linker
-            // would never be asked to keep the definition the object asked it to
-            // keep (P69 send-back 5, review-xa4 NIT 9).
-            auto const& vocab = objectFormatSchema.pe().linkerDirectives;
-            auto const token =
-                vocab.has_value()
-                    ? coffDirectiveToken(
-                          CoffDirectiveStatements{{}, std::span<std::string const>{&name, 1}, {}, {}}, *vocab)
-                    : std::expected<std::string, std::string>{std::unexpected(std::string{
-                          "the format declares no directive vocabulary"})};
-            if (!token.has_value()) {
-                return fail(DiagnosticCode::K_LinkerDirectiveUnhonourable,
-                    "pe::readRelocatableObject: the object's include directive names its own definition '"
-                    + name + "', and it cannot be handed on: " + token.error() + ".");
-            }
-            mod.linkerRequests.handOn.push_back(*token);
-            continue;
-        }
-        if (includeRow != nullptr) {
-            for (auto const& runtime : includeRow->runtimeSymbols) {
-                if (runtime.name == name) {
-                    return fail(DiagnosticCode::K_LinkerDirectiveUnhonourable,
-                        "pe::readRelocatableObject: the object's linker directive `/INCLUDE:" + name
-                        + "` asks for a symbol of the platform's C runtime that no DSS link defines: "
-                        + runtime.reason);
-                }
-            }
-        }
-        if (auto const row = rowNamed(name); row.has_value()) {
-            mod.externImports[*row].requiredByDirective = true;
-        } else {
-            freshRow(name).requiredByDirective = true;
-        }
-    }
-
-    // `/EXPORT:` is a reference too: link.exe and lld-link pull the archive
-    // member that defines an exported name nothing else names, and bind one
-    // only an import library defines (✔MEASURED 2026-10-07: `/EXPORT:fn` beside
-    // a member defining `fn`, and `/EXPORT:puts` alone, each exported by both).
-    // So the internal name of an export this object does not define is a
-    // REQUIRED reference of it, as an `/INCLUDE:` makes one: the link's archive
-    // search and library binding reach it, and the export then finds it.
-    for (auto const& e : mod.linkerRequests.exports) {
-        if (definesExternally(e.internalName)) continue;
-        if (auto const row = rowNamed(e.internalName); row.has_value()) {
-            mod.externImports[*row].requiredByDirective = true;
-        } else {
-            freshRow(e.internalName).requiredByDirective = true;
-        }
-    }
-
-    // A hide directive naming what this object does not define hides that name
-    // WHEREVER the link defines it — link-wide, as lld-link -lldmingw takes
-    // another object's `-exclude-symbols:` (✔MEASURED 2026-10-07); one that
-    // names nothing anywhere is silent there too. The link applies it
-    // (`UnitLinkerRequests::hides`), and a relocatable artifact restates it in
-    // the vocabulary's own spelling (`handOn`).
-    for (auto const& name : hiddenInOrder) {
-        if (directiveNamesDefined.contains(name)) continue;
-        auto const& vocab = objectFormatSchema.pe().linkerDirectives;
-        auto const token =
-            vocab.has_value()
-                ? coffDirectiveToken(
-                      CoffDirectiveStatements{std::span<std::string const>{&name, 1}, {}, {}, {}}, *vocab)
-                : std::expected<std::string, std::string>{std::unexpected(std::string{
-                      "the format declares no directive vocabulary"})};
-        if (!token.has_value()) {
+        CoffDirectiveRowsOf const unit{
+            definesExternally,
+            [&](std::string const& name) { return directiveNamesDefined.contains(name); },
+            &mod.externImports,
+            [&] { return symbolIds.fresh(); }};
+        if (auto const completed =
+                completeCoffLinkerDirectives(directives, unit, mod.linkerRequests, *vocab, "the object's", reporter);
+            !completed.has_value()) {
             return fail(DiagnosticCode::K_LinkerDirectiveUnhonourable,
-                "pe::readRelocatableObject: the object's hide directive names '" + name
-                + "', which another unit must define, and it cannot be handed on: " + token.error() + ".");
+                        "pe::readRelocatableObject: " + completed.error());
         }
-        mod.linkerRequests.hides.push_back(name);
-        mod.linkerRequests.handOn.push_back(*token);
     }
 
     // Per-section interval lists for relocation-site routing.
@@ -2574,7 +2385,16 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // never an atom. Slicing is BINDING-BLIND from here down: a local body's
     // bytes, bounds checks and relocation routing are the external path's,
     // unchanged.
-    for (auto& [ordinal, defs] : defsBySection) {
+    //
+    // ★ IN ASCENDING SECTION ORDINAL (P69 fold 3f, lane `xa`). This loop
+    // APPENDS every atom it cuts to `mod.functions` / `mod.dataItems`, and the
+    // link keeps each unit at its first member's position, so walking the
+    // unordered map directly made a several-section object's layout the host
+    // library's hash order. The ordinal is the object's own data, and the walk
+    // takes its entries from that order's one home.
+    for (auto const* section : substrate::entriesInKeyOrder(defsBySection)) {
+        std::uint16_t const ordinal = section->first;
+        std::vector<DefSym> const& defs = section->second;
         Section const& sec = sections[ordinal - 1u];
         std::optional<SectionKind> const rk = sec.kind;
         std::optional<DataSectionKind> const dk =
@@ -3566,6 +3386,96 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     mod.symbolIdEnd.keepClearOf(symbolIds.end());   // the module carries its table's end
     mod.expectedFuncCount = mod.functions.size();
     return mod;
+}
+
+bool applyUnitLinkerDirectives(AssembledModule&          module,
+                               ObjectFormatSchema const& objectFormatSchema,
+                               DiagnosticReporter&       reporter) {
+    auto const& options = module.linkerRequests.linkerOptions;
+    if (options.empty()) return true;
+    auto const refuse = [&](std::string text) {
+        report(reporter, DiagnosticCode::K_LinkerDirectiveUnhonourable, DiagnosticSeverity::Error,
+               "pe::applyUnitLinkerDirectives: " + std::move(text));
+        return false;
+    };
+    auto const& vocab = objectFormatSchema.pe().linkerDirectives;
+    if (!vocab.has_value()) {
+        return refuse("format '" + std::string{objectFormatSchema.name()}
+                      + "' declares no 'pe.linkerDirectives' to read the unit's linker directives by, so they "
+                        "cannot be honoured as written.");
+    }
+    // The FOLD, each text as cl writes it into `.drectve` (a text of several directives reads as several).
+    CoffUnitDirectives directives;
+    for (auto const& words : options) {
+        std::string const text = spelledLinkerOption(words);
+        if (auto const folded = foldCoffLinkerDirectives(
+                directives, text, *vocab, "the unit's", "`#pragma comment(linker, \"" + text + "\")`",
+                "a unit's linker directive `#pragma comment(linker, \"" + text + "\")`: ", reporter);
+            !folded.has_value()) {
+            return refuse(folded.error());
+        }
+    }
+    // Every change below is made on a COPY, which replaces the module only when every step has succeeded: the id
+    // door's rule for a pass that takes one id at a time, and a refusal's (the module as it was).
+    AssembledModule unit = module;
+    unit.linkerRequests.linkerOptions.clear();
+    // The unit's OWN definitions a hide names read Hidden, as the reader reads an object's back; a common's stated
+    // alignment is the largest a directive asks, as the reader aligns an object's.
+    std::unordered_set<std::string> hideAnswered;
+    for (auto& s : unit.symbols) {
+        if (s.binding != SymbolBinding::Local && directives.hiddenSet.contains(s.name)) {
+            s.visibility = SymbolVisibility::Hidden;
+            hideAnswered.insert(s.name);
+        }
+    }
+    for (auto& e : unit.externImports) {
+        if (e.commonSize == 0u) continue;
+        if (directives.hiddenSet.contains(e.mangledName)) {
+            e.commonVisibility = SymbolVisibility::Hidden;
+            hideAnswered.insert(e.mangledName);
+        }
+        if (auto const asked = directives.commonAlignmentLog2.find(e.mangledName);
+            asked != directives.commonAlignmentLog2.end()) {
+            std::uint64_t const stated = std::uint64_t{1} << asked->second;
+            e.commonAlignmentStated = std::max(e.commonAlignmentStated, stated);
+            e.commonAlignment       = std::max(e.commonAlignment, stated);
+        }
+    }
+    appendUnitLinkerRequests(unit.linkerRequests, directives.requests);
+    auto const definesExternally = [&](std::string const& name) {
+        for (auto const& s : unit.symbols) {
+            if (s.binding != SymbolBinding::Local && s.name == name) return true;
+        }
+        for (auto const& e : unit.externImports) {
+            if (e.commonSize != 0u && e.mangledName == name) return true;
+        }
+        return false;
+    };
+    // THE COMPLETION, its fresh rows' ids from the copy's own door, one at a time -- and none asked for past a
+    // refusal, which the door reports each time it is asked.
+    linker::ModuleSymbolIds ids{unit};
+    bool exhausted = false;
+    CoffDirectiveRowsOf const rows{
+        definesExternally,
+        [&](std::string const& name) { return hideAnswered.contains(name); },
+        &unit.externImports,
+        [&] {
+            if (exhausted) return SymbolId{};
+            auto const id = ids.take(reporter, "pe: a reference row a unit's linker directive asks for");
+            if (!id.has_value()) {
+                exhausted = true;
+                return SymbolId{};
+            }
+            return *id;
+        }};
+    if (auto const completed =
+            completeCoffLinkerDirectives(directives, rows, unit.linkerRequests, *vocab, "the unit's", reporter);
+        !completed.has_value()) {
+        return refuse(completed.error());
+    }
+    if (exhausted) return false;   // the door refused by name
+    module = std::move(unit);
+    return true;
 }
 
 } // namespace dss::pe

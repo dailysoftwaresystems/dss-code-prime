@@ -36,6 +36,7 @@
 #include "core/types/diagnostic_budget.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/number_decode.hpp"  // floatKindInfo — a float FORMAT's width
+#include "core/types/type_lattice/type_layout.hpp"  // the data model's widths and the admissibility predicate
 #include "mir/mir_asm_descriptor.hpp"
 
 #include <algorithm>
@@ -825,6 +826,54 @@ wideFloatCmpPlan(MirOpcode op) noexcept {
 
 // One transient lowerer per `lowerToLir` call. Holds the per-pass state
 // the dispatcher methods read/write. Mirrors `Lowerer` in `hir_to_mir.cpp`.
+// ★ P69 (lane `xa`, fold 3f — review-xa3e F3, the Lowerer's half): the ADDRESS WIDTH a lowering writes, read
+// ONCE from the data model the module states (`addressWidthOf`): its byte size and the LIR access width that
+// spells it.
+struct AddressWidth {
+    DataModel     model;
+    std::uint32_t bytes;
+    std::uint8_t  accessFlags;
+};
+
+// The address width of `mir`'s data model, or nullopt where it has none to give -- each refused BY NAME with the
+// admissibility predicate's code (S_UnsupportedDataModel): a module stating no model, a model stating no pointer
+// size, a pointer no LIR access spells; and, `atTheWall`, a model whose pointer is not the back end's address
+// width (`dataModelTheBackEndCannotLower`, the semantic gate's question and reason).
+[[nodiscard]] std::optional<AddressWidth>
+addressWidthOf(Mir const& mir, DiagnosticReporter& reporter, bool atTheWall) {
+    DataModel const model = mir.moduleFacts().dataModel;
+    auto const refuse = [&](std::string why) -> std::optional<AddressWidth> {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::S_UnsupportedDataModel;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = "the MIR module cannot be lowered: " + std::move(why);
+        reporter.report(std::move(d));
+        return std::nullopt;
+    };
+    if (model == DataModel{}) {
+        return refuse("it states no data model (`MirModuleFacts::dataModel`), so no address it holds has a "
+                      "width to read");
+    }
+    if (atTheWall) {
+        if (std::optional<std::string> why = dataModelTheBackEndCannotLower(model)) return refuse(std::move(*why));
+    }
+    std::optional<std::uint64_t> const bytes = scalarByteSize(TypeKind::Ptr, model);
+    if (!bytes.has_value()) return refuse(dataModelSpelled(model) + " states no pointer size");
+    std::optional<std::uint8_t> const flags = lirInstWidthFlagForBits(static_cast<std::uint32_t>(8 * *bytes));
+    if (!flags.has_value()) {
+        return refuse(std::format("{} has {}-byte pointers, a width no LIR access spells", dataModelSpelled(model),
+                                  *bytes));
+    }
+    return AddressWidth{model, static_cast<std::uint32_t>(*bytes), *flags};
+}
+
+// The result of a lowering refused before it began (`addressWidthOf` reported why): nothing lowered, not ok.
+[[nodiscard]] MirToLirResult refusedLowering() {
+    MirToLirResult refused;
+    refused.ok = false;
+    return refused;
+}
+
 struct Lowerer {
     Mir const&          mir;
     TargetSchema const& target;
@@ -836,6 +885,11 @@ struct Lowerer {
     TypeInterner const& interner;
     DiagnosticReporter& reporter;
     LirBuilder          lir;
+    // ★ P69 (lane `xa`, fold 3f — review-xa3e F3): THE ADDRESS WIDTH this lowering writes, read once from the
+    // module's data model (`addressWidthOf`) -- a pointer-class value's access, a jump table's slot and index
+    // scale, the TLS / TLV / import / GOT slot loads, the atomics runtime's `size_t`. Never a literal: under the
+    // one width the wall admits a literal 8 would read the same, and the seam's pin tells them apart.
+    AddressWidth        address_;
 
     // D-CSUBSET-INT128-LIR-WIDTH (TF-C94): one-shot latch for `reprKind`'s
     // 128-bit width-tier wall. `reprKind` is a `const` query called from every
@@ -1539,9 +1593,10 @@ struct Lowerer {
             std::span<DefinedSymbolName const> definedSymbolNames,
             std::optional<ObjectFormatKind> assemblyFormatKind,
             std::span<std::string const> imageDefinedNames,
-            std::uint16_t callingConventionIndex)
+            std::uint16_t callingConventionIndex,
+            AddressWidth addressWidth)
         : mir(m), target(t), convention_(t.callingConvention(callingConventionIndex)),
-          interner(i), reporter(r), lir(t),
+          interner(i), reporter(r), lir(t), address_(addressWidth),
           valueToReg(m), mirBlockToLirBlock(m.blockArena()),
           externCallDispatch_(externCallDispatch),
           wideFloatSoftcallLibrary_(std::move(wideFloatSoftcallLibrary)),
@@ -2237,7 +2292,17 @@ struct Lowerer {
         // exists to stop, so the operand's own declared width is threaded here
         // rather than left at the width-default.
         std::array<LirOperand, 1> const pin{LirOperand::makeReg(src)};
-        std::uint8_t const flags = lirWidthFlagsForBits(widthBits);
+        // ⚠ SUB-32 PROMOTES TO 32 in register plumbing: a sub-32-bit register
+        // WRITE is a partial-register hazard, and neither shipped target declares
+        // a byte/half-word register-to-register move at all -- asking for one
+        // would turn a `"r"`-bound `char` operand from a working 32-bit copy into
+        // `A_NoMatchingEncodingVariant`. The narrowing realizes at the
+        // width-exact CONSUMER, never in the plumbing.
+        auto const flags = widthFlagsOrRefuse(
+            at, widthBits < 32 ? 32u : widthBits,
+            std::format("inline asm (MIR inst {}) {} {} (constraint \"{}\"), a register copy",
+                        at.v, role, gnuIndex, constraint));
+        if (!flags.has_value()) return std::nullopt;   // reported
         // ★★★ A PHYSICAL END THAT SHARES ITS REGISTER NUMBER WITH ANOTHER
         // REGISTER (arm64 `sp`, field 31 beside `xzr`) IS ELECTED, NOT ASSUMED
         // (P68 round 8, D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED). The
@@ -2277,7 +2342,7 @@ struct Lowerer {
             std::string ambiguousWith;
             auto const elected = asm_elect::electOpcode(
                 target, names, asm_elect::ElectedOperands{pin, {}},
-                lirInstWidthBits(flags), false, destProfile, &rejections,
+                lirInstWidthBits(*flags), false, destProfile, &rejections,
                 &ambiguousWith);
             if (!elected.has_value()) {
                 std::string why;
@@ -2310,31 +2375,24 @@ struct Lowerer {
             }
             chosen = elected->opcode;
         }
-        return emitInst(chosen, dest, pin, /*payload=*/0, flags);
+        return emitInst(chosen, dest, pin, /*payload=*/0, *flags);
     }
 
-    // Project an operand's declared width in BITS onto the LIR instruction
-    // width flags of a register-to-register COPY (`lirInstWidthBits` is the
-    // inverse). 64 is the width-default and carries no flag; an unmodelled
-    // width also falls to the default, where the encoding-variant election
-    // refuses it by name rather than silently electing a neighbour.
-    //
-    // ⚠ SUB-32 PROMOTES TO 32, THE SAME RULE `registerOpWidthFlags` APPLIES
-    // to every other register plumb: a sub-32-bit register WRITE is a
-    // partial-register hazard, and neither shipped target declares a
-    // byte/half-word register-to-register move at all — asking for one would
-    // turn a `"r"`-bound `char` operand from a working 32-bit copy into
-    // `A_NoMatchingEncodingVariant`. The narrowing realizes at the
-    // width-exact CONSUMER, never in the plumbing.
-    [[nodiscard]] static constexpr std::uint8_t
-    lirWidthFlagsForBits(std::uint32_t bits) noexcept {
-        switch (bits) {
-            case 8:
-            case 16:
-            case 32:  return kLirInstFlagWidth32;
-            case 128: return kLirInstFlagWidth128;
-            default:  return 0;
-        }
+    // ★ THE ONE MAP FROM A WIDTH TO LIR FLAGS (P69 fold 3f, review-xa3e F3's Q3):
+    // `lirInstWidthFlagForBits` (lir/lir_node.hpp), asked here, and a width the
+    // LIR instruction model cannot state REFUSED by name at `at` -- where this
+    // file's two private maps (one for register plumbing, one for a memory
+    // piece) each took such a width for the 64-bit access in silence
+    // (`default: return 0`). `what` names the access for the operator.
+    [[nodiscard]] std::optional<std::uint8_t>
+    widthFlagsOrRefuse(MirInstId at, std::uint32_t bits, std::string_view what) {
+        if (std::optional<std::uint8_t> const flags = lirInstWidthFlagForBits(bits)) return *flags;
+        report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing, DiagnosticSeverity::Error,
+               std::format("{}: an access of {} bits, which is not a width the LIR instruction model can state "
+                           "(MIR inst {}); lowering it at the 64-bit default would read or write bytes that are not "
+                           "the value's",
+                           what, bits, at.v));
+        return std::nullopt;
     }
 
     // Map a MIR `TypeId` to the LIR register class that holds its
@@ -2887,6 +2945,10 @@ struct Lowerer {
                 return kLirInstFlagWidth8;
             case TypeKind::I16: case TypeKind::U16:
                 return kLirInstFlagWidth16;
+            // ★ A POINTER-CLASS value is an ADDRESS of the module's data model (P69 fold 3f,
+            // review-xa3e F3 P7): its width is READ, never the `default` arm's 64 by omission.
+            case TypeKind::Ptr: case TypeKind::FnPtr: case TypeKind::Ref: case TypeKind::NullptrT:
+                return address_.accessFlags;
             default:
                 return 0;
         }
@@ -2921,7 +2983,10 @@ struct Lowerer {
             // I32 by the dataModel — width-32 is the correct 4-byte access).
             case TypeKind::I32: case TypeKind::U32:
                 return kLirInstFlagWidth32;
-            // 8-byte integers/pointers — width-default full-slot access.
+            // A pointer-class value: an address of the module's data model (P7, as above).
+            case TypeKind::Ptr: case TypeKind::FnPtr: case TypeKind::Ref: case TypeKind::NullptrT:
+                return address_.accessFlags;
+            // 8-byte integers — width-default full-slot access.
             default:
                 return 0;
         }
@@ -4646,19 +4711,9 @@ struct Lowerer {
         return !b.carried() && (b.pinned || b.cls != b.valueCls);
     }
 
-    // The LIR width flag of a MEMORY access of `bits` — width-EXACT, unlike
-    // `lirWidthFlagsForBits` (whose sub-32 promotion is for register plumbing):
-    // a carried 1-byte struct is loaded and stored as ONE byte, never four.
-    [[nodiscard]] static constexpr std::uint8_t
-    memWidthFlagsForBits(std::uint32_t bits) noexcept {
-        switch (bits) {
-            case 8:   return kLirInstFlagWidth8;
-            case 16:  return kLirInstFlagWidth16;
-            case 32:  return kLirInstFlagWidth32;
-            case 128: return kLirInstFlagWidth128;
-            default:  return 0;
-        }
-    }
+    // A MEMORY access of a carried piece is width-EXACT (`widthFlagsOrRefuse`,
+    // with no promotion, unlike register plumbing): a carried 1-byte struct is
+    // loaded and stored as ONE byte, never four.
 
     // The memory verb `op` of the class a carriage accesses memory with — the
     // constraint's own class, or the one it stages through — refused by name
@@ -4699,14 +4754,17 @@ struct Lowerer {
                     piece * b.pieceStrideBytes)),
             };
             LirReg const dest = piece == 0 ? b.reg : b.reg2;
+            auto const pieceFlags = widthFlagsOrRefuse(
+                at, b.pieceBits[piece],
+                std::format("inline asm operand {} (constraint \"{}\"), loading its piece {}", index,
+                            b.constraint, piece));
+            if (!pieceFlags.has_value()) return false;   // reported
             if (b.stageCls == LirRegClass::None) {
-                emitInst(*loadOp, dest, ops, /*payload=*/0,
-                         memWidthFlagsForBits(b.pieceBits[piece]));
+                emitInst(*loadOp, dest, ops, /*payload=*/0, *pieceFlags);
                 continue;
             }
             LirReg const staged = lir.newVReg(b.stageCls);
-            emitInst(*loadOp, staged, ops, /*payload=*/0,
-                     memWidthFlagsForBits(b.pieceBits[piece]));
+            emitInst(*loadOp, staged, ops, /*payload=*/0, *pieceFlags);
             if (!emitAsmOperandMove(at, dest, staged, "input", index,
                                     b.constraint, b.pieceBits[piece])
                      .has_value()) {
@@ -4745,8 +4803,12 @@ struct Lowerer {
                 LirOperand::makeMemOffset(static_cast<std::int32_t>(
                     piece * b.pieceStrideBytes)),
             };
-            emitInst(*storeOp, InvalidLirReg, ops, /*payload=*/0,
-                     memWidthFlagsForBits(b.pieceBits[piece]));
+            auto const pieceFlags = widthFlagsOrRefuse(
+                at, b.pieceBits[piece],
+                std::format("inline asm operand {} (constraint \"{}\"), storing its piece {}", index,
+                            b.constraint, piece));
+            if (!pieceFlags.has_value()) return false;   // reported
+            emitInst(*storeOp, InvalidLirReg, ops, /*payload=*/0, *pieceFlags);
         }
         return true;
     }
@@ -10376,15 +10438,15 @@ struct Lowerer {
             std::array<LirOperand, 1> leaOps{LirOperand::makeSymbolRef(sym.v)};
             emitInst(*opcode(MnemonicSlot::Lea), descReg, leaOps);
             // Step 2 — load word0 (the thunk pointer) from the
-            // descriptor. Width-default 64-bit (a code pointer); base =
-            // descReg, disp 0.
+            // descriptor: a code address, at the module's address width
+            // (P69 fold 3f, F3 P4); base = descReg, disp 0.
             LirReg const calleeReg = lir.newVReg(LirRegClass::GPR);
             std::array<LirOperand, 3> thunkLoadOps{
                 LirOperand::makeReg(descReg),
                 LirOperand::makeMemBase(1),
                 LirOperand::makeMemOffset(0)};
             emitInst(*machoLoadOp, calleeReg, thunkLoadOps,
-                     /*payload=*/0, /*flags=*/0);
+                     /*payload=*/0, /*flags=*/address_.accessFlags);
             // Step 3 — call the thunk with the descriptor as arg0. The
             // abstract indirect-call form: ops[0]=callee reg (→ BLR),
             // ops[1]=the sole arg. payload 0 (non-variadic). The result
@@ -10598,8 +10660,8 @@ struct Lowerer {
         emitInst(*loadOp, idxReg, idxLoadOps,
                  /*payload=*/0, /*flags=*/kLirInstFlagWidth32);
         // Step 3 — load THIS module's TLS block base: [tp + index*W].
-        // The SIB indexed-load form (D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL); width 64
-        // (a pointer). tp is the array base, index the module ordinal, and
+        // The SIB indexed-load form (D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL), at the
+        // module's address width (a pointer; P69 fold 3f, F3 P3). tp is the array base, index the module ordinal, and
         // the scale W the array's stride -- the data model's pointer width
         // (`TlsAccessInfo::blockPointerBytes`; P69 fold 3e, X9 R15: a literal
         // 8). A block that states none is refused, never indexed by zero; a
@@ -10616,7 +10678,7 @@ struct Lowerer {
             LirOperand::makeReg(idxReg),
             LirOperand::makeMemBase(tlsAccess_->blockPointerBytes),
             LirOperand::makeMemOffset(0)};
-        emitInst(*loadOp, blockReg, blockLoadOps, /*payload=*/0, /*flags=*/0);
+        emitInst(*loadOp, blockReg, blockLoadOps, /*payload=*/0, /*flags=*/address_.accessFlags);
         // Step 4 — the object's per-thread address: block + secrel(sym).
         // VERBATIM the [Reg, SymbolRef] lea local-exec uses; its
         // tls-flagged reloc (kind 4) is the PE format's SECREL, and the
@@ -10735,9 +10797,9 @@ struct Lowerer {
                 LirOperand::makeMemBase(1),
                 LirOperand::makeMemOffset(0),
             };
-            // The slot always holds a 64-bit pointer — width-default (flags 0
-            // ⇒ 64), exactly as the extern GOT-indirect arm below loads it.
-            emitInst(*loadOp, objectAddr, loadOps, /*payload=*/0, /*flags=*/0);
+            // The slot holds an ADDRESS of the module's data model (P69 fold 3f,
+            // F3 P5), exactly as the extern GOT-indirect arm below loads it.
+            emitInst(*loadOp, objectAddr, loadOps, /*payload=*/0, /*flags=*/address_.accessFlags);
             defineValue(id, objectAddr);
             return;
         }
@@ -10781,11 +10843,11 @@ struct Lowerer {
                 LirOperand::makeMemBase(1),
                 LirOperand::makeMemOffset(0),
             };
-            // The __got slot always holds a 64-bit pointer — width-default
-            // (flags 0 ⇒ 64) full-register load (memAccessWidthFlags maps a
-            // pointer type to 0 as well; 0 here IS that value, made explicit
-            // so a mis-typed GlobalAddr can never narrow the pointer load).
-            emitInst(*loadOp, objectAddr, loadOps, /*payload=*/0, /*flags=*/0);
+            // The __got slot holds an ADDRESS of the module's data model (P69
+            // fold 3f, F3 P6) -- the width memAccessWidthFlags gives a pointer
+            // type too, read here from the model itself so a mis-typed
+            // GlobalAddr can never narrow the pointer load.
+            emitInst(*loadOp, objectAddr, loadOps, /*payload=*/0, /*flags=*/address_.accessFlags);
             defineValue(id, objectAddr);
             return;
         }
@@ -13942,9 +14004,10 @@ struct Lowerer {
         }
         // `ptrBytes` is the ADDRESS width, taken from the atomic's own MIR
         // pointer operand by the caller — the one datum at this site that
-        // genuinely has a MIR type. `size_t` takes the same width (it IS
-        // pointer-width on every LP64/LLP64 target DSS serves) and the
-        // memory-order model is a plain `int`.
+        // genuinely has a MIR type. `size_t` takes the same width: every data
+        // model's table row states size_t as wide as its pointer (LP64, LLP64,
+        // ILP32). The memory-order model is the runtime's `int` -- I32, the
+        // model's `int` (P69 fold 3f, F3 P15: it was a literal 4).
         std::vector<LirOperand> ops;
         ops.reserve(3 + slotAddrs.size() + modelRegs.size());
         ops.push_back(LirOperand::makeSymbolRef(sym.v));
@@ -13952,8 +14015,10 @@ struct Lowerer {
         ops.push_back(LirOperand::makeArgReg(objectAddr, ptrBytes));
         for (LirReg const slot : slotAddrs)
             ops.push_back(LirOperand::makeArgReg(slot, ptrBytes));
+        std::optional<std::uint64_t> const intBytes = scalarByteSize(TypeKind::I32, address_.model);
+        if (!intBytes.has_value()) return false;   // unreachable: I32 is a sized scalar under every model
         for (LirReg const modelReg : modelRegs)
-            ops.push_back(LirOperand::makeArgReg(modelReg, std::uint8_t{4}));
+            ops.push_back(LirOperand::makeArgReg(modelReg, static_cast<std::uint8_t>(*intBytes)));
         emitInst(*callOp, InvalidLirReg, ops);
         return true;
     }
@@ -15675,8 +15740,9 @@ struct Lowerer {
     //   target = load [addr]                   ; the case block's runtime address
     //   jmp *target  (succs = all distinct case blocks + default)
     //
-    // The `.data` table itself (span 8-byte slots, each an abs64 reloc to a
-    // synthetic per-block symbol) is NOT emitted here — a JumpTableDescriptor is
+    // The `.data` table itself (span slots, each an address of the module's
+    // data model and an address reloc to a synthetic per-block symbol) is NOT
+    // emitted here — a JumpTableDescriptor is
     // recorded and `compile_pipeline.cpp` materializes the AssembledData after
     // `assemble()` resolves block byte offsets. See JumpTableDescriptor.
     bool tryLowerSwitchJumpTable(MirInstId id,
@@ -15861,7 +15927,8 @@ struct Lowerer {
         lir.beginBlock(body);
         LirReg const idx64 = idxReg;
 
-        // off = idx64 * 8  (scale by the 8-byte slot size; the 4-op `lea`'s index
+        // off = idx64 * W  (scale by the slot size W, an address of the module's
+        // data model: P69 fold 3f, F3 P1/F3-R1; the 4-op `lea`'s index
         // is a raw byte offset — scale=1 — on both ISAs, so pre-scale here,
         // exactly as the GEP path pre-scales an array index). Scaling uses `mul`
         // by a materialized-8 register, NOT a shift: the shift opcodes are NOT
@@ -15869,12 +15936,13 @@ struct Lowerer {
         // count; arm64 `shl`/LSL takes a reg count) — `mul reg,reg` is the plain
         // 3-address form BOTH ISAs declare identically, keeping this lowering
         // arch-blind with no capability branch.
-        std::optional<LirReg> const eightReg = emitBareConstToFresh(8);
-        if (!eightReg.has_value()) return false;
+        std::optional<LirReg> const slotBytesReg =
+            emitBareConstToFresh(static_cast<std::int64_t>(address_.bytes));
+        if (!slotBytesReg.has_value()) return false;
         LirReg const offReg = lir.newVReg(LirRegClass::GPR);
         {
             std::array<LirOperand, 2> mulOps{
-                LirOperand::makeReg(idx64), LirOperand::makeReg(*eightReg)};
+                LirOperand::makeReg(idx64), LirOperand::makeReg(*slotBytesReg)};
             emitInst(*mulOp, offReg, mulOps);   // 64-bit multiply (default width)
         }
 
@@ -15897,14 +15965,15 @@ struct Lowerer {
             emitInst(*leaOp, addrReg, addrOps);
         }
 
-        // target = load [addr]  — 3-op load form, 64-bit (a code address).
+        // target = load [addr]  — 3-op load form, a code address of the module's
+        // address width (P69 fold 3f, F3 P2).
         LirReg const targetReg = lir.newVReg(LirRegClass::GPR);
         {
             std::array<LirOperand, 3> ldOps{
                 LirOperand::makeReg(addrReg),
                 LirOperand::makeMemBase(1),
                 LirOperand::makeMemOffset(0)};
-            emitInst(*loadOp, targetReg, ldOps);   // default (64-bit) width
+            emitInst(*loadOp, targetReg, ldOps, /*payload=*/0, /*flags=*/address_.accessFlags);
         }
 
         // jmp *target — successors = every DISTINCT case block + default (the
@@ -15934,6 +16003,7 @@ struct Lowerer {
         JumpTableDescriptor desc;
         desc.tableSymbol = tableSym;
         desc.slotCount   = static_cast<std::size_t>(span);
+        desc.slotBytes   = address_.bytes;   // the width the index was scaled by: ONE value (F3-R1)
         desc.funcIndex   = currentFuncIndex_;
         // value → case index (last-writer-wins is irrelevant — case labels are
         // unique per C 6.8.4.2; a duplicate would already be an HIR error).
@@ -17106,26 +17176,30 @@ std::array<std::string_view, 2> guardedRegionSealMnemonics() noexcept {
             kMnemonicRows[static_cast<std::size_t>(MnemonicSlot::Unreachable)].mnemonic};
 }
 
-MirToLirResult lowerToLir(Mir const&          mir,
-                          TargetSchema const& target,
-                          TypeInterner const& interner,
-                          DiagnosticReporter& reporter,
-                          std::uint16_t callingConventionIndex,
-                          std::vector<ExternImport> externImports,
-                          std::optional<ExternCallDispatch> externCallDispatch,
-                          std::optional<DataImportBinding> dataImportBinding,
-                          std::optional<TlsAccessInfo> tlsAccess,
-                          std::span<MirSehScope const> sehScopes,
-                          std::optional<std::string> wideFloatSoftcallLibrary,
-                          std::optional<ExternAddrBinding> externAddrBinding,
-                          std::optional<bool> charIsUnsigned,
-                          std::optional<AtomicsRuntime> atomicsRuntime,
-                          std::vector<SymbolBinding> indirectSlotBindings,
-                          std::vector<SymbolBinding>
-                              preemptibleDefinitionBindings,
-                          std::vector<DefinedSymbolName> definedSymbolNames,
-                          std::optional<ObjectFormatKind> assemblyFormatKind,
-                          std::vector<std::string> imageDefinedNames) {
+namespace {
+
+// The lowering of both entries (`lowerToLir`, `lowerToLirPastTheWall`), at the address width each has read from
+// the module (`addressWidthOf`).
+MirToLirResult lowerAtAddressWidth(AddressWidth addressWidth,
+                                   Mir const&          mir,
+                                   TargetSchema const& target,
+                                   TypeInterner const& interner,
+                                   DiagnosticReporter& reporter,
+                                   std::uint16_t callingConventionIndex,
+                                   std::vector<ExternImport> externImports,
+                                   std::optional<ExternCallDispatch> externCallDispatch,
+                                   std::optional<DataImportBinding> dataImportBinding,
+                                   std::optional<TlsAccessInfo> tlsAccess,
+                                   std::span<MirSehScope const> sehScopes,
+                                   std::optional<std::string> wideFloatSoftcallLibrary,
+                                   std::optional<ExternAddrBinding> externAddrBinding,
+                                   std::optional<bool> charIsUnsigned,
+                                   std::optional<AtomicsRuntime> atomicsRuntime,
+                                   std::vector<SymbolBinding> indirectSlotBindings,
+                                   std::vector<SymbolBinding> preemptibleDefinitionBindings,
+                                   std::vector<DefinedSymbolName> definedSymbolNames,
+                                   std::optional<ObjectFormatKind> assemblyFormatKind,
+                                   std::vector<std::string> imageDefinedNames) {
     // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold (2026-06-02): pass
     // the externImports vector to the Lowerer so it can distinguish
     // extern-targeting calls from module-internal direct calls.
@@ -17168,7 +17242,7 @@ MirToLirResult lowerToLir(Mir const&          mir,
               std::move(wideFloatSoftcallLibrary), charIsUnsigned,
               std::move(atomicsRuntime), std::move(indirectSlotBindings),
               std::move(preemptibleDefinitionBindings), definedSymbolNames,
-              assemblyFormatKind, imageDefinedNames, callingConventionIndex};
+              assemblyFormatKind, imageDefinedNames, callingConventionIndex, addressWidth};
     MirToLirResult result = std::move(L).run();
     // Append (not overwrite) so any future LIR-tier extern synthesis
     // — e.g. runtime-helper imports like `__chkstk` / `__divti3` /
@@ -17192,6 +17266,71 @@ MirToLirResult lowerToLir(Mir const&          mir,
                                                e.symbol.v);
     }
     return result;
+}
+
+} // namespace
+
+MirToLirResult lowerToLir(Mir const&          mir,
+                          TargetSchema const& target,
+                          TypeInterner const& interner,
+                          DiagnosticReporter& reporter,
+                          std::uint16_t callingConventionIndex,
+                          std::vector<ExternImport> externImports,
+                          std::optional<ExternCallDispatch> externCallDispatch,
+                          std::optional<DataImportBinding> dataImportBinding,
+                          std::optional<TlsAccessInfo> tlsAccess,
+                          std::span<MirSehScope const> sehScopes,
+                          std::optional<std::string> wideFloatSoftcallLibrary,
+                          std::optional<ExternAddrBinding> externAddrBinding,
+                          std::optional<bool> charIsUnsigned,
+                          std::optional<AtomicsRuntime> atomicsRuntime,
+                          std::vector<SymbolBinding> indirectSlotBindings,
+                          std::vector<SymbolBinding> preemptibleDefinitionBindings,
+                          std::vector<DefinedSymbolName> definedSymbolNames,
+                          std::optional<ObjectFormatKind> assemblyFormatKind,
+                          std::vector<std::string> imageDefinedNames) {
+    // ★ THE WALL (P69 fold 3f, review-xa3e F3; mir_to_lir.hpp): a module stating no
+    // data model, or one whose pointer is not the back end's address width, is refused
+    // by name before anything is lowered.
+    std::optional<AddressWidth> const addressWidth = addressWidthOf(mir, reporter, /*atTheWall=*/true);
+    if (!addressWidth.has_value()) return refusedLowering();
+    return lowerAtAddressWidth(*addressWidth, mir, target, interner, reporter, callingConventionIndex,
+                               std::move(externImports), externCallDispatch, dataImportBinding,
+                               std::move(tlsAccess), sehScopes, std::move(wideFloatSoftcallLibrary),
+                               externAddrBinding, charIsUnsigned, std::move(atomicsRuntime),
+                               std::move(indirectSlotBindings), std::move(preemptibleDefinitionBindings),
+                               std::move(definedSymbolNames), assemblyFormatKind, std::move(imageDefinedNames));
+}
+
+// See the header: the seam -- the same lowering past the wall's second question.
+MirToLirResult lowerToLirPastTheWall(Mir const&          mir,
+                                     TargetSchema const& target,
+                                     TypeInterner const& interner,
+                                     DiagnosticReporter& reporter,
+                                     std::uint16_t callingConventionIndex,
+                                     std::vector<ExternImport> externImports,
+                                     std::optional<ExternCallDispatch> externCallDispatch,
+                                     std::optional<DataImportBinding> dataImportBinding,
+                                     std::optional<TlsAccessInfo> tlsAccess,
+                                     std::span<MirSehScope const> sehScopes,
+                                     std::optional<std::string> wideFloatSoftcallLibrary,
+                                     std::optional<ExternAddrBinding> externAddrBinding,
+                                     std::optional<bool> charIsUnsigned,
+                                     std::optional<AtomicsRuntime> atomicsRuntime,
+                                     std::vector<SymbolBinding> indirectSlotBindings,
+                                     std::vector<SymbolBinding> preemptibleDefinitionBindings,
+                                     std::vector<DefinedSymbolName> definedSymbolNames,
+                                     std::optional<ObjectFormatKind> assemblyFormatKind,
+                                     std::vector<std::string> imageDefinedNames) {
+    std::optional<AddressWidth> const addressWidth =
+        addressWidthOf(mir, reporter, /*atTheWall=*/false);
+    if (!addressWidth.has_value()) return refusedLowering();
+    return lowerAtAddressWidth(*addressWidth, mir, target, interner, reporter, callingConventionIndex,
+                               std::move(externImports), externCallDispatch, dataImportBinding,
+                               std::move(tlsAccess), sehScopes, std::move(wideFloatSoftcallLibrary),
+                               externAddrBinding, charIsUnsigned, std::move(atomicsRuntime),
+                               std::move(indirectSlotBindings), std::move(preemptibleDefinitionBindings),
+                               std::move(definedSymbolNames), assemblyFormatKind, std::move(imageDefinedNames));
 }
 
 } // namespace dss

@@ -321,11 +321,15 @@ struct ExecDataSectionLayout {
                              : std::string{"laid out separately by this writer"}));
         return std::nullopt;
     }
+    // By (offset, item index): a zero-size item and its neighbour share an
+    // offset, and the order among them decides the members' layout order and the
+    // item a refusal names, so it is the module's data, never the sort's.
     for (auto& [unit, members] : unitMembers) {
         std::sort(members.begin(), members.end(),
                   [&](std::size_t a, std::size_t b) {
-                      return dataItems[a].inputSection->offset
-                           < dataItems[b].inputSection->offset;
+                      auto const oa = dataItems[a].inputSection->offset;
+                      auto const ob = dataItems[b].inputSection->offset;
+                      return oa != ob ? oa < ob : a < b;
                   });
     }
     std::unordered_set<std::uint32_t> placedUnits;

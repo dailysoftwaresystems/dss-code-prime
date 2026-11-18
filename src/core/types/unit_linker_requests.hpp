@@ -71,9 +71,16 @@ struct UnitHeapRequest             { ReserveCommit sizes; };
 // all the same: settled against the other units' by the option's precedence,
 // and refused by name only where it would STAND -- a reference linker that
 // takes the last `/SUBSYSTEM:` links a NATIVE one a later CONSOLE replaces.
+// `verbs`: the verbs the C runtime startups of the subsystem call an entry with
+// (the vocabulary's `subsystemStartups`). With no entry request standing, the
+// subsystem request that STANDS among the units named to the link ranks the
+// program's entries of those verbs first (`entryElectionScope`, P69 fold 3f),
+// as link.exe starts WinMain beside `main` under `/SUBSYSTEM:WINDOWS`
+// (✔MEASURED 2026-11-17).
 struct UnitSubsystemRequest {
-    SubsystemSetting setting;
-    std::string      unsupported{};
+    SubsystemSetting                  setting;
+    std::string                       unsupported{};
+    std::vector<EntryMaterialization> verbs{};
     friend bool operator==(UnitSubsystemRequest const&, UnitSubsystemRequest const&) = default;
 };
 // `runtimeStartup`: the name is the C runtime's own startup (the format's
@@ -103,6 +110,11 @@ struct UnitImageBaseRequest        { std::uint64_t address = 0; };
 struct UnitSectionAlignmentRequest { std::uint32_t bytes = 0; };
 struct UnitMismatchCheck           { std::string key; std::string value; };
 struct UnitDllImageRequest         {};
+// `/MANIFESTDEPENDENCY:<identity>` -- the image depends on the side-by-side
+// assembly the identity names (the attributes of the manifest's
+// `assemblyIdentity`, verbatim). A link-wide set: every distinct identity once,
+// at its first statement's place; no precedence settles it (P69 fold 3f).
+struct UnitManifestDependencyRequest { std::string identity; };
 // A request a reference linker honours and a DSS IMAGE cannot (the format's
 // vocabulary row is `refused`, its `reason` saying why and naming the row): an
 // image link refuses it by name; a relocatable artifact hands it on to the
@@ -114,7 +126,7 @@ using UnitImageRequestValue = std::variant<UnitStackRequest, UnitHeapRequest, Un
                                            UnitChecksumRequest, UnitImageVersionRequest,
                                            UnitImageBaseRequest, UnitSectionAlignmentRequest,
                                            UnitMismatchCheck, UnitDllImageRequest,
-                                           UnitUnhonourableRequest>;
+                                           UnitManifestDependencyRequest, UnitUnhonourableRequest>;
 
 // ── THE TWO ANSWERS A FORMAT STATES ABOUT A REQUEST ONE LINK DECIDES ACROSS ITS
 //    UNITS (P69 send-back 5, review-xa4 MINOR 6) ────────────────────────────
@@ -187,6 +199,16 @@ struct UnitExportRequest {
     friend bool operator==(UnitExportRequest const&, UnitExportRequest const&) = default;
 };
 
+// The minimum OS version a read unit states it was built for -- a Mach-O object's LC_BUILD_VERSION `minos` or
+// LC_VERSION_MIN_MACOSX `version`, `(major<<16)|(minor<<8)|patch` as the command encodes it. The link that makes an
+// IMAGE compares it with its own (`image.buildVersion.minOs`) and WARNS about a newer one, as ld64 warns -- "object file
+// (...) was built for newer 'macOS' version (26.0) than being linked (11.0)" -- and links on, as ld64 does (✔MEASURED P69
+// fold 3f, run 20261117-192243-260e95c2). `unit` names the stating unit (`nameStatingUnit`).
+struct UnitMinimumOs {
+    std::uint32_t version = 0;
+    std::string   unit{};
+};
+
 struct UnitLinkerRequests {
     std::vector<UnitImageRequest>  image;     // in directive order
     std::vector<UnitExportRequest> exports;   // link-wide
@@ -206,11 +228,40 @@ struct UnitLinkerRequests {
     // as warnings by that link. A relocatable artifact hands the token on
     // instead, and says nothing.
     std::vector<std::string>       warnings;
-
+    // ★ P69 (lane `xa`, fold 3f -- `#pragma comment(lib, ...)`'s ELF half): the LIBRARIES the unit asks its final
+    // link to search, each once, in the order first stated -- ELF's dependent-libraries section (`.deplibs`), which
+    // clang writes for `#pragma comment(lib, "x")` and ld.lld honours (GNU ld ignores it; ✔MEASURED P69 fold 3f).
+    // A link that makes an IMAGE does with them what the format's `elf.dependentLibraries` block says
+    // (`inImage`); a relocatable artifact restates them in its own section.
+    std::vector<std::string>       dependentLibraries;
+    // ★ P69 (lane `xa`, fold 3f -- `#pragma comment(linker, ...)`): the OPTIONS the unit hands its final linker that
+    // no field above reads, each one option's WORDS, in the order stated:
+    //   * a COMPILED unit's `#pragma comment(linker, "t")`, one word `t`, as the source states it -- applied to the
+    //     unit's module by its format's backend (`ObjectFormatBackend::applyUnitLinkerOptions`), exactly as that
+    //     backend's object reader applies an object's: a COFF unit's are folded into the fields above and leave none
+    //     here; a Mach-O unit's library options are read into `dependentLibraries` and the rest stay;
+    //   * a foreign Mach-O object's LC_LINKER_OPTION commands other than a library's, each its strings -- clang's
+    //     module auto-link writes `-framework` and the framework's name as TWO strings, and ld64 honours only that
+    //     spelling (✔MEASURED P69 fold 3f, run 20261117-173614-aa64206d: one string `-framework X` is "unknown ... ignored").
+    // A relocatable writer restates them; a link that makes an image says what it does with each (its reader or
+    // the backend queued a warning in `warnings` for every option the image's linker would not honour).
+    std::vector<std::vector<std::string>> linkerOptions;
+    // ★ P69 (lane `xa`, fold 3f -- the Mach-O reader's load commands): the minimum OS version each read unit states
+    // it was built for (`UnitMinimumOs`), which the link that makes an image compares with its own.
+    std::vector<UnitMinimumOs> minimumOs;
     [[nodiscard]] bool empty() const noexcept {
-        return image.empty() && exports.empty() && hides.empty() && handOn.empty() && warnings.empty();
+        return image.empty() && exports.empty() && hides.empty() && handOn.empty() && warnings.empty()
+            && dependentLibraries.empty() && linkerOptions.empty() && minimumOs.empty();
     }
 };
+
+// One linker option as its words read on a command line, one space between each (`UnitLinkerRequests::
+// linkerOptions`): a COFF unit's directive text, and every message that names an option.
+[[nodiscard]] inline std::string spelledLinkerOption(std::vector<std::string> const& words) {
+    std::string out;
+    for (std::size_t k = 0; k < words.size(); ++k) out += (k == 0 ? "" : " ") + words[k];
+    return out;
+}
 
 // Name the unit that stated `requests` on every one of them -- the object's
 // file name, or `archive(member)` -- so each diagnostic a link makes of a
@@ -221,6 +272,7 @@ inline void nameStatingUnit(UnitLinkerRequests& requests, std::string_view unit)
     for (auto& r : requests.image) r.unit = unit;
     for (auto& e : requests.exports) e.unit = unit;
     for (auto& w : requests.warnings) w = "'" + std::string{unit} + "': " + w;
+    for (auto& m : requests.minimumOs) m.unit = unit;
 }
 
 // One link's units' requests, folded into the merged module's in UNIT order --
@@ -236,6 +288,15 @@ inline void appendUnitLinkerRequests(UnitLinkerRequests& into, UnitLinkerRequest
         bool seen = false;
         for (auto const& have : into.handOn) seen = seen || have == tok;
         if (!seen) into.handOn.push_back(tok);
+    }
+    // Each unit's options are its own (P69 fold 3f): every one stays, in unit order, as the link reads them.
+    into.linkerOptions.insert(into.linkerOptions.end(), from.linkerOptions.begin(), from.linkerOptions.end());
+    into.minimumOs.insert(into.minimumOs.end(), from.minimumOs.begin(), from.minimumOs.end());
+    // A library two units name is searched once (ld.lld reads a repeated name as the one).
+    for (auto const& lib : from.dependentLibraries) {
+        bool seen = false;
+        for (auto const& have : into.dependentLibraries) seen = seen || have == lib;
+        if (!seen) into.dependentLibraries.push_back(lib);
     }
 }
 
@@ -253,11 +314,15 @@ struct DirectiveImageSettings {
     bool                                 checksum = false;
     std::vector<SectionAttributeRequest> sections;   // applied in order
     std::vector<UnitExportRequest>       exports;    // one per exported name
+    // The side-by-side assemblies the image depends on: each distinct identity
+    // once, in the order the units first state them (the image's embedded
+    // manifest names them).
+    std::vector<std::string>             manifestDependencies;
 
     [[nodiscard]] bool empty() const noexcept {
         return !stack.has_value() && !heap.has_value() && !subsystem.has_value() && !imageVersion.has_value()
             && !imageBase.has_value() && !sectionAlignment.has_value() && !checksum && sections.empty()
-            && exports.empty();
+            && exports.empty() && manifestDependencies.empty();
     }
 };
 

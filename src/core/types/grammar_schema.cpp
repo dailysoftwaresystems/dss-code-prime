@@ -2,6 +2,7 @@
 
 #include "core/crypto/sha256.hpp"   // crypto::sha256Hex — the retained content digest
 #include "core/substrate/checked_file_read.hpp"   // the ONE checked whole-file read
+#include "core/substrate/key_order.hpp"           // entriesInKeyOrder — the checks below stop at the first lexeme they meet
 #include "core/substrate/phase_timers.hpp"        // the load-config / build-config phases
 #include "core/types/config_path_walk.hpp"
 #include "core/types/grammar_schema_json.hpp"
@@ -14,6 +15,7 @@
 #include <sstream>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace dss {
 
@@ -285,8 +287,11 @@ GrammarSchema::GrammarSchema(detail::GrammarSchemaData&& d) noexcept : d_(std::m
         // of entries: unmeasurable next to the JSON parse it follows, and NOT
         // debug-only, because a Release build is exactly where a silent
         // miscompile would ship.
-        for (auto const& [lex, meanings] : d_.lexemeTable) {
-            (void)meanings;
+        // ASCENDING, never the hash tables' order (P69 fold 3f): each check aborts
+        // at the FIRST unreachable lexeme it meets, so which one it names must be a
+        // fact of the schema, not of the C++ library's bucket order.
+        for (auto const* entry : substrate::entriesInKeyOrder(d_.lexemeTable)) {
+            std::string const& lex = entry->first;
             if (lex.empty()) continue;
             auto const lens =
                 lexemeLengthsForLeadByte(static_cast<unsigned char>(lex.front()));
@@ -300,9 +305,10 @@ GrammarSchema::GrammarSchema(detail::GrammarSchemaData&& d) noexcept : d_(std::m
                 std::abort();
             }
         }
-        for (auto const& [modeV, table] : d_.lexerModeTokens) {
-            for (auto const& [lex, meanings] : table) {
-                (void)meanings;
+        for (auto const* mode : substrate::entriesInKeyOrder(d_.lexerModeTokens)) {
+            std::uint32_t const modeV = mode->first;
+            for (auto const* entry : substrate::entriesInKeyOrder(mode->second)) {
+                std::string const& lex = entry->first;
                 if (lex.empty()) continue;
                 auto const lens =
                     modeLexemeLengths_[modeV].lengthsFor(

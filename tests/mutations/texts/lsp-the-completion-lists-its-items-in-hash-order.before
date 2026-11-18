@@ -1,0 +1,2 @@
+        for (auto const* entry : substrate::entriesInKeyOrder(visible)) {
+            auto const& [name, symId] = *entry;

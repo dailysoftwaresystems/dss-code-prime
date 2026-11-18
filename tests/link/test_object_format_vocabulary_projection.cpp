@@ -303,7 +303,7 @@ void runVocabularySite(VocabularySite const& site) {
     return r != RuntimeLibraryRole::None;
 }
 constexpr auto kSelectableRoleNames =
-    namesWhere<5>(kRuntimeLibraryRoleTable, selectableRole);
+    namesWhere<6>(kRuntimeLibraryRoleTable, selectableRole);
 static_assert(kRuntimeLibraryRoleTable.rows.size()
                   == kSelectableRoleNames.size() + 1,
               "exactly one runtimeLibraries role is unselectable (the 'none' "

@@ -78,7 +78,9 @@
     { "name": "RUNTIME_FUNCTION", "type": "struct \"RUNTIME_FUNCTION\" { u32 \"unsigned long\", u32 \"unsigned long\", u32 \"unsigned long\" }" },
     { "name": "PRUNTIME_FUNCTION", "type": "ptr<RUNTIME_FUNCTION>" },
     { "name": "DISPATCHER_CONTEXT", "type": "struct \"DISPATCHER_CONTEXT\" { u64 \"unsigned long long\", u64 \"unsigned long long\", ptr<struct \"RUNTIME_FUNCTION\" { u32 \"unsigned long\", u32 \"unsigned long\", u32 \"unsigned long\" }>, u64 \"unsigned long long\", u64 \"unsigned long long\", ptr<void>, ptr<void>, ptr<void>, ptr<void>, u32 \"unsigned long\", u32 \"unsigned long\" }" },
-    { "name": "PDISPATCHER_CONTEXT", "type": "ptr<DISPATCHER_CONTEXT>" }
+    { "name": "PDISPATCHER_CONTEXT", "type": "ptr<DISPATCHER_CONTEXT>" },
+    { "$comment": "P69 fold 3f (lane `xa`; the GUI startups): what the C runtime's GUI startup reads its show-window value from (GetStartupInfoW), so DSS's own startup routine reads it the same way (runtime/platform/src/pe_gui_startup.c). MEASURED 2026-11-17 (probe-reference-cc, cl 19.52 and MinGW-w64 gcc 13.2, the SDK's own <windows.h>): sizeof 104, dwFlags at 60, wShowWindow at 64 -- pinned by tests/link/test_gui_startups.cpp.", "name": "STARTUPINFOW", "type": "struct \"STARTUPINFOW\" { u32 \"unsigned long\", ptr<u16>, ptr<u16>, ptr<u16>, u32 \"unsigned long\", u32 \"unsigned long\", u32 \"unsigned long\", u32 \"unsigned long\", u32 \"unsigned long\", u32 \"unsigned long\", u32 \"unsigned long\", u32 \"unsigned long\", u16, u16, ptr<u8>, ptr<void>, ptr<void>, ptr<void> }" },
+    { "name": "LPSTARTUPINFOW", "type": "ptr<STARTUPINFOW>" }
   ],
   "structs": [
     {
@@ -269,6 +271,29 @@
         { "name": "ScopeIndex", "type": "u32 \"unsigned long\"" },
         { "name": "Fill0", "type": "u32 \"unsigned long\"" }
       ]
+    },
+    {
+      "name": "STARTUPINFOW",
+      "fields": [
+        { "name": "cb",              "type": "u32 \"unsigned long\"" },
+        { "name": "lpReserved",      "type": "ptr<u16>" },
+        { "name": "lpDesktop",       "type": "ptr<u16>" },
+        { "name": "lpTitle",         "type": "ptr<u16>" },
+        { "name": "dwX",             "type": "u32 \"unsigned long\"" },
+        { "name": "dwY",             "type": "u32 \"unsigned long\"" },
+        { "name": "dwXSize",         "type": "u32 \"unsigned long\"" },
+        { "name": "dwYSize",         "type": "u32 \"unsigned long\"" },
+        { "name": "dwXCountChars",   "type": "u32 \"unsigned long\"" },
+        { "name": "dwYCountChars",   "type": "u32 \"unsigned long\"" },
+        { "name": "dwFillAttribute", "type": "u32 \"unsigned long\"" },
+        { "name": "dwFlags",         "type": "u32 \"unsigned long\"" },
+        { "name": "wShowWindow",     "type": "u16" },
+        { "name": "cbReserved2",     "type": "u16" },
+        { "name": "lpReserved2",     "type": "ptr<u8>" },
+        { "name": "hStdInput",       "type": "ptr<void>" },
+        { "name": "hStdOutput",      "type": "ptr<void>" },
+        { "name": "hStdError",       "type": "ptr<void>" }
+      ]
     }
   ],
   "symbols": [
@@ -344,6 +369,7 @@
     { "name": "LocalFree",               "signature": "fn(ptr<void>) -> ptr<void>",                      "kind": "function", "linkage": "external" },
 
     { "name": "GetSystemInfo",           "signature": "fn(ptr<SYSTEM_INFO>) -> void",                    "kind": "function", "linkage": "external" },
+    { "name": "GetStartupInfoW",         "signature": "fn(ptr<STARTUPINFOW>) -> void",                   "kind": "function", "linkage": "external" },
     { "name": "GetSystemTimeAsFileTime", "signature": "fn(ptr<FILETIME>) -> void",                       "kind": "function", "linkage": "external" },
     { "name": "GetTickCount64",          "signature": "fn() -> u64",                                     "kind": "function", "linkage": "external" },
     { "name": "QueryPerformanceCounter", "signature": "fn(ptr<LARGE_INTEGER>) -> i32",                    "kind": "function", "linkage": "external" },
@@ -401,6 +427,7 @@
     { "name": "INVALID_HANDLE_VALUE", "replacement": "((HANDLE)-1)" },
     { "name": "InterlockedCompareExchange", "replacement": "_InterlockedCompareExchange" },
     { "name": "TEXT", "params": ["x"], "replacement": "x" },
+    { "$comment": "P69 fold 3f (lane `xa`; the GUI startups): Visual Studio's own template declares its entry `int APIENTRY wWinMain(...)`, and the SDK's <minwindef.h> defines APIENTRY as WINAPI. WINAPI itself is the language's own predefined macro on pe (c.lang.json, erased as `__stdcall` is there), so it is not restated here: a second definition with another replacement is an incompatible redefinition (C23 6.10.4.1p2), which every `#include <windows.h>` would then diagnose.", "name": "APIENTRY", "replacement": "WINAPI" },
     { "name": "LoadLibrary", "replacement": "LoadLibraryA" },
     { "name": "OpenEvent", "replacement": "OpenEventA" },
     { "name": "CreateEvent", "replacement": "CreateEventA" },
@@ -411,6 +438,8 @@
     { "name": "TRUE",                           "value": 1,          "type": "i32" },
     { "name": "FALSE",                          "value": 0,          "type": "i32" },
     { "name": "MAX_PATH",                       "value": 260,        "type": "i32" },
+    { "name": "STARTF_USESHOWWINDOW",           "value": 1,          "type": "u32 \"unsigned long\"" },
+    { "name": "SW_SHOWDEFAULT",                 "value": 10,         "type": "i32" },
     { "name": "INVALID_FILE_ATTRIBUTES",        "value": 4294967295, "type": "u32 \"unsigned long\"" },
     { "name": "INVALID_SET_FILE_POINTER",       "value": 4294967295, "type": "u32 \"unsigned long\"" },
     { "name": "GENERIC_READ",                   "value": 2147483648, "type": "u32 \"unsigned long\"" },

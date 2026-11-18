@@ -44,6 +44,10 @@ add_library(core OBJECT
     # `entryFunctions` and a dialect's `entryLabels` alike): the driver's
     # election and the semantic tier's entry gate both ask it (P69 fold 3e).
     types/entry_names.cpp
+    # The ONE correspondence between an entry parameter SHAPE and a TYPE: the
+    # semantic tier classifies a definition with it and the startup's init
+    # builds a verb's signature with it (P69 fold 3f).
+    types/entry_param_types.cpp
     types/predefined_macro_json.cpp
     # The ONE resolver of a language type NAME (`"unsigned long"` -> its
     # typeSpecifiers row): the grammar loader at LOAD and the shipped-descriptor

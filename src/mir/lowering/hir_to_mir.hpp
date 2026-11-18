@@ -137,9 +137,15 @@ struct DSS_EXPORT MirLoweringConfig {
     // target declared no `aggregateLayout` block — a `sizeof` then fails loud at
     // the lowering site (never a guessed size). `dataModel` supplies the pointer
     // width the layout engine needs.
+    // ★ P69 (lane `xa`, fold 3f -- review-xa3e F3): `dataModel` is STATED by every
+    // config -- the driver states the format's, a fixture the model its cell is
+    // lowered under -- and its zero means none: `lowerToMir` refuses a config
+    // whose model states no pointer size, by name, before any lowering. It
+    // defaulted to LP64, so a config that forgot it lowered every unit as LP64
+    // in silence, whatever the format said.
     AggregateLayoutParams aggregateLayout{};
     bool                  aggregateLayoutLoaded = false;
-    DataModel             dataModel = DataModel::Lp64;
+    DataModel             dataModel{};
 
     // D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED: the source language's declared
     // sizes for types with NO object representation (`void`, a function type),
@@ -236,6 +242,16 @@ struct DSS_EXPORT MirLoweringConfig {
     std::uint32_t      evenGprPairAlignment       = 0;
     bool               variadicArgsAlwaysStack    = false;
 
+    // ★ P69 (lane `xa`, fold 3f -- review-xa3e F3 P12b): the convention's ARGUMENT-SLOT
+    // QUANTUM (Q2) -- the stride of the incoming overflow area this tier walks for a
+    // stacked named parameter and `va_start`'s base -- read at its home
+    // (`argumentSlotBytes`, core/types/target_schema.hpp: the value the LIR tier's
+    // `outgoingSlotSize` and both stack cursors are) and stated by
+    // `takeCallingConvention`. 0 = none stated: the first read refuses it by name. It
+    // was the data model's POINTER width (`.value_or(8)`) -- the other quantity, equal
+    // on every shipped pair, which an x32-shaped model separates.
+    std::uint32_t      argumentSlotBytes          = 0;
+
     // FC12a-core (D-FC12A-VARIADIC-CALLEE): the active CC's `__va_list_tag` layout +
     // register-save-area geometry, threaded from the resolved `TargetCallingConvention`
     // (mirrors `aggregateClassification`). ENGAGED ⇒ HIR→MIR lowers va_start (4 field
@@ -301,7 +317,10 @@ class GrammarSchema;
 // hand, and the two this fold added (`evenGprPairAlignment`, `variadicArgsAlwaysStack`)
 // reached only the pipeline — every fixture lowered AAPCS64 with no even register pair and
 // Apple's variadic aggregates in registers.
-DSS_EXPORT void takeCallingConvention(MirLoweringConfig& cfg, TargetCallingConvention const& cc);
+// ★ P69 fold 3f: it takes the TARGET as well -- the argument-slot quantum is the target's widest general register
+// (`argumentSlotBytes`), which a convention row does not restate.
+DSS_EXPORT void takeCallingConvention(MirLoweringConfig& cfg, TargetSchema const& target,
+                                      TargetCallingConvention const& cc);
 
 // Lower the frozen `hir` module to MIR. `literals` is the HirLiteralPool
 // that owns the decoded values for HIR `Literal` nodes (ML2 copies the

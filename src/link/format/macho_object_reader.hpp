@@ -7,6 +7,7 @@
 #include "core/types/target_schema.hpp"
 #include "link/object_format_schema.hpp"
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -145,6 +146,20 @@
 //     by a multi-item round-trip test.
 
 namespace dss::macho {
+
+// ★ THE LOAD COMMANDS OF A RELOCATABLE OBJECT (P69 fold 3f). The reader READS these five -- and the LC_LINKER_OPTION its
+// document names (`macho.linkerOptions`); it steps over the ones its document states a reason for
+// (`macho.skippedLoadCommands`) and REFUSES every other by name. Until fold 3f it read LC_SEGMENT_64 and LC_SYMTAB alone
+// and stepped over every other command without a word. ✔MEASURED (P69 fold 3f, run 20261117-192243-260e95c2: Apple clang 21's relocatable
+// objects, arm64 and x86_64, and ld64's `-r` outputs): eight commands -- these five, LC_LINKER_OPTION,
+// LC_LINKER_OPTIMIZATION_HINT and LC_DATA_IN_CODE.
+inline constexpr std::uint32_t kLcSegment64        = 0x19u;   // LC_SEGMENT_64
+inline constexpr std::uint32_t kLcSymtab           = 0x02u;   // LC_SYMTAB
+inline constexpr std::uint32_t kLcDysymtab         = 0x0Bu;   // LC_DYSYMTAB
+inline constexpr std::uint32_t kLcBuildVersion     = 0x32u;   // LC_BUILD_VERSION
+inline constexpr std::uint32_t kLcVersionMinMacosx = 0x24u;   // LC_VERSION_MIN_MACOSX
+inline constexpr std::array<std::uint32_t, 5> kLoadCommandsTheReaderReads{
+    kLcSegment64, kLcSymtab, kLcDysymtab, kLcBuildVersion, kLcVersionMinMacosx};
 
 // Reconstruct an `AssembledModule` from a Mach-O 64-bit MH_OBJECT
 // relocatable object's raw bytes. Returns `nullopt` (and emits a

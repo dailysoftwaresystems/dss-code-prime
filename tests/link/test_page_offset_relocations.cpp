@@ -277,3 +277,49 @@ TEST(PageOffsetRelocations, APatternedRowCarriesNoOtherDecodeDeclaration) {
     auto const e = loadErrors(doc);
     EXPECT_NE(e.find("decoded by instruction"), std::string::npos) << e;
 }
+
+// ── THE LOADER'S REFUSALS COME IN THE ORDER OF THE WIRE TYPES (P69 fold 3f) ─────
+// The rows decoded by instruction are grouped per wire type before each group is
+// checked. The groups were held in a hash map, so when several types each carried
+// a row with no pattern beside patterned ones, the refusals came in the C++
+// library's bucket order. They come in ascending wire type now, whatever order the
+// document lists the types in: here 5, 14, 2, 9, an order neither ascending nor
+// descending, so neither an insertion-ordered walk nor its reverse reads as the
+// sorted one. In-process over a hand-built document: only the refusals of THIS
+// rule are read.
+TEST(PageOffsetRelocations, RowsWithoutAPatternAreRefusedInTheOrderOfTheirWireTypes) {
+    dss::detail::ObjectFormatData data;
+    data.name = "synthetic-patterned-wire-types";
+    std::vector<std::uint32_t> const listed{5u, 14u, 2u, 9u};
+    std::uint32_t nextKind = 1;
+    auto const kindOf = [&nextKind] {
+        RelocationKind k{};
+        k.v = static_cast<decltype(k.v)>(nextKind++);
+        return k;
+    };
+    for (std::uint32_t const type : listed) {
+        ObjectFormatRelocationInfo patterned;
+        patterned.name = "patterned-" + std::to_string(type);
+        patterned.kind = kindOf();
+        patterned.nativeId = type;
+        patterned.decodeWhenInstruction.push_back({0xFF000000u, 0x39000000u});
+        data.relocations.push_back(patterned);
+        ObjectFormatRelocationInfo plain;
+        plain.name = "plain-" + std::to_string(type);
+        plain.kind = kindOf();
+        plain.nativeId = type;
+        data.relocations.push_back(plain);
+    }
+    std::vector<std::uint32_t> refused;
+    std::string seen;
+    for (auto const& p : data.validate()) {
+        if (p.message.find("declares no pattern of its own") == std::string::npos) continue;
+        seen += p.message + "\n";
+        for (std::uint32_t const type : listed) {
+            if (p.message.find("'plain-" + std::to_string(type) + "'") != std::string::npos)
+                refused.push_back(type);
+        }
+    }
+    EXPECT_EQ(refused, (std::vector<std::uint32_t>{2u, 5u, 9u, 14u}))
+        << "the rows without a pattern are not refused in ascending wire type:\n" << seen;
+}

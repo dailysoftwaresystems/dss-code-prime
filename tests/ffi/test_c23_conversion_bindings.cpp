@@ -291,7 +291,8 @@ TEST(C23ConversionBindings, ThePlatformIsReachedOnlyThroughPrivateRows) {
             if (d.kind == ObjectFormatKind::Elf) {
                 // glibc implements C23 itself, so no private row carries a DSS body there; the rows that name
                 // the platform's own export under its plain name are the ones a foreign object's reference
-                // binds (`realizePlatformExternsByOnBinaryName`), and each is an import of glibc's export.
+                // binds (its written name's route, `ffi::writtenNameRoutesOn`), and each is an import of glibc's
+                // export.
                 if (*row.elfLink == '\0') {
                     EXPECT_EQ(s, nullptr) << "glibc needs no private row for it";
                     continue;

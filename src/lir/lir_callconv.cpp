@@ -26,19 +26,9 @@ namespace {
 // Shorthand: shared diagnostic helper from lir_pass_util.
 using dss::report;
 
-// Per-class width in bytes. The cc's saved-reg and spill-slot areas
-// use the widest declared width per class as a uniform slot size —
-// this keeps offsets aligned and the substrate target-blind.
-[[nodiscard]] std::uint32_t
-widthForClass(TargetSchema const& schema, LirRegClass cls) {
-    std::uint32_t maxWidth = 0;
-    for (auto const& info : schema.registers()) {
-        if (static_cast<LirRegClass>(info.regClass) == cls) {
-            if (info.widthBytes > maxWidth) maxWidth = info.widthBytes;
-        }
-    }
-    return maxWidth;
-}
+// ★ P69 (lane `xa`, fold 3f -- review-xa3e F3 Q2): the per-class `widthForClass` that stood here was read for ONE
+// class only, the general registers, as the argument-slot quantum; that quantum's home is `argumentSlotBytes`
+// (core/types/target_schema.hpp), where HIR->MIR reads it too, and every read below asks it.
 
 // Round `n` up to a multiple of `align` (which must be a power of two).
 [[nodiscard]] std::uint32_t
@@ -287,7 +277,7 @@ computeFrameLayout(LirFuncAllocation const& alloc,
     // double-count outgoing-args and silently inflate every
     // non-leaf frame on x86_64. Exposed on FrameLayout so the
     // materialize call/arg arms use the SAME stride consistently.
-    layout.outgoingSlotSize    = widthForClass(schema, LirRegClass::GPR);
+    layout.outgoingSlotSize    = argumentSlotBytes(schema);
     layout.outgoingArgAreaSize = hasCalls
         ? (static_cast<std::uint32_t>(cc.shadowSpaceBytes)
             + outgoingArgSlots * layout.outgoingSlotSize)
@@ -661,9 +651,9 @@ computeMaxOutgoingStackArgs(Lir const& src, LirFuncId fn,
                             TargetCallingConvention const& cc) noexcept {
     // FC12a-struct: the outgoing slot quantum (= GPR width) — the unit a by-value-
     // stack aggregate's bytes round up to. MUST equal FrameLayout.outgoingSlotSize
-    // (computeFrameLayout sets it from widthForClass GPR), else the reservation and
-    // the placement store offsets disagree (a frame clobber).
-    std::uint32_t const outgoingSlotSize = widthForClass(schema, LirRegClass::GPR);
+    // (computeFrameLayout sets it from the quantum's home, `argumentSlotBytes`), else the
+    // reservation and the placement store offsets disagree (a frame clobber).
+    std::uint32_t const outgoingSlotSize = argumentSlotBytes(schema);
 
     // D-AS-REGALLOC-WIDE-CALL-OPERAND-COUNT (option E): the pre-regalloc pass
     // moved a wide call's scalar overflow args OUT of the Call operand list and
@@ -2127,8 +2117,9 @@ std::uint32_t frameSlotStride(TargetSchema const&          schema,
         }
         return w;
     };
-    std::uint32_t stride = std::max(widest(LirRegClass::GPR),
-                                    widest(LirRegClass::FPR));
+    std::uint32_t const widestGpr = widest(LirRegClass::GPR);
+    std::uint32_t const widestFpr = widest(LirRegClass::FPR);
+    std::uint32_t stride = std::max(widestGpr, widestFpr);
     for (LirRegClass const cls : occupants) {
         stride = std::max(stride, widest(cls));
     }
@@ -3190,7 +3181,7 @@ functionNeedsBodyFrameScratch(Lir const& src, LirFuncId fn,
     auto const spillOffset = [&](std::uint32_t slotV) {
         return spillSlotOffset(layout.spillAreaOffset(), layout.slotSize, slotV);
     };
-    StackArgCursor incoming{cc, widthForClass(schema, LirRegClass::GPR)};
+    StackArgCursor incoming{cc, argumentSlotBytes(schema)};
     std::uint32_t const blockCount = src.funcBlockCount(fn);
     for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
         LirBlockId const blk = src.funcBlockAt(fn, bi);
@@ -4086,7 +4077,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
     // place without seeing the aggregate (P68 round 8,
     // D-MIR-STACKED-SCALAR-AFTER-A-STACKED-AGGREGATE-REFUSED; it used to refuse
     // both interleavings).
-    StackArgCursor incomingStackArgs{cc, widthForClass(schema, LirRegClass::GPR)};
+    StackArgCursor incomingStackArgs{cc, argumentSlotBytes(schema)};
 
     // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): the per-alloca FRAME OFFSET
     // (sp-relative), indexed by the alloca's 0-based scan-order index, so a

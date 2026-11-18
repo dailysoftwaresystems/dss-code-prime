@@ -278,7 +278,8 @@ using PpOperatorRevoked = std::function<bool(std::string_view)>;
 // call of one binds to the platform's realization of the function or is refused at the use
 // (S_LibraryBuiltinUnavailable), so the operator answers 1 exactly where the call binds:
 // the preprocessor supplies `ffi::shippedLibraryFunctionProvidedOnFormat` on its active
-// object format. UNSET (`{}`) answers false — no pair is in scope (the LSP, the direct-API
+// pair: the object format and, for a row available on one arch of a format, the target's
+// arch (P69 fold 3f). UNSET (`{}`) answers false — no pair is in scope (the LSP, the direct-API
 // tests), and with no pair the binder provides no library function either.
 using PpLibraryFunctionProvided = std::function<bool(std::string_view libraryFunction)>;
 

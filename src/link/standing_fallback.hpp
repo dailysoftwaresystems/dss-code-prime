@@ -18,11 +18,15 @@
 // order of the inputs, D-LK-THE-LINK-ORDER-IS-NOT-THE-COMMAND-LINE-ORDER) -- never the order a caller's span holds
 // modules in -- and at one place the statement the caller met FIRST stands.
 //
-// Every site where two statements of one name meet calls `standingFallback`: the COFF reader (one object's directives,
-// and a weak external beside its own object's directive), the image link (`linker::bindFallbackReferences`), the
-// relocatable merge, and the archive search's offer of fallbacks.
+// Every site where two statements of one name meet calls `standingFallback`: the COFF directives' one home
+// (`pe::foldCoffLinkerDirectives` and `pe::completeCoffLinkerDirectives`, through which the COFF reader reads an
+// object's and the compile pipeline applies a compiled unit's: one unit's directives, and a weak external beside its
+// own unit's directive), the image link (`linker::bindFallbackReferences`) and the relocatable merge -- and the
+// archive search's offer of fallbacks asks the rule (`fallbackStandsOver`) in silence, the link it serves warning once
+// (P69 fold 3f).
 
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/extern_import.hpp"   // ExternImport -- the row a statement is read from
 #include "core/types/parse_diagnostic.hpp"
 #include "link/cross_cu_resolve.hpp"   // linkPositionPrecedes -- the one comparison of two places in the link
 
@@ -48,6 +52,20 @@ struct FallbackStatement {
     std::optional<std::uint32_t> place;      // the input's place in the link; none stands after every stated one
     std::string                  statedBy;   // who stated it, for the warning
 };
+
+// What a reference row states of its name's fallback, met at `place` in the link (`linkPositionOf`) and named
+// `statedBy` in a warning: a weak external's own default -- a row of WEAK binding, with the undefined default it names
+// or with none, the absolute 0 -- or a directive's fallback; none for a plain reference. The ONE reading of a row every
+// site that gathers a name's statements takes -- the image link (`bindFallbackReferences`), the relocatable merge and
+// the archive search's offer (`pullStaticArchiveMembers`, P69 fold 3f) -- so the member the search pulls for a name is
+// the one the link binds the name to.
+[[nodiscard]] inline std::optional<FallbackStatement>
+fallbackStatementOf(ExternImport const& row, std::optional<std::uint32_t> place, std::string statedBy) {
+    bool const weakDefault = row.binding == SymbolBinding::Weak;
+    if (row.fallbackName.empty() && !weakDefault) return std::nullopt;
+    return FallbackStatement{row.fallbackName, weakDefault ? FallbackSource::WeakDefault : FallbackSource::Directive,
+                             place, std::move(statedBy)};
+}
 
 // Does `candidate` stand over `prior`, a statement of the same name the caller met EARLIER?
 [[nodiscard]] inline bool fallbackStandsOver(FallbackStatement const& candidate, FallbackStatement const& prior) noexcept {

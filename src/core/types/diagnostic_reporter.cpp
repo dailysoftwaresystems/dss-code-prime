@@ -906,9 +906,14 @@ std::string DiagnosticReporter::format(ParseDiagnostic const& d,
 }
 
 std::string DiagnosticReporter::formatAll(BufferRegistry const& bufs) const {
-    // Sort by (buffer, span, severity) so the rendered output reads in
-    // source order regardless of report-call order. We render into a
+    // Sort by (buffer, span, severity, report order) so the rendered output
+    // reads in source order regardless of report-call order. We render into a
     // copy of the index list to keep all_ stable.
+    // ★ THE REPORT ORDER IS THE KEY'S LAST TERM, SO THE KEY IS TOTAL. Without it
+    // two diagnostics of one buffer, span and severity -- every span-less
+    // refusal of a link or a config read -- rendered in the order the host's
+    // unstable sort leaves equal keys in: the C++ library's choice, not the
+    // input's (P69 fold 3f).
     std::vector<std::size_t> order(all_.size());
     std::iota(order.begin(), order.end(), 0u);
     std::ranges::sort(order, [this](std::size_t a, std::size_t b) {
@@ -916,7 +921,9 @@ std::string DiagnosticReporter::formatAll(BufferRegistry const& bufs) const {
         auto const& db = all_[b];
         if (da.buffer != db.buffer) return da.buffer < db.buffer;
         if (da.span   != db.span)   return da.span   < db.span;
-        return static_cast<int>(da.severity) > static_cast<int>(db.severity);
+        if (da.severity != db.severity)
+            return static_cast<int>(da.severity) > static_cast<int>(db.severity);
+        return a < b;   // the report order
     });
 
     std::string out;

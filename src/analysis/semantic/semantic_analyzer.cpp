@@ -1,5 +1,6 @@
 #include "analysis/semantic/semantic_analyzer.hpp"
 
+#include "core/substrate/key_order.hpp"   // entriesInKeyOrder -- the trees' order where a first tree wins
 #include "core/substrate/path_identity.hpp"
 
 #include "analysis/compilation_unit/unit_attribute.hpp"
@@ -30,6 +31,7 @@
 #include "core/types/declarator_walk.hpp"     // FC4: declaratorNameNode / collectDeclarators
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/entry_names.hpp"   // realizedEntryNames -- the ONE vocabulary of a program's entry names
+#include "core/types/entry_param_types.hpp"   // classifyEntryParam -- the ONE shape <-> type correspondence
 #include "core/types/grammar_schema.hpp"
 #include "core/types/bit_int_value.hpp"
 #include "core/types/integer_literal_ladder.hpp"
@@ -1513,8 +1515,9 @@ resolveMemberAccess(EngineState& s, SemanticConfig const& cfg,
 // size C99 §6.7.7p2 froze at the typedef — either directly (`typedef int R[n];`, an
 // array or an array containing one) or as a pointee (`typedef int (*P)[n];`, where the
 // frozen quantity is the POINTEE ROW STRIDE `p[i]` steps by)? `typeContainsVla` stops at
-// a pointer top by design — the pointer itself is a fixed 8 bytes — so the pointee is
-// tested explicitly, exactly as the HIR and MIR tiers do at their own decision sites.
+// a pointer top by design — the pointer itself has its data model's size, whatever the
+// bound — so the pointee is tested explicitly, exactly as the HIR and MIR tiers do at
+// their own decision sites.
 [[nodiscard]] bool aliasHeadCarriesVla(TypeInterner const& in, TypeId headTy) {
     if (!headTy.valid()) return false;
     if (in.isVlaArray(headTy) || in.typeContainsVla(headTy)) return true;
@@ -3796,6 +3799,23 @@ pointerValueSpine(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                   NodeId expr, TypeId exprType, ScopeId here);
 [[nodiscard]] bool pointeeSpinesDiverge(std::optional<QualifierSpine> const& a,
                                         std::optional<QualifierSpine> const& b);
+
+// ★ P69 fold 3f (lane `xa`): TWO OPERANDS ARE ASKED IN SOURCE ORDER. `subtreeType` and `pointerValueSpine` may
+// intern a type, and the order type ids are minted in reaches the emitted program (mem2reg materializes zeros in
+// type-id order). As two arguments of one call their order was the host compiler's -- MSVC and GCC evaluate right
+// to left, clang left to right -- so each pairing asks the first operand, then the second, through one of these.
+[[nodiscard]] IndexContainerOperand indexContainerOperandOf(EngineState& s, Tree const& tree, NodeId first,
+                                                            NodeId second, ScopeId here) {
+    TypeId const firstType  = subtreeType(s, tree, first, here);
+    TypeId const secondType = subtreeType(s, tree, second, here);
+    return indexContainerOperand(s.lattice.interner(), firstType, secondType);
+}
+[[nodiscard]] bool pointeeSpinesOfDiverge(EngineState& s, SemanticConfig const& cfg, Tree const& tree, NodeId a,
+                                          TypeId aType, NodeId b, TypeId bType, ScopeId here) {
+    std::optional<QualifierSpine> const aSpine = pointerValueSpine(s, cfg, tree, a, aType, here);
+    std::optional<QualifierSpine> const bSpine = pointerValueSpine(s, cfg, tree, b, bType, here);
+    return pointeeSpinesDiverge(aSpine, bSpine);
+}
 
 // ★★ P69 (lane `cs`, fold f26c): THE RANK OF `n` IN `tree`'S TOKEN STREAM — its place in a pre-order walk of
 // the tree (the parser appends each child in the order it reads the unit, so pre-order IS that order) — and
@@ -20760,34 +20780,16 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                     }
                                     auto const& intern =
                                         s.lattice.interner();
-                                    // Classify STRUCTURALLY. The vocabulary says
-                                    // "pointer to pointer to a 16-bit unsigned",
-                                    // never "the wide argv", so nothing here
-                                    // assumes which platform spells a wide
-                                    // character how — a 32-bit-wchar_t platform
-                                    // simply never matches the u16 shape.
-                                    auto classifyParam =
-                                        [&](TypeId ty)
-                                        -> std::optional<EntryParamShape> {
-                                        switch (intern.kind(ty)) {
-                                        case TypeKind::I32:
-                                            return EntryParamShape::I32;
-                                        case TypeKind::Ptr: break;
-                                        default: return std::nullopt;
-                                        }
-                                        TypeId const pointee =
-                                            intern.operands(ty)[0];
-                                        if (intern.kind(pointee) != TypeKind::Ptr)
-                                            return std::nullopt;
-                                        switch (intern.kind(
-                                            intern.operands(pointee)[0])) {
-                                        case TypeKind::Char:
-                                        case TypeKind::I8:
-                                            return EntryParamShape::PtrPtrChar;
-                                        case TypeKind::U16:
-                                            return EntryParamShape::PtrPtrU16;
-                                        default: return std::nullopt;
-                                        }
+                                    // Classify STRUCTURALLY, through the ONE
+                                    // shape <-> type correspondence the
+                                    // startup's builder inverts
+                                    // (entry_param_types.hpp): the vocabulary
+                                    // says "pointer to a 16-bit unsigned",
+                                    // never "the wide command line", so a
+                                    // 32-bit-wchar_t platform simply never
+                                    // matches the u16 shapes.
+                                    auto classifyParam = [&](TypeId ty) {
+                                        return classifyEntryParam(intern, ty);
                                     };
                                     bool classified = true;
                                     EntryReturnShape obsRet =
@@ -23636,9 +23638,7 @@ constQualifiedLvalue(EngineState& s, SemanticConfig const& cfg, Tree const& tree
             // difference admits the pointer on the LEFT only, and two pointers make
             // an integer, which designates nothing.
             if (tgt == "Add" || tgt == "Sub") {
-                auto const which = indexContainerOperand(
-                    s.lattice.interner(), subtreeType(s, tree, first, here),
-                    subtreeType(s, tree, second, here));
+                auto const which = indexContainerOperandOf(s, tree, first, second, here);
                 if (which == IndexContainerOperand::Base) {
                     cur = first;
                     continue;
@@ -23704,9 +23704,7 @@ constQualifiedLvalue(EngineState& s, SemanticConfig const& cfg, Tree const& tree
                 if (!first.valid()) return {};
                 NodeId container = first;
                 if (second.valid()
-                    && indexContainerOperand(s.lattice.interner(),
-                                             subtreeType(s, tree, first, here),
-                                             subtreeType(s, tree, second, here))
+                    && indexContainerOperandOf(s, tree, first, second, here)
                            == IndexContainerOperand::Subscript) {
                     container = second;
                 }
@@ -24005,9 +24003,9 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 else if (!subscriptN.valid()) subscriptN = c;
             }
             if (target == "Index" && baseN.valid() && subscriptN.valid()) {
-                auto const verdict = subscriptConstraintOf(
-                    s.lattice.interner(), subtreeType(s, tree, baseN, here),
-                    subtreeType(s, tree, subscriptN, here));
+                TypeId const indexBaseType      = subtreeType(s, tree, baseN, here);   // source order
+                TypeId const indexSubscriptType = subtreeType(s, tree, subscriptN, here);
+                auto const verdict = subscriptConstraintOf(s.lattice.interner(), indexBaseType, indexSubscriptType);
                 if (!verdict.refusal.empty()) {
                     ParseDiagnostic d;
                     d.code     = DiagnosticCode::S_SubscriptOperandsNotPointerAndInteger;
@@ -25820,9 +25818,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             DiagnosedConversionSite::Conditional);
                     } else if (ptrRulesT.incompatiblePointerConvertsDiagnosed
                                && pointeesCanDivergeInAQualifier(in, thenT, elseT)
-                               && pointeeSpinesDiverge(
-                                      pointerValueSpine(s, cfg, tree, arms[1], thenT, here),
-                                      pointerValueSpine(s, cfg, tree, arms[2], elseT, here))) {
+                               && pointeeSpinesOfDiverge(s, cfg, tree, arms[1], thenT, arms[2], elseT, here)) {
                         // P69 (lane `cs`): the pairing only the arms' spines see
                         // ("A POINTER PAIR THE INTERNER CALLS COMPATIBLE, AND C DOES
                         // NOT") — `subtreeType` typed it `void *`, and that type is
@@ -25923,9 +25919,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             DiagnosedConversionSite::Comparison);
                     } else if (ptrRulesC.incompatiblePointerConvertsDiagnosed
                                && pointeesCanDivergeInAQualifier(in, lt, rt)
-                               && pointeeSpinesDiverge(
-                                      pointerValueSpine(s, cfg, tree, lhsN, lt, here),
-                                      pointerValueSpine(s, cfg, tree, rhsN, rt, here))) {
+                               && pointeeSpinesOfDiverge(s, cfg, tree, lhsN, lt, rhsN, rt, here)) {
                         // P69 (lane `cs`): the pairing only the operands' spines see
                         // — `&f_plain == &f_const`, `pp == qq` over `char **` / `const
                         // char **`. ✔MEASURED (probe r4f v01, v04): gcc 13.3.0 and
@@ -29576,9 +29570,7 @@ subtreeType(EngineState& s, Tree const& tree, NodeId rootNode, ScopeId scope) {
             // NOT"); the HIR `combineTernary` converts both arms to it (Pass 2's record,
             // `conditionalTypes`), SE4b reports it.
             if (pointeesCanDivergeInAQualifier(interner, thenT, elseT)) {
-                if (pointeeSpinesDiverge(
-                        pointerValueSpine(s, sem, tree, thenN, thenT, scope),
-                        pointerValueSpine(s, sem, tree, elseN, elseT, scope)))
+                if (pointeeSpinesOfDiverge(s, sem, tree, thenN, thenT, elseN, elseT, scope))
                     return interner.pointer(interner.primitive(TypeKind::Void));
             }
         }
@@ -30589,8 +30581,7 @@ expressionQualifierSpine(EngineState& s, SemanticConfig const& cfg, Tree const& 
                 if (e->target == "Comma")  { readAsAValue(ops[1]); cur = ops[1]; continue; }
                 if (e->target == "Assign") { readAsAValue(); cur = ops[0]; continue; }
                 if (e->target == "Add" || e->target == "Sub") {
-                    auto const which = indexContainerOperand(
-                        in, subtreeType(s, tree, ops[0], here), subtreeType(s, tree, ops[1], here));
+                    auto const which = indexContainerOperandOf(s, tree, ops[0], ops[1], here);
                     if (which == IndexContainerOperand::Base) {
                         readAsAValue();
                         cur = ops[0];
@@ -30613,8 +30604,7 @@ expressionQualifierSpine(EngineState& s, SemanticConfig const& cfg, Tree const& 
             if (hirCfg.postfixExprRule.valid() && r == hirCfg.postfixExprRule.v) {
                 auto const tgt = targetOf(cur, hirCfg.postfixOps);
                 if (tgt == "Index" && ops.size() == 2) {
-                    auto const which = indexContainerOperand(
-                        in, subtreeType(s, tree, ops[0], here), subtreeType(s, tree, ops[1], here));
+                    auto const which = indexContainerOperandOf(s, tree, ops[0], ops[1], here);
                     if (which == IndexContainerOperand::Base)           cur = ops[0];
                     else if (which == IndexContainerOperand::Subscript) cur = ops[1];
                     else return out;
@@ -31440,6 +31430,7 @@ void resolveSymbolAliases(EngineState& s, std::span<Tree const> trees) {
     // 1. One alias declaration per name, and no other definition of it.
     std::unordered_map<std::uint32_t, std::size_t> aliasOfSurvivor;   // survivor → pending
     std::unordered_map<std::string, std::size_t> aliasNamed;          // symbol name → pending
+    std::vector<std::size_t> aliasesAsWritten;   // the pendings kept, in the order they are written
     for (std::size_t i = 0; i < s.pendingSymbolAliases.size(); ++i) {
         auto const& p = s.pendingSymbolAliases[i];
         SymbolId const survivor = survivorOf(p.declared);
@@ -31505,6 +31496,7 @@ void resolveSymbolAliases(EngineState& s, std::span<Tree const> trees) {
         }
         aliasOfSurvivor.emplace(survivor.v, i);
         aliasNamed.emplace(symbolNameOf(sRec), i);
+        aliasesAsWritten.push_back(i);
     }
     // The definitions an alias can name. A name an alias declaration defines is no
     // definition of its own, whatever its records look like — a `static` object alias
@@ -31521,10 +31513,13 @@ void resolveSymbolAliases(EngineState& s, std::span<Tree const> trees) {
                 definitionNamed.emplace(symbolNameOf(rec), id);
         }
     }
-    // 2. Each alias's target, through any chain of aliases.
-    for (auto const& [survivorV, index] : aliasOfSurvivor) {
+    // 2. Each alias's target, through any chain of aliases. Walked in the order the
+    // aliases are WRITTEN, as step 1 walks them, never in `aliasOfSurvivor`'s: a
+    // refusal is reported per alias, and a hash table's order is its C++ library's
+    // (P69 fold 3f, the host-order class -- core/substrate/key_order.hpp states it).
+    for (std::size_t const index : aliasesAsWritten) {
         auto const& p = s.pendingSymbolAliases[index];
-        SymbolId const survivor{survivorV};
+        SymbolId const survivor = survivorOf(p.declared);
         SymbolRecord& sRec = s.symbols.at(survivor);
         auto const refuse = [&](std::string why) {
             report(p, DiagnosticCode::S_SymbolAliasTargetInvalid,
@@ -31806,17 +31801,22 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
     s.formatStatesCommons = formatStatesCommons;
     s.realizedEntryVerbs = std::move(realizedEntryVerbs);
 
-    // FC3 c1: ILP32 is DECLARED-ONLY (the wasm/spirv skeleton formats
-    // carry it for honesty) — no exercised 32-bit width path exists, so
-    // selecting it fails loud rather than silently typing `long` /
-    // pointers with untested widths. Positioned at the first tree's
-    // root (the analysis covers the whole CU); analysis continues under
-    // the collect-all discipline, but the error fails the compile.
-    if (dataModel == DataModel::Ilp32) {
+    // FC3 c1: a data model the back end cannot lower fails loud here rather than
+    // silently typing `long` / pointers with untested widths. ILP32 is the one
+    // shipped (DECLARED-ONLY: the wasm/spirv skeleton formats carry it for
+    // honesty). ★ P69 fold 3f (review-xa3e F3): the question is the ONE
+    // admissibility predicate's (`dataModelTheBackEndCannotLower`, beside the
+    // pointer width's home), never an identity test of one model's name -- so a
+    // value that names no model, or a model added later that states another
+    // pointer width, is refused by the same question, and the diagnostic says why.
+    // Positioned at the first tree's root (the analysis covers the whole CU);
+    // analysis continues under the collect-all discipline, but the error fails
+    // the compile.
+    if (std::optional<std::string> refusal = dataModelTheBackEndCannotLower(dataModel)) {
         ParseDiagnostic d;
         d.code     = DiagnosticCode::S_UnsupportedDataModel;
         d.severity = DiagnosticSeverity::Error;
-        d.actual   = std::string{dataModelName(dataModel)};
+        d.actual   = std::move(*refusal);
         for (Tree const& tree : cu->trees()) {
             if (!tree.root().valid()) continue;
             d.buffer = tree.source().id();
@@ -32419,7 +32419,11 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         // `struct timespec {…}` really is a DISTINCT C type and must never be
         // unified with anything.
         std::unordered_map<std::string, TypeId> userFileScopeTags;
-        for (auto const& [treeV, scope] : treeRootScope) {
+        // ★ IN ASCENDING TREE ID (P69 fold 3f, lane `xa`): a tag two trees define keeps
+        // the FIRST tree's type, so the walk is the units' own order
+        // (`substrate::entriesInKeyOrder`), never the order the map iterates in.
+        for (auto const* tagRoot : substrate::entriesInKeyOrder(treeRootScope)) {
+            auto const& [treeV, scope] = *tagRoot;
             // Across BOTH namespaces: a user declaration of `name` (object,
             // function, typedef, OR a struct/union/enum tag) blocks a
             // descriptor symbol of that name — this is a NAME-level goal-2 skip
@@ -32683,6 +32687,13 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                     desc->library;
                 for (auto const& [ovFmt, ovImage] : sym.library)
                     effectiveLibrary.insert_or_assign(ovFmt, ovImage);
+                // ★ P69 fold 3f (ledger 549 (b)): under the platform's link ALIAS on the active
+                // format the reference keeps its WRITTEN name and binds no image -- the image link
+                // states the alias (`ffi::frontEndKeepsTheWrittenName`) -- on every rail below.
+                bool const keepsWrittenName = s.activeFormat.has_value()
+                    && ffi::frontEndKeepsTheWrittenName(sym, s.activeFormat->kind());
+                if (keepsWrittenName) effectiveLibrary.clear();
+                std::string const linkNameHere = keepsWrittenName ? std::string{} : sym.linkName;
 
                 // D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: the SIBLING axis,
                 // merged by the IDENTICAL rule one line above — the descriptor's
@@ -32766,7 +32777,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                                                     // re-import Darwin-x86_64's
                                                     // LEGACY 32-bit-inode
                                                     // `_fstat`, silently.
-                                                    sym.linkName,
+                                                    linkNameHere,
                                                     // D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: and so
                                                     // does the SHIPPED-SOURCE
                                                     // realization. A user bare
@@ -32780,7 +32791,10 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                                                     // to LOAD. Exactly the shape
                                                     // TF-C112 found for the UCRT
                                                     // printf shims, one axis over.
-                                                    shippedSourceForFormat});
+                                                    shippedSourceForFormat,
+                                                    // ★ P69 fold 3f: and the
+                                                    // platform's link alias, kept.
+                                                    keepsWrittenName});
                     }
                     continue;
                 }
@@ -32863,7 +32877,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 // breath so the two can never disagree — the invariant
                 // `linkNameFor`'s header calls out as the difference between a
                 // stripped intra-image call and a silent dynamic import.
-                rec.linkName = sym.linkName;
+                rec.linkName = linkNameHere;
                 SymbolId const id = s.symbols.mint(rec);
                 s.scopes.injectBinding(cuRoot, sym.name, id);
 
@@ -32893,7 +32907,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                         sym.kind == ffi::ShippedSymbolKind::Function,
                         /*recipeId=*/std::string{},
                         sym.version,
-                        sym.linkName,
+                        linkNameHere,
                         /*eagerImport=*/false,
                         shippedSourceForFormat});
                     continue;
@@ -32904,7 +32918,10 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                     sym.kind == ffi::ShippedSymbolKind::Function,
                     sym.synthesize,   // D-CSUBSET-C11-THREADS-HEADER (pe shim tag)
                     sym.version,      // D-LK-ELF-SYMBOL-VERSIONING (c156)
-                    sym.linkName});   // D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME
+                    linkNameHere,     // D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME
+                    /*eagerImport=*/false,
+                    /*shippedSourcePath=*/std::string{},
+                    keepsWrittenName});   // ★ P69 fold 3f: UNBOUND under the platform's link alias
             }
 
             // Item 1: inject the descriptor's CONSTANTS (the neutral form of a
@@ -33903,6 +33920,9 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             // `__stdio_common_v*` CORES, which are ordinary recipe-less rows. Skipping them
             // also stops synthesizing four unreachable shim bodies per printf.
             if (!core.recipeId.empty()) continue;
+            // ★ P69 fold 3f (ledger 549 (b)): a row the platform's link ALIASES has no image of its
+            // own name to import (`ffi::frontEndKeepsTheWrittenName`); no recipe body calls one.
+            if (ffi::frontEndKeepsTheWrittenName(core.statedRoute)) continue;
             // A name the `#include` path already injected owns the import; first-wins,
             // exactly as injection does.
             if (!injectedNames.insert(coreName).second) continue;
@@ -33980,7 +34000,11 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         //     (injected cross-tree bindings carry the DEFINING tree's id; builtins
         //     carry InvalidTree) — the identical test the skip set uses.
         std::map<std::string, SymbolId> userOrdinaryDecls;   // ORDERED: determinism
-        for (auto const& [treeV, scope] : treeRootScope) {
+        // ★ IN ASCENDING TREE ID (P69 fold 3f, lane `xa`): `try_emplace` keeps the FIRST
+        // tree's declaration of a name, so the walk is the units' own order
+        // (`substrate::entriesInKeyOrder`), never the order the map iterates in.
+        for (auto const* declRoot : substrate::entriesInKeyOrder(treeRootScope)) {
+            auto const& [treeV, scope] = *declRoot;
             for (auto const& [name, ns, sym] : s.scopes.bindingsOf(scope)) {
                 if (!sym.valid() || ns != SymbolNamespace::Ordinary) continue;
                 auto const& rec = s.symbols.at(sym);
@@ -34076,6 +34100,10 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                         real.status == ffi::ShippedRealizationStatus::ProvidedByShippedSource;
                     if (real.status != ffi::ShippedRealizationStatus::Realized && !shippedSource)
                         continue;
+                    // ★ P69 fold 3f (ledger 549 (b)): under the platform's link ALIAS the prototype
+                    // keeps its WRITTEN name and binds no image -- the image link states the alias
+                    // (`ffi::frontEndKeepsTheWrittenName`) -- so the realization binds nothing here.
+                    if (ffi::frontEndKeepsTheWrittenName(real.statedRoute)) continue;
                     bool const isShim = !real.recipeId.empty();
                     suppressedShippedLibraries.emplace(
                         name,
@@ -34495,6 +34523,15 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                                 break;
                             }
                             {
+                                // ★ P69 fold 3f (ledger 549 (b)): under the platform's link ALIAS the
+                                // function keeps its WRITTEN name and binds no image
+                                // (`ffi::frontEndKeepsTheWrittenName`); the image link states the alias.
+                                bool const keepsWrittenName =
+                                    ffi::frontEndKeepsTheWrittenName(real.statedRoute);
+                                if (keepsWrittenName) {
+                                    real.library.clear();
+                                    real.linkName.clear();
+                                }
                                 SymbolRecord rec;
                                 rec.name         = name;
                                 rec.scope        = cuRoot;
@@ -34528,7 +34565,8 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                                 shippedExterns.push_back(ShippedExternSymbol{
                                     bound, name, real.signature, std::move(real.library),
                                     /*isFunction=*/true, real.recipeId, real.version,
-                                    real.linkName, /*eagerImport=*/false});
+                                    real.linkName, /*eagerImport=*/false,
+                                    /*shippedSourcePath=*/std::string{}, keepsWrittenName});
                                 injectedNames.insert(name);
                                 if (isShim) {
                                     mintShimCompanions(name, [&](std::string const& n) {

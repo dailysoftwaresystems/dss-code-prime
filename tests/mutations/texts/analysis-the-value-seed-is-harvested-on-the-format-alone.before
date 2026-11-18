@@ -1,0 +1,1 @@
+                predefinedTypeFacts_.has_value() && !predefinedTypeFacts_->targetName.empty()

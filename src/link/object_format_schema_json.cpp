@@ -2005,8 +2005,9 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // that listed four. A retyped set produces a wrong SENTENCE; a note about a
     // retyped set produces a wrong NOTE. Only the projection removes both
     // (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET).
-    static constexpr std::array<std::string_view, 4> kTlsAccessKeys{
-        "model", "segmentPrefixByte", "baseDisplacement", "tlsIndexSlotName"};
+    static constexpr std::array<std::string_view, 5> kTlsAccessKeys{
+        "model", "segmentPrefixByte", "baseDisplacement", "tlsIndexSlotName",
+        "bootstrap"};
     DSS_CHECK_KEY_VOCABULARY(kTlsAccessKeys);
     if (doc.contains("tlsAccess")) {
         auto const& ta = doc.at("tlsAccess");
@@ -2113,6 +2114,71 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                     info.tlsIndexSlotName =
                         ta.at("tlsIndexSlotName").get<std::string>();
                 }
+            }
+            // P69 fold 3f (ledger 716): the `macho-tlv` BOOTSTRAP -- the routine each TLV
+            // descriptor's word0 is bound to, as the object file spells it, and the ROLE of the
+            // image that exports it (the `sehPersonality` shape). REQUIRED for `macho-tlv`,
+            // refused for the models that bind none. Only the role's SPELLING is judged here: its
+            // image is the role table's answer where the writer binds it -- the family's, for a
+            // flavour whose own table does not declare the role (the dylib's), which one
+            // document cannot see.
+            static constexpr std::array<std::string_view, 2> kTlsBootstrapKeys{"role",
+                                                                               "mangledName"};
+            DSS_CHECK_KEY_VOCABULARY(kTlsBootstrapKeys);
+            if (ta.contains("bootstrap")) {
+                auto const& bs = ta.at("bootstrap");
+                if (!bs.is_object()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, "/tlsAccess/bootstrap",
+                              std::format("'tlsAccess.bootstrap' must be an object with the "
+                                          "keys {}",
+                                          allowedList(kTlsBootstrapKeys, ", ")));
+                    ok = false;
+                } else {
+                    rejectUnknownKeys(bs, kTlsBootstrapKeys, "/tlsAccess/bootstrap",
+                                      "the 'tlsAccess.bootstrap' block", coll);
+                    std::optional<RuntimeLibraryRole> role;
+                    if (bs.contains("role") && bs.at("role").is_string()) {
+                        role = runtimeLibraryRoleFromName(bs.at("role").get<std::string>());
+                    }
+                    if (!role.has_value() || *role == RuntimeLibraryRole::None) {
+                        coll.emit(DiagnosticCode::C_MalformedJson, "/tlsAccess/bootstrap/role",
+                                  std::format("'tlsAccess.bootstrap.role' must name the "
+                                              "runtime-library role of the image exporting the "
+                                              "bootstrap -- accepted: {}",
+                                              allowedList(kSelectableRuntimeLibraryRoleNames,
+                                                          ", ")));
+                        ok = false;
+                    } else {
+                        info.bootstrapRole = *role;
+                    }
+                    if (!bs.contains("mangledName") || !bs.at("mangledName").is_string()
+                        || bs.at("mangledName").get<std::string>().empty()) {
+                        coll.emit(DiagnosticCode::C_MissingField,
+                                  "/tlsAccess/bootstrap/mangledName",
+                                  "'tlsAccess.bootstrap.mangledName' must be the non-empty "
+                                  "on-disk name of the routine each TLV descriptor's word0 is "
+                                  "bound to (Darwin: \"__tlv_bootstrap\")");
+                        ok = false;
+                    } else {
+                        info.bootstrapMangledName = bs.at("mangledName").get<std::string>();
+                    }
+                }
+            }
+            if (ok && info.model == TlsAccessModel::MachoTlv
+                && info.bootstrapMangledName.empty()) {
+                coll.emit(DiagnosticCode::C_MissingField, "/tlsAccess/bootstrap",
+                          "'tlsAccess.bootstrap' is REQUIRED for the 'macho-tlv' model -- each "
+                          "TLV descriptor's word0 is bound to that routine (Darwin: {\"role\": "
+                          "\"cLibrary\", \"mangledName\": \"__tlv_bootstrap\"}); without it the "
+                          "image binds its descriptors to nothing");
+                ok = false;
+            }
+            if (ok && info.model != TlsAccessModel::MachoTlv && ta.contains("bootstrap")) {
+                coll.emit(DiagnosticCode::C_MalformedJson, "/tlsAccess/bootstrap",
+                          std::format("'tlsAccess.bootstrap' belongs to the 'macho-tlv' model "
+                                      "alone -- the '{}' model binds no bootstrap routine",
+                                      tlsAccessModelName(info.model)));
+                ok = false;
             }
             if (ok && info.model == TlsAccessModel::PeIndexed
                 && info.tlsIndexSlotName.empty()) {
@@ -3754,12 +3820,14 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                     // so these two arms are exhaustive.
                     static constexpr std::array<std::string_view, 1>
                         kProcessArgsCommonKeys{"mechanism"};
-                    static constexpr std::array<std::string_view, 4>
+                    // P69 fold 3f (F3 P16): `vectorSlotBytes` is no key of the arm -- an
+                    // entry-stack slot is a pointer of the data model -- so a document
+                    // stating it is refused by name (`rejectUnknownArmKeys`).
+                    static constexpr std::array<std::string_view, 3>
                         kProcessArgsStackVectorKeys{"argcStackOffset",
                                                     "argvStackOffset",
-                                                    "envpFollowsArgvTerminator",
-                                                    "vectorSlotBytes"};
-                    static constexpr std::array<std::string_view, 12>
+                                                    "envpFollowsArgvTerminator"};
+                    static constexpr std::array<std::string_view, 15>
                         kProcessArgsCrtKeys{"role", "configureNarrowArgvFn",
                                             "configureWideArgvFn",
                                             "argcAccessorFn",
@@ -3769,7 +3837,10 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                                             "initializeNarrowEnvironmentFn",
                                             "narrowEnvironmentAccessorFn",
                                             "initializeWideEnvironmentFn",
-                                            "wideEnvironmentAccessorFn"};
+                                            "wideEnvironmentAccessorFn",
+                                            "narrowWinMainCommandLineFn",
+                                            "wideWinMainCommandLineFn",
+                                            "winMainStartupRoutines"};
                     DSS_CHECK_KEY_VOCABULARY(kProcessArgsCommonKeys);
                     DSS_CHECK_KEY_VOCABULARY(kProcessArgsStackVectorKeys);
                     DSS_CHECK_KEY_VOCABULARY(kProcessArgsCrtKeys);
@@ -3852,7 +3923,6 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                         // slot width, or a width for no vector, is refused.
                         bool const hasEnvpKey =
                             pa.contains("envpFollowsArgvTerminator");
-                        bool const hasSlotKey = pa.contains("vectorSlotBytes");
                         if (hasEnvpKey
                          && !pa.at("envpFollowsArgvTerminator").is_boolean()) {
                             coll.emit(DiagnosticCode::C_MalformedJson,
@@ -3865,37 +3935,7 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                             out.envpFollowsArgvTerminator =
                                 pa.at("envpFollowsArgvTerminator").get<bool>();
                         }
-                        if (hasSlotKey) {
-                            auto const& slot = pa.at("vectorSlotBytes");
-                            if (!slot.is_number_unsigned()
-                             || slot.get<std::uint64_t>() == 0
-                             || slot.get<std::uint64_t>() > 64) {
-                                coll.emit(DiagnosticCode::C_MalformedJson,
-                                          "/processArgs/vectorSlotBytes",
-                                          "'vectorSlotBytes' must be an unsigned "
-                                          "slot width in bytes, 1..64 (the width "
-                                          "of one entry-stack vector slot)");
-                                armOk = false;
-                            } else {
-                                out.vectorSlotBytes = static_cast<std::uint32_t>(
-                                    slot.get<std::uint64_t>());
-                            }
-                        }
-                        if (armOk
-                         && out.envpFollowsArgvTerminator != hasSlotKey) {
-                            coll.emit(DiagnosticCode::C_MalformedJson,
-                                      "/processArgs",
-                                      out.envpFollowsArgvTerminator
-                                          ? "'envpFollowsArgvTerminator' is true "
-                                            "but 'vectorSlotBytes' is absent — "
-                                            "the environment vector's position "
-                                            "needs the slot width to be computed"
-                                          : "'vectorSlotBytes' is declared but "
-                                            "'envpFollowsArgvTerminator' is not "
-                                            "true — a slot width for no "
-                                            "environment vector is dead config");
-                            armOk = false;
-                        }
+
                     } else {
                         out.mechanism = *m;
                         // Shared by both CRT arms: a per-field non-empty-string
@@ -4066,6 +4106,83 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                                          out.initializeWideEnvironmentFn,
                                          "wideEnvironmentAccessorFn",
                                          out.wideEnvironmentAccessorFn);
+                            // P69 fold 3f (lane `xa`): the GUI startups' values
+                            // -- each OPTIONAL here, declared only by a format
+                            // realizing a WinMain verb; `validate()` holds the
+                            // verbs and the declarations together (a verb whose
+                            // value is undeclared is unrealizable, a declaration
+                            // no verb reads is dead config).
+                            if (pa.contains("narrowWinMainCommandLineFn")
+                             && !requireStr("narrowWinMainCommandLineFn",
+                                            out.narrowWinMainCommandLineFn)) {
+                                armOk = false;
+                            }
+                            if (pa.contains("wideWinMainCommandLineFn")
+                             && !requireStr("wideWinMainCommandLineFn",
+                                            out.wideWinMainCommandLineFn)) {
+                                armOk = false;
+                            }
+                            if (pa.contains("winMainStartupRoutines")) {
+                                static constexpr std::array<std::string_view, 3>
+                                    kWinMainStartupRoutineKeys{
+                                        "role", "moduleInstanceFn", "showWindowFn"};
+                                DSS_CHECK_KEY_VOCABULARY(kWinMainStartupRoutineKeys);
+                                std::string const wrPath =
+                                    "/processArgs/winMainStartupRoutines";
+                                auto const& wr = pa.at("winMainStartupRoutines");
+                                if (!wr.is_object()) {
+                                    coll.emit(DiagnosticCode::C_MalformedJson, wrPath,
+                                              std::format(
+                                                  "'winMainStartupRoutines' must be "
+                                                  "an object with the keys {}",
+                                                  allowedList(
+                                                      kWinMainStartupRoutineKeys,
+                                                      ", ")));
+                                    armOk = false;
+                                } else {
+                                    rejectUnknownKeys(
+                                        wr, kWinMainStartupRoutineKeys, wrPath,
+                                        "the 'winMainStartupRoutines' block", coll);
+                                    ProcessArgs::WinMainStartupRoutines routines;
+                                    bool routinesOk = resolveRuntimeRole(
+                                        wr, wrPath, routines.libraryPath);
+                                    if (routinesOk) {
+                                        routines.role = *runtimeLibraryRoleFromName(
+                                            wr.at("role").get<std::string>());
+                                    }
+                                    struct RoutineKey {
+                                        char const* key;
+                                        std::string* out;
+                                        char const* what;
+                                    };
+                                    std::array<RoutineKey, 2> const routineKeys{{
+                                        {"moduleInstanceFn", &routines.moduleInstanceFn,
+                                         "the zero-argument routine whose result is "
+                                         "the image's module instance"},
+                                        {"showWindowFn", &routines.showWindowFn,
+                                         "the zero-argument routine whose result is "
+                                         "the show-window value"}}};
+                                    for (auto const& k : routineKeys) {
+                                        if (!wr.contains(k.key)
+                                         || !wr.at(k.key).is_string()
+                                         || wr.at(k.key).get<std::string>().empty()) {
+                                            coll.emit(DiagnosticCode::C_MissingField,
+                                                      wrPath + "/" + k.key,
+                                                      std::format(
+                                                          "requires a non-empty '{}' "
+                                                          "-- {}", k.key, k.what));
+                                            routinesOk = false;
+                                        } else {
+                                            *k.out = wr.at(k.key).get<std::string>();
+                                        }
+                                    }
+                                    if (routinesOk) {
+                                        out.winMainStartupRoutines = std::move(routines);
+                                    } else {
+                                        armOk = false;
+                                    }
+                                }
+                            }
                         } else {
                             // Closed-enum discipline: a new ArgsMechanism member
                             // must add its own field-set arm HERE. Falling through
@@ -4124,6 +4241,21 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                     runtimeLibraryRoleFromName(blk.at("role").get<std::string>())) {
                 named.push_back(*r);
             }
+        }
+        // ★ P69 fold 3f (ledger 563 (A)): a block may also name a role by the MEMBER its
+        // image is, rather than by a `role` key -- the elf block's `interpreter` path names
+        // the `programInterpreter` row, whose image the elf backend checks is that path's last
+        // component. Enumerated as data, like the block keys above.
+        struct RoleNamedByMember {
+            char const*        block;
+            char const*        member;
+            RuntimeLibraryRole role;
+        };
+        for (RoleNamedByMember const& n :
+             {RoleNamedByMember{"elf", "interpreter", RuntimeLibraryRole::ProgramInterpreter}}) {
+            if (doc.contains(n.block) && doc.at(n.block).is_object()
+                && doc.at(n.block).contains(n.member))
+                named.push_back(n.role);
         }
         for (auto const& b : data.runtimeLibraries.bindings) {
             if (std::find(named.begin(), named.end(), b.role) != named.end()) {

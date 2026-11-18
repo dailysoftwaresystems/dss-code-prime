@@ -309,6 +309,7 @@ lowerCToLir(std::string src, std::shared_ptr<TargetSchema> target,
     // const object's value folding — a lowering the product never does, and the FOURTH miss of
     // the class the note below records three times (TF-C78 / TF-C81 / TF-C92).
     MirLoweringConfig mirCfg = languageMirLoweringConfig(**loaded);
+    mirCfg.dataModel = (*format)->dataModel();   // the format's, as the driver states it (P69 fold 3f)
     mirCfg.symbolIdSpace = MirSymbolIdSpace::endingAt(   // the unit's name table, as the driver states it
         static_cast<std::uint32_t>(model.symbols().size()));
     // Thread the SELECTED CC's by-value aggregate + va_list params into MIR
@@ -324,7 +325,7 @@ lowerCToLir(std::string src, std::shared_ptr<TargetSchema> target,
         // hand and missed the two that fold added (the even register pair, Apple's stacked
         // variadic arguments) — the miss the docblock below records three times one map
         // over (TF-C78 / TF-C81 / TF-C92), closed for the convention at its one home.
-        takeCallingConvention(mirCfg, *cc);
+        takeCallingConvention(mirCfg, *target, *cc);
     }
     // D-CSUBSET-VLA (C1b): thread the captured VLA size-expr map so a `int a[n]`
     // source lowers its runtime-operand Alloca through THIS fixture too (else the

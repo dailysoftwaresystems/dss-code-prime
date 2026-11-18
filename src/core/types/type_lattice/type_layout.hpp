@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <vector>
 
 // ── FC6: the struct/union/array LAYOUT engine (realizes D-FF3-1-TARGET-AGGREGATE-LAYOUT-PARAMS, layout half) ──
@@ -85,6 +86,25 @@ using TypeLayoutTable = substrate::ArenaAttribute<TypeInterner, StructLayout>;
 // class kinds (Ptr/Ref/FnPtr) take the `DataModel` pointer width.
 [[nodiscard]] DSS_EXPORT std::optional<std::uint64_t>
 scalarByteSize(TypeKind kind, DataModel dm) noexcept;
+
+// ★ ADMISSIBILITY, ONE PREDICATE (P69 fold 3f, review-xa3e F3): whether the back
+// end can lower a data model's widths at all. A model is admitted when it states
+// a pointer size (`scalarByteSize(TypeKind::Ptr, dm)`, the one home of the
+// pointer width) and that size is the back end's ADDRESS width,
+// `kBackEndAddressBytes` (data_model.hpp; the LIR's flags-0 width is defined
+// from it). The answer is the refusal's reason, in the operator's words, or
+// nullopt when the model is admitted. The semantic gate reads it
+// (S_UnsupportedDataModel carries the reason), so a data model added later that
+// states another width, or a value that names no model, is refused by the same
+// question that refuses ILP32, never by an identity test of one name.
+[[nodiscard]] DSS_EXPORT std::optional<std::string>
+dataModelTheBackEndCannotLower(DataModel dm);
+
+// A data model in the operator's words, for a refusal that names one: "data
+// model LP64", or "a data model no table row names (value N)" for a value of
+// `DataModel` that names no model. The one spelling such a refusal reads (P69
+// fold 3f): the predicate above and the `.eh_frame` decoder's.
+[[nodiscard]] DSS_EXPORT std::string dataModelSpelled(DataModel dm);
 
 // ⓘ A `_BitInt(N)`'s size is NOT `scalarByteSize`'s to answer (its width lives in the
 // interned record, and above 64 bits its chunk is the target's): a caller holding a

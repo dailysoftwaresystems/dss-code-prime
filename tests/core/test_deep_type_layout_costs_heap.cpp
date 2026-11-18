@@ -169,6 +169,7 @@ struct ShippedSchemas {
 
     DiagnosticReporter mirReporter;
     MirLoweringConfig mirCfg = languageMirLoweringConfig(*schema);   // the pipeline's assembly
+    mirCfg.dataModel = DataModel::Lp64;   // a config states its unit's data model
     mirCfg.symbolIdSpace = MirSymbolIdSpace::endingAt(   // the unit's name table, as the driver states it
         static_cast<std::uint32_t>(model.symbols().size()));
     mirCfg.aggregateLayout       = target->aggregateLayout();

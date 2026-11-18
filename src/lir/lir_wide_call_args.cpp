@@ -15,6 +15,7 @@
 #include <array>
 #include <cstdint>
 #include <format>
+#include <optional>
 #include <span>
 #include <unordered_map>
 #include <vector>
@@ -66,25 +67,23 @@ using dss::report;
 // output (`lowerWideCallArgs`, below), refuses a module in which one survived.
 
 // The outgoing-arg slot QUANTUM — the unit the overflow area is reserved and
-// aligned in. Every current ABI (SysV/Win64/AAPCS64/Apple) uses a pointer-width
-// (= GPR width = 8) quantum; lir_callconv derives it from widthForClass(GPR).
+// aligned in — is the convention's, read at its ONE home (`argumentSlotBytes`,
+// core/types/target_schema.hpp: the widest general register; the frame layout's
+// `outgoingSlotSize`) by `lowerWideCallArgs` and handed to each function's
+// rebuild. ★ P69 (lane `xa`, fold 3f -- review-xa3e F3 P11): a literal 8 of this
+// pass's own stood here, a second home of the quantum its own comment said
+// lir_callconv derived.
 // ⚠ It is no longer the same thing as "the space one stacked argument takes":
 // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED made that a per-CC,
-// per-axis rule that `StackArgCursor` owns. This value is what the cursor rounds
+// per-axis rule that `StackArgCursor` owns. The quantum is what the cursor rounds
 // TO, not what it advances BY. It is also the CHUNK a stacked aggregate is copied
 // in: GPR-wide, the width callconv's post-regalloc copy used, over the same span
 // (the placement reserves whole slots and the temp is rounded to 16, so the last
 // chunk's read stays inside the temp and its write inside the aggregate's slots).
-constexpr std::uint32_t kOutgoingSlotBytes = 8u;
-
-// The access width of one aggregate-copy chunk, off the SAME number the copy
-// steps by (D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT:
-// a step and an access width taken from two places drift apart). A slot the LIR
-// instruction model cannot state as a width fails the BUILD.
-static_assert(lirInstWidthFlagForBits(kOutgoingSlotBytes * 8u).has_value(),
-              "the outgoing slot must be a width a LIR memory access can state");
-constexpr std::uint8_t kOutgoingChunkWidthFlags =
-    lirInstWidthFlagForBits(kOutgoingSlotBytes * 8u).value();
+// The chunk's access width is taken off the SAME number the copy steps by
+// (D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT: a step
+// and an access width taken from two places drift apart); a quantum the LIR
+// instruction model cannot state as a width is refused by name.
 
 // The highest VIRTUAL register id `fn` names — any instruction's result or Reg
 // operand (a bundle's operands are its outer instruction's) — or 0. The rebuilt
@@ -116,7 +115,8 @@ constexpr std::uint8_t kOutgoingChunkWidthFlags =
 [[nodiscard]] bool
 lowerOneFunc(Lir const& src, LirFuncId fn, TargetSchema const& schema,
              TargetCallingConvention const& cc, std::uint16_t storeOutgoingOp,
-             std::uint16_t gprLoadOp, LirBuilder& b,
+             std::uint16_t gprLoadOp, std::uint32_t slotBytes,
+             std::uint8_t chunkWidthFlags, LirBuilder& b,
              std::vector<std::uint32_t>& entryImage, DiagnosticReporter& reporter) {
 
     auto const& funcInfo = src.funcArena().at(fn);
@@ -222,7 +222,7 @@ lowerOneFunc(Lir const& src, LirFuncId fn, TargetSchema const& schema,
             // (D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES); the
             // packing rule it applies is the shipped CC's
             // (D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED).
-            StackArgCursor stackCursor{cc, kOutgoingSlotBytes};
+            StackArgCursor stackCursor{cc, slotBytes};
             std::uint32_t argRegionIdx = 0;  // 0-based arg position
             // D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES: the
             // vararg boundary is a POSITION, and this pass RENUMBERS positions.
@@ -412,17 +412,17 @@ lowerOneFunc(Lir const& src, LirFuncId fn, TargetSchema const& schema,
             // mis-encoded.
             for (auto const& c : aggCopies) {
                 for (std::uint32_t off = 0; off < c.bytes;
-                     off += kOutgoingSlotBytes) {
+                     off += slotBytes) {
                     LirReg const chunk = b.newVReg(LirRegClass::GPR);
                     std::array<LirOperand, 3> const ld{
                         LirOperand::makeReg(c.address),
                         LirOperand::makeMemBase(1),
                         LirOperand::makeMemOffset(static_cast<std::int32_t>(off))};
                     b.addInst(gprLoadOp, chunk, ld, /*payload=*/0,
-                              kOutgoingChunkWidthFlags);
+                              chunkWidthFlags);
                     std::array<LirOperand, 1> const so{LirOperand::makeReg(chunk)};
                     b.addInst(storeOutgoingOp, InvalidLirReg, so,
-                              c.byteOffset + off, kOutgoingChunkWidthFlags);
+                              c.byteOffset + off, chunkWidthFlags);
                 }
             }
             // D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES: the
@@ -493,6 +493,19 @@ lowerWideCallArgs(Lir const& src, TargetSchema const& schema,
                "with");
         return out;
     }
+    // The convention's argument-slot quantum, read ONCE at its home, and the access
+    // width of one aggregate-copy chunk taken off it (Q3's one map).
+    std::uint32_t const slotBytes = argumentSlotBytes(schema);
+    std::optional<std::uint8_t> const chunkWidthFlags = lirInstWidthFlagForBits(slotBytes * 8u);
+    if (!chunkWidthFlags.has_value()) {
+        report(reporter, DiagnosticCode::L_StackPassedArgUnsupported,
+               DiagnosticSeverity::Error,
+               std::format("lowerWideCallArgs: the target's argument-slot quantum ({} bytes, its "
+                           "widest general register) is no width a LIR memory access can state, so "
+                           "a stacked argument has no slot to be placed or copied in",
+                           slotBytes));
+        return out;
+    }
 
     LirBuilder b{schema};
     // Carry every module side structure across the rebuild in one call — the
@@ -505,8 +518,8 @@ lowerWideCallArgs(Lir const& src, TargetSchema const& schema,
     out.blockEntryImage.assign(src.blockCount(), 0u);
     for (std::uint32_t fi = 0; fi < funcCount; ++fi) {
         LirFuncId const fn = src.funcAt(fi);
-        if (!lowerOneFunc(src, fn, schema, *cc, *storeOutgoingOp, *gprLoadOp, b,
-                          out.blockEntryImage, reporter))
+        if (!lowerOneFunc(src, fn, schema, *cc, *storeOutgoingOp, *gprLoadOp, slotBytes,
+                          *chunkWidthFlags, b, out.blockEntryImage, reporter))
             return out;
     }
     out.lir = std::move(b).finish();

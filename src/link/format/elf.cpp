@@ -3570,7 +3570,7 @@ encodeElfExecDynamic(
     writeSectionHeader(bytes, SectionHeader{
         .name_offset = shsGot, .type = SHT_PROGBITS, .flags = SHF_ALLOC | SHF_WRITE,
         .addr = gotVa, .offset = gotOff, .size = gotSz,
-        .addr_align = 8, .entry_size = 8});
+        .addr_align = kGotSlotBytes, .entry_size = kGotSlotBytes});   // a slot is one class-word address
     writeSectionHeader(bytes, SectionHeader{
         .name_offset = shsDynamic, .type = SHT_DYNAMIC, .flags = SHF_ALLOC | SHF_WRITE,
         .addr = dynamicVa, .offset = dynamicOff, .size = dynamicSz,
@@ -5776,6 +5776,45 @@ encode(AssembledModule const&    module,
     if (hasNote) {
         hNote.name_offset  = shstrtab.add(secNote->name);
     }
+    // ★ P69 (lane `xa`, fold 3f -- `#pragma comment(lib)`'s ELF half): the libraries
+    // the unit asks its final link to search, in the document's dependent-libraries
+    // section, each NUL-terminated, in the order first stated -- a relocatable
+    // object's only; an image link has done with them what the document says.
+    // ...and no OPTION a unit hands its linker (`UnitLinkerRequests::linkerOptions`): no ELF document states one --
+    // a unit's `#pragma comment(linker, ...)` is warned and dropped where it is compiled, as clang drops it -- so a
+    // relocatable object written from a module that still carries one would drop the request, unsaid.
+    if (!isExec && !module.linkerRequests.linkerOptions.empty()) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("elf::encode: the module carries the linker option '{}', and format '{}' states no option "
+                         "an object hands its linker -- writing the object without it would drop the request.",
+                         spelledLinkerOption(module.linkerRequests.linkerOptions.front()), fmt.name()));
+        return {};
+    }
+    std::vector<std::string> const& dependentLibraries = module.linkerRequests.dependentLibraries;
+    bool const hasDepLibs = !isExec && !dependentLibraries.empty();
+    SectionHeader hDepLibs;
+    std::vector<std::uint8_t> depLibsBody;
+    if (hasDepLibs) {
+        auto const& block = fmt.elf().dependentLibraries;
+        if (!block.has_value()) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("elf::encode: the unit names '{}' as a library its final link must "
+                             "search, and format '{}' states no 'elf.dependentLibraries' section to "
+                             "name it in -- writing the object without it would drop the request.",
+                             dependentLibraries.front(), fmt.name()));
+            return {};
+        }
+        for (auto const& lib : dependentLibraries) {
+            depLibsBody.insert(depLibsBody.end(), lib.begin(), lib.end());
+            depLibsBody.push_back(0);
+        }
+        hDepLibs.name_offset = shstrtab.add(block->section);
+        hDepLibs.type        = block->type;
+        hDepLibs.flags       = block->flags;
+        hDepLibs.entry_size  = block->entrySize;
+        hDepLibs.addr_align  = 1;
+        hDepLibs.size        = depLibsBody.size();
+    }
     if (hasEhFrame) {
         hEhFrame.name_offset     = shstrtab.add(std::string{kEhFrameName});
         hRelaEhFrame.name_offset = shstrtab.add(relaEhFrameName);
@@ -6291,6 +6330,8 @@ encode(AssembledModule const&    module,
             G.hBss.offset = bytes.size();   // NOBITS: no file bytes
         }
     }
+    // The dependent libraries LAST, after every group, so they grow only `e_shnum`.
+    if (hasDepLibs) layoutSection(hDepLibs, depLibsBody);
 
     padTo(bytes, 8);  // SHT alignment
     std::uint64_t const shoff = bytes.size();
@@ -6355,6 +6396,7 @@ encode(AssembledModule const&    module,
         if (G.hasRelaRelRo)    push(G.hRelaRelRo, G.idxRelaRelRo);
         if (!G.bss.empty())    push(G.hBss, G.idxBss);
     }
+    if (hasDepLibs) headers.push_back(&hDepLibs);
     if (!groupIndicesAgree) {
         emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
              "elf::encode (ET_REL): the section indices counted for the section groups' sections disagree "

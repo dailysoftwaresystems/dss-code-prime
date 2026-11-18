@@ -12,9 +12,9 @@
 //   * `/ENTRY:wmainCRTStartup` with no `wmain` defined is refused by both (LNK2019 `wmain`).
 //   * `/ENTRY:<a function>` starts the image at that function with no C runtime (66), `main` beside it an ordinary
 //     function.
-//   * `/ENTRY:WinMainCRTStartup` / `wWinMainCRTStartup` run `WinMain` (44) / `wWinMain` (55), beside `main` too. DSS's
-//     language declares no such entry and no DSS startup makes their four arguments, so DSS refuses both by name,
-//     with that reason and the row that holds the work.
+//   * `/ENTRY:WinMainCRTStartup` / `wWinMainCRTStartup` run `WinMain` (44) / `wWinMain` (55), beside `main` too. DSS
+//     refused both by name until P69 fold 3f, which realizes the GUI entries (tests/link/test_gui_startups.cpp): the
+//     two startups restrict the election as the console ones do.
 // Now each `runtimeStartups` entry of the directive vocabulary states the verbs its startup calls an entry with, and
 // the named inputs' STANDING entry request (`linker::standingEntryRequest`) scopes the election before it is held
 // (`entryElectionScope`): a startup restricts it to its verbs -- and the archive search to their names -- and a
@@ -158,22 +158,29 @@ TEST(ObjectEntryStartup, AStartupWhoseEntryNoInputDefinesIsRefused) {
     }
 }
 
-// The GUI startups are refused by name, with the true reason: what each calls, that no DSS startup makes it, and the
-// row that holds the work.
-TEST(ObjectEntryStartup, TheGuiStartupsAreRefusedByName) {
+// A stated GUI startup enters at its entry, alone and beside `main` in either order, with no precedence: the image's
+// init reads the command line of the startup's width and hands no argument count (P69 fold 3f; before it DSS refused
+// both startups by name).
+TEST(ObjectEntryStartup, TheGuiStartupsEnterAtTheirEntries) {
     test_support::ScratchDir scratch{test_support::Location::InsideRepo, "object_entry_startup_gui"};
+    struct Gui {
+        char const* shape;
+        char const* commandLine;
+        char const* otherCommandLine;
+    };
     int k = 0;
-    for (auto const& [shape, callee] : {std::pair{"winmain", "`WinMain`"}, std::pair{"wwinmain", "`wWinMain`"}}) {
-        for (auto const& p : placementsOf(shape)) {
-            SCOPED_TRACE(std::string{shape} + ", " + p.label);
+    for (Gui const& g : {Gui{"winmain", "_get_narrow_winmain_command_line", "_get_wide_winmain_command_line"},
+                         Gui{"wwinmain", "_get_wide_winmain_command_line", "_get_narrow_winmain_command_line"}}) {
+        for (auto const& p : placementsOf(g.shape)) {
+            SCOPED_TRACE(std::string{g.shape} + ", " + p.label);
             Built b;
             build(scratch.path() / std::to_string(k++), fixturesOf(p.objects), kPe, b);
-            EXPECT_NE(b.rc, 0);
-            EXPECT_TRUE(b.image.empty());
-            std::string const why = textOf(b.rep, DiagnosticCode::K_LinkerDirectiveUnhonourable);
-            EXPECT_NE(why.find(callee), std::string::npos) << b.diagnostics;
-            EXPECT_NE(why.find("D-LK-PE-IMAGE-CANNOT-HONOUR-EVERY-LINKER-DIRECTIVE"), std::string::npos)
-                << b.diagnostics;
+            ASSERT_EQ(b.rc, 0) << b.diagnostics;
+            ASSERT_FALSE(b.image.empty());
+            EXPECT_FALSE(reported(b.rep, DiagnosticCode::K_ProgramEntryChosenByPrecedence)) << b.diagnostics;
+            EXPECT_EQ(importsOf(b.image, g.commandLine), 1u) << "the image enters at the startup's entry";
+            EXPECT_EQ(importsOf(b.image, g.otherCommandLine), 0u);
+            EXPECT_EQ(importsOf(b.image, "__p___argc"), 0u) << "a GUI entry is handed no argument count";
         }
     }
 }
@@ -199,6 +206,10 @@ TEST(ObjectEntryStartupNative, EachProgramExitsAsTheReferencesDo) {
     };
     for (auto const& p : placementsOf("wmain")) run(std::string{"wmain, "} + p.label, fixturesOf(p.objects), 22u);
     run("main", fixturesOf({startupObject("main")}), 33u);
+    for (auto const& p : placementsOf("winmain")) run(std::string{"WinMain, "} + p.label, fixturesOf(p.objects), 44u);
+    for (auto const& p : placementsOf("wwinmain")) {
+        run(std::string{"wWinMain, "} + p.label, fixturesOf(p.objects), 55u);
+    }
     for (auto const& p : placementsOf("raw")) run(std::string{"raw, "} + p.label, fixturesOf(p.objects), 66u);
     run("a DSS unit's main beside wmain",
         {written("main.c", "int main(void) { return 11; }\n"), fixture(startupObject("wmain"))}, 22u);

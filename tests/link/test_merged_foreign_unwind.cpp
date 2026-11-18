@@ -253,7 +253,7 @@ TEST(MergedForeignUnwind, GccRulesSurviveReEncodingThroughTheShippedWriter) {
                           "handed back" << diagText(rep);
         ASSERT_FALSE(sec->bytes.empty()) << p.label;
 
-        auto again = link::format::decodeEhFrame(sec->bytes, regs,
+        auto again = link::format::decodeEhFrame(sec->bytes, regs, loaded->format->dataModel(),
                                                  "test::roundTrip", rep);
         ASSERT_TRUE(again.has_value()) << p.label << diagText(rep);
 
@@ -489,7 +489,7 @@ TEST(MergedForeignUnwind, AnFdeThatDoesNotCoverItsFunctionIsRefused) {
         auto const decoded = link::format::decodeEhFrame(
             std::span<std::uint8_t const>(bytes).subspan(sec->off, sec->size),
             link::format::dwarfRegisterMappingOf(*loaded->target),
-            "test::extent", probe);
+            loaded->format->dataModel(), "test::extent", probe);
         ASSERT_TRUE(decoded.has_value()) << p.label << diagText(probe);
         ASSERT_FALSE(decoded->fdes.empty()) << p.label;
         // `address_range` sits immediately after the 4-byte

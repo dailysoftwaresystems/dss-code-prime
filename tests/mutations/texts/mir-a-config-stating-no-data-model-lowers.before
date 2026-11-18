@@ -1,0 +1,1 @@
+    if (!scalarByteSize(TypeKind::Ptr, config.dataModel).has_value()) {

@@ -1393,20 +1393,25 @@ private:
             case MirOpcode::Br:
                 remember(dst_.addBr(mapSucc(oldSucc[0])));
                 return;
-            case MirOpcode::CondBr:
-                remember(dst_.addCondBr(mapCallerValue(oldOps[0], id),
-                                        mapSucc(oldSucc[0]), mapSucc(oldSucc[1])));
+            case MirOpcode::CondBr: {
+                MirInstId const  cond    = mapCallerValue(oldOps[0], id);
+                MirBlockId const onTrue  = mapSucc(oldSucc[0]);
+                MirBlockId const onFalse = mapSucc(oldSucc[1]);
+                remember(dst_.addCondBr(cond, onTrue, onFalse));
                 return;
+            }
             case MirOpcode::Switch: {
                 std::vector<std::pair<MirInstId, MirBlockId>> cases;
                 std::size_t const ncases = oldSucc.size() - 1;
                 cases.reserve(ncases);
                 for (std::size_t i = 0; i < ncases; ++i) {
-                    cases.emplace_back(mapCallerValue(oldOps[1 + i], id),
-                                       mapSucc(oldSucc[i]));
+                    MirInstId const  value  = mapCallerValue(oldOps[1 + i], id);
+                    MirBlockId const target = mapSucc(oldSucc[i]);
+                    cases.emplace_back(value, target);
                 }
-                remember(dst_.addSwitch(mapCallerValue(oldOps[0], id), cases,
-                                        mapSucc(oldSucc[ncases])));
+                MirInstId const  selector = mapCallerValue(oldOps[0], id);
+                MirBlockId const fallback = mapSucc(oldSucc[ncases]);
+                remember(dst_.addSwitch(selector, cases, fallback));
                 return;
             }
             case MirOpcode::Return: {

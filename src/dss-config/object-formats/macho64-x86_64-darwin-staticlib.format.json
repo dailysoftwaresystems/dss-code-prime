@@ -86,14 +86,30 @@
         "subtrahendNativeId": 1442840576,
         "minuendNativeId": 100663296
       }
+    ],
+    "$linkerOptionsComment": "P69 fold 3f (`#pragma comment`'s Mach-O half): the load command in which a relocatable object hands its final linker options, and how that linker reads them. ✔MEASURED (P69 fold 3f, Apple clang 21 `-fms-extensions` and the host's ld64): `#pragma comment(lib, \"x\")` writes ONE LC_LINKER_OPTION (45) holding the one string `-lx`, and `comment(linker, \"t\")` one holding `t` as ONE string -- each pragma its own command, a repeat written again, cmdsize 12 + the NUL-terminated strings zero-filled to 8 (16 for `-lz`); ld64 searches a library either kind spells (`-lz` links `compress2` and the image needs libz), and warns \"unknown linker option from object file ignored\" of the one string `-framework CoreFoundation`. A DSS relocatable object writes each library its units name (`library` and the name, once) and each other option as its strings; the reader reads a foreign object's back -- a library into the unit's libraries, a framework (`framework` and its name, TWO strings) and any other option kept, the latter warned by a link that makes an image where ld64 warns; that link ignores the libraries and frameworks (`inImage`), for `reason`.",
+    "linkerOptions": {
+      "command": 45,
+      "library": "-l",
+      "framework": "-framework",
+      "inImage": "ignored",
+      "reason": "A library or a framework to search. A DSS link binds a library function through its descriptors and the `--resolve-library` inputs, and a name nothing resolves still fails loud (ELF's `elf.dependentLibraries` and COFF's `/DEFAULTLIB:` rows say the same)."
+    },
+    "$skippedLoadCommandsComment": "P69 fold 3f (D-LK-MACHO-READER-SKIPS-LOAD-COMMANDS-IN-SILENCE): the load commands a relocatable object may carry that nothing a link makes reads -- the object reader steps over each for its `reason`. It READS LC_SEGMENT_64, LC_SYMTAB, LC_DYSYMTAB, LC_BUILD_VERSION, LC_VERSION_MIN_MACOSX and the `linkerOptions` command, and REFUSES by name every command neither read nor listed here. ✔MEASURED (P69 fold 3f, run 20261117-192243-260e95c2: Apple clang 21's relocatable objects, arm64 and x86_64, and ld64's `-r` outputs on the macos-arm64 leg): eight commands -- those six, LC_LINKER_OPTIMIZATION_HINT (46, arm64 objects only) and LC_DATA_IN_CODE (41, arm64 objects and every `ld -r` output, x86_64's too).",
+    "skippedLoadCommands": [
+      {
+        "command": 41,
+        "name": "LC_DATA_IN_CODE",
+        "reason": "marks bytes inside a code section as data, for disassemblers and debuggers: the bytes link as they are, and a DSS image states no data-in-code of its own."
+      }
     ]
   },
-  "$buildVersionComment": "D-LK10-ENTRY-MACHO-EXIT, MH_OBJECT arm — and THIS FILE MUST CARRY IT, which is the whole finding. An `ar` archive is not a Mach-O file: the `!<arch>` framing has no load commands and cannot hold a platform declaration, so in a real toolchain the platform lives in each MEMBER, because `ar` merely archives `.o` files that clang already stamped. DSS matches that by construction — `linkAndWriteStaticArchive` (src/program/compile_pipeline.cpp) links every member through the SAME `linker::link` -> `macho::encode` MH_OBJECT walker, handing it THIS schema, not the bare relocatable sibling's. So the walker's `image.buildVersion.has_value()` gate reads THIS file, and omitting the key here would ship an archive whose members each draw `ld: warning: no platform load command found` — the exact defect the sibling closes, surviving inside the `.a`. Members get the emitter for free; they do NOT get the declaration for free. Values are the sibling's verbatim (`macos` / 11.0 / 11.0) — the platform axis is per-OS, not per-CPU, so all four darwin object-flavored formats declare the identical block. ⛔ UNRUN, stated rather than implied: no DSS-emitted Mach-O `.a` has been fed to ld64, and the reachable Mac is Apple Silicon, so nothing here rests on an x86_64 probe — the claim is member-byte emission plus the mechanism above, the same honest boundary this file's `$supportedDataSectionsComment` draws.",
+  "$buildVersionComment": "D-LK10-ENTRY-MACHO-EXIT, MH_OBJECT arm — and THIS FILE MUST CARRY IT, which is the whole finding. An `ar` archive is not a Mach-O file: the `!<arch>` framing has no load commands and cannot hold a platform declaration, so in a real toolchain the platform lives in each MEMBER, because `ar` merely archives `.o` files that clang already stamped. DSS matches that by construction — `linkAndWriteStaticArchive` (src/program/compile_pipeline.cpp) links every member through the SAME `linker::link` -> `macho::encode` MH_OBJECT walker, handing it THIS schema, not the bare relocatable sibling's. So the walker's `image.buildVersion.has_value()` gate reads THIS file, and omitting the key here would ship an archive whose members each draw `ld: warning: no platform load command found` — the exact defect the sibling closes, surviving inside the `.a`. Members get the emitter for free; they do NOT get the declaration for free. Values are the sibling's verbatim (`macos` / 10.14 / 10.14, the family's IMAGE floor since P69 fold 3f) — the platform axis is per-OS, not per-CPU, so all four darwin object-flavored formats declare `macos`, each family's own image's minOs. ⛔ UNRUN, stated rather than implied: no DSS-emitted Mach-O `.a` has been fed to ld64, and the reachable Mac is Apple Silicon, so nothing here rests on an x86_64 probe — the claim is member-byte emission plus the mechanism above, the same honest boundary this file's `$supportedDataSectionsComment` draws.",
   "image": {
     "buildVersion": {
       "platform": "macos",
-      "minOs": "11.0",
-      "sdk": "11.0"
+      "minOs": "10.14",
+      "sdk": "10.14"
     }
   },
   "$visibilityWrittenAsComment": "P69 fold f26b (lane cs, D-LK-OBJECT-STV-PROTECTED-DROPPED): the visibility this format writes for each one it cannot -- an nlist entry states external, private external (N_PEXT) or neither, no protected. MEASURED (lane cs probe pv, 2026-10-16, arm64, -O0 and -O2, nm -m of the object): Apple clang 21.0.0 writes a protected definition as a plain external, warning \"target does not support 'protected' visibility; using 'default'\" [-Wunsupported-visibility], and an internal one, silently, as a private external -- what hidden writes. The x86_64 nlist has the same fields (READ, <mach-o/nlist.h>). Each one settled is warned (H_VisibilityWrittenAsAnother) before any tier reads it.",

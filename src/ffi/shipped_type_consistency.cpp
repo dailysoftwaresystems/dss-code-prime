@@ -199,15 +199,21 @@ void ShippedTypeConsistency::recordRealization(
     // authored descriptors can silently disagree about. `availableObjectFormats`
     // is absent by design — it is the GATE that chose these rows, never an axis
     // they must agree on.
+    // P69 fold 3f (ledger 549 (b)): the row's stated route as a WRITTEN name on this format -- the
+    // binders read the winner's, so two rows of one name must state the same one.
+    std::string route = "<none>";
+    if (auto const r = sym.writtenNameRoutes.find(std::string{formatName}); r != sym.writtenNameRoutes.end())
+        route = r->second.route == WrittenNameRoute::LinkerAlias ? std::string{"linkerAlias"}
+                                                                 : "refused: " + r->second.reason;
     std::string traits = std::format(
         "library={} source={} synthesize={} linkName={} version={} kind={} "
-        "linkage={} noreturn={} returnsTwice={}",
+        "linkage={} noreturn={} returnsTwice={} route={}",
         mergedEntry(desc.library, sym.library, formatName),
         mergedEntry(desc.realization, sym.realization, formatName),
         orNone(sym.synthesize), orNone(sym.linkName), orNone(sym.version),
         sym.kind == ShippedSymbolKind::Function ? "function" : "object",
         sym.linkage == ShippedSymbolLinkage::Weak ? "weak" : "external",
-        sym.noreturn ? 1 : 0, sym.returnsTwice ? 1 : 0);
+        sym.noreturn ? 1 : 0, sym.returnsTwice ? 1 : 0, route);
 
     auto const it = realizations_.find(sym.name);
     if (it == realizations_.end()) {

@@ -1,0 +1,1 @@
+        if (rows.size() > 1 || stated) {

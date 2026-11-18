@@ -869,6 +869,20 @@ struct DSS_EXPORT SymbolRecord {
 // Kept decoupled from the ffi descriptor enums: `isFunction` selects
 // ExternFunction (true) vs ExternGlobal (false) at lowering, the only
 // distinction the lowerer needs.
+//
+// ★ P69 fold 3f (ledger 549 (b)): THE ONE ANSWER to "does a shipped row's
+// reference name an image here?" — no when its body is DSS's shipped source, and
+// no when the platform's link states its name's alias (the written name kept). Both
+// row kinds below ask it (`bindsNoImage`), and the CST→HIR tier's extern producers
+// read it for `HirExternRecord.noLibraryBinding`, so a row library-less ON PURPOSE
+// reaches HIR→MIR UNBOUND — never as a row the extern pre-pass refuses for a
+// missing `importLibrary`, which an alias row read by `shippedSourcePath` alone
+// became: every pe runtime unit that calls a POSIX name stopped compiling.
+[[nodiscard]] inline bool shippedRowBindsNoImage(std::string const& shippedSourcePath,
+                                                 bool keepsWrittenName) noexcept {
+    return !shippedSourcePath.empty() || keepsWrittenName;
+}
+
 struct DSS_EXPORT ShippedExternSymbol {
     SymbolId    symbol;       // the minted extern symbol
     std::string name;         // the undecorated identifier → HirExternRecord.canonicalName
@@ -997,6 +1011,17 @@ struct DSS_EXPORT ShippedExternSymbol {
     // graph. That is the same route a plain `extern int f(void);` over a two-file
     // `cc a.c b.c` already takes; no new binding rule was invented for this.
     std::string shippedSourcePath;
+    // ★ P69 fold 3f (ledger 549 (b)): TRUE ⇒ the platform's link ALIASES this row's
+    // name (`ffi::frontEndKeepsTheWrittenName`): the reference keeps the name the
+    // program wrote and binds no image here — an image link states the alias
+    // (`stateWrittenNameRoutes`, compile_pipeline.cpp), a relocatable artifact
+    // leaves it to its final link. `library` is empty and `linkName` the written one.
+    bool keepsWrittenName = false;
+
+    // `shippedRowBindsNoImage` over this row.
+    [[nodiscard]] bool bindsNoImage() const noexcept {
+        return shippedRowBindsNoImage(shippedSourcePath, keepsWrittenName);
+    }
 };
 
 // c86 + c156: the link identity of a goal-2 SUPPRESSED shipped descriptor
@@ -1146,6 +1171,17 @@ struct DSS_EXPORT SuppressedShippedSymbol {
     // as a RAW IMPORT — and no pe image exports `opendir`, so the binary would
     // fail to LOAD at process start with rc=0 from every compile stage.
     std::string shippedSourcePath;
+    // ★ P69 fold 3f (ledger 549 (b)): the suppressed row's name is ALIASED by the
+    // platform's link (`ShippedExternSymbol::keepsWrittenName`'s sibling, for the
+    // same reason `shippedSourcePath` rides here): a user prototype of `access` over
+    // `#include <io.h>` keeps the written name and binds no image.
+    bool keepsWrittenName = false;
+
+    // `shippedRowBindsNoImage` over this row, for the user prototype that
+    // re-declares it.
+    [[nodiscard]] bool bindsNoImage() const noexcept {
+        return shippedRowBindsNoImage(shippedSourcePath, keepsWrittenName);
+    }
 };
 
 class DSS_EXPORT SemanticModel {

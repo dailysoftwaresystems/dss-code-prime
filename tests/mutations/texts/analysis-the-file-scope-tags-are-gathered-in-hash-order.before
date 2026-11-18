@@ -1,0 +1,2 @@
+        for (auto const* tagRoot : substrate::entriesInKeyOrder(treeRootScope)) {
+            auto const& [treeV, scope] = *tagRoot;

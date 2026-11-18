@@ -1543,8 +1543,10 @@ std::vector<CarriedCell> const kCarriedCells = {
 }  // namespace
 
 // Every leg: the reader states each alias's default, and DSS links each order the union accepts and refuses the other
-// naming the default left undefined. RED-ON-DISABLE: take every carried name with its copy -> clang-cl's a b refused;
-// resolve a staying name to the copy's own name -> gcc's a b links (HEAD's 7777).
+// naming the default left undefined. RED-ON-DISABLE: take every other name of a lost copy with it -> gcc's a b is
+// still refused, but by a bare K_SymbolUndefined of `m` that names neither its unit nor the lost copy, and every other
+// order links as before (MEASURED 2026-11-16 by the arm's sweep on macos-arm64-debug); resolve a staying name to the
+// copy's own name -> gcc's a b links (HEAD's 7777).
 TEST(CoffComdatSelection, ALostCopysWeakAliasResolvesToItsDefault) {
     auto const l = load();
     ASSERT_TRUE(l.target && l.object);

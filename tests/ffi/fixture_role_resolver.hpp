@@ -33,8 +33,20 @@ namespace dss::ffi_test {
 // The rows the shipped documents of each kind declare. A kind with no rows
 // (wasm / spirv, which ship no `runtimeLibraries` table at all) answers nothing,
 // exactly as its documents do.
+//
+// ★ AND OF THE ARCH, WHERE A ROLE'S IMAGE IS THE ARCH'S (P69 fold 3f, ledger
+// 563 (A)). A runtime family is keyed by (kind, target arch)
+// (`ObjectFormatSchema::inFlavourFamilyOf`), and on ELF the program
+// interpreter differs by arch: each exec and pie document of an arch names its
+// own loader, and a descriptor's arch entry (stdlib.json's aarch64
+// `__stack_chk_guard`) asks for it by the role `programInterpreter`. So the
+// table takes the arch the read is made on. A read with no arch decides no
+// arch entry, so it never asks that role. ✔MEASURED 2026-11-17: keyed by kind
+// alone, every read of the real corpus on arm64 ELF through this fixture
+// refused stdlib.json ("names runtime-library role 'programInterpreter'"),
+// and the sweeps that skip an unreadable descriptor dropped it silently.
 [[nodiscard]] inline RuntimeLibraryTable
-fixtureRuntimeLibraryTable(ObjectFormatKind fmt) {
+fixtureRuntimeLibraryTable(ObjectFormatKind fmt, std::string_view arch = {}) {
     RuntimeLibraryTable t;
     switch (fmt) {
         case ObjectFormatKind::Pe:
@@ -44,6 +56,13 @@ fixtureRuntimeLibraryTable(ObjectFormatKind fmt) {
             break;
         case ObjectFormatKind::Elf:
             t.bindings.push_back({RuntimeLibraryRole::CLibrary, "libc.so.6", {}});
+            if (arch == "x86_64") {
+                t.bindings.push_back(
+                    {RuntimeLibraryRole::ProgramInterpreter, "ld-linux-x86-64.so.2", {}});
+            } else if (arch == "arm64") {
+                t.bindings.push_back(
+                    {RuntimeLibraryRole::ProgramInterpreter, "ld-linux-aarch64.so.1", {}});
+            }
             break;
         case ObjectFormatKind::MachO:
             t.bindings.push_back(
@@ -60,21 +79,22 @@ fixtureRuntimeLibraryTable(ObjectFormatKind fmt) {
 // over the SAME table the resolver answers from, so a raw-JSON reader and a
 // resolver-carrying reader can never disagree about what a role means.
 [[nodiscard]] inline std::optional<std::string>
-fixtureRoleImage(ObjectFormatKind fmt, std::string_view roleName) {
-    auto const table = fixtureRuntimeLibraryTable(fmt);
+fixtureRoleImage(ObjectFormatKind fmt, std::string_view roleName,
+                 std::string_view arch = {}) {
+    auto const table = fixtureRuntimeLibraryTable(fmt, arch);
     for (auto const& row : table.bindings) {
         if (runtimeLibraryRoleName(row.role) == roleName) return row.image;
     }
     return std::nullopt;
 }
 
-// A resolver over the fixture table for ONE kind — the shape the driver builds
-// over the active format.
+// A resolver over the fixture table for ONE kind on one arch — the shape the
+// driver builds over the active format (whose family is its kind on its arch).
 class FixtureRoleResolver final : public RuntimeLibraryRoleResolver {
 public:
-    explicit FixtureRoleResolver(ObjectFormatKind fmt)
+    explicit FixtureRoleResolver(ObjectFormatKind fmt, std::string_view arch = {})
         : kind_(objectFormatKindName(fmt)),
-          table_(fixtureRuntimeLibraryTable(fmt)) {}
+          table_(fixtureRuntimeLibraryTable(fmt, arch)) {}
 
     [[nodiscard]] std::string_view formatKindName() const noexcept override {
         return kind_;

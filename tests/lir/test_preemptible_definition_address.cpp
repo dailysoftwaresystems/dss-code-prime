@@ -137,6 +137,7 @@ lowerFixture(TargetSchema const& sch, DiagnosticReporter& rep,
                                         CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     // This hand-built module is its own table: nothing beside it names an id it
     // does not define, so its end is the counted one, STATED (the symbol-id door
     // refuses to mint past an end nobody stated).

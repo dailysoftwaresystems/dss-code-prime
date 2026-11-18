@@ -426,6 +426,23 @@ public:
     [[nodiscard]] virtual bool
     realizesDirectiveImageSettings() const noexcept { return false; }
 
+    // ── A COMPILED UNIT'S OWN LINKER OPTIONS (P69 fold 3f, `#pragma comment(linker, ...)`) ──
+    //
+    // Apply the options a COMPILED unit states (`UnitLinkerRequests::linkerOptions`) to its module EXACTLY as this
+    // backend's object reader applies the ones an object it reads states -- so a unit compiled to an object and the
+    // same unit compiled straight into a link carry one module: the object read back. `objectFormatSchema` is the
+    // family's OBJECT document, the one that states the options' vocabulary (an image document states none: its
+    // objects are read through their archive-writing sibling). true: applied; false: refused, the refusal reported
+    // here by name and the module as it was. ★ DEFAULT nullopt: this backend's objects state no option, and the
+    // caller refuses the module by name -- the compile pipeline keeps a unit's option only where the object
+    // document states a vocabulary, so a format whose backend answers nullopt never reaches here with one.
+    [[nodiscard]] virtual std::optional<bool>
+    applyUnitLinkerOptions(AssembledModule&          /*module*/,
+                           ObjectFormatSchema const& /*objectFormatSchema*/,
+                           DiagnosticReporter&       /*reporter*/) const {
+        return std::nullopt;
+    }
+
     // ── [[D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH]] ──
     //
     // Where THIS backend's writer will put the call stub of each import that

@@ -147,6 +147,7 @@ struct PipelineOut {
     TypeId const params[] = {f64, f64};
     auto const sig = interner.fnSig(params, i32, conv);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
     mb.stateArgCounting(argCountingOf(conv == CallConv::CcMS64));
     mb.addFunction(sig, SymbolId{1});
     MirBlockId const bb = mb.createBlock(StructCfMarker::EntryBlock);

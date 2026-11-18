@@ -736,8 +736,9 @@ externAddrBindingFromName(std::string_view s) noexcept {
 //     LOWERING lands with the PE TLS cycle — the MIR→LIR arm fails
 //     LOUD (never a silently-wrong local-exec sequence) until then.
 //   * `macho-tlv` (Mach-O, C4): access is a CALL through the object's
-//     `__thread_vars` TLV descriptor (`_tlv_bootstrap`). Declared as
-//     vocabulary; fails loud at lowering until the Mach-O TLS cycle.
+//     `__thread_vars` TLV descriptor, whose word0 the image binds to the
+//     format's declared bootstrap routine (`TlsAccessInfo::bootstrap*`;
+//     Darwin's `__tlv_bootstrap`, from libSystem).
 //
 // A format that declares NO `tlsAccess` block cannot lower a
 // thread-local access at all: MIR→LIR fails loud
@@ -768,6 +769,11 @@ tlsAccessModelName(TlsAccessModel m) noexcept {
 tlsAccessModelFromName(std::string_view s) noexcept {
     return kTlsAccessModelTable.fromName(s);
 }
+
+// The runtime-library role table's enumeration (its enumerators, names and
+// rows are further down): the `macho-tlv` model names the ROLE of the image
+// that exports its bootstrap routine (`TlsAccessInfo::bootstrapRole`).
+enum class RuntimeLibraryRole : std::uint8_t;
 
 // D-CSUBSET-THREAD-LOCAL (TLS C3): the reserved well-known SymbolId VALUE
 // that names the PE `_tls_index` slot — a LINK-TIER writer-minted SINGLETON
@@ -848,6 +854,20 @@ struct DSS_EXPORT TlsAccessInfo {
     // hand-built block, which the lowering refuses rather than index by zero
     // (P69 fold 3e, the review of fold 3d's X9, R15: the scale was a literal 8).
     std::uint8_t   blockPointerBytes = 0;
+    // P69 fold 3f (ledger 716): the routine every `macho-tlv` descriptor's
+    // word0 is BOUND to (Darwin's `__tlv_bootstrap`, which dyld overwrites
+    // with its tlv_get_addr at load), as the object file spells it, and the
+    // runtime-library ROLE of the image that exports it -- the format's
+    // `tlsAccess.bootstrap` (`{"role", "mangledName"}`, the
+    // `sehPersonality` shape), REQUIRED for `macho-tlv` and refused for the
+    // other models, which bind none. The image is resolved where it is bound,
+    // through the format's role table (its FAMILY's, for a flavour whose own
+    // table does not declare the role: the dylib's). ✔MEASURED 2026-11-17
+    // (Apple clang 21's exec, `nm -m`): `__tlv_bootstrap (from libSystem)`.
+    // Empty / `None` on a hand-built block, which the writer refuses rather
+    // than bind a nameless routine.
+    std::string        bootstrapMangledName;
+    RuntimeLibraryRole bootstrapRole{};
 };
 
 // ── Shipped-library synthesis vehicle (D-CSUBSET-C11-THREADS-MACHO) ─
@@ -991,15 +1011,24 @@ enum class RuntimeLibraryRole : std::uint8_t {
     // /GS family, so DSS ships the bodies -- a `sources` row, several units
     // (one register contract no C function keeps is written in assembly).
     CompilerSupport   = 5,
+    // P69 fold 3f (ledger 563 (A)): the PROGRAM INTERPRETER -- the image a dynamic ELF
+    // executable names in PT_INTERP, which is also a library a program imports from:
+    // aarch64 glibc's ld-linux-aarch64.so.1 exports the stack protector's canary
+    // `__stack_chk_guard` and libc.so.6 does not (MEASURED, P69 fold 3f: `readelf -V`
+    // files gcc's aarch64 image's `__stack_chk_guard@GLIBC_2.17` under the interpreter).
+    // An ELF document with an `elf.interpreter` path declares this role's row, its image
+    // the path's last component (the elf backend refuses the two disagreeing).
+    ProgramInterpreter = 6,
 };
 
-inline constexpr EnumNameTable<RuntimeLibraryRole, 6> kRuntimeLibraryRoleTable{{{
+inline constexpr EnumNameTable<RuntimeLibraryRole, 7> kRuntimeLibraryRoleTable{{{
     { RuntimeLibraryRole::None,              "none"              },
     { RuntimeLibraryRole::CLibrary,          "cLibrary"          },
     { RuntimeLibraryRole::UnwindPersonality, "unwindPersonality" },
     { RuntimeLibraryRole::SystemPrimitives,  "systemPrimitives"  },
     { RuntimeLibraryRole::AtomicsRuntime,    "atomicsRuntime"    },
     { RuntimeLibraryRole::CompilerSupport,   "compilerSupport"   },
+    { RuntimeLibraryRole::ProgramInterpreter, "programInterpreter" },
 }}};
 
 // Well-formedness of the table itself: no empty spelling, no duplicate
@@ -1038,7 +1067,7 @@ isSelectableRuntimeLibraryRole(RuntimeLibraryRole r) noexcept {
 // `core/types/target_schema.hpp`
 // (D-CORE-NAMESWHERE-COUNT-DERIVED-FROM-THE-TABLE-IS-A-TAUTOLOGY).
 inline constexpr auto kSelectableRuntimeLibraryRoleNames =
-    namesWhere<5>(kRuntimeLibraryRoleTable, isSelectableRuntimeLibraryRole);
+    namesWhere<6>(kRuntimeLibraryRoleTable, isSelectableRuntimeLibraryRole);
 static_assert(kRuntimeLibraryRoleTable.rows.size()
                   == kSelectableRuntimeLibraryRoleNames.size() + 1,
               "kRuntimeLibraryRoleTable must have exactly ONE unselectable row "

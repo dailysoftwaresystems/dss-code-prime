@@ -366,10 +366,10 @@ public:
                 // CLOSED (P69, D-CONFIG-FORMAT-IDENTITY-BLOCKS-ACCEPTED-ANY-KEY):
                 // a misspelled key (`"interpeter"`) loaded clean and left the
                 // field it names at its default.
-                static constexpr std::array<std::string_view, 12> kElfBlockKeys{
+                static constexpr std::array<std::string_view, 13> kElfBlockKeys{
                     "machine", "abiVersion", "class", "data", "osabi", "type",
                     "pageAlign", "interpreter", "bindNow", "soname",
-                    "dynamicRelocationTypes", "uniqueBinding"};
+                    "dynamicRelocationTypes", "uniqueBinding", "dependentLibraries"};
                 ::dss::detail::rejectUnknownKeys(
                     e, kElfBlockKeys, "the 'elf' block",
                     [&](std::string_view key, std::string message) {
@@ -683,6 +683,74 @@ public:
                         data.elf.uniqueBinding = stated;
                     }
                 }
+                // `dependentLibraries` (P69 fold 3f, `#pragma comment(lib)`'s ELF
+                // half): the section a relocatable object names its libraries to
+                // search in, and what an image link does with them. Every part, or
+                // the block is refused.
+                if (e.contains("dependentLibraries")) {
+                    auto const& b = e.at("dependentLibraries");
+                    static constexpr std::array<std::string_view, 6> kDepLibKeys{
+                        "section", "type", "flags", "entrySize", "inImage", "reason"};
+                    auto refuse = [&](std::string_view key, std::string message) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  key.empty() ? std::string{"/elf/dependentLibraries"}
+                                              : std::format("/elf/dependentLibraries/{}", key),
+                                  std::move(message));
+                    };
+                    if (!b.is_object()) {
+                        refuse({}, "'dependentLibraries' must be an object {\"section\", \"type\", "
+                                   "\"flags\", \"entrySize\", \"inImage\", \"reason\"}");
+                    } else {
+                        ::dss::detail::rejectUnknownKeys(
+                            b, kDepLibKeys, "the ELF dependent-libraries block",
+                            [&](std::string_view key, std::string message) {
+                                refuse(key, std::move(message));
+                            });
+                        ElfDependentLibraries stated{};
+                        if (b.contains("section") && b.at("section").is_string()
+                            && b.at("section").get<std::string>().starts_with(".")
+                            && b.at("section").get<std::string>().size() > 1) {
+                            stated.section = b.at("section").get<std::string>();
+                        } else {
+                            refuse("section", "'section' must name the section, a '.'-led name");
+                        }
+                        auto const unsignedOf = [&](std::string_view key, std::uint64_t max)
+                            -> std::optional<std::uint64_t> {
+                            if (!b.contains(key) || !b.at(key).is_number_unsigned()
+                                || b.at(key).get<std::uint64_t>() > max) {
+                                refuse(key, std::format("'{}' must be an unsigned integer no greater "
+                                                        "than {}", key, max));
+                                return std::nullopt;
+                            }
+                            return b.at(key).get<std::uint64_t>();
+                        };
+                        if (auto const v = unsignedOf("type", 0xFFFFFFFFu)) {
+                            stated.type = static_cast<std::uint32_t>(*v);
+                        }
+                        if (auto const v = unsignedOf("flags", ~std::uint64_t{0})) stated.flags = *v;
+                        if (auto const v = unsignedOf("entrySize", ~std::uint64_t{0})) {
+                            stated.entrySize = *v;
+                        }
+                        // The verdict of an image link: `ignored` is the one built.
+                        // `honoured` -- search the named library as ld.lld does -- is
+                        // refused as unbuilt rather than loaded under a claim no link
+                        // keeps.
+                        if (!b.contains("inImage") || !b.at("inImage").is_string()
+                            || b.at("inImage").get<std::string>() != "ignored") {
+                            refuse("inImage", "'inImage' must be 'ignored': the one verdict a DSS "
+                                              "image link has built for a library an object names "
+                                              "(searching it, as ld.lld does, is not built)");
+                        }
+                        if (b.contains("reason") && b.at("reason").is_string()
+                            && !b.at("reason").get<std::string>().empty()) {
+                            stated.inImageReason = b.at("reason").get<std::string>();
+                        } else {
+                            refuse("reason", "'reason' must say why an image link ignores the "
+                                             "libraries an object names");
+                        }
+                        data.elf.dependentLibraries = std::move(stated);
+                    }
+                }
             }
         }
     }
@@ -694,10 +762,41 @@ public:
         // `ObjectFormatData::validate()`, so the body below is verbatim.
         auto const& elf                    = d.elf;
         auto const& sections               = d.sections;
+        // P69 fold 3f: the dependent-libraries section is a RELOCATABLE object's; an
+        // image document stating it states dead config.
+        if (elf.dependentLibraries.has_value() && elf.objectType != ElfObjectType::Rel) {
+            fail("/elf/dependentLibraries",
+                 "the dependent-libraries section is a relocatable object's; an image "
+                 "document writes none and reads none");
+        }
         auto const& entryPoint             = d.entryPoint;
         auto const& processExit            = d.processExit;
         auto const& entryCallingConvention = d.entryCallingConvention;
         auto const& processArgs            = d.processArgs;
+
+    // ★ P69 fold 3f (ledger 563 (A)): THE PROGRAM INTERPRETER IS ONE FACT. `elf.interpreter`
+    // is the PT_INTERP path every ELF reader uses; the `programInterpreter` runtime role
+    // names the same image as a library a program imports from (aarch64's canary). A
+    // document that declares the row declares it beside its path, and the row's image is
+    // the path's last component, so the two cannot drift. A document with a path and no
+    // row answers the role from its (kind, arch) family, as one with neither does.
+        if (auto const* const row =
+                d.runtimeLibraries.rowForRole(RuntimeLibraryRole::ProgramInterpreter);
+            row != nullptr) {
+            std::string_view const path{elf.interpreter};
+            std::string_view const last = path.substr(path.find_last_of('/') + 1);
+            if (path.empty()) {
+                fail("/runtimeLibraries",
+                     "the 'programInterpreter' runtime role is declared beside the path it "
+                     "names: this document has no 'elf.interpreter' (its family's executable "
+                     "document declares the row)");
+            } else if (row->image != last) {
+                fail("/runtimeLibraries",
+                     std::string{"the 'programInterpreter' role's image '"} + row->image
+                         + "' is not the last component of 'elf.interpreter' ('"
+                         + std::string{last} + "') -- one image, named twice, must agree");
+            }
+        }
 
     // ELF identity: when format kind is Elf, the identity block must
     // be populated. `fileClass=0` means "no class declared" which

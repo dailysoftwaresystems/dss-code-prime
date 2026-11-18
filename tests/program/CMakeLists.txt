@@ -167,9 +167,27 @@ dss_add_test(NAME program/test_artifact_at_any_length
 # witnesses, live on EVERY host (the host's own exec format): a variable the test
 # sets must reach `main(int, char**, char**)` byte-exact with real arguments, and
 # Darwin's four-parameter form and MSVC's 3-parameter `wmain` RUN where the host's
-# format realizes them and are REFUSED by code where it does not.
+# format realizes them. Elsewhere `wmain` is no entry and is REFUSED by code, and
+# the four-parameter `main` is entered with the richest row the format realizes,
+# warned, and RUN (P69 fold 3f; it was refused there until fold 3e).
 dss_add_test(NAME program/test_entry_envp_run
              SOURCES test_entry_envp_run.cpp)
+
+# P69 fold 3f: the bodies DSS ships for a pe name the platform image does not export
+# under its own spelling (`swab`, `access`), each RUN against the meaning the
+# reference toolchains measured. Live on every host (elsewhere the platform's own
+# functions answer); its own binary, so the arms that claim it name a runner no
+# other arm's case count rides on.
+dss_add_test(NAME program/test_platform_bodies_run
+             SOURCES test_platform_bodies_run.cpp)
+
+# P69 fold 3f: an extern DATUM read through the binding its format states, where
+# that binding is the only road to it -- an ELF image's `got-indirect` (pe64's slot
+# dispatch and Mach-O's `externAddrBinding` mask a dropped one, MEASURED). Built on
+# every host, RUN on an ELF host; its own binary so the arm that claims it names a
+# runner no other arm's case count rides on.
+dss_add_test(NAME program/test_extern_data_binding_run
+             SOURCES test_extern_data_binding_run.cpp)
 
 # D-C-ATOMICS-RUNTIME-PE64-BUS-LOCKS-EVERY-ACCESS-TO-A-CACHE-LINE-STRADDLING-OBJECT:
 # the NON-TIMING pin that DSS's pe64 atomics runtime executes no split-locked
@@ -647,6 +665,17 @@ dss_add_test(NAME program/test_every_unit
 # built and decoded, never executed (three corpus examples are the runs).
 dss_add_test(NAME program/test_release_hidden_definitions
              SOURCES test_release_hidden_definitions.cpp)
+
+# P69 fold 3f (lane `xa`) -- what a unit's `#pragma comment` asks of its link, in the active format's form: a
+# relocatable ELF object names each library once in its dependent-libraries section (x86_64 and aarch64), an image
+# names none, a directive ELF reads none of is warned and dropped, two units of one object name theirs in unit
+# order; a COFF object reads back as its unit asked (its libraries quoted as cl writes them, its directives applied
+# through the reader's one home), a unit compiled into an image is linked as its object would be, two COFF units of
+# one object state theirs in unit order; a Mach-O object names its unit's libraries and options as ld64 reads them,
+# and an image warns where ld64 would; and natively, ld.lld (Linux x86_64), link.exe (Windows) and ld64 (macOS
+# arm64) search the library a DSS unit names and the image runs.
+dss_add_test(NAME program/test_pragma_comment_link_requests
+             SOURCES test_pragma_comment_link_requests.cpp)
 
 # P69 (lane `cs`): `alias("target")` compiled from C through every tier into a relocatable object, at the baseline
 # and at release — on two ELF architectures and PE each alias is one more name on its target's definition with its

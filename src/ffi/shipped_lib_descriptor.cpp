@@ -1,6 +1,7 @@
 #include "ffi/shipped_lib_descriptor.hpp"
 
 #include "core/substrate/checked_file_read.hpp"    // the ONE checked whole-file read
+#include "core/substrate/key_order.hpp"            // entriesInKeyOrder — a walk whose refusals are read
 #include "core/substrate/path_identity.hpp"        // genericSpelling / normalizeKeepingRoot — the lossless spellings
 #include "core/types/config_document_parse.hpp"   // THE ONE config-document parse
 #include "core/types/config_key_vocabulary.hpp"   // the ONE closed-key check + the `$`-prose carve-out
@@ -295,7 +296,14 @@ struct ConstantsMemoRow {
 struct CachedDescriptor {
     std::string text;
     json        doc;
-    std::vector<std::pair<ObjectFormatKind, std::vector<std::string>>> surfaceByFormat;
+    // Keyed by the PAIR it was harvested on (P69 fold 3f): the format and the arch the asker
+    // carried, empty for none -- a symbol row may exist on one arch of a format.
+    struct SurfaceOnPair {
+        ObjectFormatKind         format;
+        std::string              arch;
+        std::vector<std::string> names;
+    };
+    std::vector<SurfaceOnPair> surfaceByFormat;
     // This parse's number, unique on the thread: a decode that read the document records it, and a
     // re-parse (the bytes changed) is a new number — so "the same generation" is "the same bytes".
     std::uint64_t                 generation = 0;
@@ -1202,7 +1210,9 @@ decodeObjectFormatNameList(json const& node, std::string const& ctx,
     for (auto const& v : node) {
         if (!v.is_string()) {
             emitMalformed(reporter, "shipped-lib descriptor " + ctx
-                                        + " entries must be strings");
+                                        + " entries must be strings (an object entry, a format on"
+                                          " one arch, is a SYMBOL row's availability -- never a"
+                                          " document's or a macro's)");
             continue;
         }
         std::string fmt = v.get<std::string>();
@@ -1560,6 +1570,216 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
                                      reporter, out);
 }
 
+// ★ P69 fold 3f (ledger 563 (A)): A SYMBOL ROW'S AVAILABILITY MAY NAME A FORMAT ON ONE ARCH,
+// `{"format": "elf", "arch": "arm64"}`, beside its string entries, optionally with the image that
+// exports the name there, named by its runtime ROLE (`"image": {"role": "<role>"}`) -- the stack
+// protector's guard is exported by the C library on Mach-O and by the program interpreter on aarch64
+// ELF, while x86_64 ELF has none (MEASURED, readelf -V of gcc's images). It is decoded PER PAIR,
+// through the ONE `when` selector (core/types/variant_when.hpp), so an entry's arch obeys the
+// selector's rule (an open vocabulary: an arch no target names matches no pair): an entry the read's
+// pair matches contributes its format; one it does not match is DROPPED; and a read that carries no
+// arch cannot decide one (the selector's Undecided) and drops it too -- the reader's own pair-less
+// rule, stated. A row whose list then holds NO entry is ABSENT on this read -- never a row with an
+// empty list, which every consumer reads as "every format". REFUSED by name: an unknown key; an entry
+// without `format` or without `arch`; an `image` that is not exactly `{"role": <a role>}`; a string
+// entry and an arch entry of one format; two arch entries that can both match one pair. A document's
+// and a macro's list stay format names (`decodeObjectFormatNameList` refuses an object entry there).
+// `images` receives (format, role) for each MATCHED entry that names one. Returns false when the row
+// is absent on this read.
+[[nodiscard]] bool decodeSymbolAvailability(json const& sym, std::string const& at,
+                                            WhenFacts const& facts, DiagnosticReporter& reporter,
+                                            std::vector<std::string>& out,
+                                            std::vector<std::pair<std::string, std::string>>& images) {
+    auto const it = sym.find("availableObjectFormats");
+    if (it == sym.end()) return true;
+    std::string const ctx = "'" + at + "': 'availableObjectFormats'";
+    if (!it->is_array()) {
+        (void)decodeObjectFormatNameList(*it, ctx, reporter, out);   // reports the shape
+        return true;
+    }
+    json strings = json::array();
+    std::vector<std::pair<std::string, WhenSpec>> arms;
+    std::vector<std::string> archFormats;
+    std::vector<std::string> matched;
+    bool anyArchEntry = false;
+    std::size_t i = 0;
+    for (auto const& v : *it) {
+        std::string const ectx = ctx + "[" + std::to_string(i++) + "]";
+        if (!v.is_object()) {
+            strings.push_back(v);
+            continue;
+        }
+        anyArchEntry = true;
+        bool ok = true;
+        for (auto const& item : v.items()) {   // ascending key: the parsed object is ordered
+            if (item.key() != "format" && item.key() != "arch" && item.key() != "image") {
+                emitMalformed(reporter, "shipped-lib descriptor " + ectx + " has unknown key '"
+                                            + item.key()
+                                            + "' (an arch entry names 'format', 'arch' and, "
+                                              "optionally, 'image')");
+                ok = false;
+            }
+        }
+        if (!v.contains("format") || !v.contains("arch")) {
+            emitMalformed(reporter, "shipped-lib descriptor " + ectx
+                                        + " must name both 'format' and 'arch' (a format on every "
+                                          "arch is a string entry)");
+            ok = false;
+        }
+        std::string role;
+        if (v.contains("image")) {
+            json const& img = v.at("image");
+            bool const shape = img.is_object() && img.size() == 1 && img.contains("role")
+                            && img.at("role").is_string();
+            std::optional<RuntimeLibraryRole> const r =
+                shape ? runtimeLibraryRoleFromName(img.at("role").get<std::string>()) : std::nullopt;
+            if (!r.has_value() || !isSelectableRuntimeLibraryRole(*r)) {
+                emitMalformed(reporter, "shipped-lib descriptor " + ectx
+                                            + ": 'image' must be exactly {\"role\": <a runtime-library "
+                                              "role>} ("
+                                            + allowedList(kSelectableRuntimeLibraryRoleNames)
+                                            + ") -- the format's role table owns which image plays it");
+                ok = false;
+            } else {
+                role = img.at("role").get<std::string>();
+            }
+        }
+        if (!ok) continue;
+        json when = json::object();
+        when["format"] = v.at("format");
+        when["arch"]   = v.at("arch");
+        WhenMatch const m = matchVariantWhen(when, WhenAxes::FullTarget, ectx, facts, reporter,
+                                             nullptr, &arms);
+        if (m == WhenMatch::Error) continue;
+        std::string const fmt = v.at("format").get<std::string>();
+        archFormats.push_back(fmt);
+        if (m == WhenMatch::Match) {
+            matched.push_back(fmt);
+            if (!role.empty()) images.emplace_back(fmt, role);
+        }
+    }
+    (void)decodeObjectFormatNameList(strings, ctx, reporter, out);
+    for (std::string const& f : archFormats) {
+        if (std::find(out.begin(), out.end(), f) != out.end()) {
+            emitMalformed(reporter, "shipped-lib descriptor " + ctx + " names the object format '" + f
+                                        + "' both as a string entry (every arch) and in an arch entry "
+                                          "-- one of the two is wrong");
+        }
+    }
+    if (auto const co = firstCoMatchingArms(arms, WhenAxes::FullTarget)) {
+        emitMalformed(reporter, "shipped-lib descriptor " + ctx + " has two arch entries that can both "
+                                    "match one pair -- '" + co->first + "' and '" + co->second
+                                    + "' -- so the row's image there is ambiguous");
+    }
+    out.insert(out.end(), matched.begin(), matched.end());
+    return !(anyArchEntry && out.empty());
+}
+
+// ★ P69 fold 3f (ledger 549 (b)): THE ONE DECODER of a stated route map -- a row's
+// `writtenNameRoute` and a `writtenNames` entry's `route` alike (`StatedWrittenNameRoute`): an
+// object, object-format name -> `"linkerAlias"` or `{"refused": <a non-empty reason>}`. Walked in
+// ascending key (the parsed object is ordered), so its refusals come in the document's order on every
+// host. A `$` key is prose. Returns false when anything was refused.
+[[nodiscard]] bool decodeWrittenNameRoutes(json const& node, std::string const& ctx,
+                                           DiagnosticReporter& reporter,
+                                           std::unordered_map<std::string, StatedWrittenNameRoute>& out) {
+    if (!node.is_object() || node.empty()) {
+        emitMalformed(reporter, "shipped-lib descriptor " + ctx
+                                    + " must be a non-empty object: object-format name -> route "
+                                      "(\"linkerAlias\", or {\"refused\": <reason>})");
+        return false;
+    }
+    bool ok = true;
+    for (auto const& item : node.items()) {
+        std::string const& fmt = item.key();
+        if (detail::isDocumentationKey(fmt)) continue;
+        auto const kind = objectFormatKindFromName(fmt);
+        if (!kind.has_value() || !isSelectableObjectFormatKind(*kind)) {
+            emitMalformed(reporter, "shipped-lib descriptor " + ctx + " names the unknown object format '"
+                                        + fmt + "' (expected "
+                                        + allowedList(kSelectableObjectFormatKindNames) + ")");
+            ok = false;
+            continue;
+        }
+        json const& v = item.value();
+        if (v.is_string() && v.get<std::string>() == "linkerAlias") {
+            out.emplace(fmt, StatedWrittenNameRoute{WrittenNameRoute::LinkerAlias, {}});
+            continue;
+        }
+        if (v.is_object() && v.size() == 1 && v.contains("refused") && v.at("refused").is_string()
+            && !v.at("refused").get<std::string>().empty()) {
+            out.emplace(fmt, StatedWrittenNameRoute{WrittenNameRoute::Refused,
+                                                    v.at("refused").get<std::string>()});
+            continue;
+        }
+        emitMalformed(reporter, "shipped-lib descriptor " + ctx + " states an unknown route on '" + fmt
+                                    + "': " + v.dump()
+                                    + " (the routes: \"linkerAlias\", or {\"refused\": <a non-empty "
+                                      "reason>}; `direct` and `body` are derived from the rows, never "
+                                      "stated)");
+        ok = false;
+    }
+    return ok;
+}
+
+// ★ P69 fold 3f: a descriptor's `writtenNames` -- the WRITTEN names it states a route for and no row
+// declares (`ShippedWrittenName`). Refused by name: an entry that is not `{"name", "route"}`; a name
+// this descriptor's rows declare (its route is that row's `writtenNameRoute` -- one written name, one
+// place); a name listed twice; a `linkerAlias` (it falls back to a row's export, and no row declares
+// the name). The corpus-wide half -- no name stated here is a row's C name or link name in ANY
+// descriptor -- is a test-time sweep over the shipped corpus.
+void decodeWrittenNames(json const& node, std::string const& pathStr, json const& symbols,
+                        DiagnosticReporter& reporter, std::vector<ShippedWrittenName>& out) {
+    std::string const ctx = "'" + pathStr + "': 'writtenNames'";
+    if (!node.is_array()) {
+        emitMalformed(reporter, "shipped-lib descriptor " + ctx + " must be an array");
+        return;
+    }
+    std::vector<std::string> rowNames;
+    for (auto const& s : symbols)
+        if (s.is_object() && s.contains("name") && s.at("name").is_string())
+            rowNames.push_back(s.at("name").get<std::string>());
+    std::size_t i = 0;
+    for (auto const& e : node) {
+        std::string const ectx = ctx + "[" + std::to_string(i++) + "]";
+        if (!e.is_object() || !e.contains("name") || !e.at("name").is_string()
+            || e.at("name").get<std::string>().empty() || !e.contains("route")) {
+            emitMalformed(reporter, "shipped-lib descriptor " + ectx
+                                        + " must be {\"name\": <a written name>, \"route\": {<object "
+                                          "format>: <route>}}");
+            continue;
+        }
+        if (!rejectUnknownKeys(reporter, e, "writtenNames[" + std::to_string(i - 1) + "]", {"name", "route"}))
+            continue;
+        std::string const name = e.at("name").get<std::string>();
+        if (std::find(rowNames.begin(), rowNames.end(), name) != rowNames.end()) {
+            emitMalformed(reporter, "shipped-lib descriptor " + ectx + ": '" + name
+                                        + "' is a row's C name in this descriptor -- its route is "
+                                          "that row's 'writtenNameRoute' (two places would state one "
+                                          "written name's route)");
+            continue;
+        }
+        if (std::any_of(out.begin(), out.end(),
+                        [&](ShippedWrittenName const& w) { return w.name == name; })) {
+            emitMalformed(reporter, "shipped-lib descriptor " + ectx + " names '" + name + "' twice");
+            continue;
+        }
+        ShippedWrittenName w;
+        w.name = name;
+        if (!decodeWrittenNameRoutes(e.at("route"), ectx + " 'route'", reporter, w.routes)) continue;
+        bool ok = true;
+        for (auto const* entry : substrate::entriesInKeyOrder(w.routes)) {
+            if (entry->second.route != WrittenNameRoute::LinkerAlias) continue;
+            emitMalformed(reporter, "shipped-lib descriptor " + ectx + ": a linker alias on '"
+                                        + entry->first + "' falls back to a ROW's export, and no row "
+                                        "declares '" + name + "' -- state it on that row's "
+                                        "'writtenNameRoute'");
+            ok = false;
+        }
+        if (ok) out.push_back(std::move(w));
+    }
+}
+
 // Decode a per-object-format `library` MAP node ({"pe":"msvcrt.dll",
 // "elf":"libc.so.6"}) into `out`. Each KEY must be a known object-format name
 // (the `objectFormatKindFromName` vocabulary — a typo like "pee" fails loud
@@ -1849,10 +2069,15 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
     }
     bool ok = true;
     for (auto const& kv : node.items()) {
-        auto const keyKind = objectFormatKindFromName(kv.key());
+        // The format's name and its entry, each read ONCE and named: a call's
+        // arguments and the operands of `+` are evaluated in an order C++ leaves
+        // unspecified, so no expression here reads them twice.
+        std::string const& formatName = kv.key();
+        json const& entry = kv.value();
+        auto const keyKind = objectFormatKindFromName(formatName);
         if (!keyKind.has_value()) {
             emitMalformed(reporter, "shipped-lib descriptor " + ctx
-                + ": 'aliases' has unknown object-format key '" + kv.key()
+                + ": 'aliases' has unknown object-format key '" + formatName
                 + "' (expected one of the object-format names: "
                 + allowedList(kSelectableObjectFormatKindNames) + ")");
             ok = false;
@@ -1870,8 +2095,8 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
         // the row itself.
         bool const documentHasIt = objectFormatInAvailabilitySet(documentFormats, *keyKind);
         if (!documentHasIt || !objectFormatInAvailabilitySet(rowFormats, *keyKind)) {
-            emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": 'aliases." + kv.key()
-                + "' lists other names of '" + rowName + "' on the object format '" + kv.key()
+            emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": 'aliases." + formatName
+                + "' lists other names of '" + rowName + "' on the object format '" + formatName
                 + "', where " + (documentHasIt ? "the row's" : "the document's")
                 + " own 'availableObjectFormats' says '" + rowName + "' does not exist — an "
                   "alias is the row under another name, so it is listed only for a format the "
@@ -1879,37 +2104,37 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
             ok = false;
             continue;
         }
-        if (!kv.value().is_array() || kv.value().empty()) {
-            emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": 'aliases." + kv.key()
+        if (!entry.is_array() || entry.empty()) {
+            emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": 'aliases." + formatName
                 + "' must be a NON-EMPTY array of names (omit the format to say it has none)");
             ok = false;
             continue;
         }
         std::vector<std::string> names;
-        for (auto const& e : kv.value()) {
+        for (auto const& e : entry) {
             if (!e.is_string() || !isCIdentifier(e.get<std::string>())) {
-                emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": 'aliases." + kv.key()
+                emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": 'aliases." + formatName
                     + "' holds an entry that is not a C identifier string");
                 ok = false;
                 continue;
             }
             std::string alias = e.get<std::string>();
             if (alias == rowName) {
-                emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": 'aliases." + kv.key()
+                emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": 'aliases." + formatName
                     + "' lists the row's own name '" + rowName + "' — an alias is ANOTHER name "
                       "of the object");
                 ok = false;
                 continue;
             }
             if (std::find(names.begin(), names.end(), alias) != names.end()) {
-                emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": 'aliases." + kv.key()
+                emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": 'aliases." + formatName
                     + "' lists '" + alias + "' twice");
                 ok = false;
                 continue;
             }
             names.push_back(std::move(alias));
         }
-        out.insert_or_assign(kv.key(), std::move(names));
+        out.insert_or_assign(formatName, std::move(names));
     }
     return ok;
 }
@@ -1979,10 +2204,15 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
         return false;
     }
     for (auto const& kv : node.items()) {
-        auto const keyKind = objectFormatKindFromName(kv.key());
+        // The format's name and its entry, each read ONCE and named: a call's
+        // arguments and the operands of `+` are evaluated in an order C++ leaves
+        // unspecified, so no expression here reads them twice.
+        std::string const& formatName = kv.key();
+        json const& entry = kv.value();
+        auto const keyKind = objectFormatKindFromName(formatName);
         if (!keyKind.has_value()) {
             emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": '" + field
-                + "' has unknown object-format key '" + kv.key()
+                + "' has unknown object-format key '" + formatName
                 + "' (expected one of the object-format names: "
                 + allowedList(kSelectableObjectFormatKindNames) + ")");
             continue;
@@ -1996,21 +2226,21 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
                 + std::string{kObjectFormatKindSentinelRejection});
             continue;
         }
-        if (!kv.value().is_object()) {
+        if (!entry.is_object()) {
             emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": '" + field
-                + "." + kv.key() + "' must be an object, e.g. "
+                + "." + formatName + "' must be an object, e.g. "
                   "{\"source\":\"runtime/platform/pe/dirent.c\"}");
             continue;
         }
-        (void)rejectUnknownKeys(reporter, kv.value(),
-                                ctx + " " + field + "." + kv.key(), {"source"});
-        if (!kv.value().contains("source") || !kv.value().at("source").is_string()) {
+        (void)rejectUnknownKeys(reporter, entry,
+                                ctx + " " + field + "." + formatName, {"source"});
+        if (!entry.contains("source") || !entry.at("source").is_string()) {
             emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": '" + field
-                + "." + kv.key() + "' must declare a string 'source' naming a "
+                + "." + formatName + "' must declare a string 'source' naming a "
                   "shipped source FILE, relative to src/dss-config/");
             continue;
         }
-        std::string src = kv.value().at("source").get<std::string>();
+        std::string src = entry.at("source").get<std::string>();
         // The path is RELATIVE to the shipped-config root and must stay inside
         // it. This is the same containment posture `findShippedConfig` takes on a
         // logical name, applied to a path: a `..` component or an absolute/rooted
@@ -2044,12 +2274,12 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
             // ONE predicate the rest of the compiler already asks.
         if (escapes) {
             emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": '" + field
-                + "." + kv.key() + ".source' must be a non-empty path RELATIVE to "
+                + "." + formatName + ".source' must be a non-empty path RELATIVE to "
                   "src/dss-config/, with forward slashes and no '.'/'..' "
                   "components, got '" + src + "'");
             continue;
         }
-        out.emplace(kv.key(), std::move(src));
+        out.emplace(formatName, std::move(src));
     }
     return true;
 }
@@ -4235,7 +4465,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                             {"header", "standard", "library", "realization",
                              "availableObjectFormats",
                              "includes", "symbols", "constants", "floatConstants",
-                             "typedefs", "structs", "unions", "macros"});
+                             "typedefs", "structs", "unions", "macros", "writtenNames"});
 
     // (3.pre) TYPEDEFS resolved FIRST — Option C (D-FFI-DESCRIPTOR-TYPEDEF-NAME-RESOLUTION).
     // A descriptor's own typedefs are decoded BEFORE its symbols /
@@ -5047,7 +5277,9 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         // is never declared, so it is never imported (DSS imports every DECLARED
         // shipped extern). (D-SHIPPED-SYMBOL-PER-TARGET-AVAILABILITY)
         std::vector<std::string> symAvail;
-        decodeShippedAvailability(sym, at, reporter, symAvail);
+        std::vector<std::pair<std::string, std::string>> symArchImages;
+        if (!decodeSymbolAvailability(sym, at, symFacts, reporter, symAvail, symArchImages))
+            continue;   // ABSENT on this pair: every entry is an arch entry the pair does not match
 
         // Optional per-SYMBOL `library` OVERRIDE — the per-object-format runtime
         // image for THIS symbol alone, SAME shape as the descriptor-level `library`
@@ -5066,6 +5298,27 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
             && !decodeLibraryMap(sym.at("library"), at, "library", reporter,
                                  roleResolver, symLibrary, symLibraryRoles))
             continue;
+        // ★ P69 fold 3f: a MATCHED arch entry's `image` is the row's import on that format,
+        // named by its ROLE -- decoded through the SAME chokepoint as a `library` role entry
+        // (resolved by the read's resolver, recorded in `libraryRoles`), so no consumer of
+        // the map changes. A format whose image the row names twice is refused.
+        bool archImagesOk = true;
+        for (auto const& [fmt, role] : symArchImages) {
+            if (sym.contains("library") && sym.at("library").is_object()
+                && sym.at("library").contains(fmt)) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at + ": the object format '"
+                                            + fmt + "' names its image twice -- in 'library' and "
+                                              "in an arch entry's 'image'");
+                archImagesOk = false;
+                continue;
+            }
+            json one = json::object();
+            one[fmt] = json::object({{"role", role}});
+            if (!decodeLibraryMap(one, at, "availableObjectFormats image", reporter, roleResolver,
+                                  symLibrary, symLibraryRoles))
+                archImagesOk = false;
+        }
+        if (!archImagesOk) continue;
 
         // D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: the per-SYMBOL `realization`
         // override, the exact sibling of the `library` override just above and
@@ -5079,6 +5332,68 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
             && !decodeRealizationMap(sym.at("realization"), at, "realization",
                                      reporter, symRealization))
             continue;
+
+        // ★ P69 fold 3f (ledger 549 (b)): the row's stated routes as a WRITTEN name
+        // (`StatedWrittenNameRoute`), through the ONE decoder `writtenNames` uses. A route is
+        // stated only where the rows cannot derive one. Refused by name: a route on a format the
+        // row exists on on NO pair (the document's gate, or the row's own list -- its string
+        // entries and its arch entries' formats: pair-independent, so no pair's read decides
+        // it); and, on the format this read is for, a route where the row's link name is its C
+        // name (the written name is then the row's own export, and the rows derive its route),
+        // and a `linkerAlias` where the row names no image or DSS owns the body (the alias falls
+        // back to the row's EXPORT). The corpus-wide decode reads every pair, so each format's
+        // half is decided on that format's reads.
+        std::unordered_map<std::string, StatedWrittenNameRoute> symRoutes;
+        if (sym.contains("writtenNameRoute")) {
+            if (!decodeWrittenNameRoutes(sym.at("writtenNameRoute"), at + " 'writtenNameRoute'", reporter,
+                                         symRoutes))
+                continue;
+            std::vector<std::string> rowFormats;   // EMPTY: the row names no list (every format)
+            if (auto const av = sym.find("availableObjectFormats"); av != sym.end() && av->is_array()) {
+                for (auto const& e : *av) {
+                    if (e.is_string()) rowFormats.push_back(e.get<std::string>());
+                    else if (e.is_object() && e.contains("format") && e.at("format").is_string())
+                        rowFormats.push_back(e.at("format").get<std::string>());
+                }
+            }
+            bool routesOk = true;
+            for (auto const* entry : substrate::entriesInKeyOrder(symRoutes)) {
+                std::string const& fmt = entry->first;
+                ObjectFormatKind const kind = *objectFormatKindFromName(fmt);   // decoded: a known format
+                if (!objectFormatInAvailabilitySet(out.availableObjectFormats, kind)
+                    || !objectFormatInAvailabilitySet(rowFormats, kind)) {
+                    emitMalformed(reporter, "shipped-lib descriptor " + at + ": '" + name
+                                                + "' states a written-name route on '" + fmt
+                                                + "', where the row does not exist");
+                    routesOk = false;
+                    continue;
+                }
+                if (!activeFormat.has_value() || *activeFormat != kind) continue;
+                if (linkName.empty() || linkName == name) {
+                    emitMalformed(reporter, "shipped-lib descriptor " + at + ": '" + name
+                                                + "' states a written-name route on '" + fmt
+                                                + "', where its link name is its C name -- the written "
+                                                  "name is the row's own export there, and the rows "
+                                                  "derive its route");
+                    routesOk = false;
+                    continue;
+                }
+                if (entry->second.route != WrittenNameRoute::LinkerAlias) continue;
+                bool const imported = symLibrary.contains(fmt) || symLibraryRoles.contains(fmt)
+                                   || out.library.contains(fmt) || out.libraryRoles.contains(fmt);
+                bool const body = symRealization.contains(fmt) || out.realization.contains(fmt)
+                               || !synthesize.empty();
+                if (!imported || body) {
+                    emitMalformed(reporter, "shipped-lib descriptor " + at + ": '" + name
+                                                + "' states a linker alias on '" + fmt
+                                                + "', which falls back to the row's EXPORT there -- the "
+                                                  "row must name an image on '" + fmt
+                                                  + "' and no body of DSS's");
+                    routesOk = false;
+                }
+            }
+            if (!routesOk) continue;
+        }
 
         // ★ P69 (lane lm): the per-symbol `aliases` map — the other names each
         // format's C library exports this object under (`ShippedSymbol::aliases`).
@@ -5157,7 +5472,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                                 {"name", "signature",
                                  "kind", "linkage", "availableObjectFormats",
                                  "noreturn", "returnsTwice", "synthesize", "version",
-                                 "linkName", "library", "realization", "aliases"});
+                                 "linkName", "library", "realization", "aliases",
+                                 "writtenNameRoute"});
 
         // Decode the pair's signature via the ONE type-text decoder. A decode
         // failure is the CRITICAL fail-loud: F_ShippedLibUnsupportedType, and the
@@ -5197,6 +5513,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                           std::move(version), std::move(linkName),
                           std::move(symLibrary), std::move(symRealization),
                           std::move(symLibraryRoles)});
+        out.symbols.back().writtenNameRoutes = std::move(symRoutes);
 
         // ★ P69 (lane lm): the active format's aliases, each ALSO a declared row
         // of its own name (`ShippedSymbol::aliases` says why). An alias row is the
@@ -5216,12 +5533,21 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                     row.aliases.clear();
                     row.aliasOf                = canonical.name;
                     row.linkName.clear();
+                    // P69 fold 3f: the alias is its own export, so the rows derive its
+                    // route; the canonical row's stated one is not the alias's.
+                    row.writtenNameRoutes.clear();
                     row.availableObjectFormats = {fmtName};
                     out.symbols.push_back(std::move(row));
                 }
             }
         }
     }
+    // ★ P69 fold 3f (ledger 549 (b)): the descriptor's WRITTEN names -- read, never declared:
+    // carried on `out.writtenNames` for the written-name binders, never appended to `symbols`.
+    if (doc.contains("writtenNames"))
+        decodeWrittenNames(doc.at("writtenNames"), core::genericSpelling(path), symbols, reporter,
+                           out.writtenNames);
+
     // The cross-row half of the alias rule — format-independent, over the raw rows.
     (void)refuseAliasesThatAreTheirOwnRow(symbols, out.availableObjectFormats,
                                           core::genericSpelling(path), reporter);
@@ -5272,7 +5598,12 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                 std::unordered_map<std::string, RuntimeLibraryRole> const& roles,
                 std::unordered_map<std::string, std::string> const& real,
                 std::string const& ctx) {
-                for (auto const& [fmt, src] : real) {
+                // ASCENDING format name, never the hash table's order (P69 fold 3f):
+                // each format's refusals are reported as the walk meets it, so their
+                // order is the descriptor's, the same on every host that built DSS.
+                for (auto const* entry : substrate::entriesInKeyOrder(real)) {
+                    std::string const& fmt = entry->first;
+                    std::string const& src = entry->second;
                     // R3 — an IMPORT and a SOURCE for one format. Two owners for one
                     // body is the defect, not a fallback: silently preferring
                     // either is how a program links against an image that does not
@@ -5323,7 +5654,9 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
             if (sym.realization.empty() && out.realization.empty()) continue;
             std::string const ctx = "symbols[" + std::to_string(i) + "] ('" + sym.name + "')";
             checkOwner(sym.library, sym.libraryRoles, sym.realization, ctx);   // (2), and R1
-            for (auto const& [fmt, src] : out.realization) {                    // (3)
+            for (auto const* entry : substrate::entriesInKeyOrder(out.realization)) {   // (3), ascending
+                std::string const& fmt = entry->first;
+                std::string const& src = entry->second;
                 if (sym.realization.contains(fmt)) continue;
                 if (std::string const declared =
                         declaredImport(sym.library, sym.libraryRoles, fmt);
@@ -5647,6 +5980,36 @@ readShippedLibFloatConstants(std::filesystem::path const& path,
         out.push_back(ShippedPpFloatConstant{c.name, c.value, lattice.interner().kind(c.type)});
     }
     return out;   // empty ⇒ the descriptor declares no `floatConstants`
+}
+
+std::optional<std::vector<std::string>>
+shippedMacrosRedefiningPredefinedMacros(std::filesystem::path const&        descriptor,
+                                        std::span<PredefinedMacroDef const> predefined,
+                                        std::optional<std::string_view>     activeTarget,
+                                        ObjectFormatKind                    activeFormat,
+                                        ShippedPairFacts const*             pairFacts,
+                                        DiagnosticReporter&                 reporter) {
+    // What the splice defines on the pair, through the splice's own three readers.
+    auto const macros = readShippedLibMacros(descriptor, reporter, activeFormat);
+    if (!macros.has_value()) return std::nullopt;
+    auto const constants = readShippedLibConstants(descriptor, reporter, activeTarget, activeFormat, pairFacts);
+    if (!constants.has_value()) return std::nullopt;
+    auto const floats = readShippedLibFloatConstants(descriptor, reporter);
+    if (!floats.has_value()) return std::nullopt;
+    std::vector<std::string> spliced;
+    spliced.reserve(macros->size() + constants->size() + floats->size());
+    for (ShippedMacro const& m : *macros) spliced.push_back(m.name);
+    for (ShippedPpConstant const& k : *constants) spliced.push_back(k.name);
+    for (ShippedPpFloatConstant const& f : *floats) spliced.push_back(f.name);
+    std::unordered_set<std::string> predefinedNames;
+    for (PredefinedMacroDef const& p : predefined) predefinedNames.insert(p.name);
+    std::vector<std::string> out;
+    for (std::string const& name : spliced) {
+        if (predefinedNames.contains(name)) out.push_back(name);
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
 }
 
 std::optional<FunctionTypeShape>
@@ -6124,8 +6487,14 @@ void harvestNamedSurface(json const& doc, std::string const& pathStr,
 // gated and every format's aliases are names (the analyzer, given no format, gates no symbol).
 void harvestValueNames(json const& doc, std::string const& pathStr,
                        std::optional<ObjectFormatKind> fmt,
+                       std::optional<std::string_view> arch,
                        DiagnosticReporter& reporter,
                        std::vector<std::string>& out) {
+    // The pair the symbol rows' arch entries are decided on (P69 fold 3f): the format and,
+    // when the asker has one, the arch; with none, an arch entry is undecided and dropped.
+    WhenFacts facts;
+    facts.format = fmt;
+    facts.arch   = arch;
     std::vector<std::string> docAvail;
     decodeShippedAvailability(doc, pathStr, reporter, docAvail);
     if (auto const symsIt = doc.find("symbols");
@@ -6141,7 +6510,10 @@ void harvestValueNames(json const& doc, std::string const& pathStr,
             std::string name = sym.at("name").get<std::string>();
             if (name.empty()) continue;
             std::vector<std::string> symAvail;
-            decodeShippedAvailability(sym, at, reporter, symAvail);
+            std::vector<std::pair<std::string, std::string>> images;
+            bool const presentHere =
+                decodeSymbolAvailability(sym, at, facts, reporter, symAvail, images);
+            if (fmt.has_value() && !presentHere) continue;
             if (fmt.has_value()
                 && !objectFormatInAvailabilitySet(
                     symAvail.empty() ? docAvail : symAvail, *fmt)) {
@@ -6186,15 +6558,17 @@ void harvestValueNames(json const& doc, std::string const& pathStr,
 std::optional<std::vector<std::string>>
 shippedSurfaceNamesForFormat(std::filesystem::path const& path,
                              ObjectFormatKind             fmt,
-                             DiagnosticReporter&          reporter) {
+                             DiagnosticReporter&          reporter,
+                             std::optional<std::string_view> arch) {
     std::size_t const errBefore = reporter.errorCount();
     CachedDescriptor* const entry = cachedDescriptorEntry(path, reporter);
     if (!entry) return std::nullopt;
-    // (a) the format's surface, if these bytes were harvested on it before.
-    for (auto const& [onFormat, names] : entry->surfaceByFormat) {
-        if (onFormat == fmt) {
+    std::string const archKey{arch.value_or(std::string_view{})};
+    // (a) the pair's surface, if these bytes were harvested on it before.
+    for (auto const& onPair : entry->surfaceByFormat) {
+        if (onPair.format == fmt && onPair.arch == archKey) {
             ++cacheStats().surfaceMemoHits;
-            return names;
+            return onPair.names;
         }
     }
     ++cacheStats().surfaceHarvests;
@@ -6206,7 +6580,7 @@ shippedSurfaceNamesForFormat(std::filesystem::path const& path,
 
     // symbols (and their aliases), constants, floatConstants — the value surfaces,
     // read through the one helper the parse-time value seed reads them with.
-    harvestValueNames(doc, pathStr, fmt, reporter, out);
+    harvestValueNames(doc, pathStr, fmt, arch, reporter, out);
     harvestNamedSurface(doc, pathStr, "typedefs",       true,  fmt, reporter, out);
     harvestNamedSurface(doc, pathStr, "structs",        true,  fmt, reporter, out);
     harvestNamedSurface(doc, pathStr, "unions",         false, fmt, reporter, out);
@@ -6221,19 +6595,21 @@ shippedSurfaceNamesForFormat(std::filesystem::path const& path,
     }
 
     if (reporter.errorCount() != errBefore) return std::nullopt;
-    if (reporter.all().size() == saidBefore) entry->surfaceByFormat.emplace_back(fmt, out);
+    if (reporter.all().size() == saidBefore)
+        entry->surfaceByFormat.push_back({fmt, archKey, out});
     return out;
 }
 
 std::optional<std::vector<std::string>>
 readShippedLibValueNames(std::filesystem::path const&   path,
                          std::optional<ObjectFormatKind> fmt,
-                         DiagnosticReporter&            reporter) {
+                         DiagnosticReporter&            reporter,
+                         std::optional<std::string_view> arch) {
     std::size_t const errBefore = reporter.errorCount();
     json const* const docPtr = cachedDescriptorJson(path, reporter);
     if (!docPtr) return std::nullopt;
     std::vector<std::string> out;
-    harvestValueNames(*docPtr, core::genericSpelling(path), fmt, reporter, out);
+    harvestValueNames(*docPtr, core::genericSpelling(path), fmt, arch, reporter, out);
     if (reporter.errorCount() != errBefore) return std::nullopt;
     return out;
 }
@@ -6265,11 +6641,37 @@ struct CorpusSymbolRow {
     // decoding a signature.
     std::vector<std::string> documentGate;
     std::vector<std::string> symbolGate;
+    // P69 fold 3f: the symbol gate's ARCH entries, each the `when` it is -- a row available
+    // on a format on one arch. A gate with any of them is never "every format", even when it
+    // holds no string entry; `symbolGateAdmits` reads the two halves together.
+    std::vector<WhenSpec> symbolArchEntries;
 };
+
+// The symbol gate on a pair: a string entry admits its format on every arch; an arch entry
+// admits its format on the pairs the ONE `when` selector matches it to
+// (core/types/variant_when.hpp) -- the rule the full read decides it by
+// (`decodeSymbolAvailability`), so an asker that carries no arch leaves it undecided, and not
+// admitted. No second reading of the selector here.
+[[nodiscard]] bool symbolGateAdmits(CorpusSymbolRow const& row, ObjectFormatKind fmt,
+                                    std::optional<std::string_view> arch) {
+    if (row.symbolArchEntries.empty()) return objectFormatInAvailabilitySet(row.symbolGate, fmt);
+    std::string_view const name = objectFormatKindName(fmt);
+    for (std::string const& f : row.symbolGate)
+        if (f == name) return true;
+    WhenFacts facts;
+    facts.format = fmt;
+    facts.arch   = arch;
+    for (WhenSpec const& entry : row.symbolArchEntries)
+        if (whenVerdict(entry, WhenAxes::FullTarget, facts) == WhenVerdict::Match) return true;
+    return false;
+}
 
 struct CorpusIndex {
     std::filesystem::path                                          root;
     std::unordered_map<std::string, std::vector<CorpusSymbolRow>>  byName;
+    // P69 fold 3f: each WRITTEN name a descriptor's `writtenNames` states, with its stated routes
+    // per format -- never a row of `byName`: a written name is read, never declared.
+    std::unordered_map<std::string, std::unordered_map<std::string, StatedWrittenNameRoute>> writtenNames;
 };
 
 // Decode ONE `availableObjectFormats` array into `out`, generically: every entry
@@ -6281,10 +6683,27 @@ struct CorpusIndex {
 // Returns false iff the key is absent / not an array, so the caller can apply the
 // next fallback tier.
 [[nodiscard]] bool scanAvailability(json const& obj,
-                                    std::vector<std::string>& out) {
+                                    std::vector<std::string>& out,
+                                    std::vector<WhenSpec>* archEntries = nullptr) {
     auto const it = obj.find("availableObjectFormats");
     if (it == obj.end() || !it->is_array()) return false;
     for (auto const& v : *it) {
+        // P69 fold 3f: a symbol row's arch entry, kept as the `when` it is for the gate; the
+        // strict read refuses a malformed one, and a document's (`archEntries` null) is skipped.
+        if (v.is_object() && archEntries != nullptr) {
+            auto const f = v.find("format");
+            auto const a = v.find("arch");
+            if (f != v.end() && f->is_string() && a != v.end() && a->is_string()) {
+                auto const kind = objectFormatKindFromName(f->get<std::string>());
+                if (kind && isSelectableObjectFormatKind(*kind)) {
+                    WhenSpec entry;
+                    entry.format = *kind;
+                    entry.arch   = a->get<std::string>();
+                    archEntries->push_back(std::move(entry));
+                }
+            }
+            continue;
+        }
         if (!v.is_string()) continue;
         auto const name = v.get<std::string>();
         auto const kind = objectFormatKindFromName(name);
@@ -6359,6 +6778,15 @@ struct CorpusIndex {
         // unrestricted, so such a row is available on every format.
         std::vector<std::string> docFormats;
         bool const hasDoc = scanAvailability(j, docFormats);
+        // ★ P69 fold 3f: the document's WRITTEN names, decoded by the ONE decoder the full read
+        // uses, leniently (a scratch reporter: the full read refuses a malformed list by name, and
+        // the corpus sweep a name two descriptors state). Never a row.
+        if (auto const wn = j.find("writtenNames"); wn != j.end()) {
+            DiagnosticReporter              scratch;
+            std::vector<ShippedWrittenName> written;
+            decodeWrittenNames(*wn, relPath, j.at("symbols"), scratch, written);
+            for (ShippedWrittenName& w : written) idx.writtenNames.try_emplace(w.name, std::move(w.routes));
+        }
         for (auto const& sym : j.at("symbols")) {
             if (!sym.is_object() || !sym.contains("name")
                 || !sym.at("name").is_string()) {
@@ -6369,8 +6797,18 @@ struct CorpusIndex {
             // TIER 1 per-symbol gate, TIER 2 the document gate, else everywhere
             // (an unrestricted row leaves `formats` EMPTY, which every consumer
             // reads through `objectFormatInAvailabilitySet` as "every format").
-            bool const hasOwn = scanAvailability(sym, row.symbolGate);
-            if (hasOwn) row.formats = row.symbolGate;
+            bool const hasOwn = scanAvailability(sym, row.symbolGate, &row.symbolArchEntries);
+            if (hasOwn) {
+                // An arch entry's format is a format the name exists on (on some arch): the
+                // availability view is pair-less over arch, and a row of arch entries alone is
+                // never "every format".
+                row.formats = row.symbolGate;
+                for (WhenSpec const& entry : row.symbolArchEntries) {
+                    std::string const f{objectFormatKindName(*entry.format)};
+                    if (std::find(row.formats.begin(), row.formats.end(), f) == row.formats.end())
+                        row.formats.push_back(f);
+                }
+            }
             else if (hasDoc) row.formats = docFormats;
             row.documentGate = docFormats;
             auto const kindIt = sym.find("kind");
@@ -6462,6 +6900,9 @@ realizeRow(ShippedLibDescriptor const& desc, ShippedSymbol const& sym,
     real.isFunction = sym.kind == ShippedSymbolKind::Function;
     real.noreturn     = sym.noreturn;       // P69 (lane `cs`)
     real.returnsTwice = sym.returnsTwice;
+    // ★ P69 fold 3f (ledger 549 (b)): the row's stated route as a WRITTEN name on this format.
+    if (auto const it = sym.writtenNameRoutes.find(formatKey); it != sym.writtenNameRoutes.end())
+        real.statedRoute = it->second;
     // D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: the per-SYMBOL `realization` override
     // MERGED OVER the descriptor's map by the SAME rule as `library` directly
     // above — one merge shape for one axis pair, so the two cannot answer
@@ -6596,7 +7037,8 @@ collectShippedExternSymbolFormats() {
 }
 
 std::optional<bool> shippedLibraryFunctionProvidedOnFormat(std::string_view name,
-                                                           ObjectFormatKind fmt) {
+                                                           ObjectFormatKind fmt,
+                                                           std::optional<std::string_view> arch) {
     CorpusIndex const* const idx = corpusIndex();
     if (idx == nullptr) return std::nullopt;   // discovery failed
     auto const it = idx->byName.find(std::string{name});
@@ -6610,10 +7052,51 @@ std::optional<bool> shippedLibraryFunctionProvidedOnFormat(std::string_view name
     // with it (the binder refuses an object).
     for (CorpusSymbolRow const& row : it->second) {
         if (objectFormatInAvailabilitySet(row.documentGate, fmt)
-            && objectFormatInAvailabilitySet(row.symbolGate, fmt))
+            && symbolGateAdmits(row, fmt, arch))
             return !row.isObject;
     }
     return false;
+}
+
+
+std::optional<ShippedSymbolAvailability> shippedExternSymbolAvailabilityOn(std::string_view name, ObjectFormatKind fmt,
+                                                                            std::optional<std::string_view> arch) {
+    CorpusIndex const* const idx = corpusIndex();
+    if (idx == nullptr) return std::nullopt;   // discovery failed
+    ShippedSymbolAvailability out;
+    auto const it = idx->byName.find(std::string{name});
+    if (it == idx->byName.end()) return out;   // no row declares it
+    out.declared = true;
+    bool unrestricted = false;
+    for (CorpusSymbolRow const& row : it->second) {
+        // The realization's two gates, in its conjunction (`shippedLibraryFunctionProvidedOnFormat`'s walk).
+        if (objectFormatInAvailabilitySet(row.documentGate, fmt) && symbolGateAdmits(row, fmt, arch))
+            out.availableHere = true;
+        if (row.formats.empty()) unrestricted = true;
+        for (std::string const& f : row.formats)
+            if (std::find(out.formats.begin(), out.formats.end(), f) == out.formats.end()) out.formats.push_back(f);
+    }
+    if (unrestricted) out.formats.clear();   // SATURATE, as the availability view does
+    return out;
+}
+
+std::optional<StatedWrittenNameRoute> shippedWrittenNameRouteOn(std::string_view name, ObjectFormatKind fmt) {
+    CorpusIndex const* const idx = corpusIndex();
+    if (idx == nullptr) return std::nullopt;   // discovery failed
+    auto const it = idx->writtenNames.find(std::string{name});
+    if (it == idx->writtenNames.end()) return std::nullopt;
+    auto const route = it->second.find(std::string{objectFormatKindName(fmt)});
+    if (route == it->second.end()) return std::nullopt;
+    return route->second;
+}
+
+bool frontEndKeepsTheWrittenName(std::optional<StatedWrittenNameRoute> const& stated) noexcept {
+    return stated.has_value() && stated->route == WrittenNameRoute::LinkerAlias;
+}
+
+bool frontEndKeepsTheWrittenName(ShippedSymbol const& sym, ObjectFormatKind fmt) {
+    auto const it = sym.writtenNameRoutes.find(std::string{objectFormatKindName(fmt)});
+    return it != sym.writtenNameRoutes.end() && frontEndKeepsTheWrittenName(it->second);
 }
 
 namespace {
@@ -6926,7 +7409,11 @@ realizeShippedExternSymbols(std::span<std::string const>      names,
     // it is exactly the state (2b)'s own defect was in until a corpus mutant made
     // it visible; the pin therefore BUILDS the second declaring descriptor rather
     // than waiting for the corpus to grow one.
-    for (auto const& [shimName, shimReal] : out) {
+    // ASCENDING recipe name, never the hash table's order (P69 fold 3f): each
+    // recipe's companion refusals are reported as the walk meets it.
+    for (auto const* entry : substrate::entriesInKeyOrder(out)) {
+        std::string const& shimName = entry->first;
+        ShippedSymbolRealization const& shimReal = entry->second;
         if (shimReal.status != ShippedRealizationStatus::Realized) continue;
         if (shimReal.recipeId.empty()) continue;      // no shim ⇒ no companions
         auto const rowsIt = wantedRows.find(shimName);
@@ -6972,6 +7459,136 @@ realizeShippedExternSymbols(std::span<std::string const>      names,
             (void)companions.addRealizationsOf(row.relPath, desc, surfaceNames,
                                                reporter);
         }
+    }
+    return out;
+}
+
+// ★ P69 fold 3f (ledger 549 (b)): THE ROUTE OF A WRITTEN NAME (the header states the order).
+// Built on the oracle above, twice at most: the C names asked (step 1, and the C-name row
+// steps 3 and 4 read), and — only for a name step 1 left unanswered — the whole corpus, whose
+// realized link names step 2 indexes. The index keeps EVERY row per link name, so two rows
+// naming one link name are seen as two whatever order the map is walked in, and refused by
+// name in sorted order.
+std::optional<std::unordered_map<std::string, WrittenNameRouteAnswer>>
+writtenNameRoutesOn(std::span<std::string const>      writtenNames,
+                    TypeInterner&                     interner,
+                    TypeRegistry&                     typeReg,
+                    DiagnosticReporter&               reporter,
+                    DataModel                         dataModel,
+                    std::optional<std::string_view>   activeTarget,
+                    ObjectFormatKind                  activeFormat,
+                    std::span<NamedTypeBinding const> namedTypes,
+                    RuntimeLibraryRoleResolver const* roleResolver,
+                    ShippedPairFacts const*           pairFacts) {
+    std::unordered_map<std::string, WrittenNameRouteAnswer> out;
+    std::vector<std::string> asked;
+    for (std::string const& w : writtenNames)
+        if (!w.empty() && std::find(asked.begin(), asked.end(), w) == asked.end()) asked.push_back(w);
+    if (asked.empty()) return out;
+    // A row answers a written name only where something provides its body here: an image, or
+    // DSS's shipped source. `Unknown`, `UnavailableForFormat` and `NoLibraryForFormat` do not.
+    auto const provides = [](ShippedSymbolRealization const& r) {
+        return r.status == ShippedRealizationStatus::Realized
+            || r.status == ShippedRealizationStatus::ProvidedByShippedSource;
+    };
+    auto const providedAs = [](ShippedSymbolRealization const& r) {
+        return r.status == ShippedRealizationStatus::Realized ? WrittenNameRouteKind::Direct
+                                                              : WrittenNameRouteKind::Body;
+    };
+    std::string const formatKey{objectFormatKindName(activeFormat)};
+
+    // (1) the row whose C name is W, when its link name here is W.
+    auto const byCName = realizeShippedExternSymbols(asked, interner, typeReg, reporter, dataModel,
+                                                     activeTarget, activeFormat, namedTypes,
+                                                     roleResolver, pairFacts);
+    if (!byCName.has_value()) return std::nullopt;   // the corpus was not located
+    std::vector<std::string> pending;
+    for (std::string const& w : asked) {
+        auto const it = byCName->find(w);
+        if (it != byCName->end() && provides(it->second)
+            && (it->second.linkName.empty() || it->second.linkName == w)) {
+            out.emplace(w, WrittenNameRouteAnswer{providedAs(it->second), w, it->second, {}});
+            continue;
+        }
+        pending.push_back(w);
+    }
+    if (pending.empty()) return out;
+
+    // (2) the ONE row whose link name here is W.
+    auto const everyName = collectShippedExternSymbolFormats();
+    if (!everyName.has_value()) return std::nullopt;
+    std::vector<std::string> names;
+    names.reserve(everyName->size());
+    for (auto const& entry : *everyName) names.push_back(entry.first);
+    auto const corpus = realizeShippedExternSymbols(names, interner, typeReg, reporter, dataModel,
+                                                    activeTarget, activeFormat, namedTypes,
+                                                    roleResolver, pairFacts);
+    if (!corpus.has_value()) return std::nullopt;
+    std::unordered_map<std::string, std::vector<std::string>> byLinkName;   // link name -> C names
+    for (auto const& [cName, r] : *corpus) {
+        if (!provides(r) || r.linkName.empty() || r.linkName == cName) continue;
+        byLinkName[r.linkName].push_back(cName);
+    }
+    std::vector<std::string> unanswered;
+    for (std::string const& w : pending) {
+        auto const it = byLinkName.find(w);
+        if (it == byLinkName.end()) {
+            unanswered.push_back(w);
+            continue;
+        }
+        std::vector<std::string> rows = it->second;
+        std::sort(rows.begin(), rows.end());
+        auto const own = byCName->find(w);
+        bool const stated = own != byCName->end() && own->second.statedRoute.has_value();
+        if (rows.size() > 1 || stated) {
+            std::string named;
+            for (std::string const& r : rows) named += (named.empty() ? "'" : ", '") + r + "'";
+            dss::report(reporter, DiagnosticCode::F_ShippedCorpusInvariantBroken, DiagnosticSeverity::Error,
+                        "the shipped corpus gives the written name '" + w + "' two routes on '" + formatKey
+                            + "': it is the link name of " + named
+                            + (stated ? std::string{", and its own row states a route there"}
+                                      : std::string{})
+                            + " -- one written name binds one way, so the corpus must name one");
+            WrittenNameRouteAnswer header;
+            if (own != byCName->end() && provides(own->second)) {
+                header.canonicalName = w;
+                header.row           = own->second;
+            }
+            out.emplace(w, std::move(header));
+            continue;
+        }
+        ShippedSymbolRealization const& r = corpus->at(rows.front());
+        out.emplace(w, WrittenNameRouteAnswer{providedAs(r), rows.front(), r, {}});
+    }
+
+    // (3) the stated route of W's C-name row, else a descriptor's written name; (4) the header.
+    for (std::string const& w : unanswered) {
+        auto const own = byCName->find(w);
+        bool const hasRow = own != byCName->end()
+                         && own->second.status != ShippedRealizationStatus::Unknown
+                         && own->second.status != ShippedRealizationStatus::UnavailableForFormat;
+        if (hasRow && own->second.statedRoute.has_value()) {
+            StatedWrittenNameRoute const& s = *own->second.statedRoute;
+            out.emplace(w, WrittenNameRouteAnswer{s.route == WrittenNameRoute::LinkerAlias
+                                                      ? WrittenNameRouteKind::LinkerAlias
+                                                      : WrittenNameRouteKind::Refused,
+                                                  w, own->second, s.reason});
+            continue;
+        }
+        if (auto const listed = shippedWrittenNameRouteOn(w, activeFormat); listed.has_value()) {
+            // A list's `linkerAlias` is refused at load (it would fall back to no row's export).
+            WrittenNameRouteAnswer refused;
+            refused.kind   = WrittenNameRouteKind::Refused;
+            refused.reason = listed->reason;
+            out.emplace(w, std::move(refused));
+            continue;
+        }
+        WrittenNameRouteAnswer header;
+        if (hasRow && provides(own->second)) {
+            header.canonicalName = w;
+            header.row           = own->second;
+        }
+        out.emplace(w, std::move(header));
     }
     return out;
 }

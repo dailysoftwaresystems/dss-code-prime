@@ -1,0 +1,2 @@
+        for (auto const* recipe : substrate::entriesInKeyOrder(*cus[ci].synthRecipes)) {
+            std::uint32_t const shimV = recipe->first;

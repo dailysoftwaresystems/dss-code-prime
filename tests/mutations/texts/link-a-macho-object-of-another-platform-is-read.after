@@ -1,0 +1,1 @@
+                stated.has_value() && platform != static_cast<std::uint32_t>(stated->platform) && false) {

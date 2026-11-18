@@ -1089,9 +1089,15 @@ TEST(RuntimeLibraryRoles, EveryRealizedRoleSourceMatchesTheRawKey) {
 // providers. That is why the rule quantifies over roles two documents BOTH
 // declare, not over the cross product.
 //
-// ⚠ AND THE GROUPING IS THE FORMAT'S OWN DECLARED KIND, read off the loaded
-// schema — never a hardcoded {pe, elf, macho} list, which would silently stop
-// covering the next kind the corpus grows.
+// ⚠ AND THE GROUPING IS THE FORMAT'S OWN FLAVOUR FAMILY, read off the loaded
+// schemas by `ObjectFormatSchema::inFlavourFamilyOf` — never a hardcoded {pe,
+// elf, macho} list, which would silently stop covering the next kind the corpus
+// grows. ★ P69 fold 3f: a family is ONE KIND ON ONE TARGET ARCH, the population
+// `assembleFlavourRuntimeLibraries` reads at build time. A role may be played by a
+// different image on each arch of a kind (the program interpreter is
+// ld-linux-x86-64.so.2 on x86_64 ELF and ld-linux-aarch64.so.1 on aarch64), and a
+// build reads its own arch's flavours; grouping by the kind alone, as this guard
+// did, refused that while no build could disagree with itself.
 TEST(RuntimeLibraryRoles, EveryFlavourOfAFormatKindNamesOneProviderPerRole) {
     auto const root = dss::test::findConfigRoot();
     ASSERT_TRUE(root.has_value()) << dss::test::configRootDiagnostic();
@@ -1099,8 +1105,14 @@ TEST(RuntimeLibraryRoles, EveryFlavourOfAFormatKindNamesOneProviderPerRole) {
     std::error_code ec;
     ASSERT_TRUE(std::filesystem::is_directory(dir, ec)) << dir.generic_string();
 
-    // (kind, role) -> provider spelling -> the documents naming it.
-    std::map<std::pair<std::string, std::string>,
+    // The families, each kept as its first document and the label it is reported
+    // by; (family, role) -> provider spelling -> the documents naming it.
+    struct Family {
+        std::shared_ptr<ObjectFormatSchema> first;
+        std::string                         label;
+    };
+    std::vector<Family> families;
+    std::map<std::pair<std::size_t, std::string>,
              std::map<std::string, std::vector<std::string>>> byFamily;
     std::size_t documents = 0;
 
@@ -1116,14 +1128,20 @@ TEST(RuntimeLibraryRoles, EveryFlavourOfAFormatKindNamesOneProviderPerRole) {
         auto loaded = ObjectFormatSchema::loadShipped(name);
         ASSERT_TRUE(loaded.has_value()) << name << " must load";
         ++documents;
-        std::string const kind{objectFormatKindName((*loaded)->kind())};
+        std::size_t family = 0;
+        while (family < families.size() && !(*loaded)->inFlavourFamilyOf(*families[family].first))
+            ++family;
+        if (family == families.size()) {
+            families.push_back({*loaded, "kind '" + std::string{objectFormatKindName((*loaded)->kind())}
+                                             + "' on arch '" + std::string{(*loaded)->targetArch()} + "'"});
+        }
         for (auto const& b : (*loaded)->runtimeLibraries().bindings) {
             // The provider spelling carries its KIND as well as its value, so a
             // format naming an IMAGE called exactly what a sibling names as a
             // SOURCE cannot collapse into agreement.
             std::string provider = b.sources.empty() ? ("image " + b.image) : "shipped sources";
             for (auto const& s : b.sources) provider += " " + s;
-            byFamily[{kind, std::string{runtimeLibraryRoleName(b.role)}}]
+            byFamily[{family, std::string{runtimeLibraryRoleName(b.role)}}]
                     [provider].push_back(name);
         }
     }
@@ -1131,7 +1149,8 @@ TEST(RuntimeLibraryRoles, EveryFlavourOfAFormatKindNamesOneProviderPerRole) {
     std::size_t multiDocumentGroups = 0;
     std::size_t peAtomicsDocuments  = 0;
     for (auto const& [key, providers] : byFamily) {
-        auto const& [kind, role] = key;
+        auto const& [family, role] = key;
+        std::string const kind{objectFormatKindName(families[family].first->kind())};
         std::size_t docs = 0;
         for (auto const& [provider, names] : providers) docs += names.size();
         if (docs >= 2) ++multiDocumentGroups;
@@ -1147,7 +1166,7 @@ TEST(RuntimeLibraryRoles, EveryFlavourOfAFormatKindNamesOneProviderPerRole) {
             }
         }
         ADD_FAILURE()
-            << "format kind '" << kind << "' declares role '" << role
+            << "the flavour family of " << families[family].label << " declares role '" << role
             << "' with " << providers.size()
             << " DIFFERENT providers across its flavour documents:" << detail
             << "\n  Who plays a runtime role is a property of the format FAMILY "
@@ -1169,7 +1188,7 @@ TEST(RuntimeLibraryRoles, EveryFlavourOfAFormatKindNamesOneProviderPerRole) {
         << documents << " document(s) loaded";
     EXPECT_GE(multiDocumentGroups, 4u)
         << "only " << multiDocumentGroups
-        << " (kind, role) group(s) had two or more documents, so this guard "
+        << " (family, role) group(s) had two or more documents, so this guard "
            "compared almost nothing — it passes vacuously on a corpus where "
            "every kind has a single flavour";
     EXPECT_GE(peAtomicsDocuments, 4u)
@@ -1241,13 +1260,15 @@ TEST(RuntimeLibraryRoles, ARuntimeLibraryRowDeclaringBothAProviderKindIsRefused)
 //
 // D-LK-PE-FOREIGN-OBJECT-STACK-PROBE-ROUTINE-UNDEFINED, D-LK-PE-FOREIGN-OBJECT-GS-COOKIE-ROUTINES-UNDEFINED,
 // D-LK-PE-FOREIGN-OBJECT-GCC-MAIN-HOOK-UNDEFINED: the routines a reference toolchain's own static runtime defines for
-// its objects are DSS's to define on pe, from three units. Every pe flavour declares the role (who plays a role is
-// the format FAMILY's fact), realized -- an empty library path -- from exactly the three units, and the block names
-// the cookie seeder DSS's PE startup calls.
-TEST(RuntimeLibraryRoles, EveryPeFlavourRealizesCompilerSupportFromItsThreeUnits) {
+// its objects are DSS's to define on pe, from three units -- and, since P69 fold 3f, the GUI startups' routines a
+// DSS image's startup calls (`winMainStartupRoutines`), from a fourth. Every pe flavour declares the role (who plays
+// a role is the format FAMILY's fact), realized -- an empty library path -- from exactly its units, and the block
+// names the cookie seeder DSS's PE startup calls.
+TEST(RuntimeLibraryRoles, EveryPeFlavourRealizesCompilerSupportFromItsUnits) {
     std::vector<std::string> const units{"runtime/platform/src/pe_compiler_support.c",
                                          "runtime/platform/src/pe_compiler_support_x86_64.s",
-                                         "runtime/platform/src/pe_gcc_unwind.c"};
+                                         "runtime/platform/src/pe_gcc_unwind.c",
+                                         "runtime/platform/src/pe_gui_startup.c"};
     std::size_t seen = 0;
     for (auto const& flavour : kPeFlavours) {
         SCOPED_TRACE(flavour.name);
@@ -1255,7 +1276,7 @@ TEST(RuntimeLibraryRoles, EveryPeFlavourRealizesCompilerSupportFromItsThreeUnits
         ASSERT_TRUE(r.has_value()) << "must load";
         auto const src = (*r)->runtimeLibraries().sourcesForRole(RuntimeLibraryRole::CompilerSupport);
         EXPECT_EQ(std::vector<std::string>(src.begin(), src.end()), units)
-            << "the compilerSupport row must be realized from exactly the three units, in that order";
+            << "the compilerSupport row must be realized from exactly its units, in that order";
         auto const& cs = (*r)->compilerSupport();
         ASSERT_TRUE(cs.has_value()) << "every pe flavour declares the compilerSupport block";
         EXPECT_EQ(cs->role, RuntimeLibraryRole::CompilerSupport);
@@ -1280,7 +1301,7 @@ TEST(RuntimeLibraryRoles, ARowOfSeveralUnitsHasOneSpellingAndTheOthersAreRefused
     ASSERT_TRUE(ObjectFormatSchema::loadFromText(text).has_value())
         << "the UNMUTATED shipped text must load clean, or the mutants prove nothing";
     constexpr std::string_view kRow =
-        R"({ "role": "compilerSupport", "sources": ["runtime/platform/src/pe_compiler_support.c", "runtime/platform/src/pe_compiler_support_x86_64.s", "runtime/platform/src/pe_gcc_unwind.c"] })";
+        R"({ "role": "compilerSupport", "sources": ["runtime/platform/src/pe_compiler_support.c", "runtime/platform/src/pe_compiler_support_x86_64.s", "runtime/platform/src/pe_gcc_unwind.c", "runtime/platform/src/pe_gui_startup.c"] })";
     ASSERT_NE(text.find(kRow), std::string::npos) << "the mutation anchor must still exist";
     struct Mutant { char const* what; char const* row; char const* at; };
     Mutant const mutants[] = {

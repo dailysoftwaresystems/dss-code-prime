@@ -3172,8 +3172,9 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                       "string");
                             continue;
                         }
-                        out.emplace_back(it.key(),
-                                         it.value().get<std::string>());
+                        std::string role = it.key();
+                        std::string reg  = it.value().get<std::string>();
+                        out.emplace_back(std::move(role), std::move(reg));
                     }
                 };
                 readRoleMap("inputRoles",  irc.inputRoleNames);

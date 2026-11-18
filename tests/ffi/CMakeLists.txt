@@ -8,6 +8,30 @@ dss_add_test(NAME ffi/test_abi_catalog SOURCES test_abi_catalog.cpp)
 dss_add_test(NAME ffi/test_c_mangle SOURCES test_c_mangle.cpp)
 dss_add_test(NAME ffi/test_ingest SOURCES test_ingest.cpp)
 dss_add_test(NAME ffi/test_shipped_lib_descriptor SOURCES test_shipped_lib_descriptor.cpp)
+# P69 fold 3f: a symbol row's availability on ONE arch of a format (ledger 563 (A)) --
+# its own binary, so the arms that claim it name a runner no other arm's count rides on. One
+# cell drives the corpus index through `DSS_CONFIG_ROOT`, so it runs under ctest.
+dss_add_test(NAME ffi/test_shipped_arch_availability SOURCES test_shipped_arch_availability.cpp)
+# P69 fold 3f (main's condition on the open arch vocabulary): every arch and format a `when`
+# selector names across the shipped config is declared by a shipped document -- a test-time
+# sweep with a synthesized negative. Reads the config's JSON directly, hence the json link.
+dss_add_test(NAME ffi/test_when_selector_vocabulary SOURCES test_when_selector_vocabulary.cpp)
+target_link_libraries(dss_ffi_test_when_selector_vocabulary PRIVATE nlohmann_json::nlohmann_json)
+# P69 fold 3f (ledger 549 (b)): the stated routes of WRITTEN names -- a row's `writtenNameRoute` and a
+# descriptor's `writtenNames`, one decoder; a written name is read, never declared. Its own binary,
+# so the arms that claim it name a runner no other arm's count rides on; its population sweeps read
+# the shipped config's JSON, hence the json link.
+dss_add_test(NAME ffi/test_written_name_routes SOURCES test_written_name_routes.cpp)
+target_link_libraries(dss_ffi_test_written_name_routes PRIVATE nlohmann_json::nlohmann_json)
+# P69 fold 3f (ledger 549 (b)): the ROUTE RESOLVER, `writtenNameRoutesOn` -- each step and refusal over
+# scratch corpora (through `DSS_CONFIG_ROOT`, so it runs under ctest) and the shipped corpus on every
+# real pair. Its own binary, so the arms that claim it name a runner no other arm's count rides on.
+dss_add_test(NAME ffi/test_written_name_resolver SOURCES test_written_name_resolver.cpp)
+# P69 fold 3f (lane `xa`): a shipped descriptor never redefines a predefined macro of its pair -- the sweep of
+# every descriptor on every real pair it names, and the synthetic negative. Its own binary, so the arm that claims
+# it names a runner no other arm's count rides on.
+dss_add_test(NAME ffi/test_shipped_macros_over_predefined_macros
+             SOURCES test_shipped_macros_over_predefined_macros.cpp)
 # D-LANG-TYPE-IDENTITY-VOCABULARY: the EXHAUSTIVE cross-descriptor sweep — it
 # enumerates the shipped object-format configs to derive the target matrix, so
 # it parses their JSON directly.

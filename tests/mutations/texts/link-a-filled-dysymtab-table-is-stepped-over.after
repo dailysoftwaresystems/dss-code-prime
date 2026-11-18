@@ -1,0 +1,1 @@
+                if (std::uint32_t const n = rdU32(bytes, lcOff + table.countAt); n != 0u && table.countAt == 0u) {

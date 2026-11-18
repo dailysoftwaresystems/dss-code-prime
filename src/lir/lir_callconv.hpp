@@ -681,8 +681,11 @@ private:
 // wide" unwritable.
 class DSS_EXPORT StackArgCursor {
 public:
-    // `slotBytes` is the outgoing slot quantum (the GPR/pointer width) — the
-    // same value `FrameLayout::outgoingSlotSize` carries.
+    // `slotBytes` is the convention's argument-slot quantum (`argumentSlotBytes`,
+    // core/types/target_schema.hpp: the widest general register) — the same value
+    // `FrameLayout::outgoingSlotSize` carries. It is the cursor's ONLY source of
+    // the quantum: the member below has no default of its own (P69 fold 3f,
+    // review-xa3e F3 P12 -- it said 8).
     StackArgCursor(TargetCallingConvention const& cc,
                    std::uint32_t slotBytes) noexcept
         : rules_(cc.stackArgPacking), slot_(slotBytes == 0 ? 1u : slotBytes) {}
@@ -760,8 +763,15 @@ private:
         // with 0 is a DROPPED CARRIER, and the caller-side walk refuses it loudly
         // rather than letting the two sides disagree — see
         // `lir_wide_call_args::lowerOneFunc`.
+        // Q3 (P69 fold 3f, review-xa3e F3 P13): a byte count becomes LIR width
+        // flags through the ONE home, `lirInstWidthFlagForBits` (lir_node.hpp),
+        // which answers none for a width the instruction model cannot state. The
+        // map this class held (`widthFlagsForBytes`) was TOTAL -- every size it did
+        // not list became the 64-bit access in silence -- and is deleted: a size
+        // the home cannot state is neither natural nor wide, and takes whole slots.
+        std::optional<std::uint8_t> const exact = lirInstWidthFlagForBits(naturalBytes * 8u);
         bool const natural = rule == StackArgPacking::Natural
-                             && naturalBytes != 0 && naturalBytes <= slot_;
+                             && exact.has_value() && naturalBytes <= slot_;
         // ★★ A SCALAR WIDER THAN THE SLOT OCCUPIES ITS OWN SIZE, IN WHOLE SLOTS,
         // AND IS MOVED AT ITS OWN WIDTH (P68 round 8,
         // D-LIR-AAPCS64-LONG-DOUBLE-ARG-PAST-V7-REFUSED). The slot rule below
@@ -774,8 +784,7 @@ private:
         // `ldr q`. Only a width the LIR instruction model states (16 → 128 bits)
         // qualifies; every size a producer states today is 1/2/4/8 or 16, so
         // every previously-reachable placement is byte-for-byte unchanged.
-        bool const wide = naturalBytes > slot_
-                          && widthFlagsForBytes(naturalBytes) != 0;
+        bool const wide = naturalBytes > slot_ && exact.has_value();
         std::uint32_t const size  = natural ? naturalBytes
                                   : wide    ? alignUp(naturalBytes, slot_)
                                             : slot_;
@@ -792,23 +801,11 @@ private:
             natural ? naturalBytes : rules_.scalarAlignment(naturalBytes, slot_);
         std::uint32_t const off   = alignUp(cursor_, align);
         cursor_ = off + size;
-        return Placement{off, (natural || wide) ? widthFlagsForBytes(naturalBytes)
-                                                : std::uint8_t{0}};
-    }
-
-    [[nodiscard]] static constexpr std::uint8_t
-    widthFlagsForBytes(std::uint32_t bytes) noexcept {
-        switch (bytes) {
-            case 1:  return kLirInstFlagWidth8;
-            case 2:  return kLirInstFlagWidth16;
-            case 4:  return kLirInstFlagWidth32;
-            case 16: return kLirInstFlagWidth128;   // a >slot scalar (see `place`)
-            default: return 0;   // 8 (and anything else) ⇒ the 64-bit access
-        }
+        return Placement{off, (natural || wide) ? *exact : std::uint8_t{0}};
     }
 
     StackArgPackingRules rules_{};
-    std::uint32_t        slot_   = 8;
+    std::uint32_t        slot_;
     std::uint32_t        cursor_ = 0;
 };
 

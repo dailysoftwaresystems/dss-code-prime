@@ -1,0 +1,1 @@
+        return static_cast<std::uint32_t>(scalarByteSize(TypeKind::Ptr, config.dataModel).value_or(8));

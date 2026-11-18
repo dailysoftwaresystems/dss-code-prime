@@ -794,8 +794,9 @@ void MirFunctionRebuilder::emitTerminator(MirOpcode op, MirInstId oldId) {
         }
         case MirOpcode::CondBr: {
             MirInstId const cond = mapOperand(oldOps[0]);
-            MirInstId const newId = dst_.addCondBr(
-                cond, mapSucc(oldSucc[0]), mapSucc(oldSucc[1]));
+            MirBlockId const onTrue  = mapSucc(oldSucc[0]);
+            MirBlockId const onFalse = mapSucc(oldSucc[1]);
+            MirInstId const newId = dst_.addCondBr(cond, onTrue, onFalse);
             remember(newId);
             return;
         }
@@ -851,9 +852,9 @@ void MirFunctionRebuilder::emitTerminator(MirOpcode op, MirInstId oldId) {
             // c115 SEH (D-WIN64-SEH-FUNCLETS): succs [tryEntry, filterEntry];
             // the region-id payload clones VERBATIM (region ids are function-
             // scoped and rebuilds are whole-function, so no renumbering).
-            MirInstId const newId = dst_.addSehTryBegin(
-                mapSucc(oldSucc[0]), mapSucc(oldSucc[1]),
-                src_.instPayload(oldId));
+            MirBlockId const tryEntry    = mapSucc(oldSucc[0]);
+            MirBlockId const filterEntry = mapSucc(oldSucc[1]);
+            MirInstId const newId = dst_.addSehTryBegin(tryEntry, filterEntry, src_.instPayload(oldId));
             remember(newId);
             return;
         }

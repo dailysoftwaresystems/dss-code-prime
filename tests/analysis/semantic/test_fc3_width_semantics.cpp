@@ -917,6 +917,55 @@ TEST(Fc3LoaderRejects, AnUncoveredSizedSuffixRejects) {
               std::string::npos) << loadDiagnostics(doc);
 }
 
+// ★ A LOAD'S REFUSALS COME IN THE ORDER OF THE SUFFIXES THEY NAME (P69 fold 3f, lane `xa`). The loader
+// counts each suffix's claims in a hash table and reports every suffix that is claimed twice or that the
+// lexer does not admit, so the ORDER of those refusals was the host library's iteration order. It walks
+// the claims in ascending suffix order. The rule each case adds names its three unknown suffixes in
+// neither that order nor its reverse, so neither an insertion-order walk nor its reverse reads as sorted.
+namespace {
+
+// The first suffixed rule of a ladder, with its suffixes replaced by three the lexer does not admit.
+[[nodiscard]] nlohmann::json withThreeUnknownSuffixes(nlohmann::json const& ladder) {
+    for (auto const& rule : ladder) {
+        if (rule["suffixes"].empty()) continue;
+        nlohmann::json extra = rule;
+        extra["suffixes"] = {"zq", "aq", "mq"};
+        return extra;
+    }
+    throw std::runtime_error("the shipped C document's ladder has no suffixed rule");
+}
+
+// Each named suffix's first mention in a load's refusals, in suffix order; npos where none.
+[[nodiscard]] std::vector<std::size_t> mentionsOf(std::string const& said) {
+    std::vector<std::size_t> at;
+    for (char const* sfx : {"aq", "mq", "zq"}) at.push_back(said.find(std::string{"suffix '"} + sfx + "'"));
+    return at;
+}
+
+}  // namespace
+
+TEST(Fc3LoaderRejects, IntegerSuffixRefusalsComeInSuffixOrder) {
+    auto doc = loadShippedCJson();
+    auto& ladder = doc["semantics"]["integerLiteralTyping"];
+    ladder.push_back(withThreeUnknownSuffixes(ladder));
+    std::string const said = loadDiagnostics(doc);
+    std::vector<std::size_t> const at = mentionsOf(said);
+    for (std::size_t const pos : at) ASSERT_NE(pos, std::string::npos) << said;
+    EXPECT_LT(at[0], at[1]) << "the refusals come in suffix order:\n" << said;
+    EXPECT_LT(at[1], at[2]) << "the refusals come in suffix order:\n" << said;
+}
+
+TEST(Fc3LoaderRejects, FloatSuffixRefusalsComeInSuffixOrder) {
+    auto doc = loadShippedCJson();
+    auto& ladder = doc["semantics"]["floatLiteralTyping"];
+    ladder.push_back(withThreeUnknownSuffixes(ladder));
+    std::string const said = loadDiagnostics(doc);
+    std::vector<std::size_t> const at = mentionsOf(said);
+    for (std::size_t const pos : at) ASSERT_NE(pos, std::string::npos) << said;
+    EXPECT_LT(at[0], at[1]) << "the refusals come in suffix order:\n" << said;
+    EXPECT_LT(at[1], at[2]) << "the refusals come in suffix order:\n" << said;
+}
+
 // ── The shift-result rule is a config verb ──────────────────────────────
 //
 // The closed verb `shiftResult` selects a shift's RESULT TYPE (C 6.5.7). The

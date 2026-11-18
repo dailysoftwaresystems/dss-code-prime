@@ -60,6 +60,7 @@
 #include "ffi/shipped_lib_descriptor.hpp"
 
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/object_format_kind.hpp"   // the selectable formats
 #include "core/types/type_lattice/type_interner.hpp"
 #include "core/types/type_lattice/type_registry.hpp"
 
@@ -513,6 +514,79 @@ TEST(ShippedSourceRealization, ASymbolsOwnSourceSupersedesTheImportItInherits) {
     fs::remove_all(dir, ec);
 }
 
+// ★ EACH FORMAT'S REFUSAL COMES IN ASCENDING FORMAT NAME, never in the order the C++ library walks
+// the `realization` map (P69 fold 3f): the reader reports R1 and R3 per format as its walk meets the
+// format, so that order is the order the author reads them in, and it must be the descriptor's, the
+// same on every host that built DSS. Every selectable object format is named, so the walk is as long
+// as the vocabulary allows: R1 once per format (a source that is not there), and R3's case (3) once
+// per format (a symbol importing on every format its descriptor realizes from a source).
+TEST(ShippedSourceRealization, PerFormatRefusalsComeInAscendingFormatName) {
+    auto const root = dss::test::findConfigRoot();
+    ASSERT_TRUE(root.has_value()) << dss::test::configRootDiagnostic();
+    fs::path const dir = fs::temp_directory_path() / "dss-per-format-refusal-order";
+    fs::create_directories(dir);
+    std::vector<std::string> ascending;
+    for (auto const name : dss::kSelectableObjectFormatKindNames) ascending.emplace_back(name);
+    std::sort(ascending.begin(), ascending.end());
+    ASSERT_GE(ascending.size(), 3u) << "too few object formats for a walk's order to be seen";
+    // One JSON object holding `value(format)` under every format.
+    auto perFormat = [&](auto const& value) {
+        json o = json::object();
+        for (auto const& f : ascending) o[f] = value(f);
+        return o.dump();
+    };
+    // The formats the refusals that say `marker` name, in the order they were reported.
+    auto formatsRefused = [](dss::DiagnosticReporter const& rep, std::string const& marker) {
+        std::vector<std::string> formats;
+        std::string const lead = "for the object format '";
+        for (auto const& d : rep.all()) {
+            if (d.actual.find(marker) == std::string::npos) continue;
+            auto const at = d.actual.find(lead);
+            if (at == std::string::npos) continue;
+            auto const from = at + lead.size();
+            formats.push_back(d.actual.substr(from, d.actual.find('\'', from) - from));
+        }
+        return formats;
+    };
+    auto read = [&](std::string const& name, std::string const& text, dss::DiagnosticReporter& rep) {
+        fs::path const at = dir / name;
+        std::ofstream(at, std::ios::binary) << text;
+        dss::TypeInterner interner{dss::CompilationUnitId{1}};
+        dss::TypeRegistry typeReg;
+        (void)dss::ffi::readShippedLibDescriptor(at, interner, typeReg, rep);
+    };
+    {
+        SCOPED_TRACE("R1: a missing source on every format");
+        dss::DiagnosticReporter rep;
+        read("order_r1.json",
+             R"({"header": "order_r1.h", "realization": )"
+                 + perFormat([](std::string const& f) {
+                       return json::object({{"source", "runtime/platform/src/no_such_unit_" + f + ".c"}});
+                   })
+                 + R"(, "symbols": [ { "name": "order_r1_fn", "signature": "fn() -> i32" } ] })",
+             rep);
+        EXPECT_EQ(formatsRefused(rep, "declares a shipped-source realization naming"), ascending)
+            << "the per-format R1 refusals are not reported in ascending format name";
+    }
+    {
+        SCOPED_TRACE("R3 (3): a symbol importing on every format its descriptor realizes");
+        dss::DiagnosticReporter rep;
+        read("order_r3.json",
+             R"({"header": "order_r3.h", "realization": )"
+                 + perFormat([](std::string const&) {
+                       return json::object({{"source", "runtime/platform/src/atomic.c"}});
+                   })
+                 + R"(, "symbols": [ { "name": "order_r3_fn", "signature": "fn() -> i32", "library": )"
+                 + perFormat([](std::string const& f) { return json("image-of-" + f); })
+                 + R"( } ] })",
+             rep);
+        EXPECT_EQ(formatsRefused(rep, "declares its own import"), ascending)
+            << "the per-format R3 refusals are not reported in ascending format name";
+    }
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
 // ── THE TREE'S OWN SHAPE ─────────────────────────────────────────────────────
 // A realization's source lives under the shipped RUNTIME tree, in its `src/`
 // half. This is the correspondence a convention alone cannot enforce, and a
@@ -595,12 +669,13 @@ TEST(ShippedSourceRealization, AFormatRowsUnitsAreReadInTheLoadersShapesOnly) {
     }
 }
 
-// The three units of the pe `compilerSupport` row are named by NO `source` key and by no descriptor -- only by the
+// The four units of the pe `compilerSupport` row are named by NO `source` key and by no descriptor -- only by the
 // four pe64 documents' `sources` arrays -- and each is a declaration of each document, so the R2/R4 sweep sees them.
 TEST(ShippedSourceRealization, AUnitNamedOnlyInASourcesArrayIsDeclaredByEachPeDocument) {
     std::vector<std::string> const units{"runtime/platform/src/pe_compiler_support.c",
                                          "runtime/platform/src/pe_compiler_support_x86_64.s",
-                                         "runtime/platform/src/pe_gcc_unwind.c"};
+                                         "runtime/platform/src/pe_gcc_unwind.c",
+                                         "runtime/platform/src/pe_gui_startup.c"};
     auto const declared = formatRealizedSources();
     for (auto const& unit : units) {
         SCOPED_TRACE(unit);

@@ -20,8 +20,10 @@
 #include "core/types/diagnostic_budget.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/target_schema.hpp"
 #include "core/types/tree.hpp"
 #include "core/types/tree_node.hpp"
+#include "link/object_format_schema.hpp"
 
 #include "analysis/compilation_unit/toy_cu_fixture.hpp"
 
@@ -29,6 +31,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -375,4 +378,49 @@ TEST(UnitTypeNames, AnotherTranslationUnitsTypedefIsNoTypeNameHere) {
     EXPECT_TRUE(treeHasRule(ccu.trees()[0], "alignofType"));
     EXPECT_EQ(countRule(ccu.trees()[0], "castExpr"), 3u)
         << "the control: `(int)sizeof`, `(int)_Alignof` and `(BT)-1` through the included typedef";
+}
+
+// ★ P69 fold 3f (ledger 563 (A)): A DESCRIPTOR'S VALUE NAME AVAILABLE ON ONE ARCH OF A FORMAT IS A
+// KNOWN NAME ON THAT ARCH ALONE. A symbol row's availability may name a format on one arch
+// (`{"format": "elf", "arch": "arm64"}`); the semantic tier declares the row on the pair the entry
+// matches and on no other, so the value seed the parse reads is harvested on the same PAIR -- the
+// unit's format AND its target's arch. Without the arch the entry is undecided and dropped, and
+// `(my_fn)42;` on arm64 elf would name `my_fn` undeclared where the semantic tier declares it. The
+// pair is applied the way the driver applies it (`applyTargetFormatPair`).
+TEST(UnitTypeNames, AValueNameAvailableOnOneArchIsKnownOnThatArchAlone) {
+    TempDir srcDir;
+    TempDir sysDir;
+    auto main = srcDir.write("main.c",
+                             "#include <archfns.h>\n"
+                             "int main(void) { (my_fn)42; return 0; }\n");
+    sysDir.write(
+        "archfns.json",
+        R"({ "header": "archfns.h",
+             "symbols": [ { "name": "my_fn", "signature": "fn() -> i32",
+                            "kind": "function", "linkage": "external",
+                            "availableObjectFormats": [ { "format": "elf", "arch": "arm64" } ] } ] })");
+
+    struct Pair {
+        char const* target;
+        char const* format;
+        bool        known;
+    };
+    for (Pair const& p :
+         {Pair{"arm64", "elf64-aarch64-linux", true}, Pair{"x86_64", "elf64-x86_64-linux", false}}) {
+        SCOPED_TRACE(std::string{p.target} + ":" + p.format);
+        auto const target = TargetSchema::loadShipped(p.target);
+        ASSERT_TRUE(target.has_value());
+        auto const format = ObjectFormatSchema::loadShipped(p.format);
+        ASSERT_TRUE(format.has_value());
+        UnitBuilder b{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
+        applyTargetFormatPair(b, **target, **format);
+        b.addSystemDir(sysDir.path());
+        b.addFile(main);
+        auto cu = std::move(b).finish();
+        ASSERT_EQ(cu.trees().size(), 1u);
+        ASSERT_TRUE(cu.trees()[0].diagnostics().hasErrors()) << "`42` cannot follow `(my_fn)`";
+        EXPECT_EQ(hasCode(cu.trees()[0].diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), !p.known)
+            << (p.known ? "the row's arch entry matches this pair, so `my_fn` is a known name here"
+                        : "the row exists on arm64 alone, so nothing declares `my_fn` here");
+    }
 }

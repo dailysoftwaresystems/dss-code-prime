@@ -1101,6 +1101,72 @@ TEST(RelocatableObjectReader, OverlappingFunctionRangesFailsLoud) {
     EXPECT_GT(rep.errorCount(), 0u);
 }
 
+// ★ THE FIRST OVERLAP REFUSED IS THE LOWER SECTION'S (P69 fold 3f, lane `xa`). The overlap guard walks the
+// object's function ranges section by section and refuses the first overlap it meets. It walked the sections in
+// the order of an unordered map, so WHICH section the refusal named was the host library's. It walks them in
+// ascending section index. The -ffunction-sections fixture has two text sections, one function each; a data
+// symbol is retyped a function overlapping each section's own function, so both sections overlap.
+TEST(RelocatableObjectReader, OverlapsInTwoSectionsAreRefusedAtTheLowerSection) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    std::vector<std::uint8_t> obj = dss::test::gccLibC164ObjectFunctionSections();
+    auto const textAt = [&obj](std::size_t at) {
+        return std::string{reinterpret_cast<char const*>(obj.data() + at)};
+    };
+    // A section's index by its name, through the section-header string table (e_shstrndx).
+    auto const sectionNamed = [&](std::string const& name) -> std::uint16_t {
+        std::uint16_t const shnum = rd16(obj, 60);
+        std::uint16_t const shstrndx = rd16(obj, 62);
+        std::size_t const names = static_cast<std::size_t>(rd64(obj, shdrAt(obj, shstrndx) + 24));
+        for (std::uint16_t i = 0; i < shnum; ++i) {
+            auto const nameOff = static_cast<std::size_t>(rd64(obj, shdrAt(obj, i)) & 0xFFFFFFFFu);   // sh_name
+            if (textAt(names + nameOff) == name) return i;
+        }
+        return 0;
+    };
+    // A `.symtab` record's offset by its name, through the symtab's own string table (`sh_link`).
+    auto const symbolNamed = [&](std::string const& name) -> std::size_t {
+        std::size_t const sh = firstShdrOfType(obj, 2);
+        if (sh == 0) return 0;
+        std::size_t const body = static_cast<std::size_t>(rd64(obj, sh + 24));
+        std::size_t const size = static_cast<std::size_t>(rd64(obj, sh + 32));
+        auto const link = static_cast<std::uint16_t>(rd64(obj, sh + 40) & 0xFFFFu);
+        std::size_t const names = static_cast<std::size_t>(rd64(obj, shdrAt(obj, link) + 24));
+        for (std::size_t off = body; off + 24 <= body + size; off += 24) {
+            auto const nameOff = static_cast<std::size_t>(rd64(obj, off) & 0xFFFFFFFFu);   // st_name
+            if (nameOff != 0 && textAt(names + nameOff) == name) return off;
+        }
+        return 0;
+    };
+    std::uint16_t const addSec   = sectionNamed(".text.lib_add");
+    std::uint16_t const greetSec = sectionNamed(".text.lib_greet");
+    ASSERT_NE(addSec, 0u);
+    ASSERT_NE(greetSec, 0u);
+    // Each retyped symbol becomes a function over [4, 12) of a text section, overlapping its function [0, 24+).
+    std::size_t const msgAt     = symbolNamed("msg");
+    std::size_t const counterAt = symbolNamed("lib_counter");
+    ASSERT_NE(msgAt, 0u);
+    ASSERT_NE(counterAt, 0u);
+    for (auto const& [at, sec] : {std::pair{msgAt, greetSec}, std::pair{counterAt, addSec}}) {
+        obj[at + 4] = static_cast<std::uint8_t>((obj[at + 4] & 0xF0u) | 2u);   // st_info: STT_FUNC, binding kept
+        obj[at + 6] = static_cast<std::uint8_t>(sec & 0xFFu);                  // st_shndx
+        obj[at + 7] = static_cast<std::uint8_t>(sec >> 8);
+        wr64(obj, at + 8, 4u);                                                  // st_value
+        wr64(obj, at + 16, 8u);                                                 // st_size
+    }
+    DiagnosticReporter rep;
+    EXPECT_FALSE(elf::readRelocatableObject(obj, *loaded.target, *loaded.format, rep).has_value());
+    std::uint16_t const lower = std::min(addSec, greetSec);
+    std::string const want = "overlapping STT_FUNC ranges in section #" + std::to_string(lower) + " ";
+    bool named = false;
+    std::string said;
+    for (auto const& d : rep.all()) {
+        named = named || d.actual.find(want) != std::string::npos;
+        said += d.actual + "\n";
+    }
+    EXPECT_TRUE(named) << "the refusal names the lower of the two overlapping sections, #" << lower << ":\n" << said;
+}
+
 // LOW guard: a format schema whose reverse map is AMBIGUOUS -- two reloc rows
 // sharing a nativeId but mapping to different kinds -- must fail loud rather
 // than let "last row wins" silently mis-decode.

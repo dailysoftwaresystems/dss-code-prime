@@ -66,7 +66,8 @@ struct EntryResolution {
     // use it. Pre-fix, multi-function modules whose entry wasn't
     // declared first in source order silently called the wrong
     // function (the first-declared one was picked as `functions[0]`
-    // via the empty-entryPoint fallback below).
+    // by a fallback for an empty entryPoint, which P69 fold 3e deleted:
+    // a module that states no entry has none, below).
     if (module.userEntrySymbol.has_value()) {
         SymbolId const want = *module.userEntrySymbol;
         for (auto const& fn : module.functions) {

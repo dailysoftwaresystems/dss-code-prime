@@ -1,5 +1,6 @@
 #include "mir/merge/mir_merge.hpp"
 
+#include "core/substrate/key_order.hpp"  // entriesInKeyOrder -- step (3c)'s walk over a unit's shim recipes
 #include "core/substrate/phase_timers.hpp"  // the merge-side whole-program verify's `--time` row
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/type_lattice/type_layout.hpp"   // computeLayout — the extent of a tentative definition
@@ -458,9 +459,9 @@ private:
             return;
         }
         if (op == MirOpcode::GlobalAddr) {
-            local_.emplace(id.v, dst_.addGlobalAddr(
-                mergedGlobalAddrSymbol(id), reType(src_.instType(id)),
-                src_.instFlags(id)));
+            SymbolId const addrSymbol = mergedGlobalAddrSymbol(id);
+            TypeId const   addrType   = reType(src_.instType(id));
+            local_.emplace(id.v, dst_.addGlobalAddr(addrSymbol, addrType, src_.instFlags(id)));
             return;
         }
         if (op == MirOpcode::BlockAddress) {
@@ -468,9 +469,9 @@ private:
             // RE-NUMBERS — a generic `addInst` would copy it verbatim and point the
             // address at the WRONG (or a stale) block (the FC7 clone-site silent-
             // miscompile class, extended to BlockAddress). Re-map via `mapBlock`.
-            local_.emplace(id.v, dst_.addBlockAddress(
-                mapBlock(src_.blockAddressTarget(id)), reType(src_.instType(id)),
-                src_.instFlags(id)));
+            MirBlockId const targetBlock = mapBlock(src_.blockAddressTarget(id));
+            TypeId const     addrType    = reType(src_.instType(id));
+            local_.emplace(id.v, dst_.addBlockAddress(targetBlock, addrType, src_.instFlags(id)));
             return;
         }
         if (op == MirOpcode::BlockAddressExport) {
@@ -544,20 +545,25 @@ private:
             case MirOpcode::Br:
                 dst_.addBr(mapBlock(succ[0]));
                 return;
-            case MirOpcode::CondBr:
-                dst_.addCondBr(mapValue(ops[0], id),
-                               mapBlock(succ[0]), mapBlock(succ[1]));
+            case MirOpcode::CondBr: {
+                MirInstId const  cond    = mapValue(ops[0], id);
+                MirBlockId const onTrue  = mapBlock(succ[0]);
+                MirBlockId const onFalse = mapBlock(succ[1]);
+                dst_.addCondBr(cond, onTrue, onFalse);
                 return;
+            }
             case MirOpcode::Switch: {
                 std::vector<std::pair<MirInstId, MirBlockId>> cases;
                 std::size_t const ncases = succ.size() - 1;
                 cases.reserve(ncases);
                 for (std::size_t i = 0; i < ncases; ++i) {
-                    cases.emplace_back(mapValue(ops[1 + i], id),
-                                       mapBlock(succ[i]));
+                    MirInstId const  value  = mapValue(ops[1 + i], id);
+                    MirBlockId const target = mapBlock(succ[i]);
+                    cases.emplace_back(value, target);
                 }
-                dst_.addSwitch(mapValue(ops[0], id), cases,
-                               mapBlock(succ[ncases]));
+                MirInstId const  selector = mapValue(ops[0], id);
+                MirBlockId const fallback = mapBlock(succ[ncases]);
+                dst_.addSwitch(selector, cases, fallback);
                 return;
             }
             case MirOpcode::Return: {
@@ -629,18 +635,22 @@ private:
                 local_.emplace(id.v, newId);
                 return;
             }
-            case MirOpcode::SehTryBegin:
+            case MirOpcode::SehTryBegin: {
                 // c115 SEH (D-WIN64-SEH-FUNCLETS): succs [tryEntry, filterEntry];
                 // the region-id payload clones verbatim (function-scoped ids —
                 // merge clones whole functions, no renumbering).
-                dst_.addSehTryBegin(mapBlock(succ[0]), mapBlock(succ[1]),
-                                    src_.instPayload(id));
+                MirBlockId const tryEntry    = mapBlock(succ[0]);
+                MirBlockId const filterEntry = mapBlock(succ[1]);
+                dst_.addSehTryBegin(tryEntry, filterEntry, src_.instPayload(id));
                 return;
-            case MirOpcode::SehFilterReturn:
+            }
+            case MirOpcode::SehFilterReturn: {
                 // operand [filterValue]; succ [handlerEntry]; payload verbatim.
-                dst_.addSehFilterReturn(mapValue(ops[0], id), mapBlock(succ[0]),
-                                        src_.instPayload(id));
+                MirInstId const  filterValue = mapValue(ops[0], id);
+                MirBlockId const handler     = mapBlock(succ[0]);
+                dst_.addSehFilterReturn(filterValue, handler, src_.instPayload(id));
                 return;
+            }
             default:
                 std::fprintf(stderr,
                     "dss::mergeCuMirs fatal: CU %u terminator opcode %d marked "
@@ -680,6 +690,51 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
             mergeFatal("a MergeCuInput is missing its mir / interner / nameOf "
                        "(decomposed-input contract violation).");
         }
+    }
+
+    // ★ P69 (lane `cs`, fold f26d): THE MERGED MODULE'S FACTS ARE ITS UNITS' FACTS JOINED (`joinUnitFacts`,
+    // beside the one list `MirModuleFacts`). It read the aliasing mode and the char-types rule from unit 0
+    // ALONE — a disagreement settled by unit order: a strict unit 0 merged with a permissive unit made the
+    // whole program strict, so the permissive unit's accesses were optimized under a rule its source never
+    // promised (READ). Two units stating DIFFERENT countings of the pair's convention were lowered for two
+    // pairs, which no link merges: refused by name, never settled by unit order. A function's own counting
+    // crosses with the function (the clone below).
+    // ★ P69 (lane `xa`, fold 3f): joined HERE, before anything is sized, because the data model is one of them and
+    // every size this merge takes is read from it -- the module's fact, the one home of the pointer width below MIR
+    // (`MirModuleFacts::dataModel`). The tentative definitions were sized by the LINK FORMAT's model while the units
+    // stated their own, and nothing compared the two: one fact read from two homes. A link whose format states a
+    // model the units were not lowered for is refused below, by name.
+    MirModuleFacts facts = cus[0].mir->moduleFacts();
+    for (std::size_t ci = 1; ci < cus.size(); ++ci) {
+        auto const joined = joinUnitFacts(facts, cus[ci].mir->moduleFacts());
+        if (!joined.has_value()) {
+            // The fact that disagrees, BY NAME (`MirFactsDisagreement`), never the first the list has.
+            std::fprintf(stderr,
+                "dss::mergeCuMirs fatal: unit %zu and an earlier unit do not agree on the module fact "
+                "'%s' (%u vs %u; 0 is a unit stating none, which a fact every unit must state refuses) "
+                "-- the units were lowered for two pairs, or one for none, and one link never merges "
+                "them\n",
+                ci, joined.error().fact, static_cast<unsigned>(joined.error().b),
+                static_cast<unsigned>(joined.error().a));
+            std::abort();
+        }
+        facts = *joined;
+    }
+    // The units were lowered for ONE data model; the link writes the model its document states. Two models are two
+    // pairs -- every `long`, pointer and layout the units hold was sized for theirs -- and no link merges them.
+    if (facts.dataModel != linkFormat.dataModel()) {
+        auto const spelled = [](DataModel m) {
+            return m == DataModel{} ? std::string{"no data model"} : dataModelSpelled(m);
+        };
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::K_CrossCuMergeUnsupported;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = std::format(
+            "mergeCuMirs: the units were lowered for {}, and the link's format '{}' states {} -- every size the "
+            "units hold was taken under theirs, so one link never merges them under the format's",
+            spelled(facts.dataModel), linkFormat.name(), spelled(linkFormat.dataModel()));
+        reporter.report(std::move(d));
+        return std::nullopt;
     }
 
     // ── THE SUBSET-IMPORT FILTER (OPT11, D-OPT11-LAZY-IMPORT-EDGE) ───────────
@@ -945,7 +1000,7 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
                 }
                 auto const lay = computeLayout(m.globalType(c.global),
                                                *cus[c.cu].interner, *rule,
-                                               linkFormat.dataModel());
+                                               facts.dataModel);
                 if (!lay.has_value()) {
                     refuse(name, std::format(
                         "the definition in CU #{} cannot be sized: the layout "
@@ -998,7 +1053,7 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
             auto const& rule = cus[ci].aggregateLayout;
             if (!rule.has_value()) return std::nullopt;
             auto const lay = computeLayout(m.globalType(g), *cus[ci].interner, *rule,
-                                           linkFormat.dataModel());
+                                           facts.dataModel);
             if (!lay.has_value()) return std::nullopt;
             return std::pair{static_cast<std::uint64_t>(lay->size),
                              std::max(static_cast<std::uint32_t>(lay->align.bytes()),
@@ -1405,8 +1460,12 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
     // it is NEVER an ExternImport row, so it cannot leak into `survivingExterns`.
     for (std::uint32_t ci = 0; ci < cus.size(); ++ci) {
         if (cus[ci].synthRecipes == nullptr) continue;
-        for (auto const& [shimV, recipeId] : *cus[ci].synthRecipes) {
-            (void)recipeId;
+        // ★ IN ASCENDING UNIT-LOCAL ID (P69 fold 3f, lane `xa`): an id minted here is
+        // the order the threads synthesis emits the shim bodies in, so the walk is
+        // the unit's own order (`substrate::entriesInKeyOrder`), never the order its
+        // unordered map happens to iterate in.
+        for (auto const* recipe : substrate::entriesInKeyOrder(*cus[ci].synthRecipes)) {
+            std::uint32_t const shimV = recipe->first;
             CuSymKey const key{ci, shimV};
             if (plan.symMerged.count(key)) continue;   // also a real symbol — leave it
             std::string const name = cus[ci].nameOf(SymbolId{shimV});
@@ -1450,31 +1509,8 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
     auto const definedIn = [&unitOfDefinition](SymbolId merged, std::uint32_t ci) {
         unitOfDefinition.emplace(merged.v, ci);
     };
-    // ★ P69 (lane `cs`, fold f26d): THE MERGED MODULE'S FACTS ARE ITS UNITS' FACTS JOINED (`joinUnitFacts`,
-    // beside the one list `MirModuleFacts`). It read the aliasing mode and the char-types rule from unit 0
-    // ALONE — a disagreement settled by unit order: a strict unit 0 merged with a permissive unit made the
-    // whole program strict, so the permissive unit's accesses were optimized under a rule its source never
-    // promised (READ). Two units stating DIFFERENT countings of the pair's convention were lowered for two
-    // pairs, which no link merges: refused by name, never settled by unit order. A function's own counting
-    // crosses with the function (the clone above).
-    {
-        MirModuleFacts facts = cus[0].mir->moduleFacts();
-        for (std::size_t ci = 1; ci < cus.size(); ++ci) {
-            auto const joined = joinUnitFacts(facts, cus[ci].mir->moduleFacts());
-            if (!joined.has_value()) {
-                // The fact that disagrees, BY NAME (`MirFactsDisagreement`), never the first the list has.
-                std::fprintf(stderr,
-                    "dss::mergeCuMirs fatal: unit %zu states the module fact '%s' differently from an "
-                    "earlier unit (%u vs %u) -- the units were lowered for two pairs, and one link "
-                    "never merges two pairs\n",
-                    ci, joined.error().fact, static_cast<unsigned>(joined.error().b),
-                    static_cast<unsigned>(joined.error().a));
-                std::abort();
-            }
-            facts = *joined;
-        }
-        builder.stateModuleFacts(facts);
-    }
+    // The units' facts, joined at the merge's entry (above).
+    builder.stateModuleFacts(facts);
 
     auto isShadowedLoser = [&](std::uint32_t ci, std::string const& name,
                                SymbolId sym, bool isLocal) -> bool {

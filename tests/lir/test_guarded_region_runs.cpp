@@ -327,6 +327,7 @@ Expected expectedFor(Lir const& lir, std::uint32_t fi) {
 TEST(GuardedRegionRuns, ANestedPairsRecordsAreInnerBodyInnerRunOuterBodyOuterRun) {
     TypeInterner ti{CompilationUnitId{1}};
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
     mb.stateSelfContainedSymbolIds();
     NestedPair const f = addNestedPair(mb, ti, SymbolId{1});
     Mir mir = std::move(mb).finish();
@@ -397,6 +398,7 @@ TEST(GuardedRegionRuns, ANestedPairsRecordsAreInnerBodyInnerRunOuterBodyOuterRun
 TEST(GuardedRegionRuns, TheRegionsStayInTheOrderTheyAreHandedIn) {
     TypeInterner ti{CompilationUnitId{1}};
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
     mb.stateSelfContainedSymbolIds();
     NestedPair const f = addNestedPair(mb, ti, SymbolId{1});
     Mir mir = std::move(mb).finish();
@@ -416,6 +418,7 @@ TEST(GuardedRegionRuns, TheRegionsStayInTheOrderTheyAreHandedIn) {
 TEST(GuardedRegionRuns, ARegionWhoseBlocksCreateNothingHasOneRecord) {
     TypeInterner ti{CompilationUnitId{1}};
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
     mb.stateSelfContainedSymbolIds();
     NestedPair const f = addNestedPair(mb, ti, SymbolId{1});
     Mir mir = std::move(mb).finish();
@@ -446,6 +449,7 @@ TEST(GuardedRegionRuns, ARunHoldsOnlyBlocksOfItsOwnFunction) {
         SCOPED_TRACE(guarded);
         TypeInterner ti{CompilationUnitId{1}};
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Llp64);
         mb.stateSelfContainedSymbolIds();
         std::array<NestedPair, 2> const fns{addNestedPair(mb, ti, SymbolId{1}),
                                             addNestedPair(mb, ti, SymbolId{2})};
@@ -484,6 +488,7 @@ TEST(GuardedRegionRuns, ARegionsRunIsEveryBlockCreatedForItsBlocks) {
     TypeId const boolT = ti.primitive(TypeKind::Bool);
     std::array<TypeId, 1> const params{i32};
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
     mb.stateArgCounting(MirArgCounting::PerClass);
     mb.stateSelfContainedSymbolIds();   // a dense switch's table symbol is minted
     mb.addFunction(ti.fnSig(params, i32, CallConv::CcSysV), SymbolId{1});
@@ -603,6 +608,7 @@ FedPhi buildFedPhi(TypeInterner& ti, bool twoWaysOut) {
     TypeId const boolT = ti.primitive(TypeKind::Bool);
     std::array<TypeId, 1> const params{i32};
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
     mb.stateArgCounting(MirArgCounting::PerClass);
     mb.stateSelfContainedSymbolIds();
     mb.addFunction(ti.fnSig(params, i32, CallConv::CcSysV), SymbolId{1});

@@ -1,0 +1,1 @@
+    appendU32LE(bytes, emitBuildVersion ? 3u : 2u);

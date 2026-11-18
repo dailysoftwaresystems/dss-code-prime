@@ -23,6 +23,7 @@
 #include "core/types/type_lattice/type_registry.hpp"
 #include "diagnostic_count.hpp"
 #include "ffi/shipped_lib_descriptor.hpp"
+#include "fixture_role_resolver.hpp"                 // a pair's runtime family, as the reads bind it
 #include "repo_root.hpp"
 #include "scratch_dir.hpp"
 #include "scoped_env.hpp"                             // DSS_CONFIG_ROOT: a scratch config root
@@ -4564,6 +4565,14 @@ TEST(ShippedLibDescriptor, RealWindowsDriveTypeSurface) {
 // `signature` arm keyed on the long-double format matches nothing. The compile
 // reads a descriptor only with a pair, so this sweep now reads each one on each
 // distinct shipped read (`shipped_read_pairs.hpp`) with that pair's own facts.
+//
+// ★ AND WITH THE PAIR'S RUNTIME FAMILY (P69 fold 3f). It read with NO role
+// resolver, so a role a descriptor names that no family row answers on the
+// pair -- an error in every compile and every binding read -- was invisible
+// here. ✔MEASURED 2026-11-17 (d272): stdlib.json's aarch64 `__stack_chk_guard`
+// entry asks `programInterpreter`, which the test-side table did not answer,
+// and this sweep stayed green. Each read now carries the fixture table of the
+// pair's family (its kind on its arch).
 TEST(ShippedLibDescriptor, AllShippedDescriptorsDecode) {
     fs::path const shippedRoot = shippedLibsRoot();
     ASSERT_FALSE(shippedRoot.empty())
@@ -4587,9 +4596,10 @@ TEST(ShippedLibDescriptor, AllShippedDescriptorsDecode) {
             // binding exactly as production does (stdio.json's vfprintf).
             auto const namedTypes = dss::test_support::validationVaListBinding(interner);
             ShippedPairFacts const facts = pair.pairFacts();
+            dss::ffi_test::FixtureRoleResolver const roles{pair.kind, pair.arch};
             auto desc = readShippedLibDescriptor(entry.path(), interner, typeReg, rep,
                                                  pair.dataModel(), pair.activeTarget(),
-                                                 pair.activeFormat(), namedTypes, nullptr,
+                                                 pair.activeFormat(), namedTypes, &roles,
                                                  &facts);
             EXPECT_TRUE(desc.has_value())
                 << "shipped descriptor failed to load: "

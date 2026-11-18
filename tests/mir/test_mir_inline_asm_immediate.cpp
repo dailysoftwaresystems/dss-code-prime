@@ -131,11 +131,13 @@ struct Lowered {
     if (!lowered.lowersToMir) return out;   // the build stops here, and so does the fixture: MIR never entered
 
     MirLoweringConfig cfg = languageMirLoweringConfig(**loaded);   // the pipeline's assembly
+    cfg.dataModel = DataModel::Lp64;   // a config states its unit's data model
     cfg.symbolIdSpace = MirSymbolIdSpace::endingAt(   // the unit's name table, as the driver states it
         static_cast<std::uint32_t>((*out.model).symbols().size()));
     if (out.target != nullptr) {
         cfg.aggregateLayout       = out.target->aggregateLayout();
         cfg.aggregateLayoutLoaded = out.target->aggregateLayoutLoaded();
+        cfg.argumentSlotBytes     = argumentSlotBytes(*out.target);   // the target's quantum, at its home
     }
     out.mir.emplace(lowerToMir(out.hir->hir, out.hir->literalPool,
                                out.model->lattice().interner(), out.mirReporter,

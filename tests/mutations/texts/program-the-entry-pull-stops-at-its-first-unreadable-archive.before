@@ -1,0 +1,2 @@
+        if (!arch) return false;   // corrupt archive -> reader fail-loud, named
+        ParsedArchive const& pa = archives[ai].emplace(ParsedArchive{std::move(bytes), std::move(*arch)});

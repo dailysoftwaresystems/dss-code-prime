@@ -937,6 +937,8 @@ TEST(EveryUnit, EveryMemberTheArchiveSearchReachesIsReadBeforeTheSearchFails) {
             EXPECT_EQ(countSaying(rep, "undefined symbol"), 0u)
                 << "the search's failure reached the link, which refused a name the failed member defines; the build "
                    "said:" << allSaid(rep);
+            EXPECT_EQ(countSaying(rep, "without reporting any diagnostic"), 0u)
+                << "a member read that reported was named silent; the build said:" << allSaid(rep);
             EXPECT_EQ(artifactsUnder(out), std::vector<std::string>{}) << "the failed build wrote an artifact";
         }
     }
@@ -986,35 +988,49 @@ TEST(EveryUnit, EveryCommonOfTheCommonsRoundIsAskedBeforeTheSearchFails) {
         EXPECT_EQ(countSaying(rep, "it could not be read (above)"), mixed ? 1u : 2u)
             << "each common whose member cannot be read is refused once, whatever came before it; the build said:"
             << allSaid(rep);
+        EXPECT_EQ(countSaying(rep, "without reporting any diagnostic"), 0u)
+            << "a common that reported, or met a refusal an earlier round reported, was named silent; the build "
+               "said:" << allSaid(rep);
         EXPECT_EQ(artifactsUnder(out), std::vector<std::string>{}) << "the failed build wrote an artifact";
     }
 }
 
-// SITE (i): the entry pull answers EVERY entry name before it fails (`pullEntryArchiveMembers`, called directly with
-// two names an archive's members define).
-TEST(EveryUnit, EveryEntryNameOfTheEntryPullIsAnsweredBeforeThePullFails) {
+// SITE (i): the entry pull reads EVERY archive it reaches before it fails (`pullEntryArchiveMembers`, called directly:
+// the link's identity check refuses a corrupt archive first on the driver's routes). Its units are the archives (P69
+// fold 3f, F1): two corrupt archives are two refusals, each naming its archive; a corrupt archive before a readable one
+// that lists the entry is one, and the pull fails all the same, pulling nothing.
+TEST(EveryUnit, EveryArchiveTheEntryPullReachesIsReadBeforeThePullFails) {
     for (UnitDocument const& d : kUnitDocuments) {
         for (bool const mixed : {false, true}) {
-            SCOPED_TRACE(std::string{d.archive} + (mixed ? " / a readable member, then an unreadable one" : " / both unreadable"));
+            SCOPED_TRACE(std::string{d.archive} + (mixed ? " / a corrupt archive, then one listing the entry" : " / two corrupt"));
             dss::test_support::ScratchDir scratch{dss::test_support::Location::InsideRepo, "every-unit-entry-pull"};
             Loaded const l = loadedFor(d.arch, execOf(d));
             ASSERT_TRUE(l.target && l.format);
-            fs::path const lib = libraryOfTwo(scratch.path() / "lib", d, {!mixed, true});
-            ASSERT_FALSE(lib.empty());
-            // Each name as the program's own election spells it on the binary: the format's C decoration (Mach-O's
+            writeBytes(scratch.path() / "corrupt_one.a", corruptArchive());
+            std::vector<fs::path> archives{scratch.path() / "corrupt_one.a"};
+            if (mixed) {
+                fs::path const lib = libraryOfTwo(scratch.path() / "lib", d, {false, false});
+                ASSERT_FALSE(lib.empty());
+                archives.push_back(lib);
+            } else {
+                writeBytes(scratch.path() / "corrupt_two.a", corruptArchive());
+                archives.push_back(scratch.path() / "corrupt_two.a");
+            }
+            // The entry as the program's own election spells it on the binary: the format's C decoration (Mach-O's
             // leading underscore), as `entryLinkNames` applies it.
-            auto const onTheBinary = [&](std::string_view name) {
-                return dss::ffi::applyCMangling(name, l.format->cSymbolDecoration().scheme);
-            };
             std::vector<dss::EntryLinkName> const names{
-                {onTheBinary("first_api"), "first_api", dss::EntryMaterialization::None},
-                {onTheBinary("second_api"), "second_api", dss::EntryMaterialization::None}};
-            std::vector<fs::path> const archives{lib};
+                {dss::ffi::applyCMangling("first_api", l.format->cSymbolDecoration().scheme), "first_api",
+                 dss::EntryMaterialization::None}};
             dss::DiagnosticReporter rep;
-            auto const pulled = dss::pullEntryArchiveMembers(names, archives, *l.target, *l.format, rep);
-            EXPECT_FALSE(pulled.has_value()) << "an entry pull of an unreadable member succeeded";
-            EXPECT_EQ(countSaying(rep, kReaderRefusal), mixed ? 1u : 2u)
-                << "each unreadable member is refused once, whatever came before it; the pull said:" << allSaid(rep);
+            auto const pulled = dss::pullEntryArchiveMembers(names, {}, archives, *l.target, *l.format, rep);
+            EXPECT_FALSE(pulled.has_value()) << "an entry pull over a corrupt archive succeeded";
+            for (char const* name : {"corrupt_one.a", "corrupt_two.a"}) {
+                if (mixed && std::string_view{name} == "corrupt_two.a") continue;
+                EXPECT_GE(countSaying(rep, name), 1u)
+                    << "the corrupt archive " << name << " was not refused by name; the pull said:" << allSaid(rep);
+            }
+            EXPECT_EQ(countSaying(rep, "without reporting any diagnostic"), 0u)
+                << "an archive that reported was named silent; the pull said:" << allSaid(rep);
         }
     }
 }

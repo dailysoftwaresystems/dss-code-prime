@@ -88,15 +88,31 @@
         "subtrahendNativeId": 1442840576,
         "minuendNativeId": 100663296
       }
+    ],
+    "$linkerOptionsComment": "P69 fold 3f (`#pragma comment`'s Mach-O half): the load command in which a relocatable object hands its final linker options, and how that linker reads them. ✔MEASURED (P69 fold 3f, Apple clang 21 `-fms-extensions` and the host's ld64): `#pragma comment(lib, \"x\")` writes ONE LC_LINKER_OPTION (45) holding the one string `-lx`, and `comment(linker, \"t\")` one holding `t` as ONE string -- each pragma its own command, a repeat written again, cmdsize 12 + the NUL-terminated strings zero-filled to 8 (16 for `-lz`); ld64 searches a library either kind spells (`-lz` links `compress2` and the image needs libz), and warns \"unknown linker option from object file ignored\" of the one string `-framework CoreFoundation`. A DSS relocatable object writes each library its units name (`library` and the name, once) and each other option as its strings; the reader reads a foreign object's back -- a library into the unit's libraries, a framework (`framework` and its name, TWO strings) and any other option kept, the latter warned by a link that makes an image where ld64 warns; that link ignores the libraries and frameworks (`inImage`), for `reason`.",
+    "linkerOptions": {
+      "command": 45,
+      "library": "-l",
+      "framework": "-framework",
+      "inImage": "ignored",
+      "reason": "A library or a framework to search. A DSS link binds a library function through its descriptors and the `--resolve-library` inputs, and a name nothing resolves still fails loud (ELF's `elf.dependentLibraries` and COFF's `/DEFAULTLIB:` rows say the same)."
+    },
+    "$skippedLoadCommandsComment": "P69 fold 3f (D-LK-MACHO-READER-SKIPS-LOAD-COMMANDS-IN-SILENCE): the load commands a relocatable object may carry that nothing a link makes reads -- the object reader steps over each for its `reason`. It READS LC_SEGMENT_64, LC_SYMTAB, LC_DYSYMTAB, LC_BUILD_VERSION, LC_VERSION_MIN_MACOSX and the `linkerOptions` command, and REFUSES by name every command neither read nor listed here. ✔MEASURED (P69 fold 3f, run 20261117-192243-260e95c2: Apple clang 21's relocatable objects, arm64 and x86_64, and ld64's `-r` outputs on the macos-arm64 leg): eight commands -- those six, LC_LINKER_OPTIMIZATION_HINT (46, arm64 objects only) and LC_DATA_IN_CODE (41, arm64 objects and every `ld -r` output, x86_64's too).",
+    "skippedLoadCommands": [
+      {
+        "command": 41,
+        "name": "LC_DATA_IN_CODE",
+        "reason": "marks bytes inside a code section as data, for disassemblers and debuggers: the bytes link as they are, and a DSS image states no data-in-code of its own."
+      }
     ]
   },
 
-  "$buildVersionComment": "D-LK10-ENTRY-MACHO-EXIT, MH_OBJECT arm: LC_BUILD_VERSION in a RELOCATABLE object. ★ `image.*` here means THIS MACH-O FILE -- not 'a loadable image'. MH_OBJECT is a `filetype` exactly like MH_EXECUTE, and `build_version_command` is legal in both, which is why the key needs no new vocabulary to reach a `.o`. ✔MEASURED 2026-08-13 on the operator's Apple Silicon Mac (macOS 26.5.2, Apple clang, `ld` PROJECT:ld-1267): `clang -c` emits into a plain `.o`, IN THIS ORDER, LC_SEGMENT_64 / LC_BUILD_VERSION (cmdsize 24, platform 1 = PLATFORM_MACOS, ntools 0) / LC_SYMTAB / LC_DYSYMTAB. Without the key ld64 prints `ld: warning: no platform load command found in '<tu>.o', assuming: macOS` once per object -- fidelity + noise, not breakage, but a per-object warning trains readers to ignore linker warnings and can bury a real one. THE PLATFORM IS PER-OS, NOT PER-CPU, which is why this x86_64 sibling declares the identical `macos` / 11.0 / 11.0 the arm64 object and both darwin -exec formats declare; the cputype above is the only axis that differs. ⚠ NOT RE-MEASURED FOR THIS SLICE: the reachable Mac is Apple Silicon, so the ld64 observation was taken on arm64 objects. Stated rather than buried -- the load command's wire shape and ld64's platform rule carry no cputype axis (both darwin -exec formats already share the identical block), so nothing here rests on an x86_64-specific probe. RED-ON-DISABLE: delete this block and mach_header_64 ncmds falls 3 -> 2, sizeofcmds drops 24, and the byte pins in tests/link/test_macho_writer.cpp go red.",
+  "$buildVersionComment": "D-LK10-ENTRY-MACHO-EXIT, MH_OBJECT arm: LC_BUILD_VERSION in a RELOCATABLE object. ★ `image.*` here means THIS MACH-O FILE -- not 'a loadable image'. MH_OBJECT is a `filetype` exactly like MH_EXECUTE, and `build_version_command` is legal in both, which is why the key needs no new vocabulary to reach a `.o`. ✔MEASURED 2026-08-13 on the operator's Apple Silicon Mac (macOS 26.5.2, Apple clang, `ld` PROJECT:ld-1267): `clang -c` emits into a plain `.o`, IN THIS ORDER, LC_SEGMENT_64 / LC_BUILD_VERSION (cmdsize 24, platform 1 = PLATFORM_MACOS, ntools 0) / LC_SYMTAB / LC_DYSYMTAB. Without the key ld64 prints `ld: warning: no platform load command found in '<tu>.o', assuming: macOS` once per object -- fidelity + noise, not breakage, but a per-object warning trains readers to ignore linker warnings and can bury a real one. THE PLATFORM IS PER-OS, NOT PER-CPU, which is why this x86_64 sibling declares the `macos` the arm64 object declares; its minOs / sdk are its family's IMAGE's, 10.14 / 10.14 (macho64-x86_64-darwin-exec's measured floor) -- an object built for a newer OS than the image it joins makes ld64 warn, and DSS's image link too (P69 fold 3f, run 20261117-192243-260e95c2). It said 11.0 / 11.0 until fold 3f, a copy of the arm64 value left behind when the x86_64 exec moved to 10.14. ⚠ NOT RE-MEASURED FOR THIS SLICE: the reachable Mac is Apple Silicon, so the ld64 observation was taken on arm64 objects. Stated rather than buried -- the load command's wire shape and ld64's platform rule carry no cputype axis (both darwin -exec formats already share the identical block), so nothing here rests on an x86_64-specific probe. RED-ON-DISABLE: delete this block and mach_header_64 ncmds falls 3 -> 2, sizeofcmds drops 24, and the byte pins in tests/link/test_macho_writer.cpp go red.",
   "image": {
     "buildVersion": {
       "platform": "macos",
-      "minOs": "11.0",
-      "sdk": "11.0"
+      "minOs": "10.14",
+      "sdk": "10.14"
     }
   },
 

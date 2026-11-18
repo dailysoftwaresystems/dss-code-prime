@@ -44,7 +44,7 @@
 #include "program/compile_pipeline.hpp"
 #include "program/program.hpp"
 #include "scratch_dir.hpp"
-#include "link_facts.hpp"   // ordinaryLinkFormat (P69: mergeCuMirs reads the link's document)
+
 #include "driver_diagnostics_listener.hpp"   // AskedDriverCodes
 
 #include <gtest/gtest.h>
@@ -2861,11 +2861,13 @@ TEST(Program_WholeProgramMerge, CrossCuCallIsDirectNoThunkSlot) {
         }
     }
 
+    // The link's document is the one the units were compiled for (P69 fold 3f): they were lowered for its LLP64,
+    // and the merge refuses a format of another model (it was handed the ELF one, LP64, and sized under it).
     auto merged = mergeCuMirs(
         std::span<MergeCuInput const>{inputs.data(), inputs.size()},
         std::move(host),
         std::span<std::string const>{entryNames.data(), entryNames.size()},
-        dss::test_support::ordinaryLinkFormat(), rep);
+        **formatR, rep);
     ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
 
     // (1a) Both `main` AND `add5` are DEFINED in the single merged module — the
@@ -2897,7 +2899,6 @@ TEST(Program_WholeProgramMerge, CrossCuCallIsDirectNoThunkSlot) {
     // never consumed (nullopt is the faithful value; a guard fires only if
     // an extern import survives without one). D-FFI-EXTERN-CALL-DISPATCH.
     auto mod = lowerMergedToAssembly(*merged, *grammar, **targetR,
-                                     (*formatR)->dataModel(),
                                      effectiveBitFieldStrategy(**targetR, **formatR),
                                      effectiveUnnamedBitFieldAlignment(**targetR,
                                                                        **formatR),
@@ -3034,7 +3035,7 @@ TEST(Program_WholeProgramMerge, CrossCuCallIsInlinedOnMergedModule) {
             std::span<MergeCuInput const>{inputs.data(), inputs.size()},
             std::move(host),
             std::span<std::string const>{entryNames.data(), entryNames.size()},
-            dss::test_support::ordinaryLinkFormat(), rep);
+            **formatR, rep);   // the document the units were compiled for (P69 fold 3f)
     };
 
     // The cross_cu_call merged module always carries exactly one main→add5 Call before
@@ -3175,7 +3176,7 @@ TEST(Program_WholeProgramMerge, ShippedStageRoutingInlinesCrossCuAtProgramStage)
         std::span<MergeCuInput const>{inputs.data(), inputs.size()},
         std::move(host),
         std::span<std::string const>{entryNames.data(), entryNames.size()},
-        dss::test_support::ordinaryLinkFormat(), rep);
+        **formatR, rep);   // the document the units were compiled for (P69 fold 3f)
     ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
 
     // ── PROGRAM direction: the full document over the merged module. ──

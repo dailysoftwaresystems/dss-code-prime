@@ -68,9 +68,11 @@ namespace dss {
 // load of a code address + indirect branch) is already emitted into the LIR; a
 // descriptor carries only what the assembler-adjacent pipeline needs to
 // MATERIALIZE the `.data` address table after `assemble()` has resolved each
-// block's byte offset. The table is `slotCount` 8-byte slots — one per value in
-// `[minCase, maxCase]` — each an abs64 relocation to the synthetic per-block
-// symbol of that value's target block (the default block for a gap). The block
+// block's byte offset. The table is `slotCount` slots of `slotBytes` each — one per
+// value in `[minCase, maxCase]`, each an ADDRESS of the module's data model (P69
+// fold 3f, review-xa3e F3-R1: the width the lowering scaled the index by, so the
+// writer and the load read ONE value) — each an address relocation to the synthetic
+// per-block symbol of that value's target block (the default block for a gap). The block
 // symbols are minted by the SAME `mintBlockSymbol` sequence the computed-goto
 // `&&label` path uses (so they are unique module-wide and get an interior-block
 // VA via `link/format/interior_block_symbol_va.hpp`), but — unlike computed-goto
@@ -78,12 +80,13 @@ namespace dss {
 // from the assembled function's `blockByteOffsets` map.
 struct DSS_EXPORT JumpTableDescriptor {
     SymbolId    tableSymbol{};    // unique `.data` symbol for this table
-    std::size_t slotCount = 0;    // (maxCase - minCase + 1) 8-byte slots
+    std::size_t slotCount = 0;    // (maxCase - minCase + 1) slots
+    std::size_t slotBytes = 0;    // one slot's width: an address of the module's data model
     std::size_t funcIndex = 0;    // index into lir.funcAt(i) of the owning function
     // slot j (0-based, value == minCase + j) → the LIR block its code address
     // occupies. Gaps carry the default block. Parallel to the emitted table's
-    // slots; the pipeline writes an abs64 reloc at byte (j * 8) targeting
-    // `blockSymbols[lirBlock.v]`.
+    // slots; the pipeline writes an address reloc at byte (j * slotBytes)
+    // targeting `blockSymbols[lirBlock.v]`.
     std::vector<std::pair<std::uint32_t /*lirBlock.v*/, std::size_t /*slotIndex*/>>
         slotBindings;
     // Each distinct target LIR block (`lirBlock.v`) → its synthetic per-block
@@ -566,5 +569,40 @@ lowerToLir(Mir const&          mir,
            // so a reference to it is DIRECT and takes no slot. Empty = no name
            // is exempt, the lowering unchanged.
            std::vector<std::string> imageDefinedNames = {});
+
+// ★ THE WALL AND ITS SEAM (P69 fold 3f, review-xa3e F3, the Lowerer's half). Every
+// address width this lowering writes -- a pointer-class value's load and store, a
+// jump table's slot and its index scale, the TLS, TLV, import and GOT slot loads,
+// the atomics runtime's `size_t` -- is read ONCE from the data model the module
+// states (`MirModuleFacts::dataModel`). `lowerToLir` is THE WALL: it refuses, by
+// name and with the admissibility predicate's reason (`S_UnsupportedDataModel`, the
+// semantic gate's verdict), a module that states no data model or one whose pointer
+// is not the back end's address width (`dataModelTheBackEndCannotLower`), before
+// anything is lowered. `lowerToLirPastTheWall` is the same lowering WITHOUT the
+// wall's second question: it lowers at whatever width the module's model states,
+// and refuses only a model that states none or one no LIR access can spell. Its one
+// reader is the seam's pin (tests/link/test_writer_address_class.cpp): under the
+// only width the wall admits, a literal 8 and a read of the model agree, so only a
+// module lowered past the wall can tell them apart. The pipeline never calls it.
+[[nodiscard]] DSS_EXPORT MirToLirResult
+lowerToLirPastTheWall(Mir const&          mir,
+                      TargetSchema const& target,
+                      TypeInterner const& interner,
+                      DiagnosticReporter& reporter,
+                      std::uint16_t callingConventionIndex,
+                      std::vector<ExternImport> externImports = {},
+                      std::optional<ExternCallDispatch> externCallDispatch = std::nullopt,
+                      std::optional<DataImportBinding> dataImportBinding = std::nullopt,
+                      std::optional<TlsAccessInfo> tlsAccess = std::nullopt,
+                      std::span<MirSehScope const> sehScopes = {},
+                      std::optional<std::string> wideFloatSoftcallLibrary = std::nullopt,
+                      std::optional<ExternAddrBinding> externAddrBinding = std::nullopt,
+                      std::optional<bool> charIsUnsigned = std::nullopt,
+                      std::optional<AtomicsRuntime> atomicsRuntime = std::nullopt,
+                      std::vector<SymbolBinding> indirectSlotBindings = {},
+                      std::vector<SymbolBinding> preemptibleDefinitionBindings = {},
+                      std::vector<DefinedSymbolName> definedSymbolNames = {},
+                      std::optional<ObjectFormatKind> assemblyFormatKind = std::nullopt,
+                      std::vector<std::string> imageDefinedNames = {});
 
 } // namespace dss

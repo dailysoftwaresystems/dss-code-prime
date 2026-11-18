@@ -42,6 +42,22 @@ FORMAT its spec names, so this option selects nothing: it is CHECKED, by members
 `artifactProfiles` the spec's format document declares under `--tree`, before anything is compiled. A format
 that declares none (a relocatable object) is compiled with no kind stated, and a kind stated for it is refused.
 
+THE DUMPS are `--dumps`, optional: a comma-separated list of the compiler's stage dumps, each kept beside its
+image, so two legs' compiles of one source can be compared stage by stage (cycle P69, 2026-11-16: the image one
+kit makes for one target differed by the host the compiler was built on, and the image alone cannot say which
+stage first decided differently). A name this program does not know, a name given twice and an empty name are
+REFUSED (exit 2) before the compiler is asked anything. The three names, and what the compiler is asked for each:
+    hir        `--emit-hir <file>`: the front end's HIR text, ONCE per source and with no --config, because the
+               front end runs before any pipeline does
+    opt-trace  `DSS_OPT_TRACE` set: every line the optimizer prints on stderr, per pass of every pipeline stage
+               (the pass, whether it mutated the module, and the instructions it rebuilt), kept whole
+    lir        `DSS_DUMP_LIR_MIN_INSTS=0` with `DSS_DUMP_LIR_FILE` naming the kept file: every function's LIR at
+               each stage the compiler dumps it, each stage under its own `STAGE` line
+opt-trace and lir are read from ONE further compile per source and arm, with exactly those variables set; the
+image is compiled with none of them set, whatever the leg's environment holds, so a dump never changes the image
+it stands beside, and the report says whether the dumping compile left the same file(s) as the kept one. A dump
+the compiler did not write is said (NONE), never a refusal: like a failed compile, it is a measurement.
+
 THE REQUEST IS PUT TO THE COMPILER BEFORE ANY SOURCE IS. The compiler exits 1 for a source that does not compile
 and 1 for a target it does not know, so an exit code cannot tell a refused request from a failed compile, and a
 list of diagnostic codes would be this program's guess at the compiler's vocabulary. Instead each (language,
@@ -54,6 +70,8 @@ with no `:` -- did not.)
 WHAT IS KEPT, under `--step-dir` (the step's own directory, `{stepBuild}`):
     kept/compile-and-keep.txt            the report, as printed
     kept/images/<name>/<arm>/<file>      every file that compile left, as the compiler named it
+    kept/dumps/<name>/hir.dsshir         the HIR dump, when `--dumps` asks for `hir`
+    kept/dumps/<name>/<arm>/<dump>.txt   `opt-trace.txt` and `lir.txt`, when `--dumps` asks for them
 `kept` is the step's declared output, so `persist` keeps it. `sync --pull` carries FILES, each named, never a
 directory (MEASURED 2026-10-08: "... is a directory in ..., and only files cross, each named: name the files in
 it"), so the report's last line but one IS the command that brings every kept file back, whole, for the leg it
@@ -67,14 +85,15 @@ THE REPORT, per source and arm: the source's size and md5, the compile's exit co
 and every file it left with its size and md5 (or that it left none). A compile that FAILS is a measurement, and
 so is one that exits 0 and leaves nothing: the run goes on, the report says so, and the step passes -- a failed
 step keeps nothing, and a report is what the caller came for. The last line counts them:
-`compile-and-keep: OK compiles=<n> built=<b> failed=<f> empty=<e> images=<i>`.
+`compile-and-keep: OK compiles=<n> built=<b> failed=<f> empty=<e> images=<i>`, and ` dumps=<d>` after it when
+`--dumps` asked for any (the dump files kept).
 Every line printed or kept passes THE ONE REDACTOR (`redact/redact.py`, loaded by path from its sibling).
 
 EXIT CODES -- 0 means every compile RAN; each refusal is one line, `compile-and-keep: REFUSED (exit <n>) - ...`
 (the compiler's own words under it, for 4), printed before any source is compiled and before anything is kept:
     2   the request is malformed (an empty option, an empty or repeated pipeline name, a pipeline name that is
-        not a plain word, an empty path for the pack), the step's directory already holds a run, or this host's
-        account cannot be named for redaction
+        not a plain word, an unknown, repeated or empty dump name, an empty path for the pack), the step's
+        directory already holds a run, or this host's account cannot be named for redaction
     3   no built dsscp: none named, a bare program name, a path that is not a file, or a file that cannot be
         started
     4   the built compiler refuses the request (the language, the target, or a pipeline), or its answer to the
@@ -137,6 +156,19 @@ KEPT = "kept"
 SOURCES = "sources"
 IMAGES = "images"
 REPORT = "compile-and-keep.txt"
+DUMPS_DIR = "dumps"
+# THE STAGE DUMPS, by the name a request gives each (see the header). A name is the request's word; the variables
+# and the flag are the compiler's, and the live arms hold this program's reading of them against a built compiler.
+HIR, OPT_TRACE, LIR = "hir", "opt-trace", "lir"
+DUMPS = (HIR, OPT_TRACE, LIR)
+HIR_FILE = "hir.dsshir"
+OPT_TRACE_FILE = "opt-trace.txt"
+LIR_FILE = "lir.txt"
+OPT_TRACE_VARIABLE = "DSS_OPT_TRACE"
+LIR_MIN_INSTS_VARIABLE = "DSS_DUMP_LIR_MIN_INSTS"
+LIR_FILE_VARIABLE = "DSS_DUMP_LIR_FILE"
+DUMP_VARIABLES = (OPT_TRACE_VARIABLE, LIR_MIN_INSTS_VARIABLE, LIR_FILE_VARIABLE)
+DUMPING_OUTPUT = "dumping-compile-output"
 # The source the control request names. It must not exist; a compiler that accepts a request names it.
 CONTROL = "compile-and-keep-absent-control"
 ITEM_KEYS = ("name", "src", "ext", "language")
@@ -328,6 +360,24 @@ def split_arms(value):
     return arms
 
 
+def split_dumps(value):
+    """The dump names of `--dumps`, in the order given; [] for none. Each is one this program knows, once."""
+    if not value:
+        return []
+    names = value.split(",")
+    if "" in names:
+        raise Refusal(EXIT_REQUEST, "--dumps names the stage dumps to keep, comma-separated and none of them empty "
+                                    "(%r)" % value)
+    unknown = [name for name in names if name not in DUMPS]
+    if unknown:
+        raise Refusal(EXIT_REQUEST, "--dumps names %s, which %s no stage dump this program keeps: the dumps are %s"
+                      % (", ".join("%r" % name for name in unknown), "is" if len(unknown) == 1 else "are",
+                         ", ".join(DUMPS)))
+    if len(set(names)) != len(names):
+        raise Refusal(EXIT_REQUEST, "--dumps names a stage dump twice: %r" % value)
+    return names
+
+
 def pipeline_args(arm):
     """What an arm adds to the compiler's command line: nothing for the baseline, else its one token."""
     return [] if arm == BASELINE else ["--config=" + arm]
@@ -368,9 +418,15 @@ def plain_word(value, what, code):
         raise Refusal(code, "%s %r is not a plain word (%s)" % (what, value, WORD.pattern))
 
 
-def run_compiler(argv, cwd, env, seconds):
-    """(exit code or a mark, stdout, stderr), each stream capped. A compiler that cannot be STARTED is a refusal:
-    nothing was measured, and the system's own words say why."""
+def one_line_ending(b):
+    """A stream's text with one line ending: a compiler on Windows ends its lines CR LF."""
+    return b.decode("utf-8", errors="replace").replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n")
+
+
+def run_compiler(argv, cwd, env, seconds, err_to=None):
+    """(exit code or a mark, stdout, stderr), each stream capped. With `err_to`, the WHOLE of stderr is also written
+    to that file, uncapped (a dump read from stderr). A compiler that cannot be STARTED is a refusal: nothing was
+    measured, and the system's own words say why."""
     try:
         p = subprocess.run(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                            stderr=subprocess.PIPE, timeout=seconds)
@@ -379,10 +435,12 @@ def run_compiler(argv, cwd, env, seconds):
         rc, out, err = "timeout-%ds" % seconds, e.stdout or b"", e.stderr or b""
     except OSError as e:
         raise Refusal(EXIT_NO_COMPILER, "the built dsscp at %s cannot be started: %s" % (argv[0], e))
+    if err_to is not None:
+        with io.open(err_to, "w", encoding="utf-8", newline="\n") as f:
+            f.write(one_line_ending(err))
 
     def text(b):
-        # One line ending in every report: a compiler on Windows ends its lines CR LF.
-        s = b.decode("utf-8", errors="replace").replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n")
+        s = one_line_ending(b)
         return s if len(s) <= MAX_STREAM_CHARS else s[:MAX_STREAM_CHARS] + "\n... %d more character(s) not kept" % (
             len(s) - MAX_STREAM_CHARS)
     return rc, text(out), text(err)
@@ -464,26 +522,94 @@ def listing(directory):
     return found
 
 
+def dump_line(emit, name, path, shown_as, how):
+    """Report one dump -> 1 when its file was written (and is kept), 0 when it was not (said, NONE)."""
+    if not os.path.isfile(path):
+        emit("== dump %s: NONE (%s, and wrote no %s)" % (name, how, os.path.basename(path)))
+        return 0
+    size, digest = file_md5(path)
+    extra = ""
+    if name == OPT_TRACE:
+        with io.open(path, encoding="utf-8", errors="replace") as f:
+            extra = ", %d line(s) from the optimizer (`opt: `)" % sum(1 for ln in f if ln.startswith("opt: "))
+    emit("== dump %s: %s, %d byte(s), md5 %s%s" % (name, shown_as, size, digest, extra))
+    return 1
+
+
+def keep_dumps(compiler, env, asked, lang, target, arm, first_arm, source_dir, source, plan, image_files, emit,
+               seconds):
+    """The dumps `asked` for one source under one arm, each written into its kept place and reported -> how many
+    dump files were kept. `plan` is (the source's dump directory, this arm's, the dumping compile's output), each
+    made through the one door before anything ran. HIR is asked once per source; opt-trace and lir come from ONE
+    further compile with exactly their variables set, whose output is compared with the kept compile's."""
+    item_dumps, arm_dumps, dumping_output = plan
+    name = os.path.basename(item_dumps)
+    kept_count = 0
+    if HIR in asked and first_arm:
+        os.makedirs(item_dumps, exist_ok=True)
+        hir = child(item_dumps, HIR_FILE, "the HIR dump")
+        argv = compiler + ["--emit-hir", hir, "--language", lang, "--target", target, os.path.basename(source)]
+        rc, out, err = run_compiler(argv, source_dir, env, seconds)
+        if rc != 0:
+            emit("-- `--emit-hir` exited %s; the compiler said:" % rc)
+            for line in said(out, err).split("\n"):
+                emit(line)
+        kept_count += dump_line(emit, HIR, hir, "%s/%s/%s" % (DUMPS_DIR, name, HIR_FILE),
+                                "`--emit-hir` exited %s" % rc)
+    wanted = [d for d in asked if d in (OPT_TRACE, LIR)]
+    if not wanted:
+        return kept_count
+    os.makedirs(arm_dumps, exist_ok=True)
+    dumping_env = dict(env)
+    files = {}
+    if OPT_TRACE in wanted:
+        dumping_env[OPT_TRACE_VARIABLE] = "1"
+        files[OPT_TRACE] = child(arm_dumps, OPT_TRACE_FILE, "the opt-trace dump")
+    if LIR in wanted:
+        files[LIR] = child(arm_dumps, LIR_FILE, "the LIR dump")
+        dumping_env[LIR_MIN_INSTS_VARIABLE] = "0"
+        dumping_env[LIR_FILE_VARIABLE] = files[LIR]
+    argv = (compiler + ["--compile", os.path.basename(source), "--language", lang, "--target", target]
+            + pipeline_args(arm) + ["--output", dumping_output])
+    rc, out, err = run_compiler(argv, source_dir, dumping_env, seconds, err_to=files.get(OPT_TRACE))
+    left = listing(dumping_output)
+    emit("== dumping compile [%s]: exit %s; it left %s" % (
+        arm, rc, "the kept compile's file(s), byte for byte" if left == image_files
+        else "OTHER file(s) than the kept compile: %s" % (", ".join("%s %d byte(s) md5 %s" % f for f in left)
+                                                          or "none")))
+    for dump in (OPT_TRACE, LIR):
+        if dump in files:
+            kept_count += dump_line(emit, dump, files[dump],
+                                    "%s/%s/%s/%s" % (DUMPS_DIR, name, arm, os.path.basename(files[dump])),
+                                    "the dumping compile exited %s" % rc)
+    return kept_count
+
+
 def compile_and_keep(tree, compiler, sources_b64, language, target, configs, kind, step_dir, emit,
-                     compile_seconds=COMPILE_SECONDS):
-    """Compile every source under every arm and keep what each compile left. `emit(line)` takes each report line
-    as it is known. Returns (the kept directory, the counts); raises Refusal before any source is compiled and
-    before anything is kept."""
+                     compile_seconds=COMPILE_SECONDS, dumps=""):
+    """Compile every source under every arm and keep what each compile left, and each stage dump `dumps` asks for.
+    `emit(line)` takes each report line as it is known. Returns (the kept directory, the counts); raises Refusal
+    before any source is compiled and before anything is kept."""
     for value, option in ((tree, "--tree"), (language, "--language"), (target, "--target"), (step_dir, "--step-dir")):
         if not value:
             raise Refusal(EXIT_REQUEST, "%s is empty" % option)
     arms = split_arms(configs)
+    dump_names = split_dumps(dumps)
     items = unpack_sources(sources_b64)
     # THE PLAN: every path, made through the one door, before a directory exists.
     scratch = child(step_dir, SOURCES, "the scratch directory")
     kept = child(step_dir, KEPT, "the kept directory")
     images = child(kept, IMAGES, "the image directory")
+    dumps_root = child(kept, DUMPS_DIR, "the dump directory")
     rows = []
     for item in items:
         source_dir = child(scratch, item["name"], "the source name")
         source = child(source_dir, item["name"] + "." + item["ext"], "the source file name")
         item_dir = child(images, item["name"], "the source name")
-        rows.extend((item, arm, source_dir, source, item_dir, child(item_dir, arm, "the pipeline name"))
+        item_dumps = child(dumps_root, item["name"], "the source name")
+        rows.extend((item, arm, source_dir, source, item_dir, child(item_dir, arm, "the pipeline name"),
+                     (item_dumps, child(item_dumps, arm, "the pipeline name"),
+                      child(source_dir, DUMPING_OUTPUT + "-" + arm, "the pipeline name")), arm == arms[0])
                     for arm in arms)
     for item in items:
         plain_word(item["name"], "the source name", EXIT_SOURCES)
@@ -494,6 +620,8 @@ def compile_and_keep(tree, compiler, sources_b64, language, target, configs, kin
         if os.path.lexists(used):
             raise Refusal(EXIT_REQUEST, "%s exists already: a step's directory is this run's alone" % used)
     env = dict(os.environ, DSS_CONFIG_ROOT=tree)
+    for variable in DUMP_VARIABLES:     # a dump is this program's to ask for, never the leg's environment's
+        env.pop(variable, None)
     os.makedirs(scratch)
     # THE REQUEST, put to the compiler before any source (see the header): once per (language, arm).
     accepted = []
@@ -509,12 +637,18 @@ def compile_and_keep(tree, compiler, sources_b64, language, target, configs, kin
     emit("compile-and-keep: target %s; %s" % (target, kind_line))
     emit("compile-and-keep: pipelines %s" % ", ".join(
         "%s (%s)" % (arm, " ".join(pipeline_args(arm)) or "no --config token") for arm in arms))
+    if dump_names:
+        emit("compile-and-keep: dumps %s" % ", ".join(
+            {HIR: "hir (`--emit-hir`, once per source)", OPT_TRACE: "opt-trace (%s)" % OPT_TRACE_VARIABLE,
+             LIR: "lir (%s=0, %s)" % (LIR_MIN_INSTS_VARIABLE, LIR_FILE_VARIABLE)}[d] for d in dump_names))
     for asked_language, arm, rc in accepted:
         emit("compile-and-keep: request accepted for language %s, pipeline %s (the control exited %s naming its "
              "absent source)" % (asked_language, arm, rc))
     os.makedirs(images)
     counts = {"compiles": 0, "built": 0, "failed": 0, "empty": 0, "images": 0}
-    for item, arm, source_dir, source, item_dir, out_dir in rows:
+    if dump_names:
+        counts["dumps"] = 0
+    for item, arm, source_dir, source, item_dir, out_dir, dump_plan, first_arm in rows:
         if not os.path.isdir(source_dir):
             os.makedirs(source_dir)
             with io.open(source, "wb") as f:
@@ -539,12 +673,15 @@ def compile_and_keep(tree, compiler, sources_b64, language, target, configs, kin
         counts["compiles"] += 1
         counts["images"] += len(files)
         counts["built" if rc == 0 and files else "empty" if rc == 0 else "failed"] += 1
+        if dump_names:
+            counts["dumps"] += keep_dumps(compiler, env, dump_names, item["language"] or language, target, arm,
+                                          first_arm, source_dir, source, dump_plan, files, emit, compile_seconds)
     return kept, counts
 
 
 def closing_line(counts):
     return ("compile-and-keep: OK compiles=%(compiles)d built=%(built)d failed=%(failed)d empty=%(empty)d "
-            "images=%(images)d" % counts)
+            "images=%(images)d" % counts + (" dumps=%d" % counts["dumps"] if "dumps" in counts else ""))
 
 
 def bring_back(tree, leg, kept_at, kept):
@@ -560,7 +697,8 @@ def bring_back(tree, leg, kept_at, kept):
     if base == ".." or base.startswith("../"):
         return ("compile-and-keep: the kept files go to %s, which is not inside the tree, so no `sync --pull` can "
                 "name them" % kept_at)
-    names = [REPORT] + [IMAGES + "/" + name for name, _, _ in listing(os.path.join(kept, IMAGES))]
+    names = ([REPORT] + [IMAGES + "/" + name for name, _, _ in listing(os.path.join(kept, IMAGES))]
+             + [DUMPS_DIR + "/" + name for name, _, _ in listing(os.path.join(kept, DUMPS_DIR))])
     return ("compile-and-keep: bring these %d file(s) back with: dssharness sync --legs %s %s"
             % (len(names), leg, " ".join("--pull %s/%s" % (base, name) for name in names)))
 
@@ -582,7 +720,7 @@ def run(a, compiler=None, out=None, places=None):
 
     try:
         kept, counts = compile_and_keep(a.tree, compiler or built_compiler(a.dsscp), a.sources_b64, a.language,
-                                        a.target, a.configs, a.kind, a.step_dir, emit)
+                                        a.target, a.configs, a.kind, a.step_dir, emit, dumps=a.dumps)
     except Refusal as e:
         out.write(shown("compile-and-keep: REFUSED (exit %d) - %s" % (e.code, e.text)) + "\n")
         return e.code
@@ -602,10 +740,26 @@ def run(a, compiler=None, out=None, places=None):
 STAND_IN = r'''
 import hashlib, json, os, sys, time
 a = sys.argv[1:]
+dumping = {v: os.environ.get(v) for v in ("DSS_OPT_TRACE", "DSS_DUMP_LIR_MIN_INSTS", "DSS_DUMP_LIR_FILE")}
 with open(os.environ["COMPILE_AND_KEEP_CALLS"], "a", encoding="utf-8") as f:
-    f.write(json.dumps({"argv": a, "cwd": os.getcwd(), "root": os.environ.get("DSS_CONFIG_ROOT")}) + "\n")
+    f.write(json.dumps({"argv": a, "cwd": os.getcwd(), "root": os.environ.get("DSS_CONFIG_ROOT"),
+                        "dumping": {k: v for k, v in dumping.items() if v is not None}}) + "\n")
 value = lambda flag: a[a.index(flag) + 1]
+if "--emit-hir" in a:
+    src = a[-1]
+    if not os.path.isfile(src) or b"NO-HIR" in open(src, "rb").read():
+        sys.stderr.write("error: no HIR for '%s'\n" % src)
+        sys.exit(1)
+    with open(value("--emit-hir"), "w", encoding="utf-8", newline="\n") as f:
+        f.write("dsshir 9 producer \"stand-in\" %s\n" % hashlib.md5(open(src, "rb").read()).hexdigest())
+    sys.exit(0)
 src, target, out = value("--compile"), value("--target"), value("--output")
+if dumping["DSS_OPT_TRACE"]:   # bytes, CR LF: the line ending a compiler on Windows writes, on every host
+    sys.stderr.buffer.write(b"opt: iter=1 pass=stand-in start\r\nopt: iter=1 pass=stand-in done 0ms mutated=1\r\n")
+    sys.stderr.flush()
+if dumping["DSS_DUMP_LIR_MIN_INSTS"] is not None and os.path.isfile(src) and b"NO-LIR" not in open(src, "rb").read():
+    with open(dumping["DSS_DUMP_LIR_FILE"], "a", encoding="utf-8", newline="\n") as f:
+        f.write("=== func 1 sym 1 : 1 blocks, 1 insts ===\n")
 config = [x.split("=", 1)[1] for x in a if x.startswith("--config=")]
 if config == ["unknownpipeline"]:
     sys.stderr.write("error: --config: not a recognized configuration\n")
@@ -632,14 +786,15 @@ stem = os.path.splitext(os.path.basename(src))[0]
 os.makedirs(out)
 for name in [stem + ".img"] + ([stem + ".map"] if b"TWO-FILES" in text else []):
     with open(os.path.join(out, name), "wb") as f:
-        f.write(("%s|%s|%s|%s" % (name, target, config, hashlib.md5(text).hexdigest())).encode())
+        f.write(("%s|%s|%s|%s" % (name, target, config, hashlib.md5(text).hexdigest())).encode()
+                + (b"|traced" if dumping["DSS_OPT_TRACE"] and b"TRACE-MOVES" in text else b""))
 sys.stderr.write("artifact %s %s\n" % (target, os.path.join(out, stem + ".img")))
 '''
 
 # ★ AN EXACT RATCHET PER BLOCK: an arm lost from a block, or a block that silently stopped running, is a failure,
 # never a smaller green.
-EXPECTED_FIXED = 107
-EXPECTED_LIVE = 5
+EXPECTED_FIXED = 123
+EXPECTED_LIVE = 7
 
 
 def b64json(doc):
@@ -684,7 +839,7 @@ def selftest(tree=None, dsscp=None, live_example=None, live_target=None):
             return [json.loads(line) for line in f if line.strip()]
 
     def request(sources, target="arch:fmt-exec", configs="baseline,opt", kind="", language="lang", compiler=fake,
-                seconds=COMPILE_SECONDS, the_tree=fake_tree, step=None):
+                seconds=COMPILE_SECONDS, the_tree=fake_tree, step=None, dumps=""):
         """One request against the stand-in -> (exit code, report lines, the step directory, the calls it made)."""
         serial[0] += 1
         step = step or os.path.join(box, "step-%03d" % serial[0])
@@ -694,7 +849,7 @@ def selftest(tree=None, dsscp=None, live_example=None, live_target=None):
         lines = []
         try:
             kept, counts = compile_and_keep(the_tree, compiler, sources if isinstance(sources, str) else b64json(sources),
-                                            language, target, configs, kind, step, lines.append, seconds)
+                                            language, target, configs, kind, step, lines.append, seconds, dumps=dumps)
             lines.append(closing_line(counts))
             rc = 0
         except Refusal as e:
@@ -776,6 +931,98 @@ def selftest(tree=None, dsscp=None, live_example=None, live_target=None):
               own[0] == 0 and [(c["argv"][1], c["argv"][3]) for c in own[3]]
               == [(CONTROL + ".x", "lang"), (CONTROL + ".x", "other"), ("alpha.x", "lang"), ("gamma.x", "other")],
               own[3])
+
+        # ── A2. the stage dumps: kept beside the images when asked, never otherwise ──
+        held = {v: os.environ.get(v) for v in DUMP_VARIABLES}
+        os.environ[OPT_TRACE_VARIABLE] = "1"            # the leg's environment holds dump variables of its own
+        os.environ[LIR_MIN_INSTS_VARIABLE] = "7"
+        try:
+            dumped = request(one, configs="baseline,opt", dumps="hir,opt-trace,lir")
+            plain = request(one)
+        finally:
+            for variable, was in held.items():
+                if was is None:
+                    os.environ.pop(variable, None)
+                else:
+                    os.environ[variable] = was
+        rc, lines, step, made = dumped
+        dumps_dir = os.path.join(step, KEPT, DUMPS_DIR)
+        kept_dumps = [n for n, _, _ in listing(dumps_dir)]
+        check("every dump asked is kept beside its image: dumps/<name>/hir.dsshir once per source, and "
+              "dumps/<name>/<arm>/opt-trace.txt and lir.txt per pipeline, and nothing else",
+              rc == 0 and sorted(kept_dumps) == ["alpha/baseline/lir.txt", "alpha/baseline/opt-trace.txt",
+                                                 "alpha/hir.dsshir", "alpha/opt/lir.txt", "alpha/opt/opt-trace.txt"],
+              (lines, kept_dumps))
+        check("the closing line counts the dump files kept after the images",
+              lines[-1] == "compile-and-keep: OK compiles=2 built=2 failed=0 empty=0 images=2 dumps=5", lines)
+        def dump_said(d, n):
+            path = os.path.join(dumps_dir, *n.split("/"))
+            return os.path.isfile(path) and any(
+                ln.startswith("== dump %s: dumps/%s, %d byte(s), md5 %s" % ((d, n) + file_md5(path))) for ln in lines)
+        check("the report gives each dump's kept name, size and md5, and the optimizer's lines in the trace",
+              all(dump_said(d, n) for d, n in ((HIR, "alpha/hir.dsshir"), (OPT_TRACE, "alpha/opt/opt-trace.txt"),
+                                               (LIR, "alpha/baseline/lir.txt")))
+              and sum(ln.endswith(", 2 line(s) from the optimizer (`opt: `)") for ln in lines) == 2, lines)
+        trace_text = attempt(lambda: io.open(os.path.join(dumps_dir, "alpha", "opt", OPT_TRACE_FILE), "rb").read())
+        check("the opt-trace dump is the dumping compile's stderr, whole, with one line ending",
+              trace_text == ("opt: iter=1 pass=stand-in start\nopt: iter=1 pass=stand-in done 0ms mutated=1\n"
+                             "artifact arch:fmt-exec %s\n" % os.path.join(step, SOURCES, "alpha",
+                                                                         DUMPING_OUTPUT + "-opt", "alpha.img"))
+              .encode("utf-8"), trace_text)
+        hir_calls = [c["argv"] for c in made if "--emit-hir" in c["argv"]]
+        check("HIR is asked ONCE per source: `--emit-hir <its kept file> --language <l> --target <spec> <source>`, "
+              "with no --config, from the source's own directory",
+              hir_calls == [["--emit-hir", os.path.join(dumps_dir, "alpha", HIR_FILE), "--language", "lang",
+                             "--target", "arch:fmt-exec", "alpha.x"]]
+              and all(c["cwd"] == os.path.join(step, SOURCES, "alpha") for c in made if "--emit-hir" in c["argv"]),
+              made)
+        image_calls = [c for c in made if "--output" in c["argv"]
+                       and c["argv"][c["argv"].index("--output") + 1].startswith(os.path.join(step, KEPT, IMAGES))]
+        dumping_calls = [c for c in made if "--output" in c["argv"]
+                         and os.path.basename(c["argv"][c["argv"].index("--output") + 1]).startswith(DUMPING_OUTPUT)]
+        check("the image and the control are compiled with NO dump variable set, though the leg's environment holds "
+              "two; the one further compile per arm has exactly the asked ones",
+              len(image_calls) == 2 and all(c["dumping"] == {} for c in made if c not in dumping_calls)
+              and [c["dumping"] for c in dumping_calls]
+              == [{OPT_TRACE_VARIABLE: "1", LIR_MIN_INSTS_VARIABLE: "0",
+                   LIR_FILE_VARIABLE: os.path.join(dumps_dir, "alpha", arm, LIR_FILE)} for arm in ("baseline", "opt")]
+              and [[x for x in c["argv"] if x.startswith("--config")] for c in dumping_calls] == [[], ["--config=opt"]],
+              made)
+        check("the report says the dumping compile left the kept compile's file(s), byte for byte",
+              sum(ln.endswith("; it left the kept compile's file(s), byte for byte") for ln in lines) == 2, lines)
+        rc, lines, step, made = plain
+        check("with no dumps asked nothing is dumped: no dump directory, no further compile, no dump variable on any "
+              "call, though the leg's environment holds two, and the closing line as before",
+              rc == 0 and sorted(os.listdir(os.path.join(step, KEPT))) == [IMAGES]
+              and len(made) == 4 and all(c["dumping"] == {} for c in made)
+              and lines[-1] == "compile-and-keep: OK compiles=2 built=2 failed=0 empty=0 images=2"
+              and not any(ln.startswith("opt: ") for ln in lines), (lines, made))
+        lir_only = request(one, configs="baseline", dumps="lir")
+        check("a dump not asked is not written and its variable not set: lir alone keeps lir.txt alone",
+              lir_only[0] == 0 and [n for n, _, _ in listing(os.path.join(lir_only[2], KEPT, DUMPS_DIR))]
+              == ["alpha/baseline/lir.txt"] and not any("--emit-hir" in c["argv"] for c in lir_only[3])
+              and [c["dumping"] for c in lir_only[3] if c["dumping"]]
+              == [{LIR_MIN_INSTS_VARIABLE: "0",
+                   LIR_FILE_VARIABLE: os.path.join(lir_only[2], KEPT, DUMPS_DIR, "alpha", "baseline", LIR_FILE)}],
+              (lir_only[1], lir_only[3]))
+        for name, value, want in (("a name it does not know", "hir,mir",
+                                   ("'mir', which is no stage dump this program keeps", "hir, opt-trace, lir")),
+                                  ("a name given twice", "lir,lir", ("names a stage dump twice",)),
+                                  ("an empty name among them", "lir,", ("none of them empty",))):
+            result = request(one, dumps=value)
+            check("REFUSED, exit 2, before the compiler is asked anything, nothing written: --dumps with " + name,
+                  refused(result, EXIT_REQUEST, *want) and result[3] == [] and untouched(result), result[1])
+        unwritten = request([{"name": "bare", "src": "NO-HIR NO-LIR\n", "ext": "x"}], configs="baseline",
+                            dumps="hir,opt-trace,lir")
+        check("a dump the compiler did not write is SAID, never a refusal, and is not counted",
+              unwritten[0] == 0 and "== dump hir: NONE (`--emit-hir` exited 1, and wrote no hir.dsshir)" in unwritten[1]
+              and "== dump lir: NONE (the dumping compile exited 0, and wrote no lir.txt)" in unwritten[1]
+              and unwritten[1][-1].endswith(" images=1 dumps=1"), unwritten[1])
+        moved = request([{"name": "moves", "src": "TRACE-MOVES\n", "ext": "x"}], configs="baseline",
+                        dumps="opt-trace")
+        check("a dumping compile that leaves another image than the kept one is SAID, file by file",
+              moved[0] == 0 and any("; it left OTHER file(s) than the kept compile: moves.img " in ln
+                                    for ln in moved[1]), moved[1])
 
         # ── B. outcomes that are measurements, never refusals ──
         mixed = request([{"name": "bad", "src": "FAILS\n", "ext": "x"}, {"name": "void", "src": "LEAVES-NOTHING\n", "ext": "x"},
@@ -996,13 +1243,13 @@ def selftest(tree=None, dsscp=None, live_example=None, live_target=None):
               unread[1])
 
         # ── I. the whole program: its printed report, its kept one, redaction, its exit codes ──
-        def whole(sources_b64, target="arch:fmt-exec", configs="baseline", kind="", leg="", kept_at=""):
+        def whole(sources_b64, target="arch:fmt-exec", configs="baseline", kind="", leg="", kept_at="", dumps=""):
             serial[0] += 1
             step = os.path.join(box, "step-%03d" % serial[0])
             os.makedirs(step)
             said_ = io.StringIO()
             a = argparse.Namespace(tree=fake_tree, dsscp="", sources_b64=sources_b64, language="lang", target=target,
-                                   configs=configs, kind=kind, step_dir=step, leg=leg, kept_at=kept_at)
+                                   configs=configs, kind=kind, step_dir=step, leg=leg, kept_at=kept_at, dumps=dumps)
             try:
                 rc = run(a, compiler=fake, out=said_, places=places)
             except Exception as e:  # as in request(): a crash is this arm's failure, by name
@@ -1030,6 +1277,15 @@ def selftest(tree=None, dsscp=None, live_example=None, live_target=None):
                             ["compile-and-keep.txt", "images/alpha/baseline/alpha.img", "images/alpha/opt/alpha.img",
                              "images/beta/baseline/beta.img", "images/beta/opt/beta.img"])
               and io.open(os.path.join(step, KEPT, REPORT), encoding="utf-8").read() == printed, printed)
+        rc, printed, step = whole(b64json(one), leg="some-leg", kept_at=os.path.join(fake_tree, "held", "dumped"),
+                                  dumps="hir,lir")
+        told = printed.rstrip("\n").split("\n")
+        check("the dumps are kept outputs: the command that brings the kept files back names every dump file too",
+              rc == 0 and told[-1].endswith(" dumps=2") and told[-2]
+              == "compile-and-keep: bring these 4 file(s) back with: dssharness sync --legs some-leg "
+                 + " ".join("--pull held/dumped/kept/" + name for name in
+                            ["compile-and-keep.txt", "images/alpha/baseline/alpha.img", "dumps/alpha/hir.dsshir",
+                             "dumps/alpha/baseline/lir.txt"]), printed)
         rc, printed, step = whole(b64json(one), leg="some-leg", kept_at=os.path.join(box, "not-the-tree"))
         check("kept files that are not inside the tree are SAID, never named by a path --pull would refuse",
               rc == 0 and "which is not inside the tree, so no `sync --pull` can name them" in printed
@@ -1136,6 +1392,10 @@ def selftest(tree=None, dsscp=None, live_example=None, live_target=None):
         check("the self-test step names no product, so it needs no build",
               "--selftest" in self_step and "{product}" not in self_step and "{buildDir}" not in self_step
               and re.search(r"(?m)^    manual: true$", self_step) is not None, self_step)
+        dumps_input = re.search(r"(?ms)^      dumps:\n(.*?)(?=^      \S|^    \S)", compile_step)
+        check("the compile step passes --dumps=\"{dumps}\", an input whose default asks for no dump",
+              '--dumps="{dumps}"' in run_line and dumps_input is not None
+              and re.search(r"(?m)^        default: ''$", dumps_input.group(1)) is not None, compile_step)
         check("every option the .yml passes is one the program takes",
               set(re.findall(r"(--[a-z0-9-]+)=", run_line))
               == {o for action in build_parser()._actions for o in action.option_strings} - {"-h", "--help"},
@@ -1219,6 +1479,25 @@ def live(check, request, tree, dsscp, example, spec):
     check("live: the kind the target's own format document declares is read from it, and accepted",
           isinstance(kinds, list) and len(kinds) >= 1 and stated[0] == 0
           and any("kind: %s, one of the profile(s) " % kinds[0] in ln for ln in stated[1]), (kinds, stated[1]))
+    arm = pipelines[0] if pipelines else BASELINE
+    dumped = request(source, target=spec, configs=arm, dumps=",".join(DUMPS), **common)
+    at = os.path.join(dumped[2], KEPT, DUMPS_DIR, stem)
+
+    def read(*parts):
+        try:
+            with io.open(os.path.join(at, *parts), encoding="utf-8", errors="replace") as f:
+                return f.read()
+        except OSError as e:
+            return "UNREAD: %s" % e
+    hir, trace, lir = read(HIR_FILE), read(arm, OPT_TRACE_FILE), read(arm, LIR_FILE)
+    check("live: under a shipped pipeline every dump is kept in the compiler's own form -- the HIR text, the "
+          "optimizer's `opt: ` lines, each function's LIR under a stage line",
+          dumped[0] == 0 and dumped[1][-1].endswith(" dumps=3") and hir.startswith("dsshir ")
+          and any(ln.startswith("opt: ") for ln in trace.split("\n"))
+          and "########## STAGE " in lir and "=== func " in lir,
+          (dumped[1], hir[:200], trace[:400], lir[:400]))
+    check("live: the compile that dumps leaves the image the compile that does not leaves, byte for byte",
+          any(ln.endswith("; it left the kept compile's file(s), byte for byte") for ln in dumped[1]), dumped[1])
 
 
 def build_parser():
@@ -1232,6 +1511,7 @@ def build_parser():
     ap.add_argument("--target", required=True, type=_path_types().path_part_arg("--target"))
     ap.add_argument("--configs", required=True, type=_path_types().path_part_arg("--configs"))
     ap.add_argument("--kind", default="", type=_path_types().text_arg("--kind"))
+    ap.add_argument("--dumps", default="", type=_path_types().text_arg("--dumps"))
     ap.add_argument("--step-dir", required=True, type=_path_types().written_path_arg("--step-dir"))
     ap.add_argument("--leg", required=True, type=_path_types().text_arg("--leg"))
     ap.add_argument("--kept-at", required=True, type=_path_types().text_arg("--kept-at"))

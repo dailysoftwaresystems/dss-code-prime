@@ -315,6 +315,43 @@ TEST(LspSemantic, CompletionOnABlankLineBeforeOrAfterEveryDeclarationOffersTheFi
     }
 }
 
+// ★ THE ITEMS COME IN NAME ORDER (P69 fold 3f, lane `xa`). Completion collects the visible names in a hash
+// table, and the reply listed its items in the order that table iterates in: the host library's, a reply
+// that differed between two builds of one server. The items are listed in the names' own order. The file
+// declares its names in neither that order nor its reverse.
+TEST(LspSemantic, CompletionListsItsItemsInNameOrder) {
+    constexpr std::string_view kNames =
+        "\n"                                              // line 0: blank, at file scope
+        "int zeta;\n"
+        "int alpha;\n"
+        "int mid;\n"
+        "int main(void) { return alpha + mid + zeta; }\n";
+    LspTestHarness h;
+    h.push(lspInitialize(1));
+    h.push(didOpen("file:///names.c", kNames));
+    h.push(posRequest("textDocument/completion", 7, "file:///names.c", 0, 0));
+    h.push(lspShutdown(2));
+    h.push(std::string{lspExit});
+    EXPECT_EQ(h.runUntilExit(), 0);
+    auto msgs = h.takeServerMessages();
+    ASSERT_GE(msgs.size(), 3u);
+    json const reply = json::parse(msgs[2]);
+    ASSERT_TRUE(reply.contains("result"));
+    ASSERT_TRUE(reply.at("result").is_array()) << reply.dump();
+    std::vector<std::string> labels;
+    for (auto const& it : reply.at("result")) labels.push_back(it.at("label").get<std::string>());
+    std::vector<std::size_t> at;
+    for (char const* name : {"alpha", "main", "mid", "zeta"}) {
+        std::size_t k = 0;
+        while (k < labels.size() && labels[k] != name) ++k;
+        ASSERT_LT(k, labels.size()) << name << " is offered: " << reply.dump();
+        at.push_back(k);
+    }
+    EXPECT_LT(at[0], at[1]) << "the items come in name order: " << reply.dump();
+    EXPECT_LT(at[1], at[2]) << "the items come in name order: " << reply.dump();
+    EXPECT_LT(at[2], at[3]) << "the items come in name order: " << reply.dump();
+}
+
 // signatureHelp inside a call's arg list → the callee's signature label.
 // Driven on tsql, whose `callExpr` callRule + the COALESCE builtin FnSig
 // give a callable with a real signature. Asserts the EXACT label

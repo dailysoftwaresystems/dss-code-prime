@@ -37,6 +37,7 @@
 #include "core/types/unit_linker_requests.hpp"
 #include "link/branch_veneers.hpp"
 #include "link/entry_trampoline.hpp"
+#include "link/format/coff_object_reader.hpp"
 #include "link/format/pe.hpp"
 #include "link/image_request.hpp"
 #include "link/import_address_references.hpp"
@@ -491,10 +492,31 @@ void driveRequiredEntry(std::uint32_t room, Drive& out) {
     out.heldAfter  = test::digestOf(m);
 }
 
+// A COMPILED UNIT'S LINKER DIRECTIVES (x86_64 PE, P69 fold 3f): `#pragma comment(linker, ...)` asks the link to
+// include two functions the unit does not define -- two required reference rows, one id at a time on the pass's own
+// copy, which replaces the module only when both were had.
+void driveUnitDirectives(std::uint32_t room, Drive& out) {
+    static Schemas const s = shipped("x86_64", "pe64-x86_64-windows");
+    AssembledModule m;
+    m.cuId              = CompilationUnitId{1};
+    m.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};
+    m.functions.push_back(std::move(fn));
+    m.symbols.push_back(ModuleSymbol{SymbolId{1}, "dss_fn", SymbolBinding::Global, SymbolVisibility::Default});
+    m.linkerRequests.linkerOptions = {{"/INCLUDE:dss_far_a"}, {"/INCLUDE:dss_far_b"}};
+    atRoom(m, room);
+    out.heldBefore = test::digestOf(m);
+    out.succeeded  = pe::applyUnitLinkerDirectives(m, *s.format, out.rep);
+    out.heldAfter  = test::digestOf(m);
+}
+
 [[nodiscard]] std::vector<Row> const& rows() {
     static std::vector<Row> const kRows = {
         {"branch-veneer: the {} veneer(s)", 0, 2, driveVeneers},
         {"entry-trampoline: the {} id(s) of the trampoline and its exit", 0, 2, driveTrampoline},
+        {"pe: a reference row a unit's linker directive asks for", 0, 2, driveUnitDirectives},
         {"pe::encodeExec: the address slot an import-slot fix-up reads", 0, 3, driveResidue},
         {"pe::encodeExec: the import-slot residue runner", 1, 3, driveResidue},
         {"pe::encodeExec: the residue runner's thread-template base", 2, 3, driveResidue},

@@ -1,1 +1,1 @@
-  "entryPrecedence": [["none", "argc-argv", "argc-argv-envp"], ["argc-wargv", "argc-wargv-wenvp"]],
+  "entryPrecedence": [["none", "argc-argv", "argc-argv-envp"], ["argc-wargv", "argc-wargv-wenvp"], ["instance-prev-cmdline-show"], ["instance-prev-wcmdline-show"]],

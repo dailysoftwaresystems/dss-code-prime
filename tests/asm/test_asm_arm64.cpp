@@ -3989,6 +3989,7 @@ TEST(Arm64Fpr, FullPipelineDoubleAddToIntEncodesFaddAndFcvtzs) {
     TypeId const params[] = {f64, f64};
     auto const sig = interner.fnSig(params, i32, CallConv::CcAAPCS64);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(sig, SymbolId{1});
     MirBlockId const bb = mb.createBlock(StructCfMarker::EntryBlock);
@@ -4093,6 +4094,7 @@ TEST(Arm64Fpr, FullPipelineDoublePlusRodataConstEncodesLeaFldurFadd) {
     TypeId const params[] = {f64};
     auto const sig = interner.fnSig(params, i32, CallConv::CcAAPCS64);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.stateArgCounting(MirArgCounting::PerClass);
     MirLiteralValue quarter; quarter.value = 0.25;
     quarter.core = TypeKind::F64;

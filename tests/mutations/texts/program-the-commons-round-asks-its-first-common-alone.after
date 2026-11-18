@@ -1,1 +1,1 @@
-        bool const everyCommonAnswered = substrate::runEveryUnit(std::min<std::size_t>(roundEnd, 1), [&](std::size_t k) {
+        bool const everyCommonAnswered = substrate::runEveryUnit(std::min<std::size_t>(roundEnd, 1), substrate::namingSilentUnits(

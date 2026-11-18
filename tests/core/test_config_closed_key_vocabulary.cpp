@@ -316,6 +316,11 @@ namespace {
 //   `entryLabels` (an assembly dialect's, P69 fold 3e) — the same fact in a
 //       dialect: the key is a LABEL of the configured assembly language, and
 //       `$` is a legal symbol character to the assemblers DSS follows.
+//   `kinds` of a `pragmaEffects` row (P69 fold 3f) — the key is the KIND a
+//       program writes as `#pragma comment`'s first operand, matched against
+//       that token: an identifier of the configured language, the key space
+//       `entryFunctions` has. Only that map: a `typeSpelling.kinds` key is a
+//       type-kind name the loader owns, and keeps the carve-out.
 //
 // Reserving `$` in any of these would silently DELETE a legal spelling from the
 // configured language, which is a worse failure than the missing annotation:
@@ -329,7 +334,9 @@ namespace {
             return true;
         }
     }
-    return false;
+    constexpr std::string_view kPragmaEffects = "/pragmaEffects/";
+    constexpr std::string_view kKinds         = "/kinds";
+    return path.find(kPragmaEffects) != std::string_view::npos && path.ends_with(kKinds);
 }
 
 } // namespace

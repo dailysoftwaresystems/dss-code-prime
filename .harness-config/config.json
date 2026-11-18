@@ -205,7 +205,8 @@
     // ★ THE ONE WSL DISTRIBUTION THIS TREE DECLARES (2026-11-17). No DssHarness leg runs in WSL any more (the
     // linux-x86_64 legs moved to the `ubuntu` ssh host), but a Windows-driven sqlite corpus still launches its Linux
     // legs, and runs its POSIX half, inside WSL: the sqlite resolver (harness_legs.py `wsl_distribution_of`) reads
-    // the distribution HERE, exactly one, never the machine's default. Until that day it read the legs' `wsl`, and
+    // the distribution HERE, exactly one, never the machine's default; the item must be named as its distribution
+    // (harness_legs.py `wsl_distribution_of` states why). Until that day it read the legs' `wsl`, and
     // checkpoint 47 went red on every host when the last such leg moved.
     "wsl": {
       "Ubuntu": {
@@ -591,7 +592,7 @@
       // An entry with no `platforms` is needed on EVERY platform (`dssharness help tools`), while
       // its own `install` has always named `linux` and `macos` only. ✔MEASURED 2026-09-18: the
       // sqlite corpus runs tclsh on Linux and macOS, and on a Windows host the recipe is derived
-      // INSIDE WSL (the harness's POSIX half, `sqlite_stage.py derive`, run through `wsl.exe -e`:
+      // INSIDE WSL (the harness's POSIX half, `sqlite_stage.py derive`, run through `wsl.exe -d <distribution> -e`:
       // deriving the SQLite recipe needs make, configure and tclsh), i.e. on the WSL leg's Linux
       // host. No Windows-native program starts it. The declaration now says what is true.
       "platforms": [
@@ -1187,6 +1188,14 @@
         "linux-x86_64-debug"
       ],
       "action": "check-retyped-closed-sets/check-retyped-closed-sets.yml"
+    },
+    "check-row-truth": {
+      "description": "Refuse a registry row whose text a fold made untrue: a reference claim with no carrier, or a name, key, path or decision the fold removed cited as current.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "check-row-truth/check-row-truth.yml"
     },
     "check-scripts-index": {
       "description": "Refuse an action that no index documents, an index entry that no action backs, and an action no runner can start.",

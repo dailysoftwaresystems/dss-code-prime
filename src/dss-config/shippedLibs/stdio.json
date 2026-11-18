@@ -81,6 +81,10 @@
     { "name": "SEEK_CUR", "value": 1, "type": "i32" },
     { "name": "SEEK_END", "value": 2, "type": "i32" }
   ],
+  "$writtenNamesComment": "P69 fold 3f (lane xa; ledger 549 (b)): `writtenNames` states the route of a WRITTEN name no row declares -- read by the reader, NEVER injected into C. `__iob_func` is the msvcrt runtime's stream accessor (its <stdio.h> reached stdin, stdout and stderr through it); DSS's pe C runtime is the UCRT, whose <stdio.h> declares no `__iob_func` and whose images export none (MEASURED: ucrtbase.dll's export table; mingw-w64's UCRT link leaves a reference to it undefined). A foreign object or `.s` unit that references it was built for msvcrt: its route on pe is refused, with the reason the written-name binders give.",
+  "writtenNames": [
+    { "name": "__iob_func", "route": { "pe": { "refused": "the msvcrt runtime's stream accessor; DSS's pe C runtime is the UCRT, and no UCRT image exports __iob_func" } } }
+  ],
   "symbols": [
     { "name": "puts",     "signature": "fn(ptr<const<char>>) -> i32",            "kind": "function", "linkage": "external" },
     { "name": "putchar",  "signature": "fn(i32) -> i32",                  "kind": "function", "linkage": "external" },

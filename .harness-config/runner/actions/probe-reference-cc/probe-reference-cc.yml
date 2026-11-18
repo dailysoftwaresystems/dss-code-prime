@@ -18,6 +18,9 @@ description: >-
   is the whole `sync --pull` command that brings every kept file back; the run's `--json` names them as
   keptOutputs. A reference toolchain's object becomes a test fixture this way, built twice and its two
   md5s compared, never by a private script.
+  A batch item's `inputs` links its probe with other units, compiled to objects, and with archives of them, in the
+  order written, so a reference linker's answer to an order question or to an archive member's entry is measured
+  on the host (2026-11-05: ld64 on the Mac).
   MSVC's cl speaks its own command line (the `msvc` dialect: /c, /FA, /Fe /Fo /Fa); it is on PATH
   on a leg whose developer environment is Visual Studio (windows-x86_64-release).
 inputs:
@@ -25,7 +28,7 @@ inputs:
     description: "ONE probe's source text, base64 (standard or URL-safe alphabet, padding optional); this or batch_b64"
     default: ''
   batch_b64:
-    description: 'a BATCH: base64 of a UTF-8 JSON array of {name, src, ext?, cc?, flags?, mode?, dump?, dialect?, keep?}, run in turn in ONE run; this or src_b64 (an EMPTY translation unit, a stdout-mode probe, travels only here, as "src": "")'
+    description: 'a BATCH: base64 of a UTF-8 JSON array of {name, src, ext?, cc?, flags?, mode?, dump?, dialect?, keep?, inputs?, archiver?}, run in turn in ONE run; this or src_b64 (an EMPTY translation unit, a stdout-mode probe, travels only here, as "src": ""). `inputs` (run and link modes) is the LINK IN ORDER: "probe" once where the item''s source stands, and units {name, src|src_ref, ext?} compiled to objects or archives {archive, members: [unit, ...]} made by ar / lib (the dialect''s, or the item''s `archiver`: ar | lib), each linked where it is written'
     default: ''
   ext:
     description: 'the source file extension: c, s, S or cpp (the msvc dialect: c or cpp; cl does not assemble)'

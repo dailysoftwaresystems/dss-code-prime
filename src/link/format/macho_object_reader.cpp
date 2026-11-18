@@ -2,6 +2,7 @@
 #include "link/format/dwarf_cfi_decode.hpp"
 #include "link/format/foreign_section_alignment.hpp"
 #include "link/format/input_section_names.hpp"   // inputSectionRow: the row an input section reads as
+#include "link/format/macho_linker_options.hpp"   // readMachOLinkerOption -- LC_LINKER_OPTION, as ld64 reads it
 #include "link/format/macho_relocation_info.hpp"
 #include "link/format/object_atom_coverage.hpp"
 #include "link/format/record_symbol_ids.hpp"
@@ -9,12 +10,15 @@
 #include "link/format/relocation_addend.hpp"
 #include "link/format/section_relative_target.hpp"
 
+#include "core/substrate/key_order.hpp"   // entriesInKeyOrder -- the slicing walk's order
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/section_kind.hpp"
 #include "core/types/symbol_attrs.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <format>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -46,6 +50,7 @@ constexpr std::size_t kLcPreambleSz   = 8;
 constexpr std::size_t kSegCmd64HdrSz  = 72;  // segment_command_64 header
 constexpr std::size_t kSection64Sz    = 80;  // one section_64 record
 constexpr std::size_t kSymtabCmdSz    = 24;  // LC_SYMTAB command
+constexpr std::size_t kLinkerOptionHdrSz = 12;  // LC_LINKER_OPTION's cmd, cmdsize, count
 constexpr std::size_t kNlist64Sz      = 16;  // one nlist_64 record
 constexpr std::size_t kRelocInfoSz    = 8;   // one relocation_info record
 constexpr std::size_t kName16Sz       = 16;  // section_64 / segname field
@@ -53,8 +58,11 @@ constexpr std::size_t kName16Sz       = 16;  // section_64 / segname field
 constexpr std::uint32_t kMachOMagic64 = 0xFEEDFACFu;  // 64-bit LE
 constexpr std::uint32_t kMhObject     = 1;            // filetype MH_OBJECT
 
-constexpr std::uint32_t kLcSegment64 = 0x19u;
-constexpr std::uint32_t kLcSymtab    = 0x02u;
+// The load commands' numbers: the reader's header (`kLoadCommandsTheReaderReads`), the one home the loader of
+// `macho.skippedLoadCommands` reads too.
+constexpr std::size_t kDysymtabCmdSz     = 80;  // LC_DYSYMTAB command
+constexpr std::size_t kBuildVersionCmdSz = 24;  // LC_BUILD_VERSION command, before its tool entries
+constexpr std::size_t kVersionMinCmdSz   = 16;  // LC_VERSION_MIN_* command
 
 // mach_header_64 field offsets.
 constexpr std::size_t kHdrMagicOff    = 0;
@@ -417,6 +425,13 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     std::uint64_t strsize = 0;
     bool          sawSymtab = false;
 
+    // P69 fold 3f: what the object states to the link that takes it -- its final linker's options (LC_LINKER_OPTION,
+    // the command the document's `macho.linkerOptions` names, read as ld64 reads it: `readMachOLinkerOption`) and the
+    // minimum OS it was built for (LC_BUILD_VERSION / LC_VERSION_MIN_MACOSX) -- the module's once it exists.
+    UnitLinkerRequests objectRequests;
+    MachOLinkerOptions const* const optionsBlock =
+        objectFormatSchema.macho().linkerOptions.has_value() ? &*objectFormatSchema.macho().linkerOptions : nullptr;
+
     std::size_t       lcOff = kMachHeader64Sz;
     std::size_t const lcEnd = kMachHeader64Sz + static_cast<std::size_t>(sizeofcmds);
     for (std::uint32_t i = 0; i < ncmds; ++i) {
@@ -524,6 +539,104 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             stroff    = rdU32(bytes, lcOff + 16);
             strsize   = rdU32(bytes, lcOff + 20);
             sawSymtab = true;
+        } else if (optionsBlock != nullptr && cmd == optionsBlock->command) {
+            // LC_LINKER_OPTION: its count, then that many NUL-terminated strings, all inside the command.
+            if (cmdsize < kLinkerOptionHdrSz) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "macho::readRelocatableObject: LC_LINKER_OPTION #" + std::to_string(i)
+                    + " cmdsize=" + std::to_string(cmdsize) + " is smaller than its 12-byte header.");
+            }
+            std::uint32_t const count = rdU32(bytes, lcOff + 8);
+            std::vector<std::string> words;
+            std::size_t       at  = lcOff + kLinkerOptionHdrSz;
+            std::size_t const end = lcOff + cmdsize;
+            for (std::uint32_t k = 0; k < count; ++k) {
+                std::size_t nul = at;
+                while (nul < end && bytes[nul] != 0) ++nul;
+                if (nul >= end) {
+                    return fail(DiagnosticCode::F_CorruptedBinary,
+                        "macho::readRelocatableObject: LC_LINKER_OPTION #" + std::to_string(i) + " states "
+                        + std::to_string(count) + " strings, and string " + std::to_string(k)
+                        + " runs past the command's end.");
+                }
+                words.emplace_back(reinterpret_cast<char const*>(bytes.data() + at), nul - at);
+                at = nul + 1;
+            }
+            readMachOLinkerOption(std::move(words), *optionsBlock, objectRequests,
+                                  "a linked object's LC_LINKER_OPTION");
+        } else if (cmd == kLcDysymtab) {
+            // LC_DYSYMTAB. In a relocatable object, a partition of the symbol table (locals, defined externals,
+            // undefined) that each symbol's own `n_type` states again, which the symbol walk reads -- and tables only a
+            // linked image, or a section of pointers or stubs, fills: the contents and module tables, the referenced
+            // symbols, the indirect symbols, the external and local relocations (✔MEASURED P69 fold 3f, run 20261117-192243-260e95c2: every
+            // one empty in each of 12 Apple clang objects, and ld64's `-r` writes no LC_DYSYMTAB at all). One that
+            // fills a table states what this reader does not read: refused by name, never stepped over.
+            if (cmdsize < kDysymtabCmdSz) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "macho::readRelocatableObject: LC_DYSYMTAB #" + std::to_string(i) + " cmdsize="
+                    + std::to_string(cmdsize) + " is smaller than the 80-byte command.");
+            }
+            struct DysymtabTable {
+                std::size_t countAt;   // the count's offset in the command
+                char const* what;
+            };
+            static constexpr std::array<DysymtabTable, 6> kTables{{{36, "contents table (ntoc)"},
+                                                                   {44, "module table (nmodtab)"},
+                                                                   {52, "referenced symbols (nextrefsyms)"},
+                                                                   {60, "indirect symbols (nindirectsyms)"},
+                                                                   {68, "external relocations (nextrel)"},
+                                                                   {76, "local relocations (nlocrel)"}}};
+            for (auto const& table : kTables) {
+                if (std::uint32_t const n = rdU32(bytes, lcOff + table.countAt); n != 0u) {
+                    return fail(DiagnosticCode::F_UnsupportedBinaryFormat,
+                        std::format("macho::readRelocatableObject: LC_DYSYMTAB #{} states {} entries of its {}, "
+                                    "which no relocatable object this reader reads fills -- refusing rather than "
+                                    "reading the object without them.",
+                                    i, n, table.what));
+                }
+            }
+        } else if (cmd == kLcBuildVersion || cmd == kLcVersionMinMacosx) {
+            // The PLATFORM the object was built for, and its minimum OS version. ld64 REFUSES an object of another
+            // platform -- "building for 'macOS', but linking in object file (...) built for 'iOS'" (✔MEASURED P69
+            // fold 3f, run 20261117-192243-260e95c2) -- and so does the reader, against the platform its document states
+            // (`image.buildVersion`; a document that states none judges none). LC_VERSION_MIN_MACOSX states macOS by
+            // its command. A minimum OS NEWER than the image's is the image link's to warn about, as ld64 warns
+            // ("object file was built for newer 'macOS' version (26.0) than being linked (11.0)", the same probe):
+            // carried to it (`UnitLinkerRequests::minimumOs`).
+            bool const build = cmd == kLcBuildVersion;
+            if (cmdsize < (build ? kBuildVersionCmdSz : kVersionMinCmdSz)) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    std::format("macho::readRelocatableObject: {} #{} cmdsize={} is smaller than its {}-byte command.",
+                                build ? "LC_BUILD_VERSION" : "LC_VERSION_MIN_MACOSX", i, cmdsize,
+                                build ? kBuildVersionCmdSz : kVersionMinCmdSz));
+            }
+            std::uint32_t const platform =
+                build ? rdU32(bytes, lcOff + 8) : static_cast<std::uint32_t>(MachOBuildVersion::Platform::MacOs);
+            std::uint32_t const minOs = rdU32(bytes, lcOff + (build ? 12 : 8));
+            if (auto const& stated = objectFormatSchema.machoImage().buildVersion;
+                stated.has_value() && platform != static_cast<std::uint32_t>(stated->platform)) {
+                // The platform's name, from the one table of them; a number no row names is said as a number.
+                auto const spelled =
+                    kMachOBuildVersionPlatformTable.findName(static_cast<MachOBuildVersion::Platform>(platform));
+                return fail(DiagnosticCode::K_NoMatchingObjectFormat,
+                    std::format("macho::readRelocatableObject: the object was built for {} (load command #{}), and "
+                                "format '{}' links for '{}' -- ld64 refuses an object of another platform, and so "
+                                "does DSS.",
+                                spelled.has_value() ? std::format("'{}'", *spelled)
+                                                    : std::format("platform {}", platform),
+                                i, objectFormatSchema.name(), machoBuildVersionPlatformName(stated->platform)));
+            }
+            objectRequests.minimumOs.push_back(UnitMinimumOs{minOs});
+        } else if (std::none_of(objectFormatSchema.macho().skippedLoadCommands.begin(),
+                                objectFormatSchema.macho().skippedLoadCommands.end(),
+                                [&](MachOSkippedLoadCommand const& s) { return s.command == cmd; })) {
+            // A command its document states a reason for (`macho.skippedLoadCommands`) is stepped over: nothing a
+            // link makes reads it. Every other is refused by name -- never stepped over in silence.
+            return fail(DiagnosticCode::F_UnsupportedBinaryFormat,
+                std::format("macho::readRelocatableObject: load command #{} (cmd 0x{:X}) is none this reader reads, "
+                            "and format '{}' states no reason to step over it ('macho.skippedLoadCommands') -- "
+                            "refusing rather than skipping a command whose meaning it does not know.",
+                            i, cmd, objectFormatSchema.name()));
         }
         lcOff += cmdsize;
     }
@@ -641,6 +754,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // -- (6) Reconstruct externs, then stage defined symbols per section --
     AssembledModule mod;
     mod.cuId = cuId;
+    mod.linkerRequests = std::move(objectRequests);   // (2)'s: its libraries, options and minimum OS
 
     // symtab index -> the extern's position in mod.externImports (for the
     // isData inference in step 7).
@@ -1122,7 +1236,18 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // Slice each section's atoms by SORTED n_value. What reached
     // `defsBySection` is every defined symbol that STARTS A BODY: the wire's
     // own boundary set, plus whatever (6.4) recovered.
-    for (auto& [ordinal, defs] : defsBySection) {
+    //
+    // ★ IN ASCENDING SECTION ORDINAL. `defsBySection` is an unordered_map, and
+    // this loop APPENDS every atom it cuts to `mod.functions` / `mod.dataItems`.
+    // Walking the map directly made the order of a several-section object's
+    // atoms, and so the layout the link keeps from them, the host library's
+    // hash-table layout: one object read into two orders by a compiler built
+    // with MSVC's library and one built with libstdc++. The ordinal is the
+    // object's own data, and the walk takes its entries from that order's one
+    // home (as the COFF reader's does).
+    for (auto const* section : substrate::entriesInKeyOrder(defsBySection)) {
+        std::uint8_t const ordinal = section->first;
+        std::vector<DefSym> const& defs = section->second;
         Section const& sec = sections[ordinal - 1u];
         std::optional<SectionKind> const rk = sec.kind;
         std::optional<DataSectionKind> const dk =
@@ -1452,6 +1577,21 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 if (rdU32(bytes, ro + kRelocInfoSz) != rAddress) {
                     return refuseRecord("is followed by a relocation at another address, and it carries "
                                         "the addend of the relocation at its own");
+                }
+                // ★ ONLY BEFORE AN ENTRY THE DOCUMENT LISTS (P69 fold 3f, `carriesAddendOf`): the
+                // assembler writes a record before PAGE21, PAGEOFF12 and BRANCH26 alone, and refuses
+                // an addend on a GOT page reference (✔MEASURED, Apple clang 21.0.0); an addend for any
+                // other entry is a shape no reference writes, refused rather than added.
+                {
+                    std::uint32_t const nextId =
+                        rdU32(bytes, ro + kRelocInfoSz + 4) & kRInfoNativeIdMask;
+                    auto const& carried = addendRecord->carriesAddendOf;
+                    if (std::find(carried.begin(), carried.end(), nextId) == carried.end()) {
+                        return refuseRecord(std::format(
+                            "is followed by a relocation of wire id {}, which the document's "
+                            "`carriesAddendOf` does not list, so no addend of it travels in a record",
+                            nextId));
+                    }
                 }
                 std::uint32_t const bits = addendRecord->addendBits;
                 if (bits == 0u || bits > 24u) {   // validate()'s rule, for a table built in memory
@@ -2125,6 +2265,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             auto const decoded = link::format::decodeEhFrame(
                 frameBytes,
                 link::format::dwarfRegisterMappingOf(targetSchema),
+                objectFormatSchema.dataModel(),   // an absptr field is one of its addresses
                 "macho::readRelocatableObject", reporter);
             if (!decoded.has_value()) return std::nullopt;  // already reported
 

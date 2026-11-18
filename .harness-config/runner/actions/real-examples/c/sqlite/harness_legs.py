@@ -268,13 +268,28 @@ _WSL_DISTRIBUTION = []
 
 
 def wsl_distribution_of(config, where):
-    """The ONE WSL distribution a DssHarness configuration declares (`hosts.wsl`,
-    whose keys name the distributions; a leg's `legs.<leg>.wsl` only refers to
-    one), or a LegError naming why there is not exactly one: none declared
-    (entering the default would be a guess), or two (which one a leg's launcher
-    should enter would be a guess). `where` names the file."""
+    """The ONE WSL distribution a DssHarness configuration declares (`hosts.wsl`;
+    a leg's `legs.<leg>.wsl` only refers to one), or a LegError naming why there is
+    not exactly one: none declared (entering the default would be a guess), two
+    (which one a leg's launcher should enter would be a guess), or a `hosts.wsl`
+    that is no object of items. `where` names the file.
+
+    ★ THE COUPLING, STATED (2026-11-17, the review of checkpoint 48, W1): a
+    `hosts.wsl` key is a DssHarness ITEM name. DssHarness keeps the distribution an
+    item names in the item's own `.env` beside its superuser credential
+    (`dssharness help secrets`), which no program of this tree reads. So the item
+    must be named as its distribution: `wsl.exe -d <key>` then enters it, and a key
+    that names no installed distribution fails LOUD at its first entry
+    (WSL_E_DISTRO_NOT_FOUND, which `wsl_usable` reports in wsl.exe's own words).
+    DssHarness answering an item's distribution to a repository's programs is held
+    for the operator as a DssHarness issue."""
     hosts = config.get("hosts") if isinstance(config, dict) else None
     wsl = hosts.get("wsl") if isinstance(hosts, dict) else None
+    if wsl is not None and not isinstance(wsl, dict):
+        raise LegError(
+            "%s declares hosts.wsl as a %s, not an object of WSL items: an argv that "
+            "enters WSL enters the ONE distribution the tree declares there"
+            % (where, type(wsl).__name__))
     named = sorted(str(k) for k in (wsl if isinstance(wsl, dict) else ()) if str(k))
     if len(named) != 1:
         raise LegError(
@@ -13553,17 +13568,20 @@ def _self_test(path=CATALOGUE, out=sys.stdout):
     import tempfile as _tf_hf
     _hf_dir = _tf_hf.mkdtemp(prefix="dss-legs-host-facts-")
     try:
-        def _hf_tree(name, wsl_text, legs_text=""):
-            # `wsl_text` is what `hosts.wsl` holds ('' writes no such section);
+        def _hf_tree(name, wsl_text, legs_text="", wsl_raw=None):
+            # `wsl_text` is what the `hosts.wsl` object holds ('' writes no such
+            # section); `wsl_raw` writes `hosts.wsl` as that JSON value instead;
             # None writes no configuration at all.
             _root = os.path.join(_hf_dir, name)
             os.makedirs(os.path.join(_root, *DSSHARNESS_CONFIG_REL[:-1]))
             if wsl_text is not None:
+                _wsl = ((", \"wsl\": %s" % wsl_raw) if wsl_raw is not None
+                        else (", \"wsl\": {%s}" % wsl_text) if wsl_text else "")
                 with open(os.path.join(_root, *DSSHARNESS_CONFIG_REL), "w",
                           encoding="utf-8") as _fh:
                     _fh.write("{\n  // a JSONC configuration, as DssHarness reads one\n"
                               "  \"legs\": {%s},\n  \"hosts\": {\"local\": {}%s}\n}\n"
-                              % (legs_text, (", \"wsl\": {%s}" % wsl_text) if wsl_text else ""))
+                              % (legs_text, _wsl))
             return _root
         # `one` is checkpoint 47's shape: the distribution declared under hosts.wsl,
         # and no leg naming it (the Linux legs run on an ssh host).
@@ -13574,6 +13592,10 @@ def _self_test(path=CATALOGUE, out=sys.stdout):
         # `none`: a leg still names a distribution, but hosts.wsl declares none.
         _hf_none = _hf_tree("none", '', '"a": {"os": "linux", "wsl": "Distro-A"}')
         _hf_absent = _hf_tree("absent", None)
+        # W3 (the review of checkpoint 48): an EMPTY hosts.wsl object declares none; a
+        # hosts.wsl that is no object is refused by its own name, not as "none".
+        _hf_empty = _hf_tree("empty", "", wsl_raw="{}")
+        _hf_scalar = _hf_tree("scalar", "", wsl_raw="\"Distro-A\"")
         check("HOST FACTS: the WSL distribution is the ONE the configuration declares "
               "under hosts.wsl, whether or not a leg names it (control: no leg naming "
               "it, checkpoint 47's shape)",
@@ -13585,6 +13607,13 @@ def _self_test(path=CATALOGUE, out=sys.stdout):
         _hf_why_none = _raise_text(lambda: tree_wsl_distribution(_hf_none))
         check("...a configuration declaring NONE is REFUSED, whatever a leg names -- "
               "never the machine's default", "no WSL distribution" in _hf_why_none, _hf_why_none)
+        _hf_why_empty = _raise_text(lambda: tree_wsl_distribution(_hf_empty))
+        check("...an EMPTY hosts.wsl object declares NONE, and is refused as none",
+              "no WSL distribution" in _hf_why_empty, _hf_why_empty)
+        _hf_why_scalar = _raise_text(lambda: tree_wsl_distribution(_hf_scalar))
+        check("...a hosts.wsl that is no object is refused BY ITS OWN NAME, never read as "
+              "declaring none", "not an object of WSL items" in _hf_why_scalar
+              and "no WSL distribution" not in _hf_why_scalar, _hf_why_scalar)
         _hf_why_absent = _raise_text(lambda: tree_wsl_distribution(_hf_absent))
         check("...and a configuration that cannot be read is REFUSED, naming it",
               "cannot be read" in _hf_why_absent, _hf_why_absent)

@@ -22,6 +22,9 @@
 #include "object_entry_support.hpp"
 
 #include "core/substrate/path_identity.hpp"   // openInputStream, openOutputStream, createDirectories: at any length
+#include "core/types/grammar_schema.hpp"      // the C grammar the entry pull's names are read from
+#include "link/object_format_schema.hpp"
+#include "program/compile_pipeline.hpp"       // pullEntryArchiveMembers, entryElectionScope, entryLinkNames
 #include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
@@ -194,6 +197,152 @@ TEST(ObjectEntryNative, ArchiveMembersAndPrecedenceRunAsTheReferencesDo) {
         }
     }
     if (natives.ranNone()) GTEST_SKIP() << natives.why();
+}
+
+// ══ ONE MEMBER, THE ONE THE ELECTION WOULD ELECT (P69 fold 3f, F1) ════════════════════════════════════════════════
+
+namespace {
+
+// The entry pull as the program asks it (`pullEntryFromArchives`): the names and the precedence of the election's
+// scope for the family's executable document, over `archives`.
+struct EntryPull {
+    std::optional<std::vector<AssembledModule>> pulled;
+    DiagnosticReporter                          rep;
+};
+
+void pullFor(Family const& f, std::vector<fs::path> const& archives, EntryPull& out) {
+    auto const grammar = GrammarSchema::loadShipped("c");
+    auto const target  = TargetSchema::loadShipped(f.arch);
+    std::string_view const spec{f.execTarget};
+    auto const format = ObjectFormatSchema::loadShipped(spec.substr(spec.find(':') + 1));
+    ASSERT_TRUE(grammar.has_value() && target.has_value() && format.has_value()) << labelOf(f);
+    EntryElectionScope const          scope = entryElectionScope(**grammar, **format, {});
+    std::vector<EntryLinkName> const names = entryLinkNames(**grammar, **format, scope.verbs);
+    out.pulled = pullEntryArchiveMembers(names, scope.precedence, archives, **target, **format, out.rep);
+}
+
+// The names the pulled members define with external linkage.
+[[nodiscard]] std::set<std::string> namesDefinedBy(EntryPull const& p) {
+    std::set<std::string> out;
+    for (auto const& m : p.pulled.value_or(std::vector<AssembledModule>{})) {
+        for (auto const& s : m.symbols) {
+            if (s.binding != SymbolBinding::Local) out.insert(s.name);
+        }
+    }
+    return out;
+}
+
+// How many diagnostics say `needle`.
+[[nodiscard]] std::size_t countSaying(DiagnosticReporter const& rep, std::string_view needle) {
+    auto const& all = rep.all();
+    return static_cast<std::size_t>(
+        std::count_if(all.begin(), all.end(), [&](auto const& d) { return d.actual.find(needle) != std::string::npos; }));
+}
+
+// An archive the `ar` reader refuses: the magic, then a member header whose size field is not a number.
+void writeCorruptArchive(fs::path const& path) {
+    std::ofstream(path, std::ios::binary) << "!<arch>\nmember.o/       0           0     0     644     zz        `\nxx";
+}
+
+}  // namespace
+
+// Every leg (in-process), on the PE families, whose document ranks `main`'s startup above `wmain`'s: the startup's
+// entry pulls ONE member -- the member of the best rank any archive lists, the first archive in the link's order that
+// lists it, the index's first entry of it -- reading each archive once, in the link's order, until one lists a name of
+// the top rank; an archive it cannot read is said once, and the pull fails after every archive it reached.
+//   * an archive of a `main` member and a `wmain` member, either order: ONE member, `main`'s (link.exe, lld-link and
+//     MinGW-w64 GNU ld each link one, ✔MEASURED P69 fold 3f; fold 3e's pull linked both);
+//   * an archive of a `wmain` member alone: it is pulled (lld-link and MinGW-w64 GNU ld `-municode` link it);
+//   * THE PRECONDITION: {`wmain` only, corrupt, `wmain` only}: no archive lists the top rank, so every one is read;
+//     the corrupt one is said ONCE and never named silent, and the pull fails;
+//   * THE CLOSING: {`wmain` only, `main` only, a path to no file}: `main`'s archive closes the walk -- its member is
+//     pulled, and the last path is never opened;
+//   * two corrupt archives before one that lists `main`: each is said, and the pull fails.
+// RED-ON-DISABLE: every arm on `pullEntryArchiveMembers`' walk, and the home's twins (the closing cell reads the
+// last path when the size is read once; the last cell names only the first corrupt archive when the walk stops at it).
+TEST(ObjectEntry, TheEntryPullElectsOneMemberAsTheElectionWould) {
+    test_support::ScratchDir scratch{test_support::Location::InsideRepo, "object-entry-archive-elect"};
+    std::size_t k = 0;
+    std::set<std::string> targets;   // the cells build DSS's own archives: one round per executable target
+    for (auto const& family : kFamilies) {
+        if (!isPe(family) || !targets.insert(family.execTarget).second) continue;
+        SCOPED_TRACE(labelOf(family));
+        std::string const lib = flavorOf(family, "staticlib");
+        auto const archiveOf = [&](std::vector<Input> const& sources) {
+            Built b;
+            build(scratch.path() / ("lib" + std::to_string(k++)), sources, lib, b);
+            EXPECT_EQ(b.rc, 0) << b.diagnostics;
+            return b.image;
+        };
+        fs::path const mainOnly  = archiveOf({written("m_main.c", kNarrowMain)});
+        fs::path const wmainOnly = archiveOf({written("m_wmain.c", kWideMain)});
+        ASSERT_FALSE(mainOnly.empty() || wmainOnly.empty());
+        for (bool const mainFirst : {true, false}) {
+            SCOPED_TRACE(mainFirst ? "main's member first" : "wmain's member first");
+            fs::path const both = mainFirst ? archiveOf({written("m_main.c", kNarrowMain), written("m_wmain.c", kWideMain)})
+                                            : archiveOf({written("m_wmain.c", kWideMain), written("m_main.c", kNarrowMain)});
+            ASSERT_FALSE(both.empty());
+            EntryPull p;
+            pullFor(family, {both}, p);
+            ASSERT_TRUE(p.pulled.has_value()) << diagnosticsOf(p.rep);
+            EXPECT_EQ(p.pulled->size(), 1u) << "the startup's one entry pulled a member per name";
+            EXPECT_TRUE(namesDefinedBy(p).contains("main")) << "the member pulled is not main's";
+            EXPECT_FALSE(namesDefinedBy(p).contains("wmain")) << "wmain's member was pulled beside main's";
+        }
+        {
+            SCOPED_TRACE("wmain's member alone");
+            EntryPull p;
+            pullFor(family, {wmainOnly}, p);
+            ASSERT_TRUE(p.pulled.has_value()) << diagnosticsOf(p.rep);
+            EXPECT_EQ(p.pulled->size(), 1u);
+            EXPECT_TRUE(namesDefinedBy(p).contains("wmain")) << "the only entry an archive lists was not pulled";
+        }
+        {
+            SCOPED_TRACE("THE PRECONDITION: wmain only, corrupt, wmain only");
+            fs::path const corrupt = scratch.path() / ("corrupt" + std::to_string(k++) + ".a");
+            writeCorruptArchive(corrupt);
+            EntryPull alone;   // what ONE read of the corrupt archive says of it
+            pullFor(family, {corrupt}, alone);
+            std::size_t const oneRead = countSaying(alone.rep, corrupt.filename().string());
+            ASSERT_GE(oneRead, 1u) << "the corrupt archive is not refused by name:" << diagnosticsOf(alone.rep);
+            EntryPull p;
+            pullFor(family, {wmainOnly, corrupt, wmainOnly}, p);
+            EXPECT_FALSE(p.pulled.has_value()) << "a pull over a corrupt archive succeeded";
+            EXPECT_EQ(countSaying(p.rep, corrupt.filename().string()), oneRead)
+                << "the corrupt archive is not said exactly once:" << diagnosticsOf(p.rep);
+            EXPECT_EQ(countSaying(p.rep, "without reporting any diagnostic"), 0u)
+                << "an archive that reported was named silent:" << diagnosticsOf(p.rep);
+        }
+        {
+            SCOPED_TRACE("THE CLOSING: wmain only, main only, a path to no file");
+            fs::path const nothing = scratch.path() / ("no_such_archive" + std::to_string(k++) + ".a");
+            EntryPull p;
+            pullFor(family, {wmainOnly, mainOnly, nothing}, p);
+            ASSERT_TRUE(p.pulled.has_value()) << diagnosticsOf(p.rep);
+            EXPECT_EQ(p.pulled->size(), 1u);
+            EXPECT_TRUE(namesDefinedBy(p).contains("main")) << "the top rank's member was not pulled";
+            EXPECT_FALSE(reported(p.rep, DiagnosticCode::F_FileOpenFailed))
+                << "an archive after the one that closed the walk was opened:" << diagnosticsOf(p.rep);
+        }
+        {
+            SCOPED_TRACE("two corrupt archives, then main only");
+            fs::path const first  = scratch.path() / ("corrupt_first" + std::to_string(k++) + ".a");
+            fs::path const second = scratch.path() / ("corrupt_second" + std::to_string(k++) + ".a");
+            writeCorruptArchive(first);
+            writeCorruptArchive(second);
+            EntryPull alone;   // what ONE read of a corrupt archive says of it
+            pullFor(family, {first}, alone);
+            std::size_t const oneRead = countSaying(alone.rep, first.filename().string());
+            ASSERT_GE(oneRead, 1u) << "the corrupt archive is not refused by name:" << diagnosticsOf(alone.rep);
+            EntryPull p;
+            pullFor(family, {first, second, mainOnly}, p);
+            EXPECT_FALSE(p.pulled.has_value()) << "a pull over corrupt archives succeeded";
+            for (fs::path const& c : {first, second}) {
+                EXPECT_EQ(countSaying(p.rep, c.filename().string()), oneRead)
+                    << c.filename().string() << " is not said exactly once:" << diagnosticsOf(p.rep);
+            }
+        }
+    }
 }
 
 // ══ THE ENTRY'S ARCHIVE AT ANY LENGTH ═════════════════════════════════════════════════════════════════════════════

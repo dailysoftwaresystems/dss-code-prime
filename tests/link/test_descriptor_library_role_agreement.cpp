@@ -22,7 +22,8 @@
 // reader resolves it through `RuntimeLibraryRoleResolver` (core) — the driver
 // adapts the ACTIVE format to it with `FormatRuntimeLibraryRoleResolver`
 // (link), which answers from the document's own row when it declares the role
-// and otherwise from the shipped flavours of the same kind, which must agree.
+// and otherwise from the shipped flavours of the same family (one kind on one
+// target arch, `ObjectFormatSchema::inFlavourFamilyOf`), which must agree.
 // The 67 restatements are gone; the two `libm.so.6` literals stay, because an
 // image that plays no role has no other spelling.
 //
@@ -177,6 +178,12 @@ using Flavours = std::map<std::string, std::vector<std::shared_ptr<ObjectFormatS
 // is selected by the pair (their keys are format kinds, all decoded) and no
 // symbol is dropped by it, so every pair yields the same corpus — and every
 // descriptor decodes on every real pair (`AllShippedDescriptorsDecode`).
+//
+// ★ P69 fold 3f: EXCEPT AN ARCH ENTRY'S ROLE. A symbol row's arch entry
+// (`{"format": "elf", "arch": "arm64", "image": {"role": …}}`) names its image
+// on the pairs it matches alone, so the ROLE half of the corpus is the pair's:
+// (1) and (4) read it on every real pair. The LITERAL half (`library` entries,
+// keyed by kind) is the same on each, so (2) and (3) read it on the first.
 struct RoleReference {
     std::string        descriptor;   // config-root-relative, forward slashes
     std::string        context;      // "(root)" or "symbols['name']"
@@ -222,7 +229,7 @@ struct ReadContext {
                          interner.pointer(interner.primitive(TypeKind::Void))}};
 };
 
-[[nodiscard]] Corpus loadCorpus() {
+[[nodiscard]] Corpus loadCorpus(dss::test_support::ShippedReadPair const& pair) {
     Corpus out;
     auto const root = configRoot();
     if (root.empty()) return out;
@@ -232,12 +239,6 @@ struct ReadContext {
         ADD_FAILURE() << "shippedLibs directory not found at " << dir;
         return out;
     }
-    auto const& pairs = dss::test_support::shippedReadPairs();
-    if (pairs.empty()) {
-        ADD_FAILURE() << "no real shipped pair to read the corpus on";
-        return out;
-    }
-    auto const&                pair  = pairs.front();
     ffi::ShippedPairFacts const facts = pair.pairFacts();
     ReadContext ctx;
     for (auto const& path : descriptorPaths(dir)) {
@@ -278,6 +279,16 @@ struct ReadContext {
     return out;
 }
 
+// The LITERAL half's read: the same on every pair (above), so the first.
+[[nodiscard]] Corpus loadCorpusOnTheFirstPair() {
+    auto const& pairs = dss::test_support::shippedReadPairs();
+    if (pairs.empty()) {
+        ADD_FAILURE() << "no real shipped pair to read the corpus on";
+        return {};
+    }
+    return loadCorpus(pairs.front());
+}
+
 [[nodiscard]] LiteralException const* exceptionFor(std::string_view format,
                                                    std::string_view image) {
     for (auto const& e : kLiteralExceptions)
@@ -285,20 +296,51 @@ struct ReadContext {
     return nullptr;
 }
 
-// The image a (kind, role) resolves to on EVERY flavour of the kind, through
-// the driver's own adapter; failures are reported against `who`. Returns the
-// agreed image, or nullopt after reporting.
+// ★ P69 fold 3f: a flavour FAMILY -- the documents of one kind on one target arch,
+// as `ObjectFormatSchema::inFlavourFamilyOf` says (its one definition, the population
+// the driver's adapter assembles a role from). A role may be played by a different
+// image on each arch of one kind -- the program interpreter is ld-linux-x86-64.so.2
+// on x86_64 ELF and ld-linux-aarch64.so.1 on aarch64 -- so a FAMILY agrees, not a kind.
+using Family = std::vector<std::shared_ptr<ObjectFormatSchema>>;
+
+// The family of `member` among the loaded flavours, in name order.
+[[nodiscard]] Family familyOf(Flavours const& flavours, ObjectFormatSchema const& member) {
+    Family out;
+    auto const group = flavours.find(std::string{objectFormatKindName(member.kind())});
+    if (group == flavours.end()) return out;
+    for (auto const& flavour : group->second)
+        if (flavour->inFlavourFamilyOf(member)) out.push_back(flavour);
+    return out;
+}
+
+// The family a real pair's build reads: its format document's
+// (`ShippedReadPair::formatDoc`), or none after reporting.
+[[nodiscard]] Family familyOfPair(Flavours const& flavours,
+                                  dss::test_support::ShippedReadPair const& pair) {
+    auto const group = flavours.find(std::string{objectFormatKindName(pair.kind)});
+    if (group != flavours.end()) {
+        for (auto const& flavour : group->second)
+            if (flavour->name() == pair.formatDoc) return familyOf(flavours, *flavour);
+    }
+    ADD_FAILURE() << pair.label()
+                  << ": the pair's format document is not among the loaded flavours";
+    return {};
+}
+
+// The image a role resolves to on EVERY flavour of `family` (of kind `kind`),
+// through the driver's own adapter; failures are reported against `who`. Returns
+// the agreed image, or nullopt after reporting.
 [[nodiscard]] std::optional<std::string>
-familyImageFor(Flavours const& flavours, std::string const& kind,
+familyImageFor(Family const& family, std::string const& kind,
                RuntimeLibraryRole role, std::string const& who) {
-    auto const group = flavours.find(kind);
-    if (group == flavours.end()) {
-        ADD_FAILURE() << who << ": no shipped object-format document declares kind '"
-                      << kind << "', so the role reference has no family to resolve in";
+    if (family.empty()) {
+        ADD_FAILURE() << who << ": no shipped object-format document of kind '"
+                      << kind << "' is in the family, so the role reference has no "
+                         "family to resolve in";
         return std::nullopt;
     }
     std::optional<std::string> agreed;
-    for (auto const& flavour : group->second) {
+    for (auto const& flavour : family) {
         FormatRuntimeLibraryRoleResolver const resolver{*flavour};
         std::string refusal;
         auto const* const row = resolver.rowForRole(role, refusal);
@@ -309,8 +351,8 @@ familyImageFor(Flavours const& flavours, std::string const& kind,
         EXPECT_NE(row, nullptr)
             << who << ": role '" << runtimeLibraryRoleName(role)
             << "' resolves to NOTHING on flavour '" << flavour->name()
-            << "' — no document of kind '" << kind << "' declares it, so every "
-               "symbol of this descriptor would be bound to no image on that build";
+            << "' — no document of its family declares it, so every symbol of "
+               "this descriptor would be bound to no image on that build";
         if (row == nullptr) return std::nullopt;
         EXPECT_FALSE(row->image.empty())
             << who << ": role '" << runtimeLibraryRoleName(role)
@@ -331,7 +373,7 @@ familyImageFor(Flavours const& flavours, std::string const& kind,
                 << who << ": role '" << runtimeLibraryRoleName(role)
                 << "' resolves to '" << row->image << "' on flavour '"
                 << flavour->name() << "' but to '" << *agreed
-                << "' on an earlier flavour of the same kind — which flavour a "
+                << "' on an earlier flavour of the same family — which flavour a "
                    "program happens to build would decide which runtime it gets";
             if (*agreed != row->image) return std::nullopt;
         }
@@ -342,6 +384,13 @@ familyImageFor(Flavours const& flavours, std::string const& kind,
 }  // namespace
 
 // ── (1) EVERY REFERENCED ROLE RESOLVES ON EVERY FLAVOUR OF ITS FAMILY ───────
+//
+// ★ P69 fold 3f: ON EVERY REAL PAIR, IN THE PAIR'S OWN FAMILY. A symbol row's arch
+// entry names its image -- by role -- on the pairs it matches alone (stdlib.json's
+// aarch64 `__stack_chk_guard`: the program interpreter), so the roles a build binds
+// are its PAIR's, and they resolve in the family of the pair's format document.
+// Every (kind, role) the corpus references must be asked of at least one family of
+// its kind: a reference no real pair of its kind reads is a hole, never a pass.
 TEST(DescriptorLibraryRoleAgreement,
      EveryRoleTheCorpusReferencesResolvesToOneImageOnEveryFlavourOfItsFamily) {
     std::size_t documents = 0;
@@ -349,47 +398,69 @@ TEST(DescriptorLibraryRoleAgreement,
     ASSERT_GE(documents, 20u)
         << "the shipped object-format corpus must have been walked; only "
         << documents << " document(s) loaded";
-    auto const corpus = loadCorpus();
-    ASSERT_FALSE(corpus.roles.empty())
+    auto const& readPairs = dss::test_support::shippedReadPairs();
+    ASSERT_FALSE(readPairs.empty()) << "no real shipped pair to read the corpus on";
+
+    // (kind, role) -> how many families were asked to resolve it.
+    std::map<std::pair<std::string, std::string>, std::size_t> askedOn;
+    std::set<std::string> descriptorsRead;
+    std::set<std::string> kinds;
+    std::set<std::string> rolesSeen;
+    std::size_t           mostRoles       = 0;
+    std::size_t           resolutions     = 0;
+    std::size_t           flavoursChecked = 0;
+    for (auto const& pair : readPairs) {
+        auto const        corpus = loadCorpus(pair);
+        std::string const kind{objectFormatKindName(pair.kind)};
+        descriptorsRead.insert(corpus.descriptors.begin(), corpus.descriptors.end());
+        mostRoles = std::max(mostRoles, corpus.roles.size());
+        std::set<std::string> here;   // the roles this pair's build binds on its own kind
+        for (auto const& r : corpus.roles) {
+            std::string const roleName{runtimeLibraryRoleName(r.role)};
+            askedOn.try_emplace(std::make_pair(r.format, roleName), 0u);
+            kinds.insert(r.format);
+            rolesSeen.insert(roleName);
+            if (r.format == kind) here.insert(roleName);
+        }
+        Family const family = familyOfPair(flavours, pair);
+        for (auto const& roleName : here) {
+            auto const role = runtimeLibraryRoleFromName(roleName);
+            ASSERT_TRUE(role.has_value()) << roleName;
+            std::string const who = "(" + kind + " on " + pair.arch + ", " + roleName + ")";
+            auto const image = familyImageFor(family, kind, *role, who);
+            EXPECT_TRUE(image.has_value()) << who;
+            ++askedOn[{kind, roleName}];
+            ++resolutions;
+            flavoursChecked += family.size();
+        }
+    }
+    ASSERT_FALSE(askedOn.empty())
         << "no descriptor names any runtime role — the migration this file "
            "guards has been reverted, or the reader no longer records roles";
-
-    std::set<std::pair<std::string, std::string>> pairs;
-    std::set<std::string>                         kinds;
-    std::set<std::string>                         rolesSeen;
-    std::size_t                                   flavoursChecked = 0;
-    for (auto const& r : corpus.roles) {
-        pairs.emplace(r.format, std::string{runtimeLibraryRoleName(r.role)});
-        kinds.insert(r.format);
-        rolesSeen.insert(std::string{runtimeLibraryRoleName(r.role)});
-    }
-    for (auto const& [kind, roleName] : pairs) {
-        auto const role = runtimeLibraryRoleFromName(roleName);
-        ASSERT_TRUE(role.has_value()) << roleName;
-        std::string who = "(" + kind + ", " + roleName + ")";
-        auto const image = familyImageFor(flavours, kind, *role, who);
-        EXPECT_TRUE(image.has_value()) << who;
-        auto const group = flavours.find(kind);
-        if (group != flavours.end()) flavoursChecked += group->second.size();
+    for (auto const& [key, families] : askedOn) {
+        EXPECT_GE(families, 1u)
+            << "(" << key.first << ", " << key.second << ") is referenced by the corpus, "
+               "but no real pair of kind '" << key.first << "' reads it, so no family "
+               "was asked to resolve it";
     }
 
     // ⚠ NON-VACUITY. Each count closes a different way this sweep could pass
     // having compared nothing: the corpus was read at all, the role references
-    // are the measured population rather than a handful, all three families
+    // are the measured population rather than a handful, all three kinds
     // with a C runtime are represented, more than one ROLE is referenced (a
     // guard exercising one role would pass while the other's rows rotted), and
     // every family was checked on more than one flavour — the family path
     // (a flavour with no own row) is what this file was written for.
-    EXPECT_GE(corpus.descriptors.size(), 40u)
-        << "only " << corpus.descriptors.size() << " descriptor(s) read";
-    EXPECT_GE(corpus.roles.size(), 60u)
-        << "only " << corpus.roles.size() << " role reference(s) collected — the "
+    EXPECT_GE(descriptorsRead.size(), 40u)
+        << "only " << descriptorsRead.size() << " descriptor(s) read";
+    EXPECT_GE(mostRoles, 60u)
+        << "only " << mostRoles << " role reference(s) collected on any pair — the "
            "migration covered 67";
     EXPECT_GE(kinds.size(), 3u) << "only " << kinds.size() << " kind(s) referenced";
     EXPECT_GE(rolesSeen.size(), 2u)
         << "only " << rolesSeen.size() << " distinct role(s) referenced; "
            "`cLibrary` and `systemPrimitives` are both bound by the corpus";
-    EXPECT_GE(flavoursChecked, 2u * pairs.size())
+    EXPECT_GE(flavoursChecked, 2u * resolutions)
         << "some family was checked on a single flavour; the whole point is the "
            "flavours that declare no row of their own";
 }
@@ -399,7 +470,7 @@ TEST(DescriptorLibraryRoleAgreement, NoRemainingLiteralRestatesAnyRolesImage) {
     std::size_t documents = 0;
     auto const  flavours  = loadFlavoursByKind(documents);
     ASSERT_GE(documents, 20u);
-    auto const corpus = loadCorpus();
+    auto const corpus = loadCorpusOnTheFirstPair();
     ASSERT_FALSE(corpus.literals.empty())
         << "no descriptor names a literal image any more — the stated exception "
            "(`libm.so.6`) has gone, and its disappearance must be argued, not "
@@ -436,7 +507,7 @@ TEST(DescriptorLibraryRoleAgreement, TheLiteralPopulationIsExactlyTheStatedExcep
     std::size_t documents = 0;
     auto const  flavours  = loadFlavoursByKind(documents);
     ASSERT_GE(documents, 20u);
-    auto const corpus = loadCorpus();
+    auto const corpus = loadCorpusOnTheFirstPair();
 
     std::set<std::pair<std::string, std::string>> used;
     for (auto const& lit : corpus.literals) {
@@ -504,22 +575,22 @@ TEST(DescriptorLibraryRoleAgreement, EveryRoleEntryDecodesToItsFamilysImageThrou
     std::size_t documents = 0;
     auto const  flavours  = loadFlavoursByKind(documents);
     ASSERT_GE(documents, 20u);
-    auto const corpus = loadCorpus();
-    ASSERT_FALSE(corpus.roles.empty());
-
-    // Which descriptors reference which kinds (root or symbol), and the
-    // family's agreed image per (kind, role) from the adapter.
+    // Which descriptors reference which kinds (root or symbol) on SOME real pair
+    // (an arch entry's role is its pairs'), and each family's agreed image per
+    // role, keyed by the family's first document, from the adapter.
     std::map<std::string, std::set<std::string>> kindsByDescriptor;
-    std::map<std::pair<std::string, std::string>, std::string> familyImage;
-    for (auto const& r : corpus.roles) {
-        kindsByDescriptor[r.descriptor].insert(r.format);
-        auto const key = std::make_pair(r.format,
-                                        std::string{runtimeLibraryRoleName(r.role)});
-        if (familyImage.count(key) != 0) continue;
-        auto const image = familyImageFor(flavours, r.format, r.role, r.descriptor);
-        if (!image.has_value()) return;   // (1) has reported it
-        familyImage.emplace(key, *image);
-    }
+    for (auto const& pair : dss::test_support::shippedReadPairs())
+        for (auto const& r : loadCorpus(pair).roles) kindsByDescriptor[r.descriptor].insert(r.format);
+    ASSERT_FALSE(kindsByDescriptor.empty());
+    std::map<std::pair<std::string, std::string>, std::optional<std::string>> familyImage;
+    auto const imageOf = [&](Family const& family, std::string const& kind, RuntimeLibraryRole role,
+                             std::string const& who) -> std::optional<std::string> {
+        if (family.empty()) return familyImageFor(family, kind, role, who);
+        auto const key = std::make_pair(std::string{family.front()->name()},
+                                        std::string{runtimeLibraryRoleName(role)});
+        if (auto const it = familyImage.find(key); it != familyImage.end()) return it->second;
+        return familyImage.emplace(key, familyImageFor(family, kind, role, who)).first->second;
+    };
 
     auto const root = configRoot();
     ASSERT_FALSE(root.empty());
@@ -536,6 +607,7 @@ TEST(DescriptorLibraryRoleAgreement, EveryRoleEntryDecodesToItsFamilysImageThrou
             auto const group = flavours.find(kind);
             ASSERT_NE(group, flavours.end()) << kind;
             for (auto const& flavour : group->second) {
+                Family const family = familyOf(flavours, *flavour);
                 FormatRuntimeLibraryRoleResolver const resolver{*flavour};
                 // On the flavour's OWN pair (P68 round 12, S2a-1): the resolver
                 // and the read are two statements about ONE format, as in a build.
@@ -558,9 +630,8 @@ TEST(DescriptorLibraryRoleAgreement, EveryRoleEntryDecodesToItsFamilysImageThrou
                         std::string const& context) {
                         auto const role = roles.find(kind);
                         if (role == roles.end()) return;
-                        auto const want = familyImage.find(
-                            {kind, std::string{runtimeLibraryRoleName(role->second)}});
-                        ASSERT_NE(want, familyImage.end());
+                        auto const want = imageOf(family, kind, role->second, rel + " " + context);
+                        if (!want.has_value()) return;   // (1) reports it
                         auto const got = library.find(kind);
                         EXPECT_NE(got, library.end())
                             << rel << " " << context << ": `library." << kind
@@ -571,12 +642,12 @@ TEST(DescriptorLibraryRoleAgreement, EveryRoleEntryDecodesToItsFamilysImageThrou
                             << "' — every symbol of this descriptor would reach "
                                "the link unbound";
                         if (got == library.end()) return;
-                        EXPECT_EQ(got->second, want->second)
+                        EXPECT_EQ(got->second, *want)
                             << rel << " " << context << ": `library." << kind
                             << "` decoded to '" << got->second << "' over '"
                             << flavour->name() << "' but the family's '"
                             << runtimeLibraryRoleName(role->second)
-                            << "' image is '" << want->second << "'";
+                            << "' image is '" << *want << "'";
                         ++decoded;
                     };
                 expectFor(desc->libraryRoles, desc->library, "(root)");

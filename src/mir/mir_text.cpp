@@ -206,6 +206,10 @@ namespace {
 // (`aliasing <permissive|strict_tbaa>`, `char_types_alias_all <true|false>`), and a function whose counting is
 // not the module's says so (`arg_counting(<per_class|flat>)` in its attribute list). Every line is OPTIONAL and
 // absent means the default, which is what a text written before them states, so no v8 text reads otherwise.
+// Within v8 (P69, lane `xa`, fold 3f): `data_model <LP64|LLP64|ILP32>` after them, the model the module is
+// lowered for (`MirModuleFacts::dataModel`, spelled by data_model.hpp's table), written whenever the module
+// states one. Absent, the module states none -- what a text written before it states -- which the join and the
+// MIR→LIR lowering refuse by name, so no v8 text is read as another model.
 constexpr int kVersion = 8;
 
 // The `arg_counting` header's spellings (`MirArgCounting`). `Unstated` has none: it is never
@@ -588,7 +592,7 @@ public:
         std::string head = std::format("dssir {}\n", kVersion);
         // The module's facts (`MirModuleFacts`), each where it is not the default: every fact of the list is bound
         // here, so one added to it does not compile until it is written.
-        auto const& [aliasing, charTypes, counting] = mir_.moduleFacts();
+        auto const& [aliasing, charTypes, counting, model] = mir_.moduleFacts();
         MirModuleFacts const defaults{};
         if (auto const word = kMirTextArgCountingTable.findName(counting))
             head += std::format("arg_counting {}\n", *word);
@@ -596,6 +600,8 @@ public:
             head += std::format("aliasing {}\n", *word);
         if (charTypes != defaults.charTypesAliasAll)
             head += std::format("char_types_alias_all {}\n", charTypes ? "true" : "false");
+        if (auto const word = kDataModelTable.findName(model))
+            head += std::format("data_model {}\n", *word);
         emitSymbolsPreamble();
         std::string symbols = takeOut();
         // ★ THE BODY IS RENDERED BEFORE THE `types` SECTION THAT PRECEDES IT IN THE
@@ -2009,6 +2015,18 @@ public:
                 builder_.setCharTypesAliasAll(word.text == "true");
             } else {
                 emitMalformed(std::format("'char_types_alias_all' takes true or false, got '{}'", word.text));
+            }
+        }
+        // P69 (lane `xa`, fold 3f): the model the module is lowered for, optional (absent: none stated).
+        if (peekIdent("data_model")) {
+            lex_.take();
+            Tok const word = lex_.take();
+            if (auto const model = kDataModelTable.fromName(word.text);
+                word.kind == TokKind::Ident && model.has_value()) {
+                builder_.stateDataModel(*model);
+            } else {
+                emitMalformed(std::format("'data_model' takes one of {}, got '{}'",
+                                          detail::renderAllowedList(allNames(kDataModelTable)), word.text));
             }
         }
         // Optional `types { ... }` then `symbols { ... }` preamble.
@@ -4699,8 +4717,10 @@ private:
                 std::uint32_t const t1 = parsePercentValue();
                 std::uint32_t const t2 = parsePercentValue();
                 refuseFlagsOnTerminator(mnemonic, flags);
-                builder_.addSehTryBegin(resolveBlockRef(t1), resolveBlockRef(t2),
-                                        region);
+                // Resolved in clause order, so an unknown name is reported as the text reads.
+                MirBlockId const tryEntry    = resolveBlockRef(t1);
+                MirBlockId const filterEntry = resolveBlockRef(t2);
+                builder_.addSehTryBegin(tryEntry, filterEntry, region);
                 break;
             }
             case MirOpcode::SehFilterReturn: {
@@ -4711,8 +4731,10 @@ private:
                 std::uint32_t const vSlot = parsePercentValue();
                 std::uint32_t const tgt   = parsePercentValue();
                 refuseFlagsOnTerminator(mnemonic, flags);
-                builder_.addSehFilterReturn(resolveValue(vSlot),
-                                            resolveBlockRef(tgt), region);
+                // Resolved in clause order, so an unknown name is reported as the text reads.
+                MirInstId const  filterValue = resolveValue(vSlot);
+                MirBlockId const handler     = resolveBlockRef(tgt);
+                builder_.addSehFilterReturn(filterValue, handler, region);
                 break;
             }
             case MirOpcode::SehTryEnd: {

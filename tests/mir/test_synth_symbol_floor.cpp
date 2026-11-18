@@ -154,6 +154,7 @@ void stateTable(MirBuilder& mb, std::uint32_t tableEnd) {
 Mir buildEntryOnly(TypeInterner& in, TypeId sig, std::uint32_t tableEnd) {
     TypeId const i32 = in.primitive(TypeKind::I32);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
     stateTable(mb, tableEnd);
     mb.addFunction(sig, SymbolId{100});
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
@@ -188,7 +189,6 @@ ProcessArgs stackVectorPa() {
     pa.argcStackOffset           = 0;
     pa.argvStackOffset           = 8;
     pa.envpFollowsArgvTerminator = true;
-    pa.vectorSlotBytes           = 8;
     return pa;
 }
 
@@ -207,6 +207,7 @@ Mir buildSehParent(TypeInterner& in, SymbolId sym, std::uint32_t tableEnd) {
     TypeId const pI32 = in.pointer(i32);
     TypeId const sig  = in.fnSig({}, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
     stateTable(mb, tableEnd);
     mb.addFunction(sig, sym);
     MirBlockId const entry     = mb.createBlock(StructCfMarker::EntryBlock);
@@ -250,6 +251,7 @@ Mir buildCallsMtxLock(TypeInterner& in, std::uint32_t tableEnd) {
     std::array<TypeId, 1> const lockParams{pV};
     TypeId const lockSig = in.fnSig(lockParams, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
     stateTable(mb, tableEnd);
     mb.addFunction(mainSig, SymbolId{100});
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
@@ -347,6 +349,7 @@ TEST(SynthSymbolFloor, TheModuleCarriesTheEndOfItsSymbolIdSpace) {
     };
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         addFn(mb, 3);
         addFn(mb, 5);
         Mir const mir = std::move(mb).finish();
@@ -355,6 +358,7 @@ TEST(SynthSymbolFloor, TheModuleCarriesTheEndOfItsSymbolIdSpace) {
     }
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.stateSymbolIdEnd(4);
         addFn(mb, 3);
         addFn(mb, 5);
@@ -366,6 +370,7 @@ TEST(SynthSymbolFloor, TheModuleCarriesTheEndOfItsSymbolIdSpace) {
         // function alike — so a mint never returns an id the module already defines,
         // whatever table end was stated.
         MirBuilder handed;
+        handed.stateDataModel(DataModel::Lp64);
         handed.stateSymbolIdEnd(4);
         (void)handed.addGlobal(i32, SymbolId{9}, UINT32_MAX, MirFuncId{}, SymbolBinding::Local,
                                SymbolVisibility::Default, /*isConst=*/false,
@@ -380,6 +385,7 @@ TEST(SynthSymbolFloor, TheModuleCarriesTheEndOfItsSymbolIdSpace) {
         // steps over it (the PE `_tls_index` singleton is the one such value today).
         ASSERT_TRUE(isWriterReservedSymbolIdValue(kTlsIndexReservedSymbolIdValue));
         MirBuilder reserved;
+        reserved.stateDataModel(DataModel::Lp64);
         reserved.stateSymbolIdEnd(kTlsIndexReservedSymbolIdValue - 1u);
         EXPECT_EQ(reserved.mintSymbol().v, kTlsIndexReservedSymbolIdValue - 1u)
             << "CONTROL: the value before the reserved one is an ordinary id";
@@ -392,17 +398,20 @@ TEST(SynthSymbolFloor, TheModuleCarriesTheEndOfItsSymbolIdSpace) {
         // saturates the end instead of wrapping it onto 0.
         constexpr std::uint32_t kLast = std::numeric_limits<std::uint32_t>::max();
         MirBuilder full;
+        full.stateDataModel(DataModel::Lp64);
         full.stateSymbolIdEnd(kLast - 1u);
         EXPECT_EQ(full.mintSymbol().v, kLast - 1u) << "CONTROL: the last id that can be minted";
         EXPECT_FALSE(full.mintSymbol().valid());
         EXPECT_FALSE(full.mintSymbol().valid());
         MirBuilder saturated;
+        saturated.stateDataModel(DataModel::Lp64);
         saturated.stateSymbolIdEnd(7);
         saturated.keepSymbolIdsClearOf(SymbolId{kLast});
         EXPECT_EQ(saturated.symbolIdEnd(), kLast);
         EXPECT_FALSE(saturated.mintSymbol().valid());
     }
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     addFn(mb, 3);
     addFn(mb, 5);
     mb.stateSymbolIdEnd(20);
@@ -419,9 +428,11 @@ TEST(SynthSymbolFloor, TheModuleCarriesTheEndOfItsSymbolIdSpace) {
     // A rebuild continues the source's ids — and so does every clone-globals helper,
     // which is how a pass that never mints still hands the end on.
     MirBuilder direct;
+    direct.stateDataModel(DataModel::Lp64);
     direct.continueSymbolIdsOf(mir);
     EXPECT_EQ(direct.mintSymbol().v, 32u);
     MirBuilder viaHelper;
+    viaHelper.stateDataModel(DataModel::Lp64);
     opt::passes::cloneGlobalsVerbatim(mir, viaHelper);
     EXPECT_EQ(std::move(viaHelper).finish().symbolIdEnd(), 32u)
         << "a rebuild that defines NOTHING still carries the source's end";
@@ -429,11 +440,13 @@ TEST(SynthSymbolFloor, TheModuleCarriesTheEndOfItsSymbolIdSpace) {
     // id space beside the two aliasing facts.
     {
         MirBuilder strict;
+        strict.stateDataModel(DataModel::Lp64);
         strict.setAliasingMode(MirAliasingMode::StrictTBAA);
         strict.setCharTypesAliasAll(false);
         strict.stateSymbolIdEnd(77);
         Mir const source = std::move(strict).finish();
         MirBuilder rebuilt;
+        rebuilt.stateDataModel(DataModel::Lp64);
         rebuilt.carryModuleFactsOf(source);
         Mir const copy = std::move(rebuilt).finish();
         EXPECT_EQ(copy.aliasingMode(), MirAliasingMode::StrictTBAA);
@@ -484,6 +497,7 @@ TEST(SynthSymbolFloor, AModuleMadeWithoutABuilderEndsPastTheSymbolsItDefines) {
     // (`SymbolIdEndIsStatedDeath.AMintPastAnEndThatWasOnlyCountedDies`).
     EXPECT_FALSE(mir.symbolIdEndIsStated());
     MirBuilder rebuilt;
+    rebuilt.stateDataModel(DataModel::Lp64);
     rebuilt.continueSymbolIdsOf(mir);
     rebuilt.stateSelfContainedSymbolIds();
     EXPECT_EQ(rebuilt.mintSymbol().v, 58u) << "the first id past it, once its maker's word is given";
@@ -541,6 +555,7 @@ TEST(SynthSymbolFloor, AUnitLoweredWithNoTableEndsPastItsImports) {
         SCOPED_TRACE(said ? "the caller says the unit is its own table" : "the caller says nothing");
         ImportOnlyUnit unit;
         MirLoweringConfig cfg;
+        cfg.dataModel = DataModel::Lp64;   // a config states its unit's data model
         if (said) cfg.symbolIdSpace = MirSymbolIdSpace::unitIsItsOwnTable();
         DiagnosticReporter rep;
         auto result = lowerToMir(unit.hir, unit.pool, unit.ti, rep, /*sourceMap=*/nullptr, cfg, &unit.ffi);
@@ -554,6 +569,7 @@ TEST(SynthSymbolFloor, AUnitLoweredWithNoTableEndsPastItsImports) {
             << "the module states its end exactly when its caller said where the id space ends";
         if (!said) continue;
         MirBuilder rebuilt;
+        rebuilt.stateDataModel(DataModel::Lp64);
         rebuilt.continueSymbolIdsOf(result.mir);
         EXPECT_GT(rebuilt.mintSymbol().v, ImportOnlyUnit::kImportSymV)
             << "the first id minted for the module must not be the import's";
@@ -572,12 +588,13 @@ TEST(SynthSymbolFloorDeath, AUnitLoweredWithNothingSaidOfItsIdSpaceIsRefusedAtIt
     auto const lowerSayingNothing = [](ImportOnlyUnit& unit) {
         DiagnosticReporter rep;
         return lowerToMir(unit.hir, unit.pool, unit.ti, rep, /*sourceMap=*/nullptr,
-                          MirLoweringConfig{}, &unit.ffi);
+                          MirLoweringConfig{.dataModel = DataModel::Lp64}, &unit.ffi);
     };
     EXPECT_DEATH({
         ImportOnlyUnit unit;
         auto const result = lowerSayingNothing(unit);
         MirBuilder rebuilt;
+        rebuilt.stateDataModel(DataModel::Lp64);
         rebuilt.continueSymbolIdsOf(result.mir);
         (void)rebuilt.mintSymbol();
     }, "MirBuilder::mintSymbol fatal: this module's symbol-id space was never stated");
@@ -595,6 +612,7 @@ TEST(SynthSymbolFloorDeath, AUnitLoweredWithNothingSaidOfItsIdSpaceIsRefusedAtIt
 TEST(SynthSymbolFloorDeath, AMintFromABuilderToldNothingDies) {
     EXPECT_DEATH({
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         (void)mb.mintSymbol();
     }, "symbol-id space was never stated");
 }
@@ -605,11 +623,13 @@ TEST(SynthSymbolFloorDeath, AMintFromABuilderToldNothingDies) {
 TEST(SynthSymbolFloorDeath, AnExhaustedSpaceKillsTheMinterThatCannotRefuse) {
     EXPECT_DEATH({
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.stateSymbolIdEnd(std::numeric_limits<std::uint32_t>::max());
         (void)mb.mintSymbolOrAbort("thePassThatMints");
     }, "thePassThatMints fatal: the module's SymbolId space is exhausted");
     EXPECT_DEATH({
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.stateSymbolIdEnd(std::numeric_limits<std::uint32_t>::max());
         Mir const full = std::move(mb).finish();
         MirSymbolIdContinuation past{full};
@@ -1018,6 +1038,7 @@ TEST(SynthSymbolFloor, ASynthesisRebuildCarriesItsModulesFactsWhole) {
     std::array<TypeId, 1> const ps{i64};
     TypeId const sig = in.fnSig(ps, in.primitive(TypeKind::Void), CallConv::CcMS64);
     MirBuilder src;
+    src.stateDataModel(DataModel::Lp64);
     src.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     src.stateArgCounting(MirArgCounting::Flat);
     src.setAliasingMode(MirAliasingMode::StrictTBAA);   // neither is the builder's default
@@ -1031,6 +1052,7 @@ TEST(SynthSymbolFloor, ASynthesisRebuildCarriesItsModulesFactsWhole) {
     Mir const mir = std::move(src).finish();
 
     MirBuilder rebuilt;
+    rebuilt.stateDataModel(DataModel::Lp64);
     continueSymbolIdsPastImports(rebuilt, mir, {});
     Mir const out = std::move(rebuilt).finish();
     EXPECT_EQ(out.argCounting(), MirArgCounting::Flat) << "the rebuild numbers its Args as its module did";

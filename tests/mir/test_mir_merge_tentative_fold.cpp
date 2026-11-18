@@ -87,6 +87,7 @@ void build(Unit& unit, Says const& says) {
     TypeId const i32 = unit.interner.primitive(TypeKind::I32);
     TypeId const ty  = says.elements == 1 ? i32 : unit.interner.array(i32, says.elements);
     MirBuilder   b;
+    b.stateDataModel(DataModel::Lp64);
     MirLinkage   linkage{says.binding, SymbolVisibility::Default};
     linkage.tentative     = says.tentative;
     std::uint32_t literal = UINT32_MAX;
@@ -294,4 +295,41 @@ TEST(MirMergeTentativeFold, ModulePrivateDefinitionsOfOneNameStayTwoObjects) {
     for (std::uint32_t i = 0; i < m.module->mir.moduleGlobalCount(); ++i) {
         EXPECT_FALSE(m.module->mir.globalIsCommon(m.module->mir.globalAt(i)));
     }
+}
+
+// P69 fold 3f (lane `xa`): every size the merge takes -- a tentative definition's above all -- is read from the
+// units' own data model (`MirModuleFacts::dataModel`, joined across them), the one home of the pointer width below
+// MIR. A link whose format states ANOTHER model is refused by name: the units' every `long`, pointer and layout was
+// sized under theirs, and the format would write the program under its own. Before the fold the merge sized the
+// tentative definitions by the format's model while the units stated their own, and nothing compared the two.
+// ⓘ Unreachable from one `compileOneTarget` by construction (every unit is lowered for the link's own format); it
+// is the merge's precondition, pinned where it is relied on, as the layout-rule refusal above is.
+TEST(MirMergeTentativeFold, UnitsLoweredForAnotherDataModelThanTheLinksFormatAreRefusedByName) {
+    auto const L = load();
+    ASSERT_TRUE(L.target && L.format);
+    auto const pe = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    ASSERT_TRUE(pe.has_value());
+    ASSERT_EQ((*pe)->dataModel(), DataModel::Llp64) << "the cell needs a format of another model than the units'";
+    auto const rule = L.target->aggregateLayout();
+    Loaded const onPe{L.target, *pe};
+    Merged m;
+    merge(m, onPe, Says{1, true}, Says{2, true}, rule, rule);   // both units state LP64 (`build`)
+    EXPECT_FALSE(m.module.has_value())
+        << "the merge folded units of LP64 under an LLP64 format, into a module stating "
+        << (m.module.has_value() ? dataModelSpelled(m.module->mir.moduleFacts().dataModel) : std::string{})
+        << " with " << m.rep.errorCount() << " error(s)";
+    bool named = false;
+    for (auto const& d : m.rep.all()) {
+        named = named
+             || (d.code == DiagnosticCode::K_CrossCuMergeUnsupported && d.severity == DiagnosticSeverity::Error
+                 && d.actual.find("lowered for data model LP64") != std::string::npos
+                 && d.actual.find("'pe64-x86_64-windows-exec' states data model LLP64") != std::string::npos);
+    }
+    EXPECT_TRUE(named) << "the refusal does not name both models and the format" << diagnosticsOf(m.rep);
+    // The control: the same units under a format of their own model merge, the two tentative definitions one object.
+    Merged same;
+    merge(same, L, Says{1, true}, Says{2, true}, rule, rule);
+    ASSERT_EQ(same.rep.errorCount(), 0u) << diagnosticsOf(same.rep);
+    ASSERT_TRUE(same.module.has_value());
+    EXPECT_EQ(definitionsOfShared(*same.module).size(), 1u);
 }

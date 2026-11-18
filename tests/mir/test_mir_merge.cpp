@@ -182,9 +182,12 @@ std::size_t countOp(Mir const& mir, MirOpcode want) {
 // c111 (D-RUNTIME-PE-MAIN-ARGS) helpers. A one-function Mir whose entry has the
 // given signature, bound to SymbolId{100}, body `return 0;` (the synth reads only
 // the signature, then appends — the body is irrelevant to arg-fetch synthesis).
-Mir buildEntryOnly(TypeInterner& in, TypeId sig) {
+// The module states its data model (P69 fold 3f): LP64 unless a cell names another -- the Win64 cells' slots are
+// 8 bytes under LLP64 as well, and the environment cell reads the 4-byte ILP32 slot by passing it.
+Mir buildEntryOnly(TypeInterner& in, TypeId sig, DataModel model = DataModel::Lp64) {
     TypeId const i32 = in.primitive(TypeKind::I32);
     MirBuilder mb;
+    mb.stateDataModel(model);
     // Counted as the convention `sig` names (a FnSig's first scalar) counts its arguments.
     mb.stateArgCounting(argCountingOf(static_cast<CallConv>(in.scalars(sig)[0]) == CallConv::CcMS64));
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
@@ -210,6 +213,7 @@ Mir buildEntryOnly(TypeInterner& in, TypeId sig) {
 // would make the refusal test pass for the wrong reason.
 Mir buildVoidEntryOnly(TypeInterner& in, TypeId sig) {
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
     // Counted as the convention `sig` names (a FnSig's first scalar) counts its arguments.
     mb.stateArgCounting(argCountingOf(static_cast<CallConv>(in.scalars(sig)[0]) == CallConv::CcMS64));
     mb.addFunction(sig, SymbolId{100});
@@ -248,6 +252,20 @@ ProcessArgs ucrtAccessorPa() {
     return pa;
 }
 
+// The pe exec block whole: the UCRT accessors above with the GUI startups' values, as the shipped pe exec document
+// declares them (P69 fold 3f) -- the block every verb of `peEntryVerbs()` is realized against.
+[[nodiscard]] ProcessArgs guiPa() {
+    ProcessArgs pa                = ucrtAccessorPa();
+    pa.narrowWinMainCommandLineFn = "_get_narrow_winmain_command_line";
+    pa.wideWinMainCommandLineFn   = "_get_wide_winmain_command_line";
+    ProcessArgs::WinMainStartupRoutines routines;
+    routines.role             = RuntimeLibraryRole::CompilerSupport;
+    routines.moduleInstanceFn = "__dss_pe_module_instance";
+    routines.showWindowFn     = "__dss_pe_show_window_mode";
+    pa.winMainStartupRoutines = routines;   // a realized role: no library path
+    return pa;
+}
+
 // The elf entry-stack mechanism as the shipped elf formats declare it: argc at
 // [sp+0], argv in place at sp+8, and the environment vector one 8-byte slot past
 // argv's NULL terminator.
@@ -257,7 +275,6 @@ ProcessArgs stackVectorPa() {
     pa.argcStackOffset           = 0;
     pa.argvStackOffset           = 8;
     pa.envpFollowsArgvTerminator = true;
-    pa.vectorSlotBytes           = 8;
     return pa;
 }
 
@@ -276,6 +293,15 @@ TypeId entrySigFor(TypeInterner& in, EntryMaterialization verb, CallConv cc) {
             break;
         case EntryParamShape::PtrPtrU16:
             params.push_back(in.pointer(in.pointer(in.primitive(TypeKind::U16))));
+            break;
+        case EntryParamShape::PtrOpaque:
+            params.push_back(in.pointer(in.primitive(TypeKind::Void)));
+            break;
+        case EntryParamShape::PtrChar:
+            params.push_back(in.pointer(in.primitive(TypeKind::Char)));
+            break;
+        case EntryParamShape::PtrU16:
+            params.push_back(in.pointer(in.primitive(TypeKind::U16)));
             break;
         case EntryParamShape::None:
             ADD_FAILURE() << "the verb table holds the `none` sentinel shape";
@@ -308,6 +334,8 @@ std::vector<EntryMaterialization> peEntryVerbs() {
         EntryMaterialization::ArgcWargv,   // `int wmain(int, wchar_t**)` — pe only
         EntryMaterialization::ArgcArgvEnvp,    // `int main(int, char**, char**)`
         EntryMaterialization::ArgcWargvWenvp,  // MSVC's 3-parameter `wmain`
+        EntryMaterialization::InstancePrevCmdlineShow,   // `WinMain` (P69 fold 3f)
+        EntryMaterialization::InstancePrevWcmdlineShow,  // `wWinMain`
     };
 }
 
@@ -364,6 +392,7 @@ TEST(MirMerge, MergeRewiresCrossCuCallToDirect) {
     Mir mir0;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(sig0, SymbolId{100});  // main
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -382,6 +411,7 @@ TEST(MirMerge, MergeRewiresCrossCuCallToDirect) {
     Mir mir1;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(sig1, SymbolId{50});  // f
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -445,6 +475,7 @@ TEST(MirMerge, MergeDedupsSameNamedFfiImports) {
         TypeId const i32 = in.primitive(TypeKind::I32);
         TypeId const sig = in.fnSig({}, i32, CallConv::CcSysV);
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(sig, fnSym);
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -528,6 +559,7 @@ TEST(MirMerge, MergeOrCombinesEagerImportBitAcrossCollapse) {
         TypeId const i32 = in.primitive(TypeKind::I32);
         TypeId const sig = in.fnSig({}, i32, CallConv::CcSysV);
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(sig, fnSym);
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -594,6 +626,7 @@ Mir buildCallsExtern(SymbolId fnSym, SymbolId extSym, TypeInterner& in) {
     TypeId const i32 = in.primitive(TypeKind::I32);
     TypeId const sig = in.fnSig({}, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.addFunction(sig, fnSym);
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(e);
@@ -1134,6 +1167,7 @@ TEST(MirMerge, MergeClonesMultiBlockCallee) {
     Mir mir0;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(sig0, SymbolId{100});  // main
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -1152,6 +1186,7 @@ TEST(MirMerge, MergeClonesMultiBlockCallee) {
     Mir mir1;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(sig1, SymbolId{50});  // f
         // Derivation-consistent stamps (both arms return → IfThen/IfElse
         // around the virtual exit; ExitBlock is a dormant marker the
@@ -1234,6 +1269,7 @@ TEST(MirMerge, MergeRederivesStaleInputMarkers) {
     Mir mir0;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(sig0, SymbolId{100});  // main
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -1249,6 +1285,7 @@ TEST(MirMerge, MergeRederivesStaleInputMarkers) {
     Mir mir1;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(sig1, SymbolId{50});  // f
         MirBlockId const e    = mb.createBlock(StructCfMarker::EntryBlock);
         MirBlockId const tail = mb.createBlock(StructCfMarker::ExitBlock);  // STALE
@@ -1307,6 +1344,7 @@ TEST(MirMerge, MergeReinternsTypesIntoHost) {
     Mir mir0;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(sig0, SymbolId{100});  // main
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -1323,6 +1361,7 @@ TEST(MirMerge, MergeReinternsTypesIntoHost) {
     Mir mir1;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(sig1, SymbolId{50});  // f
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -1372,6 +1411,7 @@ TEST(MirMerge, MergeDropsShadowedWeak) {
         TypeId const i32  = in.primitive(TypeKind::I32);
         TypeId const sig  = in.fnSig({}, i32, CallConv::CcSysV);
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(sig, SymbolId{50}, dss::test_support::linkageOf(binding));
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -1431,6 +1471,7 @@ TEST(MirMerge, MergeRemapsGlobalInitFunc) {
     MirFuncId srcInitFunc{};
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         // __init__ (symbol 200): the module-init function.
         srcInitFunc = mb.addFunction(sig, SymbolId{200});
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
@@ -1488,6 +1529,7 @@ TEST(MirMerge, MergeRemapsSymbolAddressGlobalTarget) {
     Mir mir0;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(sig0, SymbolId{1});  // main
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -1503,6 +1545,7 @@ TEST(MirMerge, MergeRemapsSymbolAddressGlobalTarget) {
     Mir mir1;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         (void)mb.addGlobal(i32_1, SymbolId{300}, mb.literalPoolAdd(i32Lit(42)),
                            MirFuncId{}, SymbolBinding::Global,
                            SymbolVisibility::Default, /*isConst=*/false,
@@ -1593,6 +1636,7 @@ TEST(MirMerge, MergeKeepsLocalStaticGlobalDistinctFromSameNamedExtern) {
     Mir mir0;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(sig0, SymbolId{10}, SymbolBinding::Local);  // fa (private)
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -1615,6 +1659,7 @@ TEST(MirMerge, MergeKeepsLocalStaticGlobalDistinctFromSameNamedExtern) {
     Mir mir1;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(sig1, SymbolId{60}, SymbolBinding::Local);  // fb (private)
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -1715,6 +1760,7 @@ TEST(MirMerge, MergePreservesFunctionNoOptimize) {
     Mir mir0;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         // sym 400: noOptimize ONLY — the two inline flags deliberately clear, so
         // a transposed argument at the copy site fails here.
         mb.addFunction(fnSig, SymbolId{400}, SymbolBinding::Global,
@@ -1775,6 +1821,7 @@ TEST(MirMerge, MergePreservesFunctionNoSanitizeThread) {
     Mir mir0;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         // sym 500: noSanitizeThread ONLY — all three sibling flags deliberately
         // clear, so a transposed/shifted argument at the copy site fails here.
         mb.addFunction(fnSig, SymbolId{500}, SymbolBinding::Global,
@@ -1823,6 +1870,7 @@ TEST(MirMerge, MergePreservesGlobalConstness) {
     Mir mir0;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         // gc (sym 300) CONST init 5 → .rodata; gm (sym 301) MUTABLE init 7 → .data
         (void)mb.addGlobal(i32, SymbolId{300}, mb.literalPoolAdd(i32Lit(5)),
                            MirFuncId{}, SymbolBinding::Global,
@@ -1871,6 +1919,7 @@ TEST(MirMerge, MergePreservesGlobalThreadLocal) {
     Mir mir0;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         // gt (sym 300) THREAD-LOCAL init 5; gp (sym 301) plain init 7.
         (void)mb.addGlobal(i32, SymbolId{300}, mb.literalPoolAdd(i32Lit(5)),
                            MirFuncId{}, SymbolBinding::Global,
@@ -1910,6 +1959,7 @@ TEST(MirMerge, MergeReportsTwoStrongConflict) {
         TypeId const i32 = in.primitive(TypeKind::I32);
         TypeId const sig = in.fnSig({}, i32, CallConv::CcSysV);
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);   // the model of the ELF document it is merged under (P69 fold 3f)
         mb.addFunction(sig, SymbolId{50}, SymbolBinding::Global,
                        SymbolVisibility::Default);
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
@@ -2192,7 +2242,9 @@ TEST(RealizeEntryShape, EveryDeclaredVerbHasAMaterializationArm) {
     // ⓘ WHY EVERY NARROW VERB AND NOT `argc-argv` ALONE
     // (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE). `argc-argv-envp` binds the narrow argv
     // accessor too — it materializes the same argv plus the environment — so a set
-    // that keeps it still realizes `__p___argv` legitimately. The narrow/wide split is what the verb decides, so
+    // that keeps it still realizes `__p___argv` legitimately, and so does WinMain's
+    // `instance-prev-cmdline-show` (its startup configures the narrow argument vector
+    // as every startup does, P69 fold 3f). The narrow/wide split is what the verb decides, so
     // the mutation removes the whole narrow side, read off the verb table
     // (`entryVerbIsWide`) rather than listed by hand.
     //
@@ -2206,7 +2258,10 @@ TEST(RealizeEntryShape, EveryDeclaredVerbHasAMaterializationArm) {
 
     // Materialize ONE verb against the signature its language row declares (spelled
     // from the verb table), and report what the pass produced — a verb never arrives
-    // against a signature the language did not match it to.
+    // against a signature the language did not match it to. The block is the pe exec
+    // format's WHOLE `processArgs` (`guiPa()`: the UCRT accessors and the GUI startups'
+    // routines), since a declared verb's arm is real only beside the block that names
+    // the routines it calls (P69 fold 3f).
     auto const runVerb = [](EntryMaterialization verb, bool& ok,
                             std::string& diagText) {
         TypeInterner in{CompilationUnitId{1}};
@@ -2215,7 +2270,7 @@ TEST(RealizeEntryShape, EveryDeclaredVerbHasAMaterializationArm) {
         std::optional<SymbolId>   entry = SymbolId{100};
         std::vector<ExternImport> ext;
         DiagnosticReporter        rep;
-        ok = realizeEntryShape(mir, in, entry, ext, verb, ucrtAccessorPa(),
+        ok = realizeEntryShape(mir, in, entry, ext, verb, guiPa(),
                                CSymbolDecorationScheme::None,
                                "pe64-x86_64-windows-exec", rep);
         diagText = allDiagText(rep);
@@ -2259,6 +2314,10 @@ TEST(RealizeEntryShape, EveryDeclaredVerbHasAMaterializationArm) {
         << "and `argc-argv-envp`, so the NARROW environment accessor";
     EXPECT_TRUE(has(declared, "_get_initial_wide_environment"))
         << "and `argc-wargv-wenvp`, so the WIDE one";
+    EXPECT_TRUE(has(declared, "_get_narrow_winmain_command_line"))
+        << "and `instance-prev-cmdline-show`, so the NARROW GUI command line";
+    EXPECT_TRUE(has(declared, "_get_wide_winmain_command_line"))
+        << "and `instance-prev-wcmdline-show`, so the WIDE one";
 
     // ── THE MUTANT: the declared set MINUS its narrow verbs. Built by FILTERING
     // rather than by re-typing the list, so the two sets cannot drift apart. ──
@@ -2272,8 +2331,9 @@ TEST(RealizeEntryShape, EveryDeclaredVerbHasAMaterializationArm) {
             mutant.push_back(v);
         }
     }
-    ASSERT_EQ(narrowVerbs, 2u)
-        << "the pe set's narrow verbs are `argc-argv` and `argc-argv-envp`";
+    ASSERT_EQ(narrowVerbs, 3u)
+        << "the pe set's narrow verbs are `argc-argv`, `argc-argv-envp` and "
+           "`instance-prev-cmdline-show`";
     ASSERT_EQ(mutant.size(), peEntryVerbs().size() - narrowVerbs)
         << "the mutation must remove EXACTLY the narrow verbs";
     ASSERT_FALSE(mutant.empty())
@@ -2290,13 +2350,15 @@ TEST(RealizeEntryShape, EveryDeclaredVerbHasAMaterializationArm) {
     auto const mutated = realizableImports(mutant);
     for (char const* narrowName : {"__p___argv", "_configure_narrow_argv",
                                    "_initialize_narrow_environment",
-                                   "_get_initial_narrow_environment"}) {
+                                   "_get_initial_narrow_environment",
+                                   "_get_narrow_winmain_command_line"}) {
         EXPECT_FALSE(has(mutated, narrowName))
             << "with the narrow verbs removed from the declared set, NOTHING the "
                "format can realize may bind " << narrowName << " — if it still "
                "does, the arm is being chosen by something other than the verb";
     }
-    for (char const* wideName : {"__p___wargv", "_get_initial_wide_environment"}) {
+    for (char const* wideName : {"__p___wargv", "_get_initial_wide_environment",
+                                 "_get_wide_winmain_command_line"}) {
         EXPECT_TRUE(has(mutated, wideName))
             << "while the untouched wide verbs must be unaffected — this is what "
                "keeps the assertions above from being satisfiable by a pass that "
@@ -2341,6 +2403,14 @@ struct OrderedCall {
         if (calls[i].symbol == symbol) return i;
     }
     return calls.size();
+}
+
+// `guiPa()` (the pe exec block whole) less one of its declarations.
+template <typename Field>
+[[nodiscard]] ProcessArgs guiPaWithout(Field ProcessArgs::*field) {
+    ProcessArgs pa = guiPa();
+    pa.*field      = Field{};
+    return pa;
 }
 
 }  // namespace
@@ -2511,8 +2581,8 @@ TEST(RealizeEntryShape, StackEnvironmentIsArgvPlusArgcPlusOneSlots) {
     EXPECT_EQ(addend, std::optional<std::int64_t>{1})
         << "one slot past argv's NULL terminator: argc + 1, never argc";
     EXPECT_EQ(scale, std::optional<std::int64_t>{8})
-        << "the DECLARED slot width (`vectorSlotBytes`), multiplied in because a MIR "
-           "Gep index is a BYTE offset";
+        << "the slot width -- a pointer of the module's data model (P69 fold 3f, F3 P16) -- "
+           "multiplied in because a MIR Gep index is a BYTE offset";
     ASSERT_TRUE(gep.has_value()) << "envp must be computed as an address off argv";
     ASSERT_TRUE(entryCall.has_value()) << "the init must call the user entry";
     EXPECT_EQ(entryCall->args, 3u);
@@ -2523,6 +2593,58 @@ TEST(RealizeEntryShape, StackEnvironmentIsArgvPlusArgcPlusOneSlots) {
 
     MirVerifier verifier{mir, &in};
     EXPECT_TRUE(verifier.verify(rep)) << "the synthesized module must verify";
+}
+
+// ★ P69 (lane `xa`, fold 3f -- review-xa3e F3 P16): THE ENVIRONMENT VECTOR'S SLOT IS A POINTER OF THE MODULE'S DATA
+// MODEL, read from the model and never from a document key: an ILP32 module's slots are 4 bytes and an LP64 one's 8;
+// a module stating no model is refused by name rather than placing envp by a guessed width.
+TEST(RealizeEntryShape, StackEnvironmentSlotIsAPointerOfTheModulesModel) {
+    std::vector<EntryMaterialization> const elfVerbs{
+        EntryMaterialization::None, EntryMaterialization::ArgcArgv, EntryMaterialization::ArgcArgvEnvp};
+    for (auto const& [model, slot] :
+         {std::pair{DataModel::Ilp32, std::int64_t{4}}, std::pair{DataModel::Lp64, std::int64_t{8}}}) {
+        SCOPED_TRACE(static_cast<unsigned>(model));
+        TypeInterner in{CompilationUnitId{1}};
+        Mir mir = buildEntryOnly(in, entrySigFor(in, EntryMaterialization::ArgcArgvEnvp, CallConv::CcSysV), model);
+        std::optional<SymbolId>   entry = SymbolId{100};
+        std::vector<ExternImport> ext;
+        DiagnosticReporter        rep;
+        ASSERT_TRUE(realizeEntryShape(
+            mir, in, entry, ext,
+            verbRealizedBy(elfVerbs, EntryMaterialization::ArgcArgvEnvp), stackVectorPa(),
+            CSymbolDecorationScheme::None, "elf64-x86_64-linux-exec", rep))
+            << allDiagText(rep);
+        ASSERT_TRUE(entry.has_value());
+        auto const synthFn = findFuncBySymbol(mir, *entry);
+        ASSERT_TRUE(synthFn.has_value());
+        std::vector<std::int64_t> scales;
+        for (std::uint32_t bi = 0; bi < mir.funcBlockCount(*synthFn); ++bi) {
+            MirBlockId const blk = mir.funcBlockAt(*synthFn, bi);
+            for (std::uint32_t ii = 0; ii < mir.blockInstCount(blk); ++ii) {
+                MirInstId const id = mir.blockInstAt(blk, ii);
+                if (mir.instOpcode(id) != MirOpcode::Mul) continue;
+                for (auto const o : mir.instOperands(id)) {
+                    auto const index = mir.tryConstLiteralIndex(o);
+                    if (!index.has_value()) continue;
+                    auto const& lit = mir.literalValue(*index);
+                    if (auto const* k = std::get_if<std::int64_t>(&lit.value)) scales.push_back(*k);
+                }
+            }
+        }
+        EXPECT_EQ(scales, std::vector<std::int64_t>{slot})
+            << "the environment vector's slot is not a pointer of the module's data model";
+    }
+    TypeInterner in{CompilationUnitId{1}};
+    Mir mir = buildEntryOnly(in, entrySigFor(in, EntryMaterialization::ArgcArgvEnvp, CallConv::CcSysV), DataModel{});
+    std::optional<SymbolId>   entry = SymbolId{100};
+    std::vector<ExternImport> ext;
+    DiagnosticReporter        rep;
+    EXPECT_FALSE(realizeEntryShape(
+        mir, in, entry, ext,
+        verbRealizedBy(elfVerbs, EntryMaterialization::ArgcArgvEnvp), stackVectorPa(),
+        CSymbolDecorationScheme::None, "elf64-x86_64-linux-exec", rep))
+        << "a module stating no data model placed envp";
+    EXPECT_GE(rep.errorCount(), 1u) << allDiagText(rep);
 }
 
 TEST(RealizeEntryShape, ALoaderDeliveredFormPassesThroughUntouched) {
@@ -2559,7 +2681,6 @@ TEST(RealizeEntryShape, AMechanismThatCannotRealizeTheVerbIsRefused) {
     // alternative to refusing is handing the entry values nothing produced.
     ProcessArgs noLayout = stackVectorPa();
     noLayout.envpFollowsArgvTerminator = false;
-    noLayout.vectorSlotBytes = 0;
     ProcessArgs noNarrowPair = ucrtAccessorPa();
     noNarrowPair.initializeNarrowEnvironmentFn.clear();
     noNarrowPair.narrowEnvironmentAccessorFn.clear();
@@ -2581,12 +2702,20 @@ TEST(RealizeEntryShape, AMechanismThatCannotRealizeTheVerbIsRefused) {
          EntryMaterialization::ArgcArgvEnvp, noLayout,
          "does not declare where the environment vector sits"},
         {"the environment verb with no CRT pair", EntryMaterialization::ArgcArgvEnvp,
-         noNarrowPair, "environment initialize/accessor pair"},
+         noNarrowPair, "narrow environment's `initializeNarrowEnvironmentFn`"},
         {"the four-value verb through a CRT", EntryMaterialization::ArgcArgvEnvpApple,
-         ucrtAccessorPa(), "produces at most 3"},
+         ucrtAccessorPa(), "produces Darwin's apple vector"},
         {"the four-value verb on the entry stack",
          EntryMaterialization::ArgcArgvEnvpApple, stackVectorPa(),
-         "produces at most 3"},
+         "produces Darwin's apple vector"},
+        // P69 fold 3f (lane `xa`): the GUI startups' values, asked per value.
+        {"a GUI verb on the entry stack", EntryMaterialization::InstancePrevCmdlineShow,
+         stackVectorPa(), "no module instance, command line or show-window value"},
+        {"a GUI verb with no routines", EntryMaterialization::InstancePrevWcmdlineShow,
+         guiPaWithout(&ProcessArgs::winMainStartupRoutines), "declares no `winMainStartupRoutines`"},
+        {"the narrow GUI verb with no command line", EntryMaterialization::InstancePrevCmdlineShow,
+         guiPaWithout(&ProcessArgs::narrowWinMainCommandLineFn),
+         "declares no `narrowWinMainCommandLineFn`"},
     };
     for (auto const& c : cases) {
         SCOPED_TRACE(c.name);
@@ -2606,6 +2735,103 @@ TEST(RealizeEntryShape, AMechanismThatCannotRealizeTheVerbIsRefused) {
         EXPECT_EQ(mir.moduleFuncCount(), 1u) << "and synthesize nothing";
         ASSERT_TRUE(entry.has_value());
         EXPECT_EQ(entry->v, 100u) << "and leave the entry symbol alone";
+    }
+}
+
+TEST(RealizeEntryShape, TheGuiVerbsFetchEachValueByWhatItIs) {
+    // MSVC's GUI startup (DOCUMENTED, the toolset's exe_common.inl / exe_winmain.cpp; ✔MEASURED 2026-11-17 by its
+    // imports and by `__argc` == 1 inside WinMain): configure the width's argument vector as every startup does, then
+    // `WinMain(&__ImageBase, nullptr, _get_narrow_winmain_command_line(), __scrt_get_show_window_mode())`. The init
+    // makes the same calls -- the instance and the show value through the format's routines, the command line through
+    // the UCRT's routine of the verb's width, the previous instance a null pointer -- and hands them in the verb's
+    // slot order (P69 fold 3f, lane `xa`).
+    struct Case {
+        EntryMaterialization     verb;
+        char const*              configure;
+        char const*              argvAccessor;
+        char const*              commandLine;
+        std::vector<char const*> forbidden;   // the other width's names, and what no GUI verb reads
+    };
+    std::vector<Case> const cases{
+        {EntryMaterialization::InstancePrevCmdlineShow, "_configure_narrow_argv", "__p___argv",
+         "_get_narrow_winmain_command_line",
+         {"_configure_wide_argv", "__p___wargv", "_get_wide_winmain_command_line", "__p___argc",
+          "_initialize_narrow_environment", "_get_initial_narrow_environment"}},
+        {EntryMaterialization::InstancePrevWcmdlineShow, "_configure_wide_argv", "__p___wargv",
+         "_get_wide_winmain_command_line",
+         {"_configure_narrow_argv", "__p___argv", "_get_narrow_winmain_command_line", "__p___argc",
+          "_initialize_wide_environment", "_get_initial_wide_environment"}},
+    };
+    for (auto const& c : cases) {
+        SCOPED_TRACE(entryMaterializationName(c.verb));
+        TypeInterner in{CompilationUnitId{1}};
+        Mir mir = buildEntryOnly(in, entrySigFor(in, c.verb, CallConv::CcMS64));
+        std::optional<SymbolId>   entry = SymbolId{100};
+        std::vector<ExternImport> ext;
+        DiagnosticReporter        rep;
+        ASSERT_TRUE(realizeEntryShape(mir, in, entry, ext, verbRealizedBy(peEntryVerbs(), c.verb), guiPa(),
+                                      CSymbolDecorationScheme::None, "pe64-x86_64-windows-exec", rep))
+            << allDiagText(rep);
+        EXPECT_EQ(rep.errorCount(), 0u) << allDiagText(rep);
+
+        std::unordered_map<std::string, ExternImport const*> byName;
+        for (auto const& e : ext) byName.emplace(e.mangledName, &e);
+        for (char const* want : {c.configure, c.argvAccessor, c.commandLine}) {
+            ASSERT_EQ(byName.count(want), 1u) << "missing UCRT import " << want;
+            EXPECT_EQ(byName[want]->libraryPath, "ucrtbase.dll") << want;
+            EXPECT_FALSE(byName[want]->isData) << want << " is a function";
+        }
+        for (char const* routine : {"__dss_pe_module_instance", "__dss_pe_show_window_mode"}) {
+            ASSERT_EQ(byName.count(routine), 1u) << "missing routine " << routine;
+            EXPECT_EQ(byName[routine]->libraryPath, "")
+                << routine << ": the compilerSupport archive defines it, bound by the link";
+        }
+        for (char const* forbidden : c.forbidden) {
+            EXPECT_EQ(byName.count(forbidden), 0u) << forbidden << " is no value of this verb";
+        }
+
+        ASSERT_TRUE(entry.has_value());
+        auto const synthFn = findFuncBySymbol(mir, *entry);
+        ASSERT_TRUE(synthFn.has_value()) << "the entry must be retargeted to the init";
+        auto const calls = orderedCalls(mir, *synthFn);
+        std::size_t const iConfigure = indexOfCall(calls, byName[c.configure]->symbol.v);
+        std::size_t const iEntry     = indexOfCall(calls, 100u);
+        ASSERT_LT(iEntry, calls.size()) << "the init must call the user entry";
+        EXPECT_LT(iConfigure, iEntry) << "the argument vector is configured before the entry is called";
+        EXPECT_EQ(calls[iEntry].args, 4u) << "the entry receives (instance, previous, command line, show)";
+
+        // The entry's four operands, in the verb's slot order: each a call of the routine of its value, the previous
+        // instance a null constant.
+        std::vector<MirInstId> entryOps;
+        for (std::uint32_t bi = 0; bi < mir.funcBlockCount(*synthFn); ++bi) {
+            MirBlockId const blk = mir.funcBlockAt(*synthFn, bi);
+            for (std::uint32_t ii = 0; ii < mir.blockInstCount(blk); ++ii) {
+                MirInstId const id = mir.blockInstAt(blk, ii);
+                if (mir.instOpcode(id) != MirOpcode::Call) continue;
+                auto const ops = mir.instOperands(id);
+                if (mir.instOpcode(ops[0]) != MirOpcode::GlobalAddr || mir.globalAddrSymbol(ops[0]).v != 100u) {
+                    continue;
+                }
+                for (std::size_t o = 1; o < ops.size(); ++o) entryOps.push_back(ops[o]);
+            }
+        }
+        ASSERT_EQ(entryOps.size(), 4u);
+        auto const calleeOf = [&](MirInstId id) -> std::uint32_t {
+            if (mir.instOpcode(id) != MirOpcode::Call) return 0;
+            auto const ops = mir.instOperands(id);
+            return mir.instOpcode(ops[0]) == MirOpcode::GlobalAddr ? mir.globalAddrSymbol(ops[0]).v : 0u;
+        };
+        EXPECT_EQ(calleeOf(entryOps[0]), byName["__dss_pe_module_instance"]->symbol.v) << "the module instance";
+        ASSERT_EQ(mir.instOpcode(entryOps[1]), MirOpcode::Const) << "the previous instance is a constant";
+        auto const& previous = mir.literalValue(mir.constLiteralIndex(entryOps[1]));
+        auto const* previousValue = std::get_if<std::int64_t>(&previous.value);
+        ASSERT_NE(previousValue, nullptr);
+        EXPECT_EQ(*previousValue, 0) << "the previous instance is null";
+        EXPECT_EQ(calleeOf(entryOps[2]), byName[c.commandLine]->symbol.v) << "the command line of the verb's width";
+        EXPECT_EQ(calleeOf(entryOps[3]), byName["__dss_pe_show_window_mode"]->symbol.v) << "the show-window value";
+
+        MirVerifier verifier{mir, &in};
+        EXPECT_TRUE(verifier.verify(rep)) << "the synthesized module must verify";
     }
 }
 
@@ -2898,6 +3124,7 @@ Mir buildSehParent(TypeInterner& in, SymbolId sym) {
     TypeId const pI32  = in.pointer(i32);
     TypeId const sig   = in.fnSig({}, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
     mb.stateArgCounting(MirArgCounting::Flat);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, sym);
@@ -3041,6 +3268,7 @@ TEST(SynthSehFunclets, LabelAddressInAFilterExpressionIsRefusedNotCloned) {
     TypeId const sig  = in.fnSig({}, i32, CallConv::CcMS64);
 
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
     mb.stateArgCounting(MirArgCounting::Flat);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, SymbolId{100});
@@ -3180,6 +3408,7 @@ Mir buildSehParentMultiBlockBody(TypeInterner& in, SymbolId sym) {
     TypeId const pI32  = in.pointer(i32);
     TypeId const sig   = in.fnSig({}, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
     mb.stateArgCounting(MirArgCounting::Flat);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, sym);
@@ -3336,6 +3565,7 @@ Mir buildSehParentOrderSensitiveMarkers(TypeInterner& in, SymbolId sym) {
     TypeId const boolTy = in.primitive(TypeKind::Bool);
     TypeId const sig   = in.fnSig({}, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
     mb.stateArgCounting(MirArgCounting::Flat);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, sym);
@@ -3506,6 +3736,7 @@ Mir buildSehParentFilterReadsLocal(TypeInterner& in, SymbolId sym) {
     TypeId const pI32  = in.pointer(i32);
     TypeId const sig   = in.fnSig({}, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
     mb.stateArgCounting(MirArgCounting::Flat);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, sym);
@@ -3743,6 +3974,7 @@ Mir buildSehNestedInnerLoopCreatedLast(TypeInterner& in, SymbolId sym) {
     TypeId const boolTy = in.primitive(TypeKind::Bool);
     TypeId const sig    = in.fnSig({}, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
     mb.stateArgCounting(MirArgCounting::Flat);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, sym);
@@ -3800,6 +4032,7 @@ Mir buildSehThreeDeep(TypeInterner& in, SymbolId sym) {
     TypeId const pI32 = in.pointer(i32);
     TypeId const sig  = in.fnSig({}, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
     mb.stateArgCounting(MirArgCounting::Flat);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, sym);
@@ -3850,6 +4083,7 @@ Mir buildSehTwoSiblingsInOneParent(TypeInterner& in, SymbolId sym) {
     TypeId const pI32 = in.pointer(i32);
     TypeId const sig  = in.fnSig({}, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
     mb.stateArgCounting(MirArgCounting::Flat);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, sym);
@@ -4017,6 +4251,7 @@ TEST(SynthSehFunclets, TwoRegionsThatOverlapWithoutNestingAreRefused) {
     TypeId const i32 = in.primitive(TypeKind::I32);
     TypeId const sig = in.fnSig({}, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
     mb.stateArgCounting(MirArgCounting::Flat);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, SymbolId{100});
@@ -4077,6 +4312,7 @@ TEST(SynthSehFunclets, ABodyThatCannotBeLaidOutAsOneRunIsRefused) {
     TypeId const boolTy = in.primitive(TypeKind::Bool);
     TypeId const sig    = in.fnSig({}, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
     mb.stateArgCounting(MirArgCounting::Flat);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, SymbolId{100});
@@ -4153,6 +4389,7 @@ Mir buildSehFilterReadsValueFromBeforeTheRegion(TypeInterner& in, SymbolId sym,
     TypeId const pI32 = in.pointer(i32);
     TypeId const sig  = in.fnSig({}, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
     mb.stateArgCounting(MirArgCounting::Flat);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     (void)mb.addGlobal(i32, SymbolId{300}, mb.literalPoolAdd(i32Lit(7)),
@@ -4297,6 +4534,7 @@ TEST(SynthThreadsShim, SynthesizesDefinitionAndHelperImportNotTheShimName) {
     TypeId const lockSig = in.fnSig(lockParams, i32, CallConv::CcSysV);  // the descriptor sig
 
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.stateArgCounting(MirArgCounting::Flat);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(mainSig, SymbolId{100});   // main
@@ -4350,6 +4588,7 @@ TEST(SynthThreadsShim, EmptyRecipeMapIsNoOp) {
     TypeInterner in{CompilationUnitId{1}};
     TypeId const i32 = in.primitive(TypeKind::I32);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.stateArgCounting(MirArgCounting::Flat);
     mb.addFunction(in.fnSig({}, i32, CallConv::CcMS64), SymbolId{100});
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
@@ -4383,6 +4622,7 @@ TEST(SynthThreadsShim, ThrdCreateDirectPassesStartRoutineNoTrampoline) {
     TypeId const createSig = in.fnSig(cp, i32, CallConv::CcMS64);   // (thr, func, arg)->int
 
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
     mb.stateArgCounting(MirArgCounting::Flat);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(mainSig, SymbolId{100});
@@ -4523,6 +4763,7 @@ TEST(SynthThreadsShim, ThrdExitConvertsExplicitlyToEachVehiclesExitParameterType
         std::array<TypeId, 1> const ep{i32};
         TypeId const exitSig = in.fnSig(ep, voidTy, CallConv::CcMS64);
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Llp64);
         mb.stateArgCounting(MirArgCounting::Flat);
         mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
         mb.addFunction(in.fnSig({}, i32, CallConv::CcMS64), SymbolId{100});
@@ -4637,6 +4878,7 @@ TEST(SynthThreadsShim, OnlyReferencedRecipesAreSynthesized) {
     TypeId const lockSig = in.fnSig(lockParams, i32, CallConv::CcMS64);
 
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.stateArgCounting(MirArgCounting::Flat);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(in.fnSig({}, i32, CallConv::CcMS64), SymbolId{100});
@@ -4699,6 +4941,7 @@ TEST(SynthThreadsShim, UnreferencedRecipesNeedNoVehicle) {
     TypeInterner in{CompilationUnitId{1}};
     TypeId const i32 = in.primitive(TypeKind::I32);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.stateArgCounting(MirArgCounting::Flat);
     mb.addFunction(in.fnSig({}, i32, CallConv::CcMS64), SymbolId{100});
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
@@ -4747,6 +4990,7 @@ TEST(SynthThreadsShim, RetiredCallOnceRecipeIsRefusedOnBothVehicles) {
         TypeId const onceSig = in.fnSig(cp, voidTy, CallConv::CcMS64);   // (flag, fn)->void
 
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.stateArgCounting(MirArgCounting::Flat);
         mb.addFunction(in.fnSig({}, i32, CallConv::CcMS64), SymbolId{100});
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
@@ -4787,6 +5031,7 @@ TEST(SynthThreadsShim, ThrdJoinIsMultiBlockAndVerifies) {
     TypeId const joinSig = in.fnSig(jp, i32, CallConv::CcMS64);   // (thrd_t, int*)->int
 
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.stateArgCounting(MirArgCounting::Flat);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(mainSig, SymbolId{100});
@@ -4847,6 +5092,7 @@ TEST(MirMerge, MultiCuThreadsShimRegistersAndSynthesizes) {
     Mir mir0;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.stateArgCounting(MirArgCounting::Flat);
         mb.addFunction(mainSig, SymbolId{100});
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
@@ -4867,6 +5113,7 @@ TEST(MirMerge, MultiCuThreadsShimRegistersAndSynthesizes) {
     Mir mir1;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.stateArgCounting(MirArgCounting::Flat);
         mb.addFunction(sig1, SymbolId{50});
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
@@ -4939,6 +5186,7 @@ TEST(MirMerge, TheMergedModuleCarriesTheEndOfTheMergesAllocation) {
     Mir mir0;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(mainSig, SymbolId{100});
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -4957,6 +5205,7 @@ TEST(MirMerge, TheMergedModuleCarriesTheEndOfTheMergesAllocation) {
     Mir mir1;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(sig1, SymbolId{50});
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -5001,6 +5250,7 @@ TEST(MirMerge, TheMergedModuleCarriesTheEndOfTheMergesAllocation) {
     // What every synthesis pass after the merge does: continue the merged module's ids,
     // then mint. The id is none the merge named.
     MirBuilder rebuilt;
+    rebuilt.stateDataModel(DataModel::Lp64);
     rebuilt.continueSymbolIdsOf(mm);
     SymbolId const fresh = rebuilt.mintSymbol();
     EXPECT_GT(fresh.v, *shimV) << "the first id minted for the merged module";
@@ -5009,6 +5259,65 @@ TEST(MirMerge, TheMergedModuleCarriesTheEndOfTheMergesAllocation) {
         << "the first id minted for the merged module is " << fresh.v
         << ", which the merge named '" << (named == merged->symbolNames.end() ? "" : named->second)
         << "'";
+}
+
+// ── A later unit's shim symbols are numbered in their unit's order (P69 fold 3f, lane `xa`) ──
+// Step 3c gives every library-shim symbol a unit leaves undefined a merged id. For a unit after the first (or
+// a first unit's id already taken) it MINTS one, and the threads synthesis emits the shim bodies in merged-id
+// order -- so the order step 3c walks a unit's `synthRecipes` (an unordered_map) in was the order of those
+// bodies in the image: the host library's hash order. The walk is in ascending unit-local id. The map below
+// is filled in neither that order nor its reverse, so an insertion-order walk and a reverse one both red.
+TEST(MirMerge, ALaterUnitsShimSymbolsAreNumberedInTheirUnitsOrder) {
+    TypeInterner in0{CompilationUnitId{1}};
+    TypeId const i32_0   = in0.primitive(TypeKind::I32);
+    TypeId const mainSig = in0.fnSig({}, i32_0, CallConv::CcMS64);
+    Mir mir0;
+    {
+        MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
+        mb.addFunction(mainSig, SymbolId{100});
+        MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(e);
+        mb.addReturn(mb.addConst(i32Lit(0), i32_0));
+        mir0 = std::move(mb).finish();
+    }
+
+    TypeInterner in1{CompilationUnitId{2}};
+    TypeId const i32_1 = in1.primitive(TypeKind::I32);
+    TypeId const sig1  = in1.fnSig({}, i32_1, CallConv::CcSysV);
+    Mir mir1;
+    {
+        MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
+        mb.addFunction(sig1, SymbolId{50});
+        MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(e);
+        mb.addReturn(mb.addConst(i32Lit(7), i32_1));
+        mir1 = std::move(mb).finish();
+    }
+    std::unordered_map<std::uint32_t, std::string> recipes1;
+    recipes1.emplace(30u, "mtx_unlock");
+    recipes1.emplace(10u, "mtx_init");
+    recipes1.emplace(20u, "mtx_lock");
+
+    MergeCuInput cu0{&mir0, &in0, namerOf({{100, "main"}}), {}};
+    MergeCuInput cu1{&mir1, &in1,
+                     namerOf({{50, "helper"}, {10, "mtx_init"}, {20, "mtx_lock"}, {30, "mtx_unlock"}}), {}};
+    cu1.synthRecipes = &recipes1;
+    std::vector<MergeCuInput> cus{cu0, cu1};
+
+    std::vector<std::string> const entries{"main"};
+    DiagnosticReporter rep;
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
+    ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
+    ASSERT_EQ(rep.errorCount(), 0u);
+
+    std::unordered_map<std::string, std::uint32_t> idOf;
+    for (auto const& [v, name] : merged->symbolNames) idOf.emplace(name, v);
+    ASSERT_TRUE(idOf.contains("mtx_init") && idOf.contains("mtx_lock") && idOf.contains("mtx_unlock"))
+        << "step 3c names every shim symbol of the later unit";
+    EXPECT_LT(idOf.at("mtx_init"), idOf.at("mtx_lock")) << "the shim symbols are numbered in their unit's order";
+    EXPECT_LT(idOf.at("mtx_lock"), idOf.at("mtx_unlock")) << "the shim symbols are numbered in their unit's order";
 }
 
 // ── D-CSUBSET-C11-THREADS-MACHO: the `pthread` vehicle (Darwin libSystem) ──────────────
@@ -5026,6 +5335,7 @@ TEST(SynthThreadsShim, PthreadVehicleSynthesizesDefinitionAndPthreadHelperImport
     TypeId const lockSig = in.fnSig(lockParams, i32, CallConv::CcAAPCS64);
 
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.stateArgCounting(MirArgCounting::PerClass);
     mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(mainSig, SymbolId{100});
@@ -5085,6 +5395,7 @@ TEST(SynthThreadsShim, MissingLibrarySynthesisWithReferencedRecipeFailsLoud) {
     std::array<TypeId, 1> const lockParams{pV};
     TypeId const lockSig = in.fnSig(lockParams, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.stateArgCounting(MirArgCounting::Flat);
     mb.addFunction(in.fnSig({}, i32, CallConv::CcMS64), SymbolId{100});
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
@@ -5136,6 +5447,7 @@ TEST(SynthThreadsShim, PthreadEveryRecipeEmitsAndVerifies) {
         TypeId const i32 = in.primitive(TypeKind::I32);
         TypeId const pV  = in.pointer(in.primitive(TypeKind::Void));
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.stateArgCounting(MirArgCounting::PerClass);
         mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
         mb.addFunction(in.fnSig({}, i32, CallConv::CcMS64), SymbolId{100});
@@ -5195,6 +5507,7 @@ TEST(MirMerge, MultiCuThreadsShimSynthesizesPthreadVehicle) {
     Mir mir0;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);   // the model of the ELF document it is merged under (P69 fold 3f)
         mb.stateArgCounting(MirArgCounting::PerClass);
         mb.addFunction(mainSig, SymbolId{100});
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
@@ -5214,6 +5527,7 @@ TEST(MirMerge, MultiCuThreadsShimSynthesizesPthreadVehicle) {
     Mir mir1;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);   // the model of the ELF document it is merged under (P69 fold 3f)
         mb.stateArgCounting(MirArgCounting::PerClass);
         mb.addFunction(sig1, SymbolId{50});
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
@@ -5275,6 +5589,7 @@ TEST(MirMerge, MergePreservesVocabularyIdentityAcrossCus) {
         TypeId const ptr  = in.pointer(elem);
         TypeId const sig  = in.fnSig({}, ptr, CallConv::CcSysV);
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(sig, sym);
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -5372,6 +5687,7 @@ TEST(MirMerge, TheMergedModulesFactsAreItsUnitsJoinedAndEachFunctionKeepsItsCoun
         Mir mir0;
         {
             MirBuilder mb;
+            mb.stateDataModel(DataModel::Lp64);
             mb.stateArgCounting(MirArgCounting::PerClass);
             mb.setAliasingMode(c.u0.aliasing);
             mb.setCharTypesAliasAll(c.u0.charTypes);
@@ -5395,6 +5711,7 @@ TEST(MirMerge, TheMergedModulesFactsAreItsUnitsJoinedAndEachFunctionKeepsItsCoun
         Mir mir1;
         {
             MirBuilder mb;
+            mb.stateDataModel(DataModel::Lp64);
             mb.stateArgCounting(MirArgCounting::PerClass);
             mb.setAliasingMode(c.u1.aliasing);
             mb.setCharTypesAliasAll(c.u1.charTypes);
@@ -5439,14 +5756,18 @@ TEST(MirMerge, TheMergedModulesFactsAreItsUnitsJoinedAndEachFunctionKeepsItsCoun
 TEST(MirMerge, TwoUnitsStatingAMustAgreeFactDifferentlyAreRefusedByTheFactsName) {
     MirModuleFacts flat;
     flat.argCounting = MirArgCounting::Flat;
+    flat.dataModel   = DataModel::Lp64;   // every unit states its model (P69 fold 3f): the join reads only counting
     MirModuleFacts perClass;
     perClass.argCounting = MirArgCounting::PerClass;
+    perClass.dataModel   = DataModel::Lp64;
     auto const refused = joinUnitFacts(flat, perClass);
     ASSERT_FALSE(refused.has_value()) << "two countings joined";
     EXPECT_STREQ(refused.error().fact, "argCounting");
     EXPECT_EQ(refused.error().a, static_cast<std::uint32_t>(MirArgCounting::Flat));
     EXPECT_EQ(refused.error().b, static_cast<std::uint32_t>(MirArgCounting::PerClass));
-    auto const withNone = joinUnitFacts(MirModuleFacts{}, perClass);
+    MirModuleFacts noCounting;
+    noCounting.dataModel = DataModel::Lp64;
+    auto const withNone = joinUnitFacts(noCounting, perClass);
     ASSERT_TRUE(withNone.has_value()) << "a unit stating no counting refused";
     EXPECT_EQ(withNone->argCounting, MirArgCounting::PerClass);
     auto const same = joinUnitFacts(perClass, perClass);
@@ -5477,6 +5798,33 @@ TEST(MirMerge, AFactEveryUnitMustStateRefusesAnUnstatedUnitByName) {
     EXPECT_EQ(*exempt, C::Flat);
 }
 
+// ★ P69 (lane `xa`, fold 3f -- review-xa3e F3, ledger 639): THE DATA MODEL IS A FACT EVERY UNIT MUST STATE AND
+// AGREE ON. Units lowered for two models were lowered for two pairs, and a unit stating none would take another's
+// in silence: each is refused by the fact's name, on either side, with both values; two units stating one model
+// join to it.
+TEST(MirMerge, TheDataModelIsAFactEveryUnitMustStateAndAgreeOn) {
+    auto const facts = [](DataModel m) {
+        MirModuleFacts f;
+        f.argCounting = MirArgCounting::PerClass;
+        f.dataModel   = m;
+        return f;
+    };
+    for (auto const& [a, b] : {std::pair{DataModel{}, DataModel::Lp64}, std::pair{DataModel::Lp64, DataModel{}},
+                               std::pair{DataModel{}, DataModel{}}, std::pair{DataModel::Lp64, DataModel::Llp64}}) {
+        auto const r = joinUnitFacts(facts(a), facts(b));
+        ASSERT_FALSE(r.has_value()) << "joined model " << static_cast<unsigned>(a) << " with "
+                                    << static_cast<unsigned>(b);
+        EXPECT_STREQ(r.error().fact, "dataModel");
+        EXPECT_EQ(r.error().a, static_cast<std::uint32_t>(a));
+        EXPECT_EQ(r.error().b, static_cast<std::uint32_t>(b));
+    }
+    for (DataModel const m : {DataModel::Lp64, DataModel::Llp64}) {
+        auto const joined = joinUnitFacts(facts(m), facts(m));
+        ASSERT_TRUE(joined.has_value()) << "two units stating one model refused";
+        EXPECT_EQ(joined->dataModel, m);
+    }
+}
+
 // ★ P69 (lane `cs`, fold f26d -- review-csf26c2 N9): THE MERGE'S FRESH IDS AT THE LAST VALUE. The merged module's
 // counting door (`SymbolAllocator`) takes from the core's cursor (core/types/symbol_id_cursor.hpp), seeded past unit
 // 0's highest id: a unit 0 whose highest id is the last value but one leaves no fresh id, and the merge aborts by
@@ -5490,6 +5838,7 @@ TEST(MirMergeDeathTest, AMergeWhoseFreshIdsAreExhaustedAbortsByName) {
         Mir mir0;
         {
             MirBuilder mb;
+            mb.stateDataModel(DataModel::Lp64);
             mb.stateArgCounting(MirArgCounting::PerClass);
             mb.addFunction(in0.fnSig({}, i32_0, CallConv::CcSysV),
                            SymbolId{std::numeric_limits<std::uint32_t>::max() - 1u});
@@ -5503,6 +5852,7 @@ TEST(MirMergeDeathTest, AMergeWhoseFreshIdsAreExhaustedAbortsByName) {
         Mir mir1;
         {
             MirBuilder mb;
+            mb.stateDataModel(DataModel::Lp64);
             mb.stateArgCounting(MirArgCounting::PerClass);
             mb.addFunction(in1.fnSig({}, i32_1, CallConv::CcSysV), SymbolId{50});
             MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);

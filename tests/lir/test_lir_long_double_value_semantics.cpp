@@ -135,6 +135,7 @@ constexpr std::array<char const*, 2> kModelNames{"x87 F80 on x86_64",
     std::vector<TypeId> const params{ptr, ptr};
     TypeId const sig = in.fnSig(params, voidT, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(sig, SymbolId{1});
     mb.beginBlock(mb.createBlock(StructCfMarker::EntryBlock));
@@ -163,6 +164,7 @@ constexpr std::array<char const*, 2> kModelNames{"x87 F80 on x86_64",
     std::vector<TypeId> const params{ptr, outPtr};
     TypeId const sig = in.fnSig(params, voidT, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(sig, SymbolId{1});
     mb.beginBlock(mb.createBlock(StructCfMarker::EntryBlock));
@@ -188,6 +190,7 @@ constexpr std::array<char const*, 2> kModelNames{"x87 F80 on x86_64",
     std::vector<TypeId> const params{ptr, ptr};
     TypeId const sig = in.fnSig(params, voidT, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(sig, SymbolId{1});
     mb.beginBlock(mb.createBlock(StructCfMarker::EntryBlock));
@@ -210,6 +213,7 @@ constexpr std::array<char const*, 2> kModelNames{"x87 F80 on x86_64",
     std::vector<TypeId> const params{ptr, ptr};
     TypeId const sig = in.fnSig(params, voidT, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(sig, SymbolId{1});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
@@ -237,6 +241,7 @@ constexpr std::array<char const*, 2> kModelNames{"x87 F80 on x86_64",
     std::vector<TypeId> const params{ptr, ptr};
     TypeId const sig = in.fnSig(params, voidT, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(sig, SymbolId{1});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
@@ -270,6 +275,7 @@ constexpr std::array<char const*, 2> kModelNames{"x87 F80 on x86_64",
     std::vector<TypeId> const params{ptr, ptr};
     TypeId const sig = in.fnSig(params, voidT, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(sig, SymbolId{1});
     mb.beginBlock(mb.createBlock(StructCfMarker::EntryBlock));
@@ -297,6 +303,7 @@ constexpr std::array<char const*, 2> kModelNames{"x87 F80 on x86_64",
     std::vector<TypeId> const params{ptr, ptr};
     TypeId const sig = in.fnSig(params, voidT, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(sig, SymbolId{1});
     mb.beginBlock(mb.createBlock(StructCfMarker::EntryBlock));

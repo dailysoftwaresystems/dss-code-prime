@@ -1,0 +1,18 @@
+{
+  "$comment": "D-DIAG-ENTRY-RESOLUTION-CODE-SPLIT-CORPUS-COVERAGE (P69 fold 3f, lane `xa`, review-xa3e F5): two units each define `main`, so the program defines its entry twice. On pe64, whose document ranks `main`'s startup in the top `entryPrecedence` group, both definitions are candidates of that one group, and the election refuses them as an ambiguous entry (K_ProgramEntryAmbiguous) -- stating the one name and how many times it is defined, never the advice to build for a target that realizes fewer verbs, which no target answers for a name defined twice. Every reference refuses the same two units: ✔MEASURED 2026-11-16 (probe-reference-cc), link.exe of MSVC 19.52 (LNK2005 `main already defined`, then LNK1169), MinGW-w64 GNU ld of gcc 13.2.0 (`multiple definition of 'main'`), lld-link under clang 18.1.3 (`duplicate symbol: main`), and GNU ld under gcc 13.3.0 and clang 18.1.3 on ELF -- so the refusal is the references' answer, not this compiler's alone. A whole-program fact with no single declaration at fault: `positioned: false`, which is what lets a refusal take two sources. No `release` arm: both runners refuse `optimizedPipelines` beside `expectDiagnostics` at load, because a refusal builds no image. The other formats' path (no precedence) is pinned with object inputs by `ObjectEntry.AnObjectsEntryBesideAnotherEntryIsAmbiguous`. RED-ON-DISABLE: let the top group's first candidate win -> K_ProgramEntryAmbiguous is not said (the link meets the two definitions of `main` instead), which the expectation reds.",
+  "language": "c",
+  "sources": ["main.c", "second.c"],
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec"
+    }
+  ],
+  "expectDiagnostics": [
+    {
+      "code": "K_ProgramEntryAmbiguous",
+      "line": 1,
+      "col": 1,
+      "positioned": false
+    }
+  ]
+}

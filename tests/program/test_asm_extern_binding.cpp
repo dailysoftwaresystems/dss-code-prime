@@ -97,7 +97,7 @@ constexpr std::string_view kMachOEntryCallsBarePutchar =
 // image exports `mtx_lock`), and the `encode` tier runs no MIR synthesis.
 // Binding it would link clean and die at LOAD with 0xC0000139. (★ P69: this
 // was `printf` until the pe printf family became DSS's runtime SOURCE — see
-// `ShippedSourceRowWrittenByItsCNameStaysUnboundAndFailsTheLink`.)
+// `ShippedSourceRowWrittenByItsCNameIsRefusedWithItsLinkName`.)
 constexpr std::string_view kCallsMtxLock =
     "\t.text\n"
     "\t.globl\tmain\n"
@@ -289,9 +289,14 @@ TEST(AsmExternBinding, SynthesizeRecipeRowIsRefusedOnPeAndBoundOnElf) {
 // `call printf` on pe names a symbol NOTHING defines — the platform's printf is DSS's
 // runtime source under `__dss_isoc23_printf`, and ucrtbase exports no `printf` — so the
 // binder must NOT bind it to an image (that is the 0xC0000139 load failure) and the
-// build must fail LOUD rather than produce a binary. The same source still binds glibc's
-// `printf` on elf (the arm above's shape).
-TEST(AsmExternBinding, ShippedSourceRowWrittenByItsCNameStaysUnboundAndFailsTheLink) {
+// build must fail LOUD rather than produce a binary. Since P69 fold 3f the written
+// name's ROUTE decides, not whether the row's body is an image's or DSS's source: the
+// platform's header renames `printf` away on pe (the `Header` route, its row riding
+// along), and the `.s` binder refuses such a name by name, giving the link name to
+// write, as it refuses `call time` (until that fold the reference stayed unbound and
+// the link refused it, K_SymbolUndefined). The same source still binds glibc's `printf`
+// on elf (the arm above's shape).
+TEST(AsmExternBinding, ShippedSourceRowWrittenByItsCNameIsRefusedWithItsLinkName) {
     ScratchDir scratch{Location::InsideRepo, "asm-extern"};
     scratch.useAsCwd();
     auto const src = writeFile(scratch.path(), "printf.s", kCallsPrintf);
@@ -302,8 +307,10 @@ TEST(AsmExternBinding, ShippedSourceRowWrittenByItsCNameStaysUnboundAndFailsTheL
         {std::string{"x86_64:pe64-x86_64-windows-exec"}}, rep);
     std::string const text = allDiagnosticText(rep);
     EXPECT_NE(rc, 0) << "a pe image importing `printf` links clean and fails at LOAD\n" << text;
-    EXPECT_TRUE(sawCode(rep, DiagnosticCode::K_SymbolUndefined)) << text;
-    EXPECT_NE(text.find("printf"), std::string::npos) << text;
+    EXPECT_TRUE(sawCode(rep, DiagnosticCode::A_AsmTextUnsupported)) << text;
+    EXPECT_NE(text.find("'printf'"), std::string::npos) << text;
+    EXPECT_NE(text.find("'__dss_isoc23_printf'"), std::string::npos)
+        << "the refusal names the link name to write\n" << text;
 
     ScratchDir elfScratch{Location::InsideRepo, "asm-extern"};
     elfScratch.useAsCwd();

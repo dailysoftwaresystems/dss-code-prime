@@ -19401,6 +19401,57 @@ TEST(SemanticAnalyzerC, SourceTagUnifiesWithDescriptorMember) {
 // ⚠ THIS TEST IS GREEN ON BOTH SIDES OF TF-C97 — it is a guard against a future
 // descriptor edit (spelling one of the two `i64 "long"`) silently splitting the
 // identity, NOT evidence that the fix works. The closing pin is the one above.
+// ★ OF TWO UNITS THAT DEFINE ONE TAG, THE FIRST UNIT'S TYPE IS ADOPTED (P69 fold 3f, lane `xa`). The analysis
+// gathers the user's file-scope tags over every tree's root scope, and a tag two trees define keeps the FIRST
+// tree's type (`try_emplace`). It walked the trees in the order of an unordered map keyed by tree id, so which
+// unit's `struct timespec` the descriptor's member adopted was the host library's. It walks them in ascending tree
+// id: the units' own order. Both orders of the two units are asked -- the unit that includes the header first once
+// and second once -- and the member adopts the type of the unit that comes first each time.
+namespace {
+
+[[nodiscard]] SemanticModel analyzeRealShippedUnitsForTarget(std::vector<std::string> sources,
+                                                             ObjectFormatKind format, std::string_view arch,
+                                                             DataModel dataModel) {
+    fs::path const shipped = findRealShippedLibsDir();   // throws if unresolvable
+    auto schema = loadShippedSchema("c");
+    UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
+    builder.addSystemDir(shipped);
+    builder.setActiveFormat(format);
+    for (std::size_t i = 0; i < sources.size(); ++i) {
+        builder.addInMemory(std::move(sources[i]), "unit" + std::to_string(i) + ".c");
+    }
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    assertNoBuilderErrors(*cu);
+    return analyze(cu, DiagnosticBudget::libraryDefault(), dataModel,
+                   AggregateLayoutParams{ScalarAlignmentRule::Natural, 16},
+                   std::nullopt, SelectableObjectFormatKind::of(format), arch);
+}
+
+}  // namespace
+
+TEST(SemanticAnalyzerC, OfTwoUnitsDefiningOneTagTheFirstUnitsTypeIsAdopted) {
+    std::string const includer = std::string{"#include <time.h>\n#include <sys/stat.h>\n"} + kSourceTimespecDecl;
+    std::string const other = "struct timespec { long s; long ns; };\n";
+    for (bool const includerFirst : {true, false}) {
+        SCOPED_TRACE(includerFirst ? "the including unit first" : "the other unit first");
+        auto model = analyzeRealShippedUnitsForTarget(
+            includerFirst ? std::vector<std::string>{includer, other} : std::vector<std::string>{other, includer},
+            ObjectFormatKind::MachO, "arm64", DataModel::Lp64);
+        SymbolRecord const* member = findInjectedSym(model, "st_mtimespec");
+        ASSERT_NE(member, nullptr);
+        SymbolRecord const* firstUnits = nullptr;   // the source `timespec` of the lowest tree id
+        std::size_t sourceTags = 0;
+        for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+            SymbolRecord const& r = model.symbols()[i];
+            if (r.name != "timespec" || !r.tree.valid()) continue;
+            ++sourceTags;
+            if (firstUnits == nullptr || r.tree.v < firstUnits->tree.v) firstUnits = &r;
+        }
+        ASSERT_EQ(sourceTags, 2u) << "each unit defines its own `struct timespec`";
+        EXPECT_EQ(member->type.v, firstUnits->type.v) << "the member adopts the first unit's `struct timespec`";
+    }
+}
+
 TEST(SemanticAnalyzerC, DescriptorOnlyTimespecIsAlreadyOneType) {
     auto model = analyzeRealShippedForTarget(
         std::string{"#include <time.h>\n#include <sys/stat.h>\n"}

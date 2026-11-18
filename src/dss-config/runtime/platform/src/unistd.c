@@ -43,6 +43,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <io.h>
+#include <stdlib.h>
 #include <windows.h>
 
 /* POSIX: return the number of seconds NOT slept (0 when the full interval
@@ -115,25 +116,17 @@ int truncate64(const char *path, long long length) {
     return 0;
 }
 
-/* Copy `n` bytes from `from` to `to`, swapping each ADJACENT PAIR. An odd `n`
- * leaves the trailing byte alone (the last pair is incomplete), and a negative
- * or <2 count copies nothing — both are the historical CRT/glibc behaviours.
- * Written out rather than bound to ucrtbase's `_swab` because this descriptor's
- * pe arm is realized as a whole: one format cannot name both a library image
- * and a source (refusal R3), and a six-line byte loop is not worth splitting
- * the arm for. */
+/* `swab` IS THE PLATFORM'S `_swab`. ucrtbase.dll exports `_swab` and no
+ * `swab`, and both reference toolchains bind a written `swab` to it: link.exe
+ * through OLDNAMES, mingw-w64 through its import library's alias member
+ * (MEASURED, P69 fold 3f: six bytes swap three pairs, an odd count leaves its
+ * last byte unwritten, zero and one write nothing, and a negative count reaches
+ * the invalid-parameter handler and sets EINVAL, under cl and mingw-w64 alike).
+ * This descriptor's pe arm is realized from this unit, and a symbol owns one
+ * body per format (R3), so `swab` is a body here -- one that FORWARDS, so every
+ * count, the negative one and the null pointers included, has the platform's
+ * own meaning, and nothing is re-implemented to drift from it. Its cost is one
+ * call frame. */
 void swab(char *from, char *to, int n) {
-    int i;
-
-    if (from == 0 || to == 0 || n < 2) return;
-    i = 0;
-    while (i + 1 < n) {
-        char a;
-        char b;
-        a = from[i];
-        b = from[i + 1];
-        to[i] = b;
-        to[i + 1] = a;
-        i = i + 2;
-    }
+    _swab(from, to, n);
 }

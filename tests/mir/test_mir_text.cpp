@@ -1397,6 +1397,35 @@ TEST(MirText, AUnionMemberSpellingIsReadOnlyWhereItMeansSomething) {
 // CONTROL: a module of default facts writes neither header line nor the attribute, so every golden stays unchanged.
 // RED-ON-DISABLE: drop the `aliasing` line, and the module reads back permissive; drop the function's attribute,
 // and the module reads back refused.
+TEST(MirText, ADataModelIsReadByItsTableNameAndAnyOtherWordIsRefused) {
+    // P69 (lane `xa`, fold 3f): the `data_model` header line, spelled by data_model.hpp's table: each row reads
+    // back as itself, a text without the line states none, and a word no row names is refused by name.
+    for (auto const& [word, model] : {std::pair{"LP64", DataModel::Lp64}, std::pair{"LLP64", DataModel::Llp64},
+                                      std::pair{"ILP32", DataModel::Ilp32}}) {
+        DiagnosticReporter r;
+        auto parsed = parseMir(std::string{"dssir 8\ndata_model "} + word + "\nmodule {\n}\n", CompilationUnitId{1}, r);
+        ASSERT_NE(parsed, nullptr);
+        ASSERT_TRUE(parsed->ok) << word;
+        EXPECT_EQ(parsed->mir.moduleFacts().dataModel, model) << word;
+    }
+    {
+        DiagnosticReporter r;
+        auto parsed = parseMir("dssir 8\nmodule {\n}\n", CompilationUnitId{1}, r);
+        ASSERT_NE(parsed, nullptr);
+        ASSERT_TRUE(parsed->ok);
+        EXPECT_EQ(parsed->mir.moduleFacts().dataModel, DataModel{}) << "a text without the line states no model";
+    }
+    for (char const* word : {"LP32", "lp64", "8"}) {
+        DiagnosticReporter r;
+        auto parsed = parseMir(std::string{"dssir 8\ndata_model "} + word + "\nmodule {\n}\n", CompilationUnitId{1}, r);
+        ASSERT_NE(parsed, nullptr);
+        EXPECT_FALSE(parsed->ok) << word;
+        bool named = false;
+        for (auto const& d : r.all()) named = named || d.actual.find("'data_model' takes one of") != std::string::npos;
+        EXPECT_TRUE(named) << word;
+    }
+}
+
 TEST(MirText, EveryModuleFactAndAFunctionsOwnArgCountingRoundTrip) {
     TypeInterner ti{CompilationUnitId{1}};
     TypeId const voidTy = ti.primitive(TypeKind::Void);
@@ -1410,6 +1439,7 @@ TEST(MirText, EveryModuleFactAndAFunctionsOwnArgCountingRoundTrip) {
     b.stateArgCounting(MirArgCounting::PerClass);
     b.setAliasingMode(MirAliasingMode::StrictTBAA);
     b.setCharTypesAliasAll(false);
+    b.stateDataModel(DataModel::Llp64);
     MirFuncId const own = b.addFunction(mixed, SymbolId{1});
     b.stateFunctionArgCounting(own, MirArgCounting::Flat);
     MirBlockId const e1 = b.createBlock(StructCfMarker::EntryBlock);
@@ -1428,6 +1458,7 @@ TEST(MirText, EveryModuleFactAndAFunctionsOwnArgCountingRoundTrip) {
     std::string const text = emitMir(m, ctx, r1);
     EXPECT_NE(text.find("\naliasing strict_tbaa\n"), std::string::npos) << text;
     EXPECT_NE(text.find("\nchar_types_alias_all false\n"), std::string::npos) << text;
+    EXPECT_NE(text.find("\ndata_model LLP64\n"), std::string::npos) << text;
     EXPECT_NE(text.find("arg_counting(flat)"), std::string::npos) << text;
     auto parsed = parseMir(text, CompilationUnitId{1}, r2);
     ASSERT_NE(parsed, nullptr);
@@ -1448,5 +1479,7 @@ TEST(MirText, EveryModuleFactAndAFunctionsOwnArgCountingRoundTrip) {
     std::string const plainText = emitMir(dm, ctx, r3);
     EXPECT_EQ(plainText.find("aliasing"), std::string::npos) << plainText;
     EXPECT_EQ(plainText.find("char_types_alias_all"), std::string::npos) << plainText;
+    EXPECT_EQ(plainText.find("data_model"), std::string::npos) << "a module stating no model writes none\n"
+                                                                << plainText;
     EXPECT_EQ(plainText.find("arg_counting("), std::string::npos) << plainText;
 }

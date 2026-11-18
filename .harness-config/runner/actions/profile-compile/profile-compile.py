@@ -66,6 +66,19 @@ Usage:
   tree this file lives in. Every value flag needs a non-empty value; anything else
   on the command line is refused.
 
+THE HOST-EQUALITY GATE (P69, 2026-11-16):
+  profile-compile.py --host-equality <label>,<label>[,...]
+  Every leg profiles the SAME kit for the SAME target, so the image must be the same bytes on every leg: an image
+  is a function of its inputs and its target, never of the host whose toolchain built the compiler. (MEASURED
+  2026-11-16: the kit image differed in 4,879,353 of 6,019,864 bytes between the MSVC-built and the GCC-built
+  compiler. An optimizer pass walked an unordered container while minting phis.)
+  This mode reads `build/perf/<label>/image/` for each label named: this leg's own, and every other leg's, each
+  brought back first with `dssharness sync --legs <leg> --pull build/perf/<leg>/image/`. It compares every
+  file's name, size and md5, writes what it read to `build/perf/host-equality.txt`, and prints `HOST-EQUALITY-OK
+  <md5 of each file>` when every leg holds the same files with the same bytes. Otherwise it prints
+  `HOST-EQUALITY-FAILED` with each leg's files and exits 1. It REFUSES (exit 1) before reading any image: fewer
+  than two labels, an empty or repeated label, and a label whose image directory holds no file.
+
 Output: the last line is `PROFILE-LEG-OK <label>   (out: <dir>)` on success, and
 `PROFILE-LEG-FAILED <label> rc=<rc>  (log: <file>)` when the compile failed -- the
 failure token never contains the success token.
@@ -508,11 +521,85 @@ def list_artifacts(image_dir, limit):
                 return
 
 
+# ── THE HOST-EQUALITY GATE (see the header) ─────────────────────────────────────────
+HOST_OK_TOKEN = "HOST-EQUALITY-OK"
+HOST_FAILED_TOKEN = "HOST-EQUALITY-FAILED"
+HOST_RECORD = "host-equality.txt"
+
+
+class HostEqualityRefusal(Exception):
+    """A request the gate refuses before it reads any image."""
+
+
+def image_files(image_dir):
+    """[(name relative to `image_dir`, size, md5)] for every regular file under it, sorted by name."""
+    import hashlib
+    found = []
+    for dirpath, dirnames, filenames in os.walk(image_dir):
+        dirnames.sort()
+        for f in sorted(filenames):
+            p = os.path.join(dirpath, f)
+            if not os.path.isfile(p):
+                continue
+            h = hashlib.md5()
+            with open(p, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
+            found.append((os.path.relpath(p, image_dir).replace(os.sep, "/"), os.path.getsize(p), h.hexdigest()))
+    return found
+
+
+def host_equality(perf_dir, labels_value):
+    """(equal, report lines) for the images `build/perf/<label>/image/` of every label in `labels_value`; raises
+    HostEqualityRefusal before reading any image when the request cannot be judged."""
+    labels = labels_value.split(",") if labels_value else []
+    if len(labels) < 2:
+        raise HostEqualityRefusal("--host-equality compares two legs or more: name at least two labels, "
+                                  "comma-separated (got %r)" % labels_value)
+    if "" in labels:
+        raise HostEqualityRefusal("--host-equality names an empty label in %r" % labels_value)
+    if len(set(labels)) != len(labels):
+        raise HostEqualityRefusal("--host-equality names a label twice: %r" % labels_value)
+    dirs = [(label, os.path.join(perf_dir, label, "image")) for label in labels]
+    for label, d in dirs:
+        if not os.path.isdir(d) or not any(files for _, _, files in os.walk(d)):
+            raise HostEqualityRefusal(
+                "leg %s has no image to compare: %s holds no file. Profile it, and bring a remote leg's image back "
+                "with `dssharness sync --legs %s --pull build/perf/%s/image/`" % (label, d, label, label))
+    listings = [(label, image_files(d)) for label, d in dirs]
+    lines = []
+    for label, files in listings:
+        lines.append("host-equality: %s: %d file(s): %s" % (
+            label, len(files), ", ".join("%s %d byte(s) md5 %s" % f for f in files)))
+    equal = all(files == listings[0][1] for _, files in listings[1:])
+    if equal:
+        lines.append("%s %s  (%s)" % (HOST_OK_TOKEN, " ".join("%s=%s" % (n, d) for n, _, d in listings[0][1]),
+                                      ", ".join(labels)))
+    else:
+        lines.append("%s the legs' images differ (%s): an image must be a function of its inputs and its target, "
+                     "never of the host that built the compiler" % (HOST_FAILED_TOKEN, ", ".join(labels)))
+    return equal, lines
+
+
+def run_host_equality(labels_value):
+    """The gate's run -> its exit code: the lines printed and written to build/perf/host-equality.txt."""
+    perf_dir = os.path.join(resolve_repo(), "build", "perf")
+    try:
+        equal, lines = host_equality(perf_dir, labels_value)
+    except HostEqualityRefusal as exc:
+        die(str(exc))
+    with open(os.path.join(perf_dir, HOST_RECORD), "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("\n".join(lines) + "\n")
+    for line in lines:
+        sys.stdout.write(line + "\n")
+    return 0 if equal else 1
+
+
 # ── the run ─────────────────────────────────────────────────────────────────────
 # ── THE COMMAND LINE'S OWN SELF-TEST: no kit, no build ───────────────────────────
 SELFTEST_MARKER = "profile-compile self-test: "
 # ⚠ Raising this is the claim that the arms you added actually RUN.
-EXPECTED_ARMS = 9
+EXPECTED_ARMS = 15
 # A compile log's `--time` report as dsscp writes it (program.cpp `emitPhaseTimeReport`'s own lines), with a trace line
 # before it and an optimizer trace line after it, which are no part of it.
 _REPORT_SAMPLE = (
@@ -598,6 +685,52 @@ def self_test():
         "reported %r" % (broken,))
     arm("a broken run's report still ends at the first line of neither prefix (the control)",
         len(broken) == 7 and not any(l.startswith("opt:") for l in broken), "reported %r" % (broken,))
+
+    # The host-equality gate, over images this self-test writes itself.
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="dss-profile-compile-") as perf:
+        def image(label, files):
+            for name, data in files.items():
+                p = os.path.join(perf, label, "image", "fmt", name)
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                with open(p, "wb") as fh:
+                    fh.write(data)
+
+        def judged(labels):
+            try:
+                return host_equality(perf, labels)
+            except HostEqualityRefusal as exc:
+                return "REFUSED: %s" % exc
+
+        image("a", {"app": b"same bytes"})
+        image("b", {"app": b"same bytes"})
+        image("c", {"app": b"other bytes"})
+        image("d", {"app": b"same bytes", "app.map": b"x"})
+        os.makedirs(os.path.join(perf, "empty", "image"))
+        got = judged("a,b")
+        arm("host-equality: two legs whose image is the same bytes pass, naming the file's md5",
+            isinstance(got, tuple) and got[0] and got[1][-1].startswith(HOST_OK_TOKEN + " fmt/app=")
+            and got[1][-1].endswith("(a, b)"), "got %r" % (got,))
+        got = judged("a,c")
+        import hashlib
+        md5s = (hashlib.md5(b"same bytes").hexdigest(), hashlib.md5(b"other bytes").hexdigest())
+        arm("host-equality: two legs whose image differs FAIL, each leg's md5 said",
+            isinstance(got, tuple) and not got[0] and got[1][-1].startswith(HOST_FAILED_TOKEN)
+            and got[1][0].startswith("host-equality: a: ") and md5s[0] in got[1][0]
+            and got[1][1].startswith("host-equality: c: ") and md5s[1] in got[1][1], "got %r" % (got,))
+        got = judged("a,d")
+        arm("host-equality: a leg that left another file beside the same image FAILS",
+            isinstance(got, tuple) and not got[0], "got %r" % (got,))
+        got = judged("a")
+        arm("host-equality: one label is REFUSED before any image is read",
+            isinstance(got, str) and "at least two labels" in got, "got %r" % (got,))
+        got = judged("a,a")
+        arm("host-equality: a label named twice is REFUSED",
+            isinstance(got, str) and "names a label twice" in got, "got %r" % (got,))
+        got = judged("a,empty")
+        arm("host-equality: a leg whose image directory holds no file is REFUSED by name, with the pull to run",
+            isinstance(got, str) and "leg empty has no image" in got and "--pull build/perf/empty/image/" in got,
+            "got %r" % (got,))
     failed = ran.count(False)
     if len(ran) != EXPECTED_ARMS:
         print("%s%d arm(s) ran, %d expected -- FAIL" % (SELFTEST_MARKER, len(ran), EXPECTED_ARMS))
@@ -610,6 +743,10 @@ def main(argv=None):
     argv = sys.argv[1:] if argv is None else list(argv)
     if argv == ["--self-test"]:
         return self_test()
+    if argv[:1] == ["--host-equality"]:
+        if len(argv) != 2:
+            die("--host-equality takes one value, the labels, comma-separated, and nothing else. See --help.")
+        return run_host_equality(argv[1])
     o = parse_cli(argv)
     if o["help"]:
         sys.stdout.write(__doc__ or "profile-compile: no help text (python -OO)\n")

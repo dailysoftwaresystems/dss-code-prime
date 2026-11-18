@@ -95,8 +95,31 @@
     "addendRelocation": {
       "$comment": "ARM64_RELOC_ADDEND (type 10), the record that names no symbol and patches no field: its r_symbolnum holds a signed 24-bit addend for the NEXT relocation entry at its own address, whose field holds instruction bits and so cannot hold one (a PAGE21 or PAGEOFF12 of `sym + n`). Wire id (10<<28)|(2<<25) = 0xA4000000 = 2751463424, r_length 2 as Apple clang writes it. MEASURED 2026-11-13, Apple clang 21.0.0 `-arch arm64 -O2`: a call of `strtol(\"0b1\" + 2, ...)` reaches the merged literal as `l_.str.1 + 2` through ADDEND 2 before its PAGE21 and again before its PAGEOFF12 (tests/link/data/foreign_libc_names_strto_arm64_macho_clang_c17_O2.o). The object reader adds the record's addend to the next entry's; the object writer emits one before every instruction relocation whose addend is not 0 (P69 fold 3e).",
       "nativeId": 2751463424,
-      "addendBits": 24
-    }
+      "addendBits": 24,
+      "$carriesAddendOfComment": "The relocation rows a record may stand before (P69 fold 3f), by wire id: ARM64_RELOC_BRANCH26 620756992, ARM64_RELOC_PAGE21 889192448 and ARM64_RELOC_PAGEOFF12 1140850688 (every PAGEOFF12 row of this document, whatever the access width). MEASURED 2026-11-14 (probe-reference-cc, macos-arm64-debug, Apple clang 21.0.0 and the host's Apple ld; host runs 20261114-091613-4edb0e10 and -091923-c6a91569): the assembler writes `sym@PAGE+n`, `sym@PAGEOFF+n` and `bl sym+n` as this record before each of those three, and Apple's ld links the object with a C harness and the program reads +8, +16 and the branch's +8 (exit 42); `sym@GOTPAGE+8` is refused by the assembler (\"gotpage label reference not allowed an addend\"). The object reader refuses a record before any other entry, and the object writer refuses a non-zero addend on any other instruction relocation, each naming the entry. A NEGATIVE addend: the writer masks it to r_symbolnum's 24 bits (-4 is 0xFFFFFC); Apple's assembler writes that record with its sign bits unmasked into r_info, which Apple's ld refuses (MEASURED, the same runs), so DSS's masked record is measured on Apple's ld by tests/link/test_macho_object_reader.cpp's native tier, the reference's acceptance being the measurement.",
+      "carriesAddendOf": [620756992, 889192448, 1140850688]
+    },
+    "$linkerOptionsComment": "P69 fold 3f (`#pragma comment`'s Mach-O half): the load command in which a relocatable object hands its final linker options, and how that linker reads them. ✔MEASURED (P69 fold 3f, Apple clang 21 `-fms-extensions` and the host's ld64): `#pragma comment(lib, \"x\")` writes ONE LC_LINKER_OPTION (45) holding the one string `-lx`, and `comment(linker, \"t\")` one holding `t` as ONE string -- each pragma its own command, a repeat written again, cmdsize 12 + the NUL-terminated strings zero-filled to 8 (16 for `-lz`); ld64 searches a library either kind spells (`-lz` links `compress2` and the image needs libz), and warns \"unknown linker option from object file ignored\" of the one string `-framework CoreFoundation`. A DSS relocatable object writes each library its units name (`library` and the name, once) and each other option as its strings; the reader reads a foreign object's back -- a library into the unit's libraries, a framework (`framework` and its name, TWO strings) and any other option kept, the latter warned by a link that makes an image where ld64 warns; that link ignores the libraries and frameworks (`inImage`), for `reason`.",
+    "linkerOptions": {
+      "command": 45,
+      "library": "-l",
+      "framework": "-framework",
+      "inImage": "ignored",
+      "reason": "A library or a framework to search. A DSS link binds a library function through its descriptors and the `--resolve-library` inputs, and a name nothing resolves still fails loud (ELF's `elf.dependentLibraries` and COFF's `/DEFAULTLIB:` rows say the same)."
+    },
+    "$skippedLoadCommandsComment": "P69 fold 3f (D-LK-MACHO-READER-SKIPS-LOAD-COMMANDS-IN-SILENCE): the load commands a relocatable object may carry that nothing a link makes reads -- the object reader steps over each for its `reason`. It READS LC_SEGMENT_64, LC_SYMTAB, LC_DYSYMTAB, LC_BUILD_VERSION, LC_VERSION_MIN_MACOSX and the `linkerOptions` command, and REFUSES by name every command neither read nor listed here. ✔MEASURED (P69 fold 3f, run 20261117-192243-260e95c2: Apple clang 21's relocatable objects, arm64 and x86_64, and ld64's `-r` outputs on the macos-arm64 leg): eight commands -- those six, LC_LINKER_OPTIMIZATION_HINT (46, arm64 objects only) and LC_DATA_IN_CODE (41, arm64 objects and every `ld -r` output, x86_64's too).",
+    "skippedLoadCommands": [
+      {
+        "command": 46,
+        "name": "LC_LINKER_OPTIMIZATION_HINT",
+        "reason": "ld64's hints for shortening an ADRP/ADD or ADRP/LDR sequence it may rewrite: an optimization of code that is already correct without it, which a DSS link does not make."
+      },
+      {
+        "command": 41,
+        "name": "LC_DATA_IN_CODE",
+        "reason": "marks bytes inside a code section as data, for disassemblers and debuggers: the bytes link as they are, and a DSS image states no data-in-code of its own."
+      }
+    ]
   },
   "$buildVersionComment": "D-LK10-ENTRY-MACHO-EXIT, MH_OBJECT arm — and THIS FILE MUST CARRY IT, which is the whole finding. An `ar` archive is not a Mach-O file: the `!<arch>` framing has no load commands and cannot hold a platform declaration, so in a real toolchain the platform lives in each MEMBER, because `ar` merely archives `.o` files that clang already stamped. DSS matches that by construction — `linkAndWriteStaticArchive` (src/program/compile_pipeline.cpp) links every member through the SAME `linker::link` -> `macho::encode` MH_OBJECT walker, handing it THIS schema, not the bare relocatable sibling's. So the walker's `image.buildVersion.has_value()` gate reads THIS file, and omitting the key here would ship an archive whose members each draw `ld: warning: no platform load command found` — the exact defect the sibling closes, surviving inside the `.a`. Members get the emitter for free; they do NOT get the declaration for free. Values are the sibling's verbatim (`macos` / 11.0 / 11.0) under this file's standing 'kept in sync with the relocatable sibling by hand' rule. ⛔ UNRUN, stated rather than implied: no DSS-emitted Mach-O `.a` has been fed to ld64, so the claim here is member-byte emission plus the mechanism above, not archive link acceptance — the same honest boundary this file's `$supportedDataSectionsComment` draws.",
   "image": {

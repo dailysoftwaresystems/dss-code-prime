@@ -7,6 +7,7 @@
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/preprocess/preprocessor.hpp"   // PreScanMemoCounters, for the --time report
 #include "core/substrate/large_stack_call.hpp"  // D-PARSE-DEEP-FRONTEND-STACK: build CUs on a large stack
+#include "core/substrate/key_order.hpp"  // entriesInKeyOrder -- the merged recipe partition's order
 #include "core/substrate/mint_monotonic_id.hpp"  // the startup module's unit id (an all-object link's)
 #include "core/substrate/phase_timers.hpp"      // c97: --time per-phase breakdown
 #include "core/substrate/thread_pool.hpp"       // D-PERF-4-CU-PARALLELISM: per-CU build pool
@@ -1476,6 +1477,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         if (entryScope.verbs.empty() || entryScope.electsNone || staticArchives.empty()) return true;
         std::vector<EntryLinkName> const names = entryLinkNames(grammar, **formatR, entryScope.verbs);
         auto members = pullEntryArchiveMembers(std::span<EntryLinkName const>{names},
+                                               std::span<std::vector<EntryMaterialization> const>{entryScope.precedence},
                                                std::span<std::filesystem::path const>{staticArchives},
                                                **targetR, **formatR, reporter);
         if (!members) return false;   // reported
@@ -1512,7 +1514,6 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         std::optional<std::string> wideFloatSoftcallLibrary =
             wfLib.empty() ? std::nullopt : std::optional<std::string>(std::string(wfLib));
         return lowerMergedToAssembly(whole, grammar, **targetR,
-                                     (*formatR)->dataModel(),
                                      effectiveBitFieldStrategy(**targetR, **formatR),
                                      effectiveUnnamedBitFieldAlignment(**targetR, **formatR),
                                      ccIndex, wholeId,
@@ -1670,9 +1671,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
             return false;
         }
         bool       entryOk = true;
-        auto const elected = resolveProgramEntry(cands, entryScope.verbs, entryScope.precedence,
-                                                 (*formatR)->name(), reporter, entryOk,
-                                                 entryScope.restrictedBy);
+        auto const elected = resolveProgramEntry(cands, entryScope, (*formatR)->name(), reporter, entryOk);
         if (!entryOk) return false;   // two rival entries — reported
         bool const                   ofUnit = elected->index < unitEntries.size();
         ForeignEntryCandidate const& winner =
@@ -2576,8 +2575,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     auto resolvedEntry =
         entryScope.electsNone
             ? std::optional<ResolvedEntry>{}
-            : resolveProgramEntry(cands, entryScope.verbs, entryScope.precedence, (*formatR)->name(),
-                                  reporter, entryOk, entryScope.restrictedBy);
+            : resolveProgramEntry(cands, entryScope, (*formatR)->name(), reporter, entryOk);
     if (!entryOk) return std::nullopt;   // undefined / ambiguous entry — already reported.
     ForeignEntryCandidate const* objectEntry = nullptr;
     EntryMaterialization         objectEntryVerb = EntryMaterialization::None;
@@ -2768,7 +2766,10 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         // the linker's `K_NoMatchingObjectFormat` (which would send an operator to the
         // object-format config for what is a recipe-table defect).
         std::unordered_map<std::uint32_t, std::string> mergedThreadsRecipes;
-        for (auto const& [symV, name] : merged->symbolNames) {
+        // ★ IN ASCENDING SYMBOL ID (P69 fold 3f, lane `xa`): the first name with no
+        // family is the one reported, so the walk is the merged module's own order.
+        for (auto const* entry : substrate::entriesInKeyOrder(merged->symbolNames)) {
+            auto const& [symV, name] = *entry;
             std::string const bare = dss::ffi::unapplyCMangling(name, cSymDecor);
             if (!dss::ffi::isKnownSynthesizeRecipe(bare)
                 || definedOrImported.find(symV) != definedOrImported.end()) {
@@ -2895,6 +2896,18 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     auto const unitOfDefinition = merged->unitOfDefinition;
     auto mod = lowerWholeModule(*merged, cuMirs[0].cuId, std::move(sehScopes));
     if (!mod) return std::nullopt;  // back-half tier failure already reported via `reporter`
+    // P69 fold 3f: what each unit's source asks of its link, in unit order -- the
+    // order the link reads its precedence from (`appendUnitLinkerRequests`) --
+    // and the options they state applied as their objects would be read back,
+    // through the one object document every unit of the link states its options by.
+    {
+        ObjectFormatSchema const* optionsDocument = nullptr;
+        for (CuMirModule const& cm : cuMirs) {
+            appendUnitLinkerRequests(mod->linkerRequests, cm.linkerRequests);
+            if (optionsDocument == nullptr) optionsDocument = cm.linkerOptionsDocument;
+        }
+        if (!stateUnitLinkerOptions(*mod, optionsDocument, reporter)) return std::nullopt;
+    }
     // The merged module stands where its first unit's source does (P69 fold 3d,
     // D-LK-THE-LINK-ORDER-IS-NOT-THE-COMMAND-LINE-ORDER), and each definition it
     // holds where ITS unit's source does: the merge keys them by the merged

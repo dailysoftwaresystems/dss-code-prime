@@ -1,0 +1,2 @@
+    for (auto const& v : node) {
+        if (!v.is_string()) {

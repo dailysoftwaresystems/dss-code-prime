@@ -1,0 +1,1 @@
+    case 0x00: return addressBytes;   // absptr: one address of the reading object

@@ -1,1 +1,2 @@
-    if (reporter.all().size() == saidBefore) entry->surfaceByFormat.emplace_back(fmt, out);
+    if (reporter.all().size() == saidBefore)
+        entry->surfaceByFormat.push_back({fmt, archKey, out});

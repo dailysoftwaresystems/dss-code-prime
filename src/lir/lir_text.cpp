@@ -469,14 +469,18 @@ void emitRegConstraintPool(std::string& out, LirRegConstraintPool const& pool,
     out.append("reg_constraints {\n");
     for (std::uint32_t i = 0; i < pool.size(); ++i) {
         auto const& c = pool.at(i);
+        // In source order: each list may report a disagreement, and the
+        // refusals come in the order the clauses are written, never in the
+        // order a host compiler evaluates a call's arguments.
+        std::string const in = renderConstraintRegList(
+            c.inputNames, c.inputOrdinals, "in", i, schema, reporter);
+        std::string const outList = renderConstraintRegList(
+            c.outputNames, c.outputOrdinals, "out", i, schema, reporter);
+        std::string const clobber = renderConstraintRegList(
+            c.clobberedNames, c.clobberedOrdinals, "clobber", i, schema, reporter);
         out.append(std::format(
             "  rc#{} = in {} out {} clobber {} inrole {} outrole {}\n", i,
-            renderConstraintRegList(c.inputNames, c.inputOrdinals,
-                                    "in", i, schema, reporter),
-            renderConstraintRegList(c.outputNames, c.outputOrdinals,
-                                    "out", i, schema, reporter),
-            renderConstraintRegList(c.clobberedNames, c.clobberedOrdinals,
-                                    "clobber", i, schema, reporter),
+            in, outList, clobber,
             renderConstraintRoleList(c.inputRoleNames),
             renderConstraintRoleList(c.outputRoleNames)));
     }

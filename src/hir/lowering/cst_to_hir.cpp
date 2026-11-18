@@ -1539,9 +1539,9 @@ struct Lowerer {
             HirLiteralValue v;
             v.core  = TypeKind::I32;
             v.value = std::int64_t{0};
-            HirNodeId const zeroLit = builder.makeLiteral(
-                interner.primitive(TypeKind::I32), literals.add(v),
-                HirFlags::Synthetic);
+            TypeId const    zeroLitType  = interner.primitive(TypeKind::I32);
+            auto const      zeroLitValue = literals.add(v);
+            HirNodeId const zeroLit      = builder.makeLiteral(zeroLitType, zeroLitValue, HirFlags::Synthetic);
             HirNodeId const nullPtr = builder.makeCast(
                 zeroLit, cond.type, HirFlags::Synthetic);
             return {track(builder.addParent(HirKind::BinaryOp,
@@ -3982,9 +3982,9 @@ struct Lowerer {
         HirLiteralValue v;
         v.core  = TypeKind::I32;
         v.value = std::int64_t{0};
-        HirNodeId const zeroLit = builder.makeLiteral(
-            interner.primitive(TypeKind::I32), literals.add(v),
-            HirFlags::Synthetic);
+        TypeId const    zeroLitType  = interner.primitive(TypeKind::I32);
+        auto const      zeroLitValue = literals.add(v);
+        HirNodeId const zeroLit      = builder.makeLiteral(zeroLitType, zeroLitValue, HirFlags::Synthetic);
         return E{track(zeroLit, node), interner.primitive(TypeKind::I32)};
     }
 
@@ -6285,12 +6285,16 @@ struct Lowerer {
             truncated = coerce(E{read(W, tX), W}, rT).id;
         }
         SymbolId const tR = bind(rT, truncated);
-        if (!predicate)
-            stmts.push_back(builder.makeAssignStmt(
-                builder.makeDeref(read(pT, tP), rT, HirFlags::Synthetic), read(rT, tR)));
-        HirNodeId const differs = builder.addParent(
-            HirKind::BinaryOp, std::array{coerce(E{read(rT, tR), rT}, W).id, read(W, tX)},
-            boolType(), encodeOp(HirOpKind::Ne));
+        // The store's target, then its value, then the comparison: HIR node ids in source order.
+        if (!predicate) {
+            HirNodeId const resultPlace = builder.makeDeref(read(pT, tP), rT, HirFlags::Synthetic);
+            HirNodeId const resultValue = read(rT, tR);
+            stmts.push_back(builder.makeAssignStmt(resultPlace, resultValue));
+        }
+        std::array const differsOperands{coerce(E{read(rT, tR), rT}, W).id, read(W, tX)};
+        TypeId const     differsType = boolType();
+        HirNodeId const  differs     = builder.addParent(HirKind::BinaryOp, differsOperands, differsType,
+                                                         encodeOp(HirOpKind::Ne));
         TypeId const yieldTy = resultType.valid() ? resultType : boolType();
         HirNodeId const yield = (yieldTy.v == boolType().v)
             ? differs : coerce(E{differs, boolType()}, yieldTy).id;
@@ -6446,9 +6450,9 @@ struct Lowerer {
             HirLiteralValue v;
             v.core  = TypeKind::I32;
             v.value = std::int64_t{0};
-            HirNodeId const zeroLit = builder.makeLiteral(
-                interner.primitive(TypeKind::I32), literals.add(v),
-                HirFlags::Synthetic);
+            TypeId const    zeroLitType  = interner.primitive(TypeKind::I32);
+            auto const      zeroLitValue = literals.add(v);
+            HirNodeId const zeroLit      = builder.makeLiteral(zeroLitType, zeroLitValue, HirFlags::Synthetic);
             return E{track(zeroLit, operandNode), interner.primitive(TypeKind::I32)};
         }
         std::string_view const text = tree().text(tokenNode);
@@ -6638,8 +6642,9 @@ struct Lowerer {
         // — the arithmetic, the comparisons and the shift's left operand alike; the
         // semantic typer's `combineBinary` reads the same two operands the same way.
         auto const [lhsN, rhsN] = binaryOperandNodes(anchor);
-        return combineCoreBinary(anchor, *op, asBitFieldValue(lhsN, lhs),
-                                 asBitFieldValue(rhsN, rhs));
+        E const lhsValue = asBitFieldValue(lhsN, lhs);   // HIR node ids in source order
+        E const rhsValue = asBitFieldValue(rhsN, rhs);
+        return combineCoreBinary(anchor, *op, lhsValue, rhsValue);
     }
 
     // P68 round 9 (lane `cs`): the core-operator half of `combineBinary`, split out
@@ -9228,8 +9233,9 @@ struct Lowerer {
         HirLiteralValue v;
         v.core  = TypeKind::I64;
         v.value = inc ? std::int64_t{1} : std::int64_t{-1};
-        return builder.makeLiteral(interner.primitive(TypeKind::I64),
-                                   literals.add(v), HirFlags::Synthetic);
+        TypeId const stepType  = interner.primitive(TypeKind::I64);
+        auto const   stepValue = literals.add(v);
+        return builder.makeLiteral(stepType, stepValue, HirFlags::Synthetic);
     }
 
     // FC-F1 (C 6.5.2.4 / 6.5.6): `++`/`--` on a Ptr<T> lvalue steps by sizeof(T),
@@ -9518,9 +9524,9 @@ struct Lowerer {
         HirNodeId const stored = coerce(rhs, valTy).id;
         SymbolId const t = freshSymbol();
         stmts.push_back(builder.makeVarDecl(valTy, t.v, stored, HirFlags::Synthetic));
-        stmts.push_back(builder.makeAssignStmt(
-            atomicRmwTargetNode(lv),
-            builder.makeRef(valTy, t.v, HirFlags::Synthetic)));
+        HirNodeId const target = atomicRmwTargetNode(lv);   // HIR node ids in source order
+        HirNodeId const value  = builder.makeRef(valTy, t.v, HirFlags::Synthetic);
+        stmts.push_back(builder.makeAssignStmt(target, value));
         return {track(builder.makeSeqExpr(
                           stmts, builder.makeRef(valTy, t.v, HirFlags::Synthetic),
                           valTy, HirFlags::Synthetic), node),
@@ -15106,10 +15112,10 @@ struct Lowerer {
                         // ★ P69 (D-C-C23-CONVERSIONS-MISSING-ON-THE-UCRT-AND-LIBSYSTEM):
                         // a row whose BODY is DSS's shipped source names no image, so it
                         // is UNBOUND exactly as the injected producer below makes it
-                        // (`!ext.shippedSourcePath.empty()`) — pe's printf family is such
-                        // a row, and bound "library-with-no-image" it stopped HIR→MIR.
-                        /*noLibraryBinding=*/shipped == nullptr
-                            || !shipped->shippedSourcePath.empty(),
+                        // (`bindsNoImage()`) — pe's printf family is such a row, and
+                        // bound "library-with-no-image" it stopped HIR→MIR. ★ P69 fold
+                        // 3f: so is a row whose name the platform's link aliases.
+                        /*noLibraryBinding=*/shipped == nullptr || shipped->bindsNoImage(),
                         // c156 (D-LK-ELF-SYMBOL-VERSIONING): carry the suppressed
                         // shipped symbol's required version through the user
                         // prototype's synthesized import, else the versioned
@@ -15966,8 +15972,9 @@ struct Lowerer {
             ef, rec->name,
             shipped != nullptr ? shipped->library
                                : std::unordered_map<std::string, std::string>{},
-            // ★ P69: a shipped-SOURCE row is unbound — the bare-prototype arm's rule.
-            /*noLibraryBinding=*/shipped == nullptr || !shipped->shippedSourcePath.empty(),
+            // ★ P69: a shipped-SOURCE row, or one the platform's link aliases (fold 3f),
+            // is unbound — `bindsNoImage()`, the bare-prototype arm's rule.
+            /*noLibraryBinding=*/shipped == nullptr || shipped->bindsNoImage(),
             shipped != nullptr ? shipped->version : std::string{},
             /*isEagerImport=*/false,
             rec->asmName,   // TF-C88 (asm label)
@@ -16692,9 +16699,10 @@ struct Lowerer {
             // Nothing to bind ⇒ UNBOUND, and say so explicitly rather than
             // leaving an empty library to be interpreted downstream. ★ P69: a
             // shipped-SOURCE realization binds nothing either — its body is
-            // linked from DSS's runtime archive (the bare-prototype arm's rule).
+            // linked from DSS's runtime archive (the bare-prototype arm's rule) —
+            // nor does a row the platform's link aliases (fold 3f): `bindsNoImage()`.
             /*noLibraryBinding=*/(shipped == nullptr && libraryOverride.empty())
-                || (shipped != nullptr && !shipped->shippedSourcePath.empty()),
+                || (shipped != nullptr && shipped->bindsNoImage()),
             shipped != nullptr ? shipped->version : std::string{}};
         // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): the label was read PER
         // DECLARATOR by
@@ -17524,9 +17532,12 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
         // driver added to the build graph. It reuses that marker rather than
         // minting a second "unbound" concept, because there is only one question
         // here — does this reference name an image? — and c86 already answers it.
+        // ★ P69 fold 3f: the row answers it (`bindsNoImage()`), and a row whose
+        // name the platform's link ALIASES answers no as well: the image link
+        // states the alias.
         externDecls.push_back(HirExternRecord{
             node, ext.name, ext.library,
-            /*noLibraryBinding=*/!ext.shippedSourcePath.empty(),
+            /*noLibraryBinding=*/ext.bindsNoImage(),
             ext.version,          // D-LK-ELF-SYMBOL-VERSIONING (c156)
             // UCRT-P4 (Decision 1): almost always TRUE — a `#include`d descriptor
             // symbol is imported whether or not the TU calls it. It is FALSE only

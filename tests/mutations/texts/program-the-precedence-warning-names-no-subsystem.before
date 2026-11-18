@@ -1,0 +1,2 @@
+            bool const bySubsystem = std::find(scope.rankedFirst.begin(), scope.rankedFirst.end(),
+                                               *candidates[top[0]].verb) != scope.rankedFirst.end();

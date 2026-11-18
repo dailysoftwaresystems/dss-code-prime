@@ -457,6 +457,18 @@ struct DSS_EXPORT ExternImport {
     // directive it came from.
     std::string fallbackName;
 
+    // ★ THE FALLBACK'S IMAGE, WHERE THE STATEMENT KNOWS IT (P69 fold 3f, ledger 549 (b)). Empty
+    // for every fallback but one the image link STATES for a written name whose route is the
+    // platform's link alias (`stateWrittenNameRoutes`, program tier): link.exe binds a written
+    // `close` through oldnames.lib's weak external to `_close` in the C runtime's image, so the
+    // statement carries that image with the fallback's name. `linker::bindFallbackReferences`
+    // applies it only when it TAKES the fallback and no row of the link binds the fallback's
+    // name already: an image whose program defines `close` imports nothing (F9). `fallbackIsData`
+    // is the fallback's own kind, read when the reference states none (`Pending`).
+    std::string fallbackLibraryPath;
+    std::string fallbackVersion;
+    bool        fallbackIsData = false;
+
     // ★★ A COMMON (TENTATIVE) DEFINITION, NOT A REFERENCE (P69,
     // D-LK-OBJECT-READERS-MISREAD-COMMON-SYMBOLS). Zero for every row but one an
     // object READER made from a COMMON symbol: zero-filled storage of

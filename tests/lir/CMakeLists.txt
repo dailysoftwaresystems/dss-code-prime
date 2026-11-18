@@ -134,6 +134,13 @@ dss_add_test(NAME lir/test_lir_frame_slot_stride
 dss_add_test(NAME lir/test_lir_frame_access_width
              SOURCES test_lir_frame_access_width.cpp)
 
+# P69 fold 3f (lane `xa`, review-xa3e F3 -- the pointer width's Lowerer half): every address MIR->LIR writes is an
+# address of the module's data model, read once; the wall (`lowerToLir`) refuses a module stating no model or one
+# whose pointer is not the back end's address width, by name; past it (`lowerToLirPastTheWall`, the seam) an ILP32
+# module lowers each Q1 form at 4 bytes and an LP64 or LLP64 one at 8, on both shipped CPUs.
+dss_add_test(NAME lir/test_lowering_address_width
+             SOURCES test_lowering_address_width.cpp)
+
 # D-LIR-ASM-OPERAND-MOVE-IS-CLASS-BLIND + D-TARGET-NO-CROSS-CLASS-MOVE-VERB: the
 # inline-asm operand materialisation used ONE module-wide integer `mov` for
 # every operand whatever class it bound — a live silent miscompile on both

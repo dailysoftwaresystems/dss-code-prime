@@ -1,0 +1,3 @@
+void swab(char *from, char *to, int n) {
+    _swab(from, to, n);
+}

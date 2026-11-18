@@ -1,0 +1,1 @@
+            if (!elected.has_value() || rank->second < elected->rank) {

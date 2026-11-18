@@ -102,7 +102,7 @@ Mir::Mir(InstArena instArena, BlockArena blockArena, FuncArena funcArena,
       succPool_(std::move(succPool)),
       literalPool_(std::move(literalPool)),
       asmDescriptorPool_(std::move(asmDescriptorPool)),
-      facts_{aliasingMode, charTypesAliasAll, MirArgCounting::Unstated} {
+      facts_{aliasingMode, charTypesAliasAll, MirArgCounting::Unstated, DataModel{}} {
     // The four arenas are tagged by ONE module id (the cross-tier guard relies
     // on it: a MirBlockId and a MirInstId of the same module share the tag). A
     // direct (non-builder) ctor that mismatched them would let an id from one

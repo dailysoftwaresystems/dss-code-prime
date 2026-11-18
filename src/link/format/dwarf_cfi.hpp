@@ -732,8 +732,14 @@ buildEhFrameHdr(EhFrameSection const& sec, std::uint64_t hdrVa,
                 static_cast<std::int64_t>(ehFrameVa + sec.fdeOffsets[k])
                 - static_cast<std::int64_t>(hdrVa))});
     }
+    // TOTAL, so the table is a function of the section and never of the sort:
+    // two FDEs at one address (a zero-length function beside its neighbour)
+    // tie on `pc`, and an unstable sort would order them as the host's
+    // library does. The FDE's own offset breaks the tie.
     std::sort(rows.begin(), rows.end(),
-              [](Row const& a, Row const& b) { return a.pc < b.pc; });
+              [](Row const& a, Row const& b) {
+                  return a.pc != b.pc ? a.pc < b.pc : a.fde < b.fde;
+              });
     for (auto const& r : rows) {
         appendU32LE(out, static_cast<std::uint32_t>(r.pc));
         appendU32LE(out, static_cast<std::uint32_t>(r.fde));

@@ -1247,6 +1247,24 @@ struct DSS_EXPORT ElfUniqueBinding {
     SymbolBinding readAs = SymbolBinding::Global;
 };
 
+// ★ ELF's DEPENDENT-LIBRARIES SECTION (P69 lane `xa`, fold 3f -- `#pragma comment(lib, ...)`'s ELF half): where a
+// relocatable object names the libraries it asks its final link to search -- each a NUL-terminated name, in one
+// section of the stated type -- and what a DSS link that makes an IMAGE does with them. ✔MEASURED (P69 fold 3f,
+// clang 18.1.3 x86_64-linux-gnu): `#pragma comment(lib, "m")` writes `.deplibs` (SHT_LLVM_DEPENDENT_LIBRARIES,
+// 0x6fff4c04, SHF_MERGE|SHF_STRINGS, entsize 1) holding `m\0`, verbatim, a repeated name twice; ld.lld HONOURS it
+// (`cos` links, NEEDED libm.so.6), GNU ld ignores it. The reader reads such a section into the unit's
+// `UnitLinkerRequests::dependentLibraries`; the relocatable writer writes them back; an image link does what
+// `inImage` says -- `ignored`, the one built verdict, for the stated reason (a DSS link binds a library function
+// through its descriptors and `--resolve-library`, and a name nothing resolves still fails loud: COFF's
+// `/DEFAULTLIB:` row says the same).
+struct DSS_EXPORT ElfDependentLibraries {
+    std::string   section;            // ".deplibs"
+    std::uint32_t type      = 0;      // sh_type
+    std::uint64_t flags     = 0;      // sh_flags
+    std::uint64_t entrySize = 0;      // sh_entsize
+    std::string   inImageReason;      // why an image link ignores them (`inImage: ignored`)
+};
+
 struct DSS_EXPORT ElfIdentity {
     std::uint8_t   fileClass = 0;    // ELFCLASS64=2 / ELFCLASS32=1
     std::uint8_t   dataEncoding = 0; // ELFDATA2LSB=1 / ELFDATA2MSB=2
@@ -1314,6 +1332,9 @@ struct DSS_EXPORT ElfIdentity {
     // `ElfUniqueBinding`. Absent: the document states none, its reader refuses
     // such a symbol and its writer such a definition, by name.
     std::optional<ElfUniqueBinding> uniqueBinding;
+    // The dependent-libraries section -- see `ElfDependentLibraries`. Absent: the document states none, and its
+    // relocatable writer refuses, by name, a unit that names a library to search.
+    std::optional<ElfDependentLibraries> dependentLibraries;
 };
 
 // ── PE/COFF-specific identity block (loaded only when kind == Pe) ──
@@ -1471,11 +1492,20 @@ enum class LinkerDirectiveMeaning : std::uint8_t {
     // the subsystem AND operating-system versions when stated (link.exe sets
     // both from `CONSOLE,6.1`, ✔MEASURED 2026-10-07). A version below the row's
     // `minimumVersion` is warned and the format's default kept, as link.exe does
-    // (LNK4010 on 5.01; it takes 5.02 for x64, ✔MEASURED 2026-10-07). A DSS
-    // image starts in the language's entry whatever the subsystem: link.exe and
-    // lld-link REFUSE `/SUBSYSTEM:WINDOWS` with only `main` (their GUI default
-    // startup calls WinMain), and run `/SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup`
-    // as a GUI image of `main` — the meaning DSS gives both.
+    // (LNK4010 on 5.01; it takes 5.02 for x64, ✔MEASURED 2026-10-07). With no
+    // `/ENTRY:` standing, the subsystem that stands CHOOSES THE STARTUP: the
+    // row's `subsystemStartups` names the C runtime startups each subsystem
+    // starts a program at, and the program's entry election ranks the entries
+    // they call above every other (P69 fold 3f; ✔MEASURED 2026-11-17, cl 19.52
+    // + link.exe 14.52, as an object's directive and as the link's option:
+    // `/SUBSYSTEM:WINDOWS` beside `main` and WinMain runs WinMain, beside `main`
+    // and wWinMain wWinMain; `/SUBSYSTEM:CONSOLE` beside `main` and WinMain
+    // runs `main`). A program defining none of them starts in its own entry:
+    // link.exe and lld-link REFUSE `/SUBSYSTEM:WINDOWS` with only `main` (their
+    // GUI default startup calls WinMain), and link.exe `/SUBSYSTEM:CONSOLE` with
+    // only WinMain, where gcc runs both (`main` under -mwindows, WinMain under
+    // its console default); and both run `/SUBSYSTEM:WINDOWS
+    // /ENTRY:mainCRTStartup` as a GUI image of `main` — the meaning DSS gives each.
     Subsystem,
     // `symbol` — the image's entry (`/ENTRY:`). A name in the row's
     // `runtimeStartups` is the C runtime's startup, which in a DSS image is the
@@ -1521,6 +1551,27 @@ enum class LinkerDirectiveMeaning : std::uint8_t {
     // that makes a program refuses it by name, the build's target being the
     // program the user asked for.
     DllImage,
+    // `identity` — the image depends on a side-by-side assembly
+    // (`/MANIFESTDEPENDENCY:`; the identity is the attributes of the manifest's
+    // `assemblyIdentity`, the common controls version 6 a GUI program names). A
+    // LINK-WIDE SET, like the hides: every distinct identity once, at its first
+    // statement's place in unit order, compared as text byte for byte; nothing
+    // is dropped, so no precedence applies, and a shared library takes it as a
+    // program does. ✔MEASURED 2026-11-17 (P69 fold 3f, probe-reference-cc runs 20261117-140648-927055da, 20261117-140952-a037b4db,
+    // 20261117-142310-025e5c2e, 20261117-142455-10b66d4b: cl 19.52 + link.exe 14.52 and clang 18.1.3 + lld-link 18.1.3,
+    // each with /MANIFEST:EMBED): two units' identities in unit order, a repeat
+    // once, one more space or another case twice, a DLL's resource id 2. The
+    // image writer embeds the manifest that names them (`PeEmbeddedManifest`).
+    ManifestDependency,
+    // ★ P69 fold 3f (`#pragma comment(lib, ...)`'s COFF half): a LIBRARY the
+    // object asks its final linker to search (`/DEFAULTLIB:x`, which cl writes for
+    // `#pragma comment(lib, "x")`, always quoted). Read into the unit's
+    // `UnitLinkerRequests::dependentLibraries`, each once; restated by a
+    // relocatable writer; a link that makes an IMAGE ignores it, for the row's
+    // `reason` (required on it): a DSS link binds a library function through its
+    // descriptors. ✔MEASURED P69 fold 3f: link.exe makes a `GetSystemMetrics`
+    // call link and run with `comment(lib, "user32")` alone.
+    DependentLibrary,
     // A request a reference honours and a DSS image cannot honour yet — REFUSED
     // by name by a link that makes an image; `reason` says why and names the row
     // that carries the work. A relocatable artifact hands it on to its final
@@ -1531,7 +1582,7 @@ enum class LinkerDirectiveMeaning : std::uint8_t {
     Ignored,
 };
 
-inline constexpr EnumNameTable<LinkerDirectiveMeaning, 18> kLinkerDirectiveMeaningTable{{{
+inline constexpr EnumNameTable<LinkerDirectiveMeaning, 20> kLinkerDirectiveMeaningTable{{{
     { LinkerDirectiveMeaning::HideSymbols,       "hideSymbols"       },
     { LinkerDirectiveMeaning::ExportSymbol,      "exportSymbol"      },
     { LinkerDirectiveMeaning::IncludeSymbol,     "includeSymbol"     },
@@ -1548,6 +1599,8 @@ inline constexpr EnumNameTable<LinkerDirectiveMeaning, 18> kLinkerDirectiveMeani
     { LinkerDirectiveMeaning::SectionAlignment,  "sectionAlignment"  },
     { LinkerDirectiveMeaning::MismatchCheck,     "mismatchCheck"     },
     { LinkerDirectiveMeaning::DllImage,          "dllImage"          },
+    { LinkerDirectiveMeaning::ManifestDependency, "manifestDependency" },
+    { LinkerDirectiveMeaning::DependentLibrary,  "dependentLibrary"  },
     { LinkerDirectiveMeaning::Refused,           "refused"           },
     { LinkerDirectiveMeaning::Ignored,           "ignored"           },
 }}};
@@ -1574,12 +1627,27 @@ struct DSS_EXPORT PeRuntimeStartup {
     friend bool operator==(PeRuntimeStartup const&, PeRuntimeStartup const&) = default;
 };
 
+// A subsystem with the C runtime startups the format's vendor linker starts a
+// program at under it when no `/ENTRY:` stands (P69 fold 3f; ✔MEASURED
+// 2026-11-17, cl 19.52 + link.exe 14.52: WINDOWS starts WinMainCRTStartup or
+// wWinMainCRTStartup, CONSOLE mainCRTStartup or wmainCRTStartup). Each startup
+// is a `runtimeStartups` row of the same vocabulary, and `verbs` the verbs
+// those rows call an entry with, resolved at load: what a STANDING subsystem
+// request ranks first in the program's entry election (`entryElectionScope`).
+struct DSS_EXPORT PeSubsystemStartups {
+    std::string                       subsystem;   // a `subsystems` name, compared without regard to case
+    std::vector<std::string>          startups;
+    std::vector<EntryMaterialization> verbs;
+    friend bool operator==(PeSubsystemStartups const&, PeSubsystemStartups const&) = default;
+};
+
 struct DSS_EXPORT PeLinkerDirectiveRow {
     std::string            option;   // compared without regard to case
     LinkerDirectiveMeaning meaning = LinkerDirectiveMeaning::Ignored;
     // WHY dropping or refusing the request is right — required on an `ignored`
-    // or `refused` row, and refused on any other (a meaning the reader applies
-    // needs no excuse).
+    // or `refused` row, and on a `dependentLibrary` one (why a link that makes an
+    // image ignores the library), and refused on any other (a meaning the reader
+    // applies needs no excuse).
     std::string            reason;
     // `subsystem` rows only (required there): each name the option takes and its
     // IMAGE_SUBSYSTEM value. A name the table lacks is refused by name.
@@ -1591,6 +1659,10 @@ struct DSS_EXPORT PeLinkerDirectiveRow {
     // takes for this machine; a lower one is warned and the format's default
     // version kept.
     std::optional<VersionPair>         minimumVersion;
+    // `subsystem` rows only (required there, every name of `subsystems` once):
+    // the C runtime startups each subsystem starts a program at, each resolved
+    // at load to the verbs its `runtimeStartups` row states.
+    std::vector<PeSubsystemStartups>   subsystemStartups;
     // `entryPoint` rows only (required there): the names that mean the C
     // runtime's own startup — the target's startup in a DSS image — each with
     // the verbs it calls an entry with.
@@ -1627,6 +1699,41 @@ struct DSS_EXPORT PeLinkerDirectives {
     std::vector<PeLinkerDirectiveRow> directives;
 };
 
+// ── THE MANIFEST AN IMAGE EMBEDS (P69 fold 3f) ──────────────────────────────
+// D-LK-PE-IMAGE-CANNOT-HONOUR-EVERY-LINKER-DIRECTIVE item (2). A unit's
+// `/MANIFESTDEPENDENCY:<identity>` asks that the image depend on a side-by-side
+// assembly, which the Windows loader activates from the image's manifest.
+// ✔MEASURED 2026-11-17 (probe-reference-cc runs 20261117-140648-927055da, 20261117-140952-a037b4db, 20261117-142310-025e5c2e, 20261117-142455-10b66d4b: cl 19.52 + link.exe
+// 14.52 and clang 18.1.3 + lld-link 18.1.3): asked to embed (/MANIFEST:EMBED),
+// both write ONE resource -- type RT_MANIFEST (24), id 1 in an EXE and 2 in a
+// DLL, language 0x409, code page 0 -- whose text names each DISTINCT identity
+// once, in the order the units first state them, after a trustInfo block that
+// asks for no elevation; by default both write the manifest BESIDE the image
+// instead, and an image whose units state none carries none. A DSS link writes
+// one artifact, so it embeds -- the shape both references write when asked --
+// and only when a unit states a dependency. The resource's coordinates and the
+// text are this block's (an image document's `pe.embeddedManifest`): the text
+// is link.exe's, the platform toolchain's, line by line, and the writer holds
+// no XML and no number of its own (`pe::encodeEmbeddedManifestSection`).
+//
+// `{identity}` in a `dependency` line is replaced by an identity verbatim; the
+// loader requires it in exactly one line of `dependency` and in no other line.
+inline constexpr std::string_view kEmbeddedManifestIdentity = "{identity}";
+
+struct DSS_EXPORT PeEmbeddedManifest {
+    std::string              section;               // the resource section's name (`.rsrc`)
+    std::uint32_t            characteristics = 0;   // its section header's Characteristics
+    std::uint16_t            resourceType    = 0;   // RT_MANIFEST
+    std::uint16_t            resourceId      = 0;   // 1 in a program, 2 in a DLL: the flavour's document says
+    std::uint16_t            language        = 0;
+    std::uint32_t            codePage        = 0;
+    std::string              lineEnd;               // ends every line of the text
+    std::vector<std::string> head;                  // the lines before the first dependency
+    std::vector<std::string> dependency;            // the lines of one dependency, once per identity
+    std::vector<std::string> tail;                  // the lines after the last dependency
+    friend bool operator==(PeEmbeddedManifest const&, PeEmbeddedManifest const&) = default;
+};
+
 struct DSS_EXPORT PeIdentity {
     std::uint16_t machine = 0;          // IMAGE_FILE_MACHINE_AMD64=0x8664
                                         // / I386=0x014C / ARM64=0xAA64
@@ -1637,6 +1744,10 @@ struct DSS_EXPORT PeIdentity {
     // an image, which neither writes nor reads a member through its own document
     // (a member is read through its archive's relocatable sibling).
     std::optional<PeLinkerDirectives> linkerDirectives;
+    // The manifest an IMAGE embeds for its units' side-by-side assembly
+    // dependencies (above); absent on a relocatable document, which embeds no
+    // resource -- the image its final linker writes does.
+    std::optional<PeEmbeddedManifest> embeddedManifest;
 };
 
 // ── PE32+ Optional Header (loaded when PE objectType != Obj) ──
@@ -1771,9 +1882,46 @@ struct DSS_EXPORT MachODifferenceRelocation {
 // 2751463424 ... is not declared"). The JSON key `macho.addendRelocation`; absent = the format has no such record (an
 // x86_64 field holds its own addend), and a reader then refuses the entry as an undeclared wire id. Read by the object
 // reader and written by the object writer, so it is declared by the `filetype: object` documents alone.
+// ★ WHICH ENTRIES IT MAY CARRY (P69 fold 3f): `carriesAddendOf`, the wire ids of the relocation rows a record may
+// stand before. ✔MEASURED 2026-11-14 (probe-reference-cc, Apple clang 21.0.0 + Apple's ld, host runs
+// 20261114-091613-4edb0e10 and -091923-c6a91569): the assembler writes the record before PAGE21, PAGEOFF12 and
+// BRANCH26 and Apple's ld links the object and runs it; it REFUSES an addend on a GOT page reference ("gotpage label
+// reference not allowed an addend"). A record before any other entry is refused by the reader, and an addend on any
+// other instruction relocation by the writer, each naming the entry -- where both took any successor before.
 struct DSS_EXPORT MachOAddendRelocation {
-    std::uint32_t nativeId   = 0;    // the record's wire id, packed as a relocation row's is
-    std::uint32_t addendBits = 0;    // the signed addend's width in r_symbolnum (at most 24)
+    std::uint32_t              nativeId   = 0;   // the record's wire id, packed as a relocation row's is
+    std::uint32_t              addendBits = 0;   // the signed addend's width in r_symbolnum (at most 24)
+    std::vector<std::uint32_t> carriesAddendOf;  // the relocation rows' wire ids it may carry the addend of
+};
+
+// ★ MACH-O'S LINKER OPTIONS (P69 fold 3f -- `#pragma comment`'s Mach-O half): the load command in which a relocatable
+// object hands its final linker options -- LC_LINKER_OPTION: a count, then that many NUL-terminated strings,
+// zero-filled to 8 -- and how that linker reads them (`macho::readMachOLinkerOption`,
+// link/format/macho_linker_options.hpp).
+// ✔MEASURED (P69 fold 3f, Apple clang 21 -fms-extensions with ld64): `#pragma comment(lib, "x")` writes ONE command
+// holding the one string `-lx`, and `comment(linker, "t")` one holding `t` as one string, each pragma its own command;
+// ld64 searches a library either kind spells, and warns "unknown linker option from object file ignored" of the one
+// string `-framework X`. The reader reads a library into `UnitLinkerRequests::dependentLibraries` and every other
+// option into `linkerOptions`; the relocatable writer writes each back; a link that makes an IMAGE ignores the
+// libraries and frameworks (`inImage: ignored`), for the stated reason. The JSON key `macho.linkerOptions`, declared by
+// the `filetype: object` documents alone: the object reader and writer are handed no other.
+struct DSS_EXPORT MachOLinkerOptions {
+    std::uint32_t command = 0;   // the load command's number (LC_LINKER_OPTION)
+    std::string   library;       // the prefix of a one-string option naming a library to search ("-l")
+    std::string   framework;     // the first of a two-string option naming a framework to search ("-framework")
+    std::string   inImageReason; // why a link that makes an image ignores them (`inImage: ignored`)
+};
+
+// ★ A LOAD COMMAND A RELOCATABLE OBJECT CARRIES THAT NOTHING A LINK MAKES READS (P69 fold 3f): the object reader steps
+// over it for the stated reason; every command it neither reads (`macho::kLoadCommandsTheReaderReads`, the document's
+// `macho.linkerOptions`) nor finds here it REFUSES by name. The JSON key `macho.skippedLoadCommands`, declared by the
+// `filetype: object` documents alone (the reader is handed no other). ✔MEASURED (P69 fold 3f, run 20261117-192243-260e95c2): Apple clang 21
+// writes LC_LINKER_OPTIMIZATION_HINT into arm64 objects, and LC_DATA_IN_CODE into arm64 objects and every `ld -r`
+// output.
+struct DSS_EXPORT MachOSkippedLoadCommand {
+    std::uint32_t command = 0;   // the load command's number
+    std::string   name;          // its <mach-o/loader.h> name, for every message that names it
+    std::string   reason;        // why nothing a link makes reads it
 };
 
 struct DSS_EXPORT MachOIdentity {
@@ -1809,6 +1957,14 @@ struct DSS_EXPORT MachOIdentity {
     // The record that carries the next entry's addend -- the JSON key `macho.addendRelocation`; see
     // `MachOAddendRelocation`. nullopt = the format has none.
     std::optional<MachOAddendRelocation> addendRelocation;
+    // The load command a relocatable object hands its final linker options in -- the JSON key `macho.linkerOptions`;
+    // see `MachOLinkerOptions`. nullopt = the format states none, and a unit's option is warned and dropped where it
+    // is compiled.
+    std::optional<MachOLinkerOptions> linkerOptions;
+    // The load commands a relocatable object may carry that the reader steps over, each for its reason -- the JSON
+    // key `macho.skippedLoadCommands`; see `MachOSkippedLoadCommand`. Empty = every command the reader does not read
+    // is refused by name.
+    std::vector<MachOSkippedLoadCommand> skippedLoadCommands;
 };
 
 // ── Mach-O image block (loaded when filetype is MH_EXECUTE or
@@ -4056,6 +4212,26 @@ public:
         return d_.backend != nullptr && d_.backend->isImageFlavor(d_);
     }
 
+    // ★ P69 (lane `xa`, fold 3f): whether an object this document describes can NAME a library its final link is
+    // asked to search (`UnitLinkerRequests::dependentLibraries`) -- ELF's dependent-libraries section
+    // (`elf.dependentLibraries`), a COFF vocabulary's `dependentLibrary` option, Mach-O's linker options
+    // (`macho.linkerOptions`). A document stating none takes no such request (the compile pipeline warns and drops
+    // it, `stateSourceLinkerRequests`).
+    [[nodiscard]] bool statesDependentLibraries() const noexcept {
+        if (d_.elf.dependentLibraries.has_value() || d_.macho.linkerOptions.has_value()) return true;
+        if (!d_.pe.linkerDirectives.has_value()) return false;
+        for (auto const& row : d_.pe.linkerDirectives->directives) {
+            if (row.meaning == LinkerDirectiveMeaning::DependentLibrary) return true;   // COFF's `/DEFAULTLIB:`
+        }
+        return false;
+    }
+    // Whether an object this document describes hands its linker OPTIONS a unit states as text (`#pragma
+    // comment(linker, ...)`): a COFF directive vocabulary (`pe.linkerDirectives`), Mach-O's linker options
+    // (`macho.linkerOptions`, P69 fold 3f).
+    [[nodiscard]] bool readsLinkerDirectives() const noexcept {
+        return d_.pe.linkerDirectives.has_value() || d_.macho.linkerOptions.has_value();
+    }
+
     // Do these RAW BYTES look like a relocatable object file THIS format
     // could have written? The public face of the backends'
     // `looksLikeRelocatableObject()`: a caller holding a file named as a
@@ -4249,8 +4425,19 @@ public:
         return d_.runtimeLibraries;
     }
 
+    // ★ P69 fold 3f (ledger 563 (A)): THE ONE DEFINITION OF A FLAVOUR FAMILY — the
+    // documents of one format kind AND one target arch (`targetArch`). A runtime role
+    // may be played by a different image on each arch of a kind (the program
+    // interpreter is ld-linux-x86-64.so.2 on x86_64 ELF and ld-linux-aarch64.so.1 on
+    // aarch64); within a family every flavour plays it alike. The build-time assembly
+    // below and the corpus guards (`RuntimeLibraryRoles`,
+    // `DescriptorLibraryRoleAgreement`) all read this one predicate, so the rule the
+    // guards pin and the rule a build enforces are about one population.
+    [[nodiscard]] bool inFlavourFamilyOf(ObjectFormatSchema const& member) const noexcept;
+
     // ── D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE ──
-    // The role table of the SHIPPED FLAVOURS OF THIS KIND — the half of a
+    // The role table of the SHIPPED FLAVOURS OF THIS FAMILY (`inFlavourFamilyOf`:
+    // one kind on one target arch) — the half of a
     // descriptor's `{"role": …}` answer this document does not declare itself,
     // this document standing in for its shipped namesake (a `loadFromText`
     // mutant of `…-exec` supersedes the shipped `…-exec`). Assembled by the same

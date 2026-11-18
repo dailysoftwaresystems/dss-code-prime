@@ -302,3 +302,12 @@ target_include_directories(dss_analysis_preprocess_test_math_h_float_constants
 # failure names the builtin and the pair. Reads the shipped config, so it runs through ctest.
 dss_add_test(NAME analysis/preprocess/test_library_builtin_answer_sweep
              SOURCES test_library_builtin_answer_sweep.cpp)
+
+# P69 fold 3f (lane `xa`) -- `#pragma comment(kind[, "text"])`, a request to the program's LINK, read as the C
+# document's `comment` row says: each kind that asks something recorded with its text in reach order, the operand
+# macro-expanded and its literals concatenated, a kind with no text silent, a form cl cannot read warned and
+# recorded as nothing, a dead branch's nothing; and the loader's refusal of a row that does not state its kinds.
+dss_add_test(NAME analysis/preprocess/test_pragma_comment
+             SOURCES test_pragma_comment.cpp)
+target_include_directories(dss_analysis_preprocess_test_pragma_comment
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)

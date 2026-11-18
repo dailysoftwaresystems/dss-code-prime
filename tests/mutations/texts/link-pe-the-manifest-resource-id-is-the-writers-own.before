@@ -1,0 +1,1 @@
+    oneEntryDirectory(manifest.resourceId, kResourceSubdirectory | static_cast<std::uint32_t>(languageDirectory));

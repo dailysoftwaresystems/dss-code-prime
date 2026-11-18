@@ -195,6 +195,7 @@ struct Descents {
     TypeId const ptr   = in.pointer(i64);
     TypeId const sig   = in.fnSig(std::vector<TypeId>{ptr}, voidT, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
     mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(sig, SymbolId{1});
     mb.beginBlock(mb.createBlock(StructCfMarker::EntryBlock));
@@ -448,6 +449,7 @@ TEST(StackedArgumentRealignment, ACarrierNoCallConsumesRealignsNothing) {
     TypeId const ptr = in.pointer(i64);
     TypeId const sig = in.fnSig(std::vector<TypeId>{ptr}, i64, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(sig, SymbolId{1});
     mb.beginBlock(mb.createBlock(StructCfMarker::EntryBlock));
@@ -777,10 +779,15 @@ TEST(StackedArgumentRealignment, ARealignedCallersLinkedImageDescribesItsFrameOf
             ASSERT_TRUE(code.has_value());
             ASSERT_LE(unwind->fileOff + unwind->size, image.size());
             DiagnosticReporter decodeRep;
+            // The image's own data model: an absptr field is one of its addresses (P69 fold 3f).
+            auto const imageFormat = ObjectFormatSchema::loadShipped(
+                std::string_view{arm.spec}.substr(arm.spec.find(':') + 1));
+            ASSERT_TRUE(imageFormat.has_value()) << arm.spec;
             auto const decoded = link::format::decodeEhFrame(
                 std::span<std::uint8_t const>(image).subspan(static_cast<std::size_t>(unwind->fileOff),
                                                              static_cast<std::size_t>(unwind->size)),
-                link::format::dwarfRegisterMappingOf(**target), "test::linked-image", decodeRep);
+                link::format::dwarfRegisterMappingOf(**target), (*imageFormat)->dataModel(), "test::linked-image",
+                decodeRep);
             ASSERT_TRUE(decoded.has_value()) << inventory(decodeRep);
             // The one function whose CFA leaves SP: the realigned caller (at release, `main` if it took it in).
             std::vector<link::format::DecodedFde const*> dynamic;

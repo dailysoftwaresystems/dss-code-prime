@@ -22,6 +22,7 @@
 #include "object_entry_support.hpp"
 
 #include "asm/asm.hpp"
+#include "core/types/entry_shape.hpp"
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
 
@@ -80,6 +81,23 @@ struct AsmCell {
         any = true;
     }
     return any;
+}
+
+// Darwin's four-parameter `main`. It never reads its fourth parameter: where the format realizes no four-value row,
+// nothing defines it.
+constexpr char const* kFourParameterMain =
+    "int main(int argc, char **argv, char **envp, char **apple) { (void)argv; (void)envp; (void)apple; "
+    "return argc; }\n";
+
+// Whether the family's executable format realizes the four-value entry row (Darwin's `apple` vector), by its document.
+[[nodiscard]] bool realizesTheFourthVector(Family const& f) {
+    std::string_view const spec{f.execTarget};
+    auto const format = ObjectFormatSchema::loadShipped(spec.substr(spec.find(':') + 1));
+    if (!format.has_value()) {
+        ADD_FAILURE() << "cannot load the shipped format of " << f.execTarget;
+        return false;
+    }
+    return (*format)->realizesEntryVerb(EntryMaterialization::ArgcArgvEnvpApple);
 }
 
 [[nodiscard]] std::size_t importsOf(fs::path const& image, char const* symbol) {
@@ -169,18 +187,45 @@ TEST(ObjectEntry, AnAssemblyUnitsEntryIsElectedWithTheObjects) {
 // REFUSED, on every format, a signature the language declares no row for, where gcc (-Wmain, a warning) and cl link
 // `int main(int, double)` and `void main(void)`. Every leg, every executable format: each links, entered with the
 // richest row its format realizes (a PE image's init reads the argument count, the vector and the environment), and
-// S_EntryShapeNotDeclared is said as a warning naming `main`. RED-ON-DISABLE: stamp no row on such a definition -> no
-// entry is elected and every build is refused K_ProgramEntryUndefined; make the diagnostic an error -> every build is
-// refused at the declarator.
+// S_EntryShapeNotDeclared is said as a warning naming `main`.
+// THE SHAPE DIMENSION (P69 fold 3f): Darwin's four-parameter `main` is a row the language declares and only Mach-O
+// realizes. ✔MEASURED (lane `xa`, 2026-11-16, probe-reference-cc; the program never reads its fourth parameter):
+// gcc 13.3.0 on Linux and MinGW-w64 gcc 13.2.0 compile it silent (-Wall and -Wpedantic warn -Wmain) and run it, argv
+// and the environment intact; cl 19.52 compiles it silent at /W4 and /Wall and runs it the same; clang 18.1.3 refuses
+// it ("too many parameters (4) for 'main'"). So on ELF and pe64 it is entered with the richest row the format realizes,
+// `argc-argv-envp`, and warned (it was refused K_ProgramEntryUndefined until fold 3e); on Mach-O it is its own row,
+// silent. program/test_entry_envp_run RUNS it on the host's own format.
+// RED-ON-DISABLE: stamp no row on such a definition -> no entry is elected and every build is refused
+// K_ProgramEntryUndefined (the four-parameter cell is stamped with its declared, unrealized row and refused the same);
+// make the diagnostic an error -> every build is refused at the declarator; judge the signature by every verb the
+// language declares -> the four-parameter cell on ELF and pe64 is stamped with the four-value row, silent, and refused
+// K_ProgramEntryUndefined.
 TEST(EntrySignature, AnEntryNameOfNoRealizedRowIsEnteredAndWarned) {
     test_support::ScratchDir scratch{test_support::Location::InsideRepo, "entry-signature-main"};
     std::size_t k = 0;
     for (auto const& family : execFamilies()) {
-        for (char const* source : {"int main(int argc, double d) { (void)argc; (void)d; return 11; }\n",
-                                   "void main(void) { }\n"}) {
-            SCOPED_TRACE(std::string{family.execTarget} + ": " + source);
+        // THE SHAPE DIMENSION: each signature, and whether this format realizes a row of it -- read from the format's
+        // own document, never from its name. A realized row is that row, silent; any other signature is entered with
+        // the richest row the format realizes, and warned.
+        bool const fourthVector = realizesTheFourthVector(family);
+        struct SignatureCell {
+            char const* source;
+            bool        warned;
+            char const* richest;   // the row the warning names it entered with; nullptr: not asserted
+        };
+        for (SignatureCell const shape :
+             {SignatureCell{"int main(int argc, double d) { (void)argc; (void)d; return 11; }\n", true, nullptr},
+              SignatureCell{"void main(void) { }\n", true, nullptr},
+              SignatureCell{kFourParameterMain, !fourthVector, "argc-argv-envp"}}) {
+            SCOPED_TRACE(std::string{family.execTarget} + ": " + shape.source);
             Built b;
-            entrySignatureCell(scratch.path() / std::to_string(k++), family, source, "main", true, b);
+            entrySignatureCell(scratch.path() / std::to_string(k++), family, shape.source, "main", shape.warned, b);
+            if (shape.warned && shape.richest != nullptr) {
+                EXPECT_NE(textOf(b.rep, DiagnosticCode::S_EntryShapeNotDeclared)
+                              .find("called with the richest of them, '" + std::string{shape.richest} + "'"),
+                          std::string::npos)
+                    << b.diagnostics;
+            }
             if (isPe(family) && !b.image.empty()) expectTheArgumentAccessorsImported(b.image);
         }
     }

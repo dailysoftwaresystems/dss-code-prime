@@ -9,6 +9,7 @@
 #include "core/types/header_case_diagnostic.hpp"   // reportHeaderCaseAmbiguity (the ONE fold-collision emit)
 #include "core/types/include_path_resolve.hpp"
 #include "core/types/integer_literal_ladder.hpp"  // preprocessorLiteralSignedness (the ONE phase-4 signedness rule the shipped-constant spelling is verified against)
+#include "core/types/char_decode.hpp"   // decodeStringLiteralBody: a `#pragma comment` literal's text (P69 fold 3f)
 #include "core/types/literal_close_token.hpp"   // D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN
 #include "core/types/number_decode.hpp"   // decodeFloatLiteralAtKind (a spliced float constant read back, P69 round 4)
 #include "core/types/type_spelling.hpp"   // spellCoreKind: a declared type named as the language spells it
@@ -1182,6 +1183,8 @@ void sbHandleEndif(std::vector<CondFrame>& stack, SourceSpan at,
 struct PragmaMatch {
     PragmaEffect effect = PragmaEffect::Unsupported;
     std::size_t  words  = 0;   // how many leading words the matched row consumed
+    // The matched row itself (P69 fold 3f: a `linkerComment` row's kinds are read from it).
+    PragmaEffectRow const* row = nullptr;
 };
 [[nodiscard]] inline std::optional<PragmaMatch>
 matchPragmaEffect(PreprocessConfig const&      cfg,
@@ -1195,7 +1198,7 @@ matchPragmaEffect(PreprocessConfig const&      cfg,
         }
         if (!ok) continue;
         if (!best.has_value() || row.prefix.size() > best->words) {
-            best = PragmaMatch{row.effect, row.prefix.size()};
+            best = PragmaMatch{row.effect, row.prefix.size(), &row};
         }
     }
     return best;
@@ -4120,6 +4123,13 @@ public:
                   // include tree, so `__has_include` and `#embed` search the
                   // listings the splice already read.
                   HeaderSearchCache& headerSearch,
+                  // P69 fold 3f (ledger 563 (A)): REQUIRED, like the two above -- the
+                  // active pair's TARGET name (the `when.arch` vocabulary), or none. A
+                  // shipped row may be available on ONE arch of a format, so the
+                  // `__has_builtin` question is asked of the corpus on the pair the
+                  // semantic tier's binder binds on; a construction that forgot it
+                  // would answer 0 for such a row where the call binds.
+                  std::optional<std::string_view> activeTarget,
                   std::span<fs::path const> includeDirs = {},
                   std::span<fs::path const> systemDirs = {},
                   std::optional<ObjectFormatKind> activeFormat = {},
@@ -4143,6 +4153,7 @@ public:
           prefixLen_(prefixLen), lineMap_(lineMap),
           includeDirs_(includeDirs), systemDirs_(systemDirs),
           activeFormat_(activeFormat),
+          activeTarget_(activeTarget),
           headerNameMatching_(headerNameMatching),
           headerSearch_(headerSearch),
           includingDir_(std::move(includingDir)),
@@ -4314,6 +4325,12 @@ public:
     [[nodiscard]] std::unordered_set<std::uint32_t> const&
     pragmaNoOptimizeByOffset() const noexcept {
         return noOptimizeByOffset_;
+    }
+
+    // P69 fold 3f (`linkerComment`): each reached `#pragma comment` that asks
+    // something of the link, in reach order. EMPTY for every TU that states none.
+    [[nodiscard]] std::vector<PragmaLinkRequest> const& pragmaLinkRequests() const noexcept {
+        return linkRequests_;
     }
 
     // TF-C82: a `#pragma pack(push, N)` never closed by a `pack(pop)` at end of
@@ -5090,6 +5107,10 @@ private:
                        DiagnosticSeverity::Warning);
                 return;
             }
+            case PragmaEffect::LinkerComment:
+                applyCommentPragma(std::span<Token const>{sig}.subspan(m->words), *m->row,
+                                   diagSpan);
+                return;
             case PragmaEffect::IncludeOnce:
                 // ★★★ D-PP-PRAGMA-RECOGNIZED-SEMANTICS — THIS ARM WAS THE DEFECT,
                 // AND IT IS NOW INERT BY CONSTRUCTION RATHER THAN BY OMISSION.
@@ -5347,6 +5368,103 @@ private:
         }
         bad("the state word is not one the language declares "
             "('pragmaOptimizeOnWord' / 'pragmaOptimizeOffWord')");
+    }
+
+    // ── P69 (lane `xa`, fold 3f): `#pragma comment(kind[, "text"])` ─────────────
+    //
+    // A REQUEST TO THE PROGRAM'S LINK, by kind. The row
+    // (`PragmaEffect::LinkerComment`) states each kind it reads and what that
+    // kind asks (`PragmaCommentRequest`); a kind that asks something, stated with
+    // its text, is RECORDED in reach order (`pragmaLinkRequests`). What it becomes
+    // is the active object format's data -- the compile pipeline's question,
+    // never this function's. ✔MEASURED (P69 fold 3f; cl 19.52, clang 18.1.3 on
+    // its msvc and ELF targets, gcc 13.3):
+    //   * the operand is MACRO-EXPANDED, the kind and the text alike (`#define K
+    //     lib` / `comment(K, "user32")`), adjacent string literals concatenate,
+    //     and the kind is case-sensitive;
+    //   * a kind stated with no text asks nothing: cl writes nothing and says
+    //     nothing;
+    //   * a form cl cannot read -- no parenthesized operand, a kind no row lists,
+    //     an operand that is not `kind` or `kind, string-literals`, a PREFIXED
+    //     literal -- writes nothing anywhere: cl warns (C4081, C4109; C2002
+    //     refuses a wide literal), clang refuses each form, gcc ignores every
+    //     one. It is accepted here and WARNED: the union's acceptance, cl's
+    //     diagnostic.
+    // AGNOSTIC: the delimiters are matched by SCHEMA KIND (`parenOpen_`,
+    // `parenClose_`, `argSep_`); a literal by its shape -- an opener, a body
+    // whose kind the schema says a coalesced literal emits, and that body's
+    // closer (`closeTokenForCoalescedBody`) -- and the unprefixed one by the
+    // language's quote opener (`quoteIncludeKind_`, as `#pragma optimize` reads
+    // its option string). The kinds' names are the row's.
+    void applyCommentPragma(std::span<Token const> args, PragmaEffectRow const& row,
+                            SourceSpan diagSpan) {
+        std::string spelled;
+        for (auto const& w : row.prefix) spelled += (spelled.empty() ? "" : " ") + w;
+        auto const ignored = [&](std::string_view why) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorPragma, synth_->id(), diagSpan,
+                   std::format("'#pragma {}' ignored: {} -- nothing is asked of the "
+                               "link (cl warns and writes nothing; clang refuses the "
+                               "form; gcc ignores every one)",
+                               spelled, why),
+                   DiagnosticSeverity::Warning);
+        };
+        std::vector<Token> sig;
+        for (Token const& t : expandRun(std::vector<Token>(args.begin(), args.end()))) {
+            if (isTrivia(t) || isNewline(t) || t.coreKind == CoreTokenKind::Eof) continue;
+            sig.push_back(t);
+        }
+        auto const isKind = [](Token const& t, SchemaTokenId k) {
+            return k.valid() && t.schemaKind == k;
+        };
+        if (sig.size() < 3 || !isKind(sig.front(), parenOpen_)
+            || !isKind(sig.back(), parenClose_)) {
+            ignored("its operand is not a parenthesized kind");
+            return;
+        }
+        std::span<Token const> const inner =
+            std::span<Token const>{sig}.subspan(1, sig.size() - 2);
+        std::string_view const kind = text(inner.front());
+        auto const named = std::ranges::find(row.commentKinds, kind, &PragmaCommentKind::name);
+        if (named == row.commentKinds.end()) {
+            ignored(std::format("'{}' is not a kind it reads", kind));
+            return;
+        }
+        if (inner.size() == 1) return;   // a kind with no text asks nothing (cl says nothing)
+        if (inner.size() < 3 || !isKind(inner[1], argSep_)) {
+            ignored(std::format("the kind '{}' is followed by something other than a "
+                                "separator and a string literal",
+                                kind));
+            return;
+        }
+        // The text: adjacent string literals -- each its opener, its body and its
+        // closer -- concatenated, every escape decoded.
+        std::string textOf;
+        for (std::size_t p = 2; p < inner.size(); p += 3) {
+            SchemaTokenId const closer =
+                p + 2 < inner.size()
+                    ? closeTokenForCoalescedBody(*schema_, inner[p + 1].schemaKind)
+                    : SchemaTokenId{};
+            if (!closer.valid() || inner[p + 2].schemaKind != closer) {
+                ignored(std::format("the text of '{}' is not one or more adjacent "
+                                    "string literals",
+                                    kind));
+                return;
+            }
+            if (!isKind(inner[p], quoteIncludeKind_)) {
+                ignored(std::format("the text of '{}' is a prefixed string literal "
+                                    "('{}'), which names no library or directive",
+                                    kind, text(inner[p])));
+                return;
+            }
+            auto const decoded = decodeStringLiteralBody(text(inner[p + 1]));
+            if (!decoded.has_value()) {
+                ignored(std::format("the text of '{}' holds a malformed escape", kind));
+                return;
+            }
+            textOf += *decoded;
+        }
+        if (named->request == PragmaCommentRequest::Nothing) return;
+        linkRequests_.push_back(PragmaLinkRequest{named->request, std::move(textOf)});
     }
 
     // TF-C85: stamp the `#pragma optimize` state onto an EMITTED token, at the
@@ -5879,10 +5997,13 @@ private:
     // The token-text accessor + the macro-state callbacks the shared `sbHandle*`
     // free functions need, bound to THIS expander's buffer + macro table. A
     // `Token` is a 16B POD that does not carry its text, so `textOf` slices it.
-    [[nodiscard]] std::function<std::string_view(Token const&)> textOfCb() {
+    // The two that only READ (a token's text, a macro's definedness) are `const`,
+    // so a call handed all three asks ONE member that may write: C++ leaves the
+    // order of a call's arguments unspecified, and it decides nothing here.
+    [[nodiscard]] std::function<std::string_view(Token const&)> textOfCb() const {
         return [this](Token const& t) { return text(t); };
     }
-    [[nodiscard]] std::function<bool(std::string_view)> isDefinedCb() {
+    [[nodiscard]] std::function<bool(std::string_view)> isDefinedCb() const {
         return [this](std::string_view n) { return isDefined(n); };
     }
     [[nodiscard]] std::function<bool(std::vector<Token> const&, std::size_t,
@@ -5954,10 +6075,13 @@ private:
         // reads the realization oracle's own rows, so the operator answers 1 exactly where
         // the semantic tier's binder binds the call. No active format: unset, so 0 — the
         // binder provides no library function without one either.
+        // P69 fold 3f (ledger 563 (A)): asked on the active PAIR -- the format and the
+        // target's arch -- since a row may be available on one arch of a format, and the
+        // binder reads the corpus on the pair.
         if (activeFormat_.has_value()) {
             cb.platform.libraryFunctionProvided =
-                [fmt = *activeFormat_](std::string_view lib) {
-                    return ffi::shippedLibraryFunctionProvidedOnFormat(lib, fmt)
+                [fmt = *activeFormat_, arch = activeTarget_](std::string_view lib) {
+                    return ffi::shippedLibraryFunctionProvidedOnFormat(lib, fmt, arch)
                         .value_or(false);
                 };
         }
@@ -6138,7 +6262,10 @@ private:
     // CALLERS: `expandTokens` (a `#if`/`#elif` controlling expression, which
     // wraps it in the `defined` barrier) and `handleLine` (C23 6.10.6p6, whose
     // operand must NOT get that barrier — a `#line` operand token spelled
-    // `defined` is an ordinary identifier there). The barrier is therefore the
+    // `defined` is an ordinary identifier there). (A pragma's operand is not
+    // expanded (C 6.10.6p1) except where a row reads one that every reference
+    // expands: `#pragma comment`'s, `applyCommentPragma`, P69 fold 3f -- no
+    // barrier either.) The barrier is therefore the
     // ONLY difference between the two, and it lives in the caller that needs it
     // rather than being re-decided inside a second expansion path. A private
     // expander for one directive is the duplicated-truth-table shape this
@@ -9917,6 +10044,9 @@ private:
     std::span<fs::path const>            includeDirs_;
     std::span<fs::path const>            systemDirs_;
     std::optional<ObjectFormatKind>      activeFormat_;
+    // P69 fold 3f: the active pair's target name, when known (the constructor's
+    // `activeTarget`) -- what `__has_builtin`'s corpus question is asked on beside the format.
+    std::optional<std::string_view>      activeTarget_;
     // D-PP-HEADER-CASE-INSENSITIVE-PE: the active format's header-NAME case
     // rule, applied by every include search the AUTHORITATIVE pass performs.
     HeaderNameMatching                   headerNameMatching_;
@@ -10027,6 +10157,12 @@ private:
     // the only place that can see the conflict. It is silent DELIBERATELY: there
     // is no wrong artifact to warn about.
     std::unordered_set<std::uint32_t> noOptimizeByOffset_;
+
+    // ── P69 fold 3f: the `#pragma comment` product (the `linkerComment` verb) ──
+    // Each reached pragma that asks something of the link, in reach order --
+    // `applyCommentPragma` runs once per REACHED pragma, in this authoritative
+    // pass alone. EMPTY for a TU that states none.
+    std::vector<PragmaLinkRequest> linkRequests_;
 };
 
 } // namespace
@@ -10628,9 +10764,10 @@ PreprocessResult preprocessRun(
     //     user; the authoritative pass re-walks the same bytes and is the sole
     //     reporter. Every façade entry point rolls this reporter back, so it also
     //     cannot grow with the TU.
-    //   • The SAME `merged.effective`, includeDirs, systemDirs, activeFormat and
-    //     header-name matching the authoritative expander gets, so `__has_include`
-    //     and predefined definedness answer identically in both.
+    //   • The SAME `merged.effective`, includeDirs, systemDirs, activeFormat, the
+    //     pair's arch (P69 fold 3f) and header-name matching the authoritative
+    //     expander gets, so `__has_include`, `__has_builtin` and predefined
+    //     definedness answer identically in both.
     //
     // ⚠ IT IS NOT `run()`. Nothing walks a token stream through it — it is driven
     // one directive at a time by `SynthBuilder`, so it never records a `#pragma
@@ -10676,6 +10813,15 @@ PreprocessResult preprocessRun(
             }
         }
     }
+    // The pair's target name, the `when.arch` fact — the SAME name the typedef
+    // read in `shippedTypedefsForPredefines` selects by. No pair ⇒ no arch, so an
+    // arch-keyed arm then matches nothing, exactly as a format-keyed one does
+    // without a format. Read ONCE, here (P69 fold 3f): the splice below selects
+    // by it, and both expanders ask `__has_builtin`'s corpus question on it.
+    std::optional<std::string_view> const activeTarget =
+        typeFacts != nullptr && !typeFacts->targetName.empty()
+            ? std::optional<std::string_view>{typeFacts->targetName}
+            : std::optional<std::string_view>{};
     DiagnosticReporter preScanScratch{budget.asConfig()};
     auto preScanOracleBuffer = SourceBuffer::fromString(
         std::string{}, "<pp-prescan-oracle>");
@@ -10686,6 +10832,7 @@ PreprocessResult preprocessRun(
                                 /*lineMap=*/nullptr,
                                 headerNameMatching,
                                 headerSearch,
+                                activeTarget,
                                 includeDirs,
                                 systemDirs,
                                 activeFormat,
@@ -10731,14 +10878,6 @@ PreprocessResult preprocessRun(
         // `when: { "longDoubleFormat": … }` arm is selected by.
         typeFacts != nullptr ? std::optional<LongDoubleFormat>{typeFacts->longDoubleFormat}
                              : std::optional<LongDoubleFormat>{}};
-    // The pair's target name, the `when.arch` fact — the SAME name the typedef
-    // read in `shippedTypedefsForPredefines` selects by. No pair ⇒ no arch, so an
-    // arch-keyed arm then matches nothing, exactly as a format-keyed one does
-    // without a format.
-    std::optional<std::string_view> const activeTarget =
-        typeFacts != nullptr && !typeFacts->targetName.empty()
-            ? std::optional<std::string_view>{typeFacts->targetName}
-            : std::optional<std::string_view>{};
     SynthBuilder builder{schema, includeDirs, systemDirs, activeFormat,
                          activeTarget, headerNameMatching, headerSearch,
                          *result.diagnostics, 0, includeStack, includeOnce,
@@ -10812,6 +10951,8 @@ PreprocessResult preprocessRun(
     MacroExpander expander{prefixBuffer,  schema,      *result.diagnostics,
                            prefixLen,     &result.lineMap,
                            headerNameMatching, headerSearch,
+                           // P69 fold 3f: the pair's arch, for `__has_builtin`.
+                           activeTarget,
                            includeDirs,   systemDirs,   activeFormat,
                            // The SHARED derivation — see
                            // `includingDirectoryOf`. `__has_include("h")` must
@@ -10843,6 +10984,8 @@ PreprocessResult preprocessRun(
     // specifier's first token. Empty for every TU that uses no `#pragma pack`.
     result.pragmaPackByOffset = expander.pragmaPackByOffset();
     result.pragmaNoOptimizeByOffset = expander.pragmaNoOptimizeByOffset();
+    // P69 fold 3f: what the TU's `#pragma comment`s ask of its link, in reach order.
+    result.pragmaLinkRequests = expander.pragmaLinkRequests();
 
     // A byte offset is in an AUTHORITATIVE dead conditional region (`#if 0 …
     // #endif`) iff it falls in one of `expander.deadRanges()`. Those ranges are in

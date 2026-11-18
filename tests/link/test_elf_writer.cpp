@@ -671,6 +671,7 @@ TEST(ElfWriter, GotExternAddrValueEmitsAdrGotPageAndLd64GotLo12OnAarch64) {
     SymbolId const kCaller{10};
     SymbolId const kExtern{20};
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.addFunction(sig, kCaller);
     MirBlockId const bb = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(bb);

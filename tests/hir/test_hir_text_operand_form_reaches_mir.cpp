@@ -62,7 +62,7 @@ constexpr std::string_view kResolvedToNothingPrefix =
                                            DiagnosticReporter& reporter) {
     return lowerToMir(parsed.hir, parsed.literalPool,
                       parsed.interner, reporter,
-                      &parsed.sourceMap, MirLoweringConfig{},
+                      &parsed.sourceMap, MirLoweringConfig{.dataModel = DataModel::Lp64},
                       /*ffiMap=*/nullptr, /*linkageMap=*/nullptr,
                       /*mutabilityMap=*/nullptr, /*volatileMap=*/nullptr,
                       /*alignmentMap=*/nullptr, /*threadLocalMap=*/nullptr,

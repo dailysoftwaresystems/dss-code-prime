@@ -37,6 +37,7 @@
 #include "link/format/pe.hpp"
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
+#include "program/compile_pipeline.hpp"   // pullStaticArchiveMembers, linkAndWriteStaticArchive -- the fallback's pull
 #include "program/program.hpp"
 #include "format_reject_support.hpp"   // countAtPath / countWithMessage / rejectSummary
 #include "repo_root.hpp"               // findConfigRoot — the shipped documents the refusals mutate
@@ -201,11 +202,16 @@ TEST(CoffLinkerDirectives, TheReferencesOwnDirectiveTextsAreRead) {
     ASSERT_TRUE(msvc.has_value()) << msvc.error();
     EXPECT_TRUE(msvc->hidden.empty());
     EXPECT_EQ(exportedNamesOf(*msvc), std::vector<std::string>{"lib_export"});
+    // P69 fold 3f: each library a library to search, unquoted, in order -- and not handed on as well (a relocatable
+    // writer restates it from the field).
+    EXPECT_EQ(msvc->dependentLibraries, (std::vector<std::string>{"MSVCRT", "OLDNAMES"}));
+    EXPECT_EQ(msvc->handOn, std::vector<std::string>{"/EXPORT:lib_export"});
     // clang-cl 19: unquoted, `.lib` spelled, no leading pad.
     auto const clangCl = pe::parseCoffLinkerDirectives(
         " /DEFAULTLIB:msvcrt.lib /DEFAULTLIB:oldnames.lib /EXPORT:lib_export", v);
     ASSERT_TRUE(clangCl.has_value()) << clangCl.error();
     EXPECT_EQ(exportedNamesOf(*clangCl), std::vector<std::string>{"lib_export"});
+    EXPECT_EQ(clangCl->dependentLibraries, (std::vector<std::string>{"msvcrt.lib", "oldnames.lib"}));
     // clang --target=x86_64-w64-windows-gnu: the hide directive, a list, any case, a BOM, NUL padding, a quote.
     static constexpr char kGnuText[] =
         "\xEF\xBB\xBF -exclude-symbols:helper -EXCLUDE-SYMBOLS:a,b /exclude-symbols:\"q\"\0\0";
@@ -249,8 +255,9 @@ TEST(CoffLinkerDirectives, TheReferencesOwnDirectiveTextsAreRead) {
     EXPECT_EQ(pragmas->included, (std::vector<std::string>{"_tls_used", "dss_tls_cb"}));
     EXPECT_EQ(pragmas->alternates, (std::vector<pe::CoffAlternateName>{{"alt_sym", "alt_default"}}));
     EXPECT_EQ(exportedNamesOf(*pragmas), std::vector<std::string>{"exp_sym"});
-    // Round 4: the image requests among them, in directive order (`/merge:` and `/manifestdependency:` are the two a
-    // DSS image refuses, as the link that makes one will).
+    EXPECT_EQ(pragmas->dependentLibraries, std::vector<std::string>{"user32"});
+    // Round 4: the image requests among them, in directive order (`/merge:` is the one a DSS image refuses, as the
+    // link that makes one will; `/manifestdependency:` it embeds in its manifest, P69 fold 3f).
     EXPECT_EQ(pragmas->image.size(), 9u) << "manifestdependency, subsystem, merge, section, stack, heap, "
                                             "failifmismatch, release, entry";
     EXPECT_TRUE(pragmas->warnings.empty()) << "every option the probe named is in the vocabulary";
@@ -269,7 +276,9 @@ TEST(CoffLinkerDirectives, TheReferencesOwnDirectiveTextsAreRead) {
 // option, is a red here before it is a silently dropped request anywhere. P69 round 4: the five options link.exe
 // and lld-link honour that a round-3 DSS link dropped (stack, subsystem, entry, section, and export in an EXE)
 // have their meanings, and so does every other option link.exe takes in a directive (✔MEASURED 2026-10-07); the
-// two a DSS image cannot carry are `refused`, naming their row.
+// one a DSS image cannot carry is `refused`, naming its row. P69 fold 3f: `manifestdependency` has its meaning, the
+// manifest the image embeds; `defaultlib` is a library to search (`dependentLibrary`), whose reason says why an image
+// link ignores it.
 TEST(CoffLinkerDirectives, TheShippedVocabularyGivesEveryOptionAMeaningOrAReason) {
     auto const& v = shippedVocabulary();
     std::size_t ignored = 0;
@@ -279,16 +288,18 @@ TEST(CoffLinkerDirectives, TheShippedVocabularyGivesEveryOptionAMeaningOrAReason
         if (row.meaning == LinkerDirectiveMeaning::Ignored || row.meaning == LinkerDirectiveMeaning::Refused) {
             (row.meaning == LinkerDirectiveMeaning::Ignored ? ignored : refused) += 1;
             EXPECT_FALSE(row.reason.empty()) << "an ignored or refused option states the reason that is right";
+        } else if (row.meaning == LinkerDirectiveMeaning::DependentLibrary) {
+            EXPECT_FALSE(row.reason.empty()) << "a library option states why an image link ignores it";
         } else {
-            EXPECT_TRUE(row.reason.empty()) << "a reason belongs to an ignored or refused row only";
+            EXPECT_TRUE(row.reason.empty()) << "a reason belongs to an ignored, refused or library row only";
         }
         if (row.meaning == LinkerDirectiveMeaning::Refused) {
             EXPECT_NE(row.reason.find("D-LK-PE-IMAGE-CANNOT-HONOUR-EVERY-LINKER-DIRECTIVE"), std::string::npos)
                 << "a refused option names the row that carries the work: " << row.reason;
         }
     }
-    EXPECT_EQ(ignored, 9u);
-    EXPECT_EQ(refused, 2u);
+    EXPECT_EQ(ignored, 8u);
+    EXPECT_EQ(refused, 1u);
     auto const optionFor = [&](LinkerDirectiveMeaning m) {
         std::vector<std::string> out;
         for (auto const& row : v.directives) {
@@ -312,7 +323,9 @@ TEST(CoffLinkerDirectives, TheShippedVocabularyGivesEveryOptionAMeaningOrAReason
     EXPECT_EQ(optionFor(LinkerDirectiveMeaning::SectionAlignment), std::vector<std::string>{"align"});
     EXPECT_EQ(optionFor(LinkerDirectiveMeaning::MismatchCheck), std::vector<std::string>{"failifmismatch"});
     EXPECT_EQ(optionFor(LinkerDirectiveMeaning::DllImage), std::vector<std::string>{"dll"});
-    EXPECT_EQ(optionFor(LinkerDirectiveMeaning::Refused), (std::vector<std::string>{"manifestdependency", "merge"}));
+    EXPECT_EQ(optionFor(LinkerDirectiveMeaning::ManifestDependency), std::vector<std::string>{"manifestdependency"});
+    EXPECT_EQ(optionFor(LinkerDirectiveMeaning::DependentLibrary), std::vector<std::string>{"defaultlib"});
+    EXPECT_EQ(optionFor(LinkerDirectiveMeaning::Refused), std::vector<std::string>{"merge"});
 }
 
 // P69 round 4 (MINOR 3): an option NO reference honours in a directive is WARNED and dropped, as link.exe does
@@ -642,6 +655,76 @@ TEST(CoffLinkerDirectives, AModuleWithNoHiddenDefinitionWritesNoDirectiveSection
     EXPECT_FALSE(sectionNamed(obj, ".drectve").has_value()) << "every other object is byte-identical";
 }
 
+// P69 fold 3f: a library the unit asks its final link to search is written as the writer states every directive --
+// the vocabulary's first prefix and the option it declares for the meaning (`-defaultlib`, which the reader takes
+// as cl's `/DEFAULTLIB`) -- with the name QUOTED as cl quotes it (✔MEASURED P69 fold 3f, run
+// 20261117-143416-a9be43b7: cl quotes every library, one holding a space included), a path's trailing backslash
+// doubled before the closing quote; and read back as a library to search, ONCE however often the object's directives
+// name it (a repeated library is searched once): the second name is patched over, in place, to the first's.
+TEST(CoffLinkerDirectives, TheWriterQuotesEachLibraryAndTheReaderReadsEachOnce) {
+    auto const l = loadPe("pe64-x86_64-windows");
+    ASSERT_TRUE(l.target && l.format);
+    AssembledModule m = hiddenHelperModule(SymbolVisibility::Default, false);
+    m.linkerRequests.dependentLibraries = {"dss one", "dss_two", "C:\\dss libs\\"};
+    DiagnosticReporter rep;
+    auto const obj = pe::encode(m, *l.target, *l.format, rep);
+    ASSERT_FALSE(obj.empty()) << diagnosticsOf(rep);
+    auto const d = sectionNamed(obj, ".drectve");
+    ASSERT_TRUE(d.has_value()) << "the object names no library";
+    std::string const text(obj.begin() + d->raw, obj.begin() + d->raw + d->size);
+    EXPECT_NE(text.find("-defaultlib:\"dss one\""), std::string::npos) << "a library is written unquoted: " << text;
+    EXPECT_NE(text.find("-defaultlib:\"dss_two\""), std::string::npos) << "a library is written unquoted: " << text;
+    EXPECT_NE(text.find("-defaultlib:\"C:\\dss libs\\\\\""), std::string::npos)
+        << "a library is written unquoted: " << text;
+    {
+        DiagnosticReporter readRep;
+        auto const read = pe::readRelocatableObject(obj, *l.target, *l.format, readRep);
+        ASSERT_TRUE(read.has_value()) << diagnosticsOf(readRep);
+        EXPECT_EQ(read->linkerRequests.dependentLibraries, m.linkerRequests.dependentLibraries);
+        EXPECT_TRUE(read->linkerRequests.handOn.empty()) << "a library is restated from its field, not handed on";
+    }
+    std::size_t const two = text.find("dss_two");
+    ASSERT_NE(two, std::string::npos);
+    auto patched = obj;
+    std::string_view const one = "dss one";
+    std::copy(one.begin(), one.end(), patched.begin() + d->raw + two);
+    DiagnosticReporter readRep;
+    auto const read = pe::readRelocatableObject(patched, *l.target, *l.format, readRep);
+    ASSERT_TRUE(read.has_value()) << diagnosticsOf(readRep);
+    EXPECT_EQ(read->linkerRequests.dependentLibraries, (std::vector<std::string>{"dss one", "C:\\dss libs\\"}))
+        << "a library the object names twice is read twice, where it is searched once";
+}
+
+// P69 fold 3f: a unit's own linker options are applied to its module before it is written
+// (`pe::applyUnitLinkerDirectives`, which the compile pipeline calls); one the writer still finds was applied by no
+// vocabulary, and the writer refuses the module by name rather than write an object without it. CONTROL: applied,
+// the same option is handed on.
+TEST(CoffLinkerDirectives, TheWriterRefusesAUnitOptionNoVocabularyApplied) {
+    auto const l = loadPe("pe64-x86_64-windows");
+    ASSERT_TRUE(l.target && l.format);
+    AssembledModule m = hiddenHelperModule(SymbolVisibility::Default, false);
+    m.linkerRequests.linkerOptions = {{"/STACK:0x200000"}};
+    {
+        DiagnosticReporter rep;
+        EXPECT_TRUE(pe::encode(m, *l.target, *l.format, rep).empty());
+        bool named = false;
+        for (auto const& d : rep.all()) {
+            named = named || (d.code == DiagnosticCode::K_NoMatchingObjectFormat
+                              && d.actual.find("/STACK:0x200000") != std::string::npos);
+        }
+        EXPECT_TRUE(named) << "the unapplied option is not named" << diagnosticsOf(rep);
+    }
+    DiagnosticReporter rep;
+    ASSERT_TRUE(pe::applyUnitLinkerDirectives(m, *l.format, rep)) << diagnosticsOf(rep);
+    EXPECT_TRUE(m.linkerRequests.linkerOptions.empty());
+    auto const obj = pe::encode(m, *l.target, *l.format, rep);
+    ASSERT_FALSE(obj.empty()) << diagnosticsOf(rep);
+    auto const d = sectionNamed(obj, ".drectve");
+    ASSERT_TRUE(d.has_value());
+    std::string const text(obj.begin() + d->raw, obj.begin() + d->raw + d->size);
+    EXPECT_NE(text.find("/STACK:0x200000"), std::string::npos) << text;
+}
+
 // P69 round 4: what the reader no longer refuses, and why. An option no reference honours is the LINK's to warn
 // about (MINOR 3: link.exe LNK4229, GNU ld "unrecognized"); a hide or an export naming a symbol this object does not
 // define is LINK-WIDE (✔MEASURED 2026-10-07: link.exe and lld-link export a name another object defines, lld-link
@@ -825,7 +908,8 @@ TEST(CoffLinkerDirectives, ADssDllLinkingAMemberWithAHiddenHelperExportsTheEntry
 // A cl object's own requests, honoured by a DSS link (✔MEASURED 2026-10-06 that link.exe honours each, run
 // 20261006-222410-df088936): `/alternatename:member_hook=member_hook_default` answers a reference nothing else
 // defines (exit 42) and yields to a definition the program makes (exit 43); `/INCLUDE:member_kept` names a function
-// the object defines; and the object's `/DEFAULTLIB:` options are read and dropped, each for its stated reason.
+// the object defines; and the object's `/DEFAULTLIB:` options are read as libraries to search, which a link that
+// makes an image ignores for the row's stated reason.
 TEST(CoffLinkerDirectivesNative, ADssLinkHonoursAClObjectsAlternateNameAndInclude) {
     test_support::ScratchDir scratch{test_support::Location::InsideRepo, "coff-directives-cl"};
     auto const dir = scratch.path();
@@ -955,15 +1039,20 @@ TEST(CoffLinkerDirectives, TheLoaderRefusesEveryMalformedOrMisplacedVocabulary) 
              d["pe"]["linkerDirectives"]["directives"][0]["reason"]  = "the hide option dropped on purpose";
          },
          "/pe/linkerDirectives/directives", "declares no 'hideSymbols' option"},
+        // Row 6 is `nodefaultlib` (`ignored`); row 5 `defaultlib` is a library to search (P69 fold 3f).
         {"an ignored option that states no reason", "pe64-x86_64-windows",
+         [](nlohmann::json& d) { d["pe"]["linkerDirectives"]["directives"][6].erase("reason"); },
+         "/pe/linkerDirectives/directives/6/reason", "is 'ignored' and states no 'reason'"},
+        {"a library option that states no reason", "pe64-x86_64-windows",
          [](nlohmann::json& d) { d["pe"]["linkerDirectives"]["directives"][5].erase("reason"); },
-         "/pe/linkerDirectives/directives/5/reason", "is 'ignored' and states no 'reason'"},
+         "/pe/linkerDirectives/directives/5/reason", "is 'dependentLibrary' and states no 'reason'"},
         {"an applied option that states a reason", "pe64-x86_64-windows",
          [](nlohmann::json& d) { d["pe"]["linkerDirectives"]["directives"][2]["reason"] = "stale"; },
-         "/pe/linkerDirectives/directives/2/reason", "a 'reason' only an 'ignored' or 'refused' row states"},
+         "/pe/linkerDirectives/directives/2/reason",
+         "a 'reason' only an 'ignored', 'refused' or 'dependentLibrary' row states"},
         {"an empty reason", "pe64-x86_64-windows",
-         [](nlohmann::json& d) { d["pe"]["linkerDirectives"]["directives"][5]["reason"] = ""; },
-         "/pe/linkerDirectives/directives/5/reason", "'reason' must be a non-empty string"},
+         [](nlohmann::json& d) { d["pe"]["linkerDirectives"]["directives"][6]["reason"] = ""; },
+         "/pe/linkerDirectives/directives/6/reason", "'reason' must be a non-empty string"},
         // P69 round 4: the per-meaning tables, each read on its own meaning's row alone.
         {"a refused option that states no reason", "pe64-x86_64-windows",
          [](nlohmann::json& d) { d["pe"]["linkerDirectives"]["directives"][13].erase("reason"); },
@@ -982,6 +1071,37 @@ TEST(CoffLinkerDirectives, TheLoaderRefusesEveryMalformedOrMisplacedVocabulary) 
              d["pe"]["linkerDirectives"]["directives"][10]["subsystems"] = nlohmann::json{{"console", 3}};
          },
          "/pe/linkerDirectives/directives/10/subsystems", "belongs to a 'subsystem' row"},
+        // P69 fold 3f (lane `xa`): each subsystem names the C runtime startups it starts a program at, each a
+        // `runtimeStartups` row, every name of `subsystems` once.
+        {"a subsystem row with no subsystem startups", "pe64-x86_64-windows",
+         [](nlohmann::json& d) { d["pe"]["linkerDirectives"]["directives"][9].erase("subsystemStartups"); },
+         "/pe/linkerDirectives/directives/9/subsystemStartups", "names no 'subsystemStartups'"},
+        {"subsystem startups on another row", "pe64-x86_64-windows",
+         [](nlohmann::json& d) {
+             d["pe"]["linkerDirectives"]["directives"][12]["subsystemStartups"] =
+                 nlohmann::json{{"console", nlohmann::json::array({"mainCRTStartup"})}};
+         },
+         "/pe/linkerDirectives/directives/12/subsystemStartups", "belongs to a 'subsystem' row"},
+        {"a subsystem naming no startup", "pe64-x86_64-windows",
+         [](nlohmann::json& d) {
+             d["pe"]["linkerDirectives"]["directives"][9]["subsystemStartups"]["windows"] = nlohmann::json::array();
+         },
+         "/pe/linkerDirectives/directives/9/subsystemStartups/windows", "a non-empty array of distinct"},
+        {"a subsystem whose startups are unstated", "pe64-x86_64-windows",
+         [](nlohmann::json& d) { d["pe"]["linkerDirectives"]["directives"][9]["subsystemStartups"].erase("windows"); },
+         "/pe/linkerDirectives/directives/9/subsystemStartups", "the subsystem 'windows' states its startups 0 times"},
+        {"startups of a subsystem the table lacks", "pe64-x86_64-windows",
+         [](nlohmann::json& d) {
+             d["pe"]["linkerDirectives"]["directives"][9]["subsystemStartups"]["posix"] =
+                 nlohmann::json::array({"mainCRTStartup"});
+         },
+         "/pe/linkerDirectives/directives/9/subsystemStartups/posix", "is no name of 'subsystems'"},
+        {"a subsystem startup no runtime startup row lists", "pe64-x86_64-windows",
+         [](nlohmann::json& d) {
+             d["pe"]["linkerDirectives"]["directives"][9]["subsystemStartups"]["windows"] =
+                 nlohmann::json::array({"WinMainCRTStartup", "DssUnlistedCRTStartup"});
+         },
+         "/pe/linkerDirectives/directives/9/subsystemStartups/windows/1", "is no 'runtimeStartups' row"},
         {"an entry row with no runtime startups", "pe64-x86_64-windows",
          [](nlohmann::json& d) { d["pe"]["linkerDirectives"]["directives"][12].erase("runtimeStartups"); },
          "/pe/linkerDirectives/directives/12/runtimeStartups", "names no 'runtimeStartups'"},
@@ -990,6 +1110,14 @@ TEST(CoffLinkerDirectives, TheLoaderRefusesEveryMalformedOrMisplacedVocabulary) 
              d["pe"]["linkerDirectives"]["directives"][12]["unsupportedStartups"]["WinMainCRTStartup"] = "";
          },
          "/pe/linkerDirectives/directives/12/unsupportedStartups/WinMainCRTStartup", "a non-empty reason"},
+        // P69 fold 3f (lane `xa`): a startup is provided or refused, never both.
+        {"a startup both provided and refused", "pe64-x86_64-windows",
+         [](nlohmann::json& d) {
+             d["pe"]["linkerDirectives"]["directives"][12]["unsupportedStartups"]["wmainCRTStartup"] =
+                 "a reason";
+         },
+         "/pe/linkerDirectives/directives/12/unsupportedStartups/wmainCRTStartup",
+         "is also a 'runtimeStartups' row"},
         // P69 fold 3e (class C's N5): each runtime startup states the verbs it calls an entry with, which a stated
         // startup restricts the program's entry election to -- a list of names states none.
         {"runtime startups listed without their verbs", "pe64-x86_64-windows",
@@ -1016,7 +1144,7 @@ TEST(CoffLinkerDirectives, TheLoaderRefusesEveryMalformedOrMisplacedVocabulary) 
          "/pe/linkerDirectives/directives/1/runtimeSymbols", "belongs to a 'includeSymbol' row"},
         // P69 send-back 5 (review-xa4 MINOR 6): the two answers a row states about a request one link decides
         // across its units — required there, refused anywhere else, each a closed set. Row 10 is `stack` (`first`,
-        // `ignored` with its reason), row 20 `version` (`last`, `honoured`), row 5 `defaultlib` (`ignored`).
+        // `ignored` with its reason), row 20 `version` (`last`, `honoured`), row 5 `defaultlib` (`dependentLibrary`).
         {"a setting row that states no precedence", "pe64-x86_64-windows",
          [](nlohmann::json& d) { d["pe"]["linkerDirectives"]["directives"][10].erase("unitPrecedence"); },
          "/pe/linkerDirectives/directives/10/unitPrecedence", "states no 'unitPrecedence'"},
@@ -1392,6 +1520,68 @@ TEST(CoffLinkerDirectivesLink, AWeakExternalOfTheAbsoluteZeroStandsOverAnotherUn
     std::string const said = diagnosticsOf(l->rep);
     EXPECT_NE(said.find("nothing (the absolute 0) stands"), std::string::npos) << said;
     EXPECT_NE(said.find("'second_target' is dropped"), std::string::npos) << said;
+}
+
+// ★ THE ARCHIVE SEARCH PULLS THE MEMBER OF THE FALLBACK THAT STANDS, AND NO OTHER (P69 fold 3f, review F8 of H6c2): a
+// name two units give two fallbacks, each defined only by its own member of one archive, has ONE fallback the link
+// binds it to (`standingFallback`), and the search offers that one alone -- by the link's order of the units, never
+// the order the span holds them in, and a weak external's own default over a directive's, the absolute 0 offering
+// nothing. ✔MEASURED P69 fold 3f (GFB, link.exe 14.52 of cl 19.52 with /VERBOSE, a .lib of two members each defining
+// one fallback and printing its name from an initializer): two objects stating `/alternatename:` for one name load the
+// member of the first one's fallback alone, in both orders; one object stating two loads its first one's; a MinGW gcc
+// weak external beside a directive loads NO member -- its defined default and its absolute 0 alike stand.
+TEST(CoffLinkerDirectivesLink, TheArchiveSearchPullsOnlyTheMemberOfTheFallbackThatStands) {
+    auto const t    = TargetSchema::loadShipped("x86_64");
+    auto const exec = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    auto const lib  = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-staticlib");
+    ASSERT_TRUE(t.has_value() && exec.has_value() && lib.has_value());
+    test_support::ScratchDir scratch{test_support::Location::InsideRepo, "coff-directives-fallback-pull"};
+    std::vector<AssembledModule> const members{definer(10, {{"real_target", kTargetBody}}),
+                                               definer(11, {{"second_target", kRivalBody}})};
+    std::vector<std::string> const memberNames{"real", "second"};
+    fs::path const archive = scratch.path() / "fallbacks.lib";
+    DiagnosticReporter written;
+    ASSERT_TRUE(linkAndWriteStaticArchive(members, memberNames, **t, **lib, archive, written))
+        << diagnosticsOf(written);
+    std::vector<fs::path> const archives{archive};
+    using Names = std::vector<std::string>;
+    // The names the members the search pulls for `clients` define.
+    auto const pulledFor = [&](std::vector<AssembledModule> const& clients) {
+        DiagnosticReporter rep;
+        auto const pulled = pullStaticArchiveMembers(clients, archives, {}, **t, **exec, rep);
+        EXPECT_TRUE(pulled.has_value()) << diagnosticsOf(rep);
+        Names names;
+        for (auto const& m : pulled.value_or(std::vector<AssembledModule>{})) {
+            for (auto const& s : m.symbols) {
+                if (s.binding != SymbolBinding::Local) names.push_back(s.name);
+            }
+        }
+        return names;
+    };
+    for (bool const firstPlacedFirst : {true, false}) {
+        SCOPED_TRACE(firstPlacedFirst ? "the span's first unit placed first" : "the span's first unit placed second");
+        AssembledModule first  = callerUnit("my_alias", "real_target");
+        AssembledModule second = secondCaller("my_alias", "second_target");
+        first.linkPosition     = firstPlacedFirst ? 0u : 2u;
+        second.linkPosition    = firstPlacedFirst ? 2u : 0u;
+        EXPECT_EQ(pulledFor({first, second}), (firstPlacedFirst ? Names{"real_target"} : Names{"second_target"}))
+            << "the search pulled the member of a directive's fallback that does not stand";
+        AssembledModule weak = callerUnit("my_alias", "real_target");
+        weak.externImports[0].binding = SymbolBinding::Weak;   // a weak external whose default is `real_target`
+        weak.linkPosition             = firstPlacedFirst ? 0u : 2u;
+        AssembledModule directive     = secondCaller("my_alias", "second_target");
+        directive.linkPosition        = firstPlacedFirst ? 2u : 0u;
+        EXPECT_EQ(pulledFor({weak, directive}), Names{"real_target"})
+            << "the search pulled the member of a directive's fallback a weak external's own default stands over";
+    }
+    AssembledModule nothing = callerUnit("my_alias", "");
+    nothing.externImports[0].binding = SymbolBinding::Weak;   // a weak external whose default is the absolute 0
+    nothing.linkPosition             = 2u;
+    AssembledModule directive        = secondCaller("my_alias", "second_target");
+    directive.linkPosition           = 0u;
+    EXPECT_EQ(pulledFor({nothing, directive}), Names{}) << "the absolute 0 stands, and no member answers it";
+    // CONTROL: one unit's fallback, alone, pulls its member.
+    EXPECT_EQ(pulledFor({secondCaller("my_alias", "second_target")}), Names{"second_target"});
 }
 
 TEST(CoffLinkerDirectivesLink, AFallbackCycleNothingDefinesIsRefused) {

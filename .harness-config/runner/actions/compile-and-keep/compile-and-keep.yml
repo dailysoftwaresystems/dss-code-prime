@@ -6,7 +6,9 @@ description: >-
   stated `<targetName>:<formatName>`
   target, once per stated pipeline, and keeps every file each compile left, with a text report beside
   them: per source and pipeline the compile's exit code, what the compiler printed, and each image's
-  name, size and md5. DSS builds any target on any host, so a leg that can build the compiler makes
+  name, size and md5; and, where `dumps` asks, the compiler's stage dumps (HIR, the optimizer's per-pass
+  trace, LIR) beside each image, so two legs' compiles of one source compare stage by stage. DSS
+  builds any target on any host, so a leg that can build the compiler makes
   the images a machine that cannot build it will run. The sources travel as base64 in `sources_b64`,
   never as files in the tree: a synced file would overwrite the ONE copy of the repository that host
   keeps, under whatever lane is using it; the manual `pack` step writes that value from files, on the
@@ -43,11 +45,14 @@ steps:
       kind:
         description: "optional: the artifact profile the images must be, checked against the `artifactProfiles` of the target's format document (it selects nothing: the format names the kind)"
         default: ''
+      dumps:
+        description: "optional: the compiler's stage dumps to keep beside the images, comma-separated, of `hir` (the front end's HIR, once per source), `opt-trace` (the optimizer's per-pass lines) and `lir` (every function's LIR at each stage the compiler dumps it); any other name is refused"
+        default: ''
     # ★ EVERY OPTION IS SPELLED `--name=value`: a URL-safe base64 value can BEGIN with `-`, and argparse would read
     # it as another option. `--kept-at` is where this leg's kept outputs of THIS step go, the step's own name after
     # the leg's place for them: the program writes the command that brings the kept files back from it.
     run: |
-      python3 ./compile-and-keep.py --tree="{treeDir}" --dsscp="{product}" --sources-b64="{sources_b64}" --language="{language}" --target="{target}" --configs="{configs}" --kind="{kind}" --step-dir="{stepBuild}" --leg="{leg}" --kept-at="{actionArtifacts}/compile"
+      python3 ./compile-and-keep.py --tree="{treeDir}" --dsscp="{product}" --sources-b64="{sources_b64}" --language="{language}" --target="{target}" --configs="{configs}" --kind="{kind}" --dumps="{dumps}" --step-dir="{stepBuild}" --leg="{leg}" --kept-at="{actionArtifacts}/compile"
     outputs: [kept]
     persist: true
     successPattern: 'compile-and-keep: OK compiles=\d+ '

@@ -74,6 +74,7 @@ TEST(MirLoweringExtern, MirAliasingModeDefaultsToPermissive) {
     DiagnosticReporter rep;
     HirLiteralPool pool;
     MirLoweringConfig cfg;  // strictAliasingOnDistinctTypes defaults false
+    cfg.dataModel = DataModel::Lp64;   // a config states its unit's data model
     auto result = lowerToMir(built.hir, pool, ti, rep,
                              /*sourceMap=*/nullptr, cfg, &ffi);
     ASSERT_TRUE(result.ok);
@@ -100,6 +101,7 @@ TEST(MirLoweringExtern, MirAliasingFlagsBothBridgeThroughLowerToMir) {
     DiagnosticReporter rep;
     HirLiteralPool pool;
     MirLoweringConfig cfg;
+    cfg.dataModel = DataModel::Lp64;   // a config states its unit's data model
     // Both NON-DEFAULT: opt into strict-TBAA AND opt OUT of the C99
     // §6.5 ¶7 character-type exception (a hypothetical Rust-like
     // strict-typed language).
@@ -128,6 +130,7 @@ TEST(MirLoweringExtern, MirAliasingModeFlipsToStrictTBAAWhenConfigOptsIn) {
     DiagnosticReporter rep;
     HirLiteralPool pool;
     MirLoweringConfig cfg;
+    cfg.dataModel = DataModel::Lp64;   // a config states its unit's data model
     cfg.strictAliasingOnDistinctTypes = true;
     auto result = lowerToMir(built.hir, pool, ti, rep,
                              /*sourceMap=*/nullptr, cfg, &ffi);
@@ -149,7 +152,7 @@ TEST(MirLoweringExtern, ExternFunctionWithFfiMetadataPopulatesExternImports) {
     DiagnosticReporter rep;
     HirLiteralPool pool;
     auto result = lowerToMir(built.hir, pool, ti, rep,
-                             /*sourceMap=*/nullptr, MirLoweringConfig{},
+                             /*sourceMap=*/nullptr, MirLoweringConfig{.dataModel = DataModel::Lp64},
                              &ffi);
     ASSERT_TRUE(result.ok);
     ASSERT_EQ(result.externImports.size(), 1u);
@@ -170,7 +173,7 @@ TEST(MirLoweringExtern, MissingFfiMetadataFailsLoud) {
     DiagnosticReporter rep;
     HirLiteralPool pool;
     auto result = lowerToMir(built.hir, pool, ti, rep,
-                             /*sourceMap=*/nullptr, MirLoweringConfig{},
+                             /*sourceMap=*/nullptr, MirLoweringConfig{.dataModel = DataModel::Lp64},
                              /*ffiMap=*/nullptr);
     EXPECT_FALSE(result.ok);
     EXPECT_TRUE(result.externImports.empty());
@@ -199,7 +202,7 @@ TEST(MirLoweringExtern, EmptyLibraryPathFailsLoud) {
     DiagnosticReporter rep;
     HirLiteralPool pool;
     auto result = lowerToMir(built.hir, pool, ti, rep,
-                             /*sourceMap=*/nullptr, MirLoweringConfig{},
+                             /*sourceMap=*/nullptr, MirLoweringConfig{.dataModel = DataModel::Lp64},
                              &ffi);
     EXPECT_FALSE(result.ok);
     EXPECT_TRUE(result.externImports.empty());
@@ -220,7 +223,7 @@ TEST(MirLoweringExtern, EmptyMangledNameFailsLoud) {
     DiagnosticReporter rep;
     HirLiteralPool pool;
     auto result = lowerToMir(built.hir, pool, ti, rep,
-                             /*sourceMap=*/nullptr, MirLoweringConfig{},
+                             /*sourceMap=*/nullptr, MirLoweringConfig{.dataModel = DataModel::Lp64},
                              &ffi);
     EXPECT_FALSE(result.ok);
     EXPECT_TRUE(result.externImports.empty());
@@ -238,7 +241,7 @@ TEST(MirLoweringExtern, ModuleWithoutExternsProducesEmptyExternImports) {
     DiagnosticReporter rep;
     HirLiteralPool pool;
     auto result = lowerToMir(hir, pool, ti, rep,
-                             /*sourceMap=*/nullptr, MirLoweringConfig{},
+                             /*sourceMap=*/nullptr, MirLoweringConfig{.dataModel = DataModel::Lp64},
                              /*ffiMap=*/nullptr);
     EXPECT_TRUE(result.ok);
     EXPECT_TRUE(result.externImports.empty());
@@ -266,7 +269,7 @@ TEST(MirLoweringExtern, MissingSymbolIdFailsLoud) {
     DiagnosticReporter rep;
     HirLiteralPool pool;
     auto result = lowerToMir(hir, pool, ti, rep,
-                             /*sourceMap=*/nullptr, MirLoweringConfig{},
+                             /*sourceMap=*/nullptr, MirLoweringConfig{.dataModel = DataModel::Lp64},
                              &ffi);
     EXPECT_FALSE(result.ok);
     EXPECT_TRUE(result.externImports.empty());
@@ -303,7 +306,7 @@ TEST(MirLoweringExtern, ExternSymbolCollidesWithFunctionSymbolFailsLoud) {
     DiagnosticReporter rep;
     HirLiteralPool pool;
     auto result = lowerToMir(hir, pool, ti, rep,
-                             /*sourceMap=*/nullptr, MirLoweringConfig{},
+                             /*sourceMap=*/nullptr, MirLoweringConfig{.dataModel = DataModel::Lp64},
                              &ffi);
     EXPECT_FALSE(result.ok);
     EXPECT_TRUE(result.externImports.empty());
@@ -334,7 +337,7 @@ TEST(MirLoweringExtern, DuplicateExternSymbolFailsLoud) {
     DiagnosticReporter rep;
     HirLiteralPool pool;
     auto result = lowerToMir(hir, pool, ti, rep,
-                             /*sourceMap=*/nullptr, MirLoweringConfig{},
+                             /*sourceMap=*/nullptr, MirLoweringConfig{.dataModel = DataModel::Lp64},
                              &ffi);
     EXPECT_FALSE(result.ok);
     EXPECT_EQ(result.externImports.size(), 1u);   // first row landed; second rejected
@@ -361,7 +364,7 @@ TEST(MirLoweringExtern, InvalidExternSignatureFailsLoud) {
     DiagnosticReporter rep;
     HirLiteralPool pool;
     auto result = lowerToMir(hir, pool, ti, rep,
-                             /*sourceMap=*/nullptr, MirLoweringConfig{},
+                             /*sourceMap=*/nullptr, MirLoweringConfig{.dataModel = DataModel::Lp64},
                              &ffi);
     EXPECT_FALSE(result.ok);
     EXPECT_TRUE(result.externImports.empty());
@@ -397,7 +400,7 @@ TEST(MirLoweringExtern, MultipleExternsAcrossTwoLibrariesPropagateInOrder) {
     DiagnosticReporter rep;
     HirLiteralPool pool;
     auto result = lowerToMir(hir, pool, ti, rep,
-                             /*sourceMap=*/nullptr, MirLoweringConfig{},
+                             /*sourceMap=*/nullptr, MirLoweringConfig{.dataModel = DataModel::Lp64},
                              &ffi);
     ASSERT_TRUE(result.ok);
     ASSERT_EQ(result.externImports.size(), 2u);
@@ -440,7 +443,7 @@ TEST(MirLoweringExtern, ExternGlobalThreadLocalFlagReachesImportRow) {
     DiagnosticReporter rep;
     HirLiteralPool pool;
     auto result = lowerToMir(hir, pool, ti, rep,
-                             /*sourceMap=*/nullptr, MirLoweringConfig{},
+                             /*sourceMap=*/nullptr, MirLoweringConfig{.dataModel = DataModel::Lp64},
                              &ffi, /*linkageMap=*/nullptr,
                              /*mutabilityMap=*/nullptr,
                              /*volatileMap=*/nullptr,
@@ -516,7 +519,7 @@ TEST(MirLoweringExtern, WeakOnAnExternImportReachesTheImportRowOnBothRails) {
     DiagnosticReporter rep;
     HirLiteralPool pool;
     auto result = lowerToMir(hir, pool, ti, rep,
-                             /*sourceMap=*/nullptr, MirLoweringConfig{},
+                             /*sourceMap=*/nullptr, MirLoweringConfig{.dataModel = DataModel::Lp64},
                              &ffi, &linkage);
     ASSERT_TRUE(result.ok)
         << (rep.all().empty() ? "" : rep.all()[0].actual);
@@ -569,7 +572,7 @@ TEST(MirLoweringExtern, LocalBindingOnAnExternImportFailsLoud) {
     DiagnosticReporter rep;
     HirLiteralPool pool;
     auto result = lowerToMir(hir, pool, ti, rep,
-                             /*sourceMap=*/nullptr, MirLoweringConfig{},
+                             /*sourceMap=*/nullptr, MirLoweringConfig{.dataModel = DataModel::Lp64},
                              &ffi, &linkage);
     EXPECT_FALSE(result.ok)
         << "an unspellable import binding must stop the lowering, not ride to a "
@@ -619,7 +622,7 @@ TEST(MirLoweringExtern, ExternGlobalWithNoFfiMetadataFailsLoud) {
     HirLiteralPool pool;
     auto result = lowerToMir(hir, pool, ti, rep,
                              /*sourceMap=*/nullptr,
-                             MirLoweringConfig{},
+                             MirLoweringConfig{.dataModel = DataModel::Lp64},
                              /*ffiMap=*/nullptr);
     EXPECT_FALSE(result.ok)
         << "an ExternGlobal with no FFI metadata must fail loud at MIR "
@@ -645,7 +648,11 @@ TEST(MirLoweringExtern, LowerToLirPropagatesExternsToMirToLirResult) {
     // assignment so a future refactor that drops the wire is a
     // test failure (not a silent regression).
     TypeInterner ti = makeInterner();
-    Mir emptyMir{};  // value-default Mir is OK for this propagation test
+    // An empty module, stating the data model it is lowered for (the wall refuses one stating none).
+    MirBuilder emptyBuilder;
+    emptyBuilder.stateSelfContainedSymbolIds();
+    emptyBuilder.stateDataModel(DataModel::Lp64);
+    Mir const emptyMir = std::move(emptyBuilder).finish();
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     std::vector<ExternImport> externs;
@@ -706,6 +713,7 @@ TEST(MirLoweringExtern, ThreadsShimSymbolSeedsFunctionSymbols) {
     DiagnosticReporter rep;
     HirLiteralPool pool;
     MirLoweringConfig cfg;
+    cfg.dataModel = DataModel::Lp64;   // a config states its unit's data model
     auto result = lowerToMir(built.hir, pool, ti, rep, /*sourceMap=*/nullptr, cfg,
                              /*ffiMap=*/nullptr, nullptr, nullptr, nullptr, nullptr,
                              nullptr, nullptr, nullptr, nullptr, &recipes);
@@ -723,6 +731,7 @@ TEST(MirLoweringExtern, ThreadsShimUnseededRefFailsLoud) {
     DiagnosticReporter rep;
     HirLiteralPool pool;
     MirLoweringConfig cfg;
+    cfg.dataModel = DataModel::Lp64;   // a config states its unit's data model
     auto result = lowerToMir(built.hir, pool, ti, rep, /*sourceMap=*/nullptr, cfg,
                              /*ffiMap=*/nullptr, nullptr, nullptr, nullptr, nullptr,
                              nullptr, nullptr, nullptr, nullptr, /*synthRecipeMap=*/nullptr);

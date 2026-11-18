@@ -433,25 +433,36 @@ TEST(ArchiveWeakReferenceSearch, ALinkFormatWithNoArchiveSiblingIsRefusedByName)
 
 // To a program, DSS's runtime is the platform's library: a weak reference to a name whose body a descriptor states
 // DSS ships as source on the link's format binds — the member that defines it is fetched — whatever the members'
-// document says of an operator's archive. The corpus is asked by name (the shipped descriptors' `realization`
-// rows): `strtol` and `memset_explicit` on pe, `memset_explicit` alone on ELF, where glibc's image exports `strtol`.
-// CONTROLS: `hook`, which no descriptor declares, follows the members' document on both; and `strtol` on ELF does
-// too — the same name, the platform's own image's there, so an operator's archive that defines it is not searched
-// for a weak reference, as GNU ld does not search one.
+// document says of an operator's archive. The corpus is asked by name (the written name's route, `Body`): on pe
+// `__dss_isoc23_strtol`, the link name the C23 `strtol` row realizes to there, and `memset_explicit` on ELF, where
+// glibc 2.39 has none. CONTROLS: `hook`, which no descriptor declares, follows the members' document on both; and
+// the written `strtol` does too on both — the platform's own image's name (`__dss_platform_strtol`'s row, P69 fold
+// 3f: the UCRT and glibc export it), so an operator's archive that defines it is not searched for a weak reference,
+// as GNU ld does not search one.
 TEST(ArchiveWeakReferenceSearch, AWeakReferenceToANameTheRuntimeRealizesIsFetched) {
     test_support::ScratchDir scratch{test_support::Location::InsideRepo, "weak-archive-runtime-name"};
     DiagnosticReporter rep;
-    auto const pe = archiveOf(scratch.path(), "pe64-x86_64-windows-staticlib", memberDefining("strtol", "hook"));
+    auto const pe =
+        archiveOf(scratch.path(), "pe64-x86_64-windows-staticlib", memberDefining("__dss_isoc23_strtol", "hook"));
     ASSERT_FALSE(pe.empty());
-    auto const peRuntime = pulledFor("pe64-x86_64-windows-exec", pe, {{"strtol", SymbolBinding::Weak}}, rep);
+    auto const peRuntime =
+        pulledFor("pe64-x86_64-windows-exec", pe, {{"__dss_isoc23_strtol", SymbolBinding::Weak}}, rep);
     ASSERT_TRUE(peRuntime.has_value()) << diagnosticsOf(rep);
-    EXPECT_EQ(*peRuntime, 1u) << "pe: DSS ships `strtol`'s body, so the weak reference binds";
+    EXPECT_EQ(*peRuntime, 1u) << "pe: DSS ships the C23 `strtol`'s body under this name, so the weak reference binds";
     auto const peHook = pulledFor("pe64-x86_64-windows-exec", pe, {{"hook", SymbolBinding::Weak}}, rep);
     ASSERT_TRUE(peHook.has_value()) << diagnosticsOf(rep);
     EXPECT_EQ(*peHook, 0u) << "CONTROL: a name no descriptor declares follows the members' document";
-    auto const peRelocatable = pulledFor("pe64-x86_64-windows", pe, {{"strtol", SymbolBinding::Weak}}, rep);
+    auto const peRelocatable =
+        pulledFor("pe64-x86_64-windows", pe, {{"__dss_isoc23_strtol", SymbolBinding::Weak}}, rep);
     ASSERT_TRUE(peRelocatable.has_value()) << diagnosticsOf(rep);
     EXPECT_EQ(*peRelocatable, 1u) << "a relocatable link asks the same question";
+
+    std::filesystem::remove(pe);
+    auto const peUcrt = archiveOf(scratch.path(), "pe64-x86_64-windows-staticlib", memberDefining("strtol", "hook"));
+    ASSERT_FALSE(peUcrt.empty());
+    auto const peImageName = pulledFor("pe64-x86_64-windows-exec", peUcrt, {{"strtol", SymbolBinding::Weak}}, rep);
+    ASSERT_TRUE(peImageName.has_value()) << diagnosticsOf(rep);
+    EXPECT_EQ(*peImageName, 0u) << "CONTROL: on pe the written `strtol` is the UCRT's, not a body DSS ships";
 
     auto const elfC23 =
         archiveOf(scratch.path(), "elf64-x86_64-linux-staticlib", memberDefining("memset_explicit", "hook"));

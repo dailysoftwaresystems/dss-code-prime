@@ -8,6 +8,7 @@
 #include "link/format/object_format_backends.hpp"
 #include "link/format/relocation_addend.hpp"
 
+#include "core/substrate/key_order.hpp"   // entriesInKeyOrder -- the section walks' order
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/type_lattice/type_layout.hpp"   // scalarByteSize -- the data model's pointer width
 #include "core/types/section_kind.hpp"
@@ -1153,8 +1154,13 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // refuses the pair outright when their declared extents disagree -- so an
     // equal start can no longer arrive here at all, and the carve-out that let
     // it pass is gone rather than left standing as an untrue permission.
-    for (auto& [secIdx, ivs] : funcIntervalsBySec) {
-        std::vector<Interval> sorted = ivs;
+    //
+    // ★ IN ASCENDING SECTION INDEX (P69 fold 3f, lane `xa`): the first overlap
+    // found is the one refused, so the walk takes the object's own order from
+    // that order's one home, never the unordered map's.
+    for (auto const* section : substrate::entriesInKeyOrder(funcIntervalsBySec)) {
+        std::uint16_t const secIdx = section->first;
+        std::vector<Interval> sorted = section->second;
         std::sort(sorted.begin(), sorted.end(),
                   [](Interval const& a, Interval const& b) { return a.start < b.start; });
         for (std::size_t k = 1; k < sorted.size(); ++k) {
@@ -1407,6 +1413,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 bytes.subspan(static_cast<std::size_t>(unwindSec->offset),
                               static_cast<std::size_t>(unwindSec->size)),
                 link::format::dwarfRegisterMappingOf(targetSchema),
+                objectFormatSchema.dataModel(),   // an absptr field is one of its addresses
                 "elf::readRelocatableObject", reporter);
             if (!decodedUnwind.has_value()) return std::nullopt;  // already reported
 
@@ -1907,7 +1914,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                     std::string_view what) -> std::optional<FdeRef> {
                 auto const it = unwindRelocs.find(field.fieldOffset);
                 if (it == unwindRelocs.end()) return std::nullopt;
-                std::uint32_t const width = link::format::dwEhPeHandlerFieldWidth(field.encoding);
+                std::uint32_t const width = field.width;   // the bytes the decoder read it at
                 std::span<std::uint8_t const> site{};
                 if (!rangeExceedsBuffer(field.fieldOffset, width, unwindSec->size)) {
                     site = std::span<std::uint8_t const>{
@@ -2358,7 +2365,12 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // already correct -- which is why the two tests above pass again.
     {
         std::vector<std::pair<std::size_t, AssembledFunction>> padAtoms;
-        for (auto& [secIdx, ivs] : funcIntervalsBySec) {
+        // ★ IN ASCENDING SECTION INDEX (P69 fold 3f, lane `xa`): each padding atom
+        // takes a fresh id from the object's one counter, and the first section
+        // refused below is the one reported, so the walk is the object's own order.
+        for (auto const* section : substrate::entriesInKeyOrder(funcIntervalsBySec)) {
+            std::uint16_t const secIdx = section->first;
+            std::vector<Interval> const& ivs = section->second;
             if (ivs.size() < 2) continue;
             if (secIdx >= secs.size()) continue;
             Shdr const& psec = secs[secIdx];
@@ -2453,6 +2465,37 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         }
     }
 
+    // ★ P69 (lane `xa`, fold 3f -- `#pragma comment(lib)`'s ELF half): the libraries the object asks its final
+    // link to search -- the document's dependent-libraries section (clang's `.deplibs`), each NUL-terminated name
+    // once, in the order first stated. A link that makes an image does with them what the document says; a
+    // relocatable artifact restates them. A document stating no such section reads it as the wire says: a
+    // non-allocated section, no runtime body.
+    if (auto const& block = objectFormatSchema.elf().dependentLibraries; block.has_value()) {
+        for (auto const& s : secs) {
+            if (s.name != block->section || s.type != block->type) continue;
+            if (s.offset > bytes.size() || s.size > bytes.size() - s.offset) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                            "elf::readRelocatableObject: the dependent-libraries section '" + s.name
+                                + "' runs past the end of the object.");
+            }
+            std::string_view const body{reinterpret_cast<char const*>(bytes.data()) + s.offset,
+                                        static_cast<std::size_t>(s.size)};
+            if (!body.empty() && body.back() != '\0') {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                            "elf::readRelocatableObject: the dependent-libraries section '" + s.name
+                                + "' does not end its last name with a NUL.");
+            }
+            std::size_t at = 0;
+            while (at < body.size()) {
+                std::size_t const end = body.find('\0', at);
+                std::string name{body.substr(at, end - at)};
+                at = end + 1;
+                if (name.empty()) continue;   // clang's `comment(lib)` with no name: an empty entry
+                auto& libs = mod.linkerRequests.dependentLibraries;
+                if (std::find(libs.begin(), libs.end(), name) == libs.end()) libs.push_back(std::move(name));
+            }
+        }
+    }
     // A fresh id the table could not hand out was refused by name there; nothing it handed out leaves.
     if (symbolIds.refused()) return std::nullopt;
     mod.symbolIdEnd.keepClearOf(symbolIds.end());   // the module carries its table's end
