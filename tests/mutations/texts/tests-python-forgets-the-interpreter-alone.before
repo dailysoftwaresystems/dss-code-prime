@@ -1,0 +1,2 @@
+    foreach(_dss_python_cached IN ITEMS _Python3_EXECUTABLE _Python3_EXECUTABLE_DEBUG
+                                        _Python3_INTERPRETER_SIGNATURE _Python3_INTERPRETER_PROPERTIES)

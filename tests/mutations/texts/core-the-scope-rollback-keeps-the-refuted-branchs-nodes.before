@@ -1,0 +1,1 @@
+    scopeChain_->truncateTo(std::max(snap.scopeChainSize, heldTrailEnd_));

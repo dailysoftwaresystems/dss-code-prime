@@ -8,11 +8,14 @@
 #include "lir/lir_node.hpp"
 #include "lir/lir_callconv.hpp"
 #include "lir/lir_pass_util.hpp"
+#include "lir/lir_reg.hpp"
+#include "lir/lir_verifier.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
 #include <format>
+#include <optional>
 #include <span>
 #include <unordered_map>
 #include <vector>
@@ -27,11 +30,24 @@ using dss::report;
 // EVERY OUTGOING-ARGUMENT BYTE OFFSET, and it is the only tier that can.
 //
 // A stacked SCALAR is materialized here as a `store_outgoing_arg` carrier whose
-// payload IS its byte offset. A stacked by-value AGGREGATE stays on the Call —
-// it is not a register operand at regalloc pressure, and its byte-copy needs
-// physical registers that do not exist yet — but its byte offset is decided HERE
-// too and STATED on the carrier as a trailing `MemOffset` operand, which
-// `lir_callconv` then reads rather than re-deriving.
+// payload IS its byte offset. ★ So, since P69 round 4, is a stacked by-value
+// AGGREGATE (D-AS-REGALLOC-WIDE-CALL-AGGREGATE-ADDRESS-OPERANDS): its bytes are
+// COPIED here, before allocation, from the temp that holds them into its placed
+// outgoing bytes — one GPR-wide `load` from [temp + k] into a fresh virtual
+// register and one `store_outgoing_arg` carrier at placement + k per chunk — and
+// the (address, ByValueStackAgg) carrier leaves the Call. ⚠⚠ This file used to
+// keep that carrier ON the Call, "not a register operand at regalloc pressure",
+// for `lir_callconv` to copy post-regalloc. Its ADDRESS is a register operand
+// all the same: ✔MEASURED (round-4 dsscp, x86_64 ELF and Mach-O x86_64) a call
+// passing eight ints and ten or eleven long doubles (each an x87 MEMORY-class
+// aggregate on SysV) exhausted the rewriter's reload scratch at the call
+// (`L_VirtualRegInPostRegalloc` — a spilled carrier address is scratch-reloaded,
+// while a spilled register ARG is loaded straight into its ABI register by
+// callconv), and one passing fourteen left callconv no free caller-saved GPR to
+// copy through (`L_CcRegLookupFailed`); gcc and clang compile both. Copied before
+// allocation, each address is read by single-operand loads the allocator places
+// like any other, and the Call carries only what its ABI passes in registers.
+// (The byte-copy needs no physical register: its temporaries are virtual.)
 //
 // ⚠⚠ THE ALTERNATIVE IS THE SILENT MISCOMPILE THIS ROW NAMES, and it shipped.
 // While the aggregate's placement was re-derived in `lir_callconv`, that
@@ -44,29 +60,69 @@ using dss::report;
 // with no diagnostic.
 //
 // ★ THE PROTOTYPE NOTE THIS REPLACED said a production version would fold ALL
-// overflow placement into this single pre-regalloc site. That is what happened;
-// what stays in `lir_callconv` is the MATERIALIZATION of the byte-copy (which
-// genuinely needs post-regalloc physical registers), never the DECISION of where
-// it lands.
+// overflow placement into this single pre-regalloc site. That is what happened —
+// and since P69 round 4 the aggregate's MATERIALIZATION is here too, so the one
+// site that decides where an outgoing byte lands also writes it — and no later
+// pass reads a carrier: the LIR verifier's stage rule, run on this pass's own
+// output (`lowerWideCallArgs`, below), refuses a module in which one survived.
 
 // The outgoing-arg slot QUANTUM — the unit the overflow area is reserved and
-// aligned in. Every current ABI (SysV/Win64/AAPCS64/Apple) uses a pointer-width
-// (= GPR width = 8) quantum; lir_callconv derives it from widthForClass(GPR).
+// aligned in — is the convention's, read at its ONE home (`argumentSlotBytes`,
+// core/types/target_schema.hpp: the widest general register; the frame layout's
+// `outgoingSlotSize`) by `lowerWideCallArgs` and handed to each function's
+// rebuild. ★ P69 (lane `xa`, fold 3f -- review-xa3e F3 P11): a literal 8 of this
+// pass's own stood here, a second home of the quantum its own comment said
+// lir_callconv derived.
 // ⚠ It is no longer the same thing as "the space one stacked argument takes":
 // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED made that a per-CC,
-// per-axis rule that `StackArgCursor` owns. This value is what the cursor rounds
-// TO, not what it advances BY.
-constexpr std::uint32_t kOutgoingSlotBytes = 8u;
+// per-axis rule that `StackArgCursor` owns. The quantum is what the cursor rounds
+// TO, not what it advances BY. It is also the CHUNK a stacked aggregate is copied
+// in: GPR-wide, the width callconv's post-regalloc copy used, over the same span
+// (the placement reserves whole slots and the temp is rounded to 16, so the last
+// chunk's read stays inside the temp and its write inside the aggregate's slots).
+// The chunk's access width is taken off the SAME number the copy steps by
+// (D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT: a step
+// and an access width taken from two places drift apart); a quantum the LIR
+// instruction model cannot state as a width is refused by name.
+
+// The highest VIRTUAL register id `fn` names — any instruction's result or Reg
+// operand (a bundle's operands are its outer instruction's) — or 0. The rebuilt
+// function copies these ids verbatim, so a register this pass mints must start
+// above it (`LirBuilder::reserveVRegIdsThrough`).
+[[nodiscard]] std::uint32_t highestVirtualRegId(Lir const& src, LirFuncId fn) {
+    std::uint32_t highest = src.funcNumVRegs(fn);
+    auto const note = [&](LirReg r) {
+        if (r.valid() && r.isPhysical == 0 && r.id > highest) highest = r.id;
+    };
+    std::uint32_t const blockCount = src.funcBlockCount(fn);
+    for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
+        LirBlockId const blk = src.funcBlockAt(fn, bi);
+        std::uint32_t const n = src.blockInstCount(blk);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            LirInstId const inst = src.blockInstAt(blk, i);
+            note(src.instResult(inst));
+            for (auto const& o : src.instOperands(inst))
+                if (o.kind == LirOperandKind::Reg) note(o.reg);
+        }
+    }
+    return highest;
+}
 
 // Rewrite ONE function into builder `b`. Splits each Call's scalar overflow
-// args into `store_outgoing_arg` carriers emitted before the (shrunken) call.
+// args into `store_outgoing_arg` carriers emitted before the (shrunken) call,
+// and copies each stacked by-value aggregate into its outgoing bytes there too
+// (GPR `load` `gprLoadOp` + `store_outgoing_arg` per chunk).
 [[nodiscard]] bool
 lowerOneFunc(Lir const& src, LirFuncId fn, TargetSchema const& schema,
              TargetCallingConvention const& cc, std::uint16_t storeOutgoingOp,
-             LirBuilder& b, DiagnosticReporter& reporter) {
+             std::uint16_t gprLoadOp, std::uint32_t slotBytes,
+             std::uint8_t chunkWidthFlags, LirBuilder& b,
+             std::vector<std::uint32_t>& entryImage, DiagnosticReporter& reporter) {
 
     auto const& funcInfo = src.funcArena().at(fn);
     b.addFunction(SymbolId{funcInfo.symbol});
+    // Every copied id is taken: the chunk temporaries mint above them.
+    b.reserveVRegIdsThrough(highestVirtualRegId(src, fn));
 
     std::uint32_t const blockCount = src.funcBlockCount(fn);
     std::unordered_map<std::uint32_t, LirBlockId> srcToDst;
@@ -77,6 +133,9 @@ lowerOneFunc(Lir const& src, LirFuncId fn, TargetSchema const& schema,
     for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
         LirBlockId const srcBlock = src.funcBlockAt(fn, bi);
         b.beginBlock(srcToDst.at(srcBlock.v));
+        // The block image this rebuild publishes (`LirWideCallResult::blockEntryImage`): this
+        // source block's instructions begin in the block just begun.
+        entryImage[srcBlock.v] = srcToDst.at(srcBlock.v).v;
 
         std::uint32_t const instN = src.blockInstCount(srcBlock);
         for (std::uint32_t i = 0; i < instN; ++i) {
@@ -126,8 +185,6 @@ lowerOneFunc(Lir const& src, LirFuncId fn, TargetSchema const& schema,
             bool const variadicForcesStack =
                 cc.variadicArgsAlwaysStack
                 && ::dss::call_payload::isVariadic(payload);
-            std::uint32_t const fixedOps =
-                ::dss::call_payload::fixedOperandCount(payload);
 
             std::vector<LirOperand> keepOps;
             keepOps.reserve(ops.size());
@@ -142,6 +199,15 @@ lowerOneFunc(Lir const& src, LirFuncId fn, TargetSchema const& schema,
                 std::uint8_t  widthFlags;
             };
             std::vector<OutStore> stores;
+            // P69 round 4: each stacked by-value aggregate this Call passes — the
+            // temp's address, the aggregate's size and its placed byte offset —
+            // copied into the outgoing area before the Call (see the file header).
+            struct AggCopy {
+                LirReg        address;
+                std::uint32_t bytes;
+                std::uint32_t byteOffset;
+            };
+            std::vector<AggCopy> aggCopies;
 
             // Preserve ops[0] (callee: SymbolRef direct / Reg indirect) and,
             // when present, ops[1] (the sret pointer routed to x8) — NEVER
@@ -156,7 +222,7 @@ lowerOneFunc(Lir const& src, LirFuncId fn, TargetSchema const& schema,
             // (D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES); the
             // packing rule it applies is the shipped CC's
             // (D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED).
-            StackArgCursor stackCursor{cc, kOutgoingSlotBytes};
+            StackArgCursor stackCursor{cc, slotBytes};
             std::uint32_t argRegionIdx = 0;  // 0-based arg position
             // D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES: the
             // vararg boundary is a POSITION, and this pass RENUMBERS positions.
@@ -193,15 +259,16 @@ lowerOneFunc(Lir const& src, LirFuncId fn, TargetSchema const& schema,
                 // and `argRegionIdx` is still the ORIGINAL numbering at every
                 // call site below — which is what makes the restatement exact.
                 auto const noteKeptPosition = [&] {
-                    if (argRegionIdx < fixedOps) ++keptFixedArgs;
+                    if (!::dss::call_payload::passesThroughEllipsis(payload, argRegionIdx)) ++keptFixedArgs;
                 };
                 if (lirIsByValueStackAggCarrier(ops, k)) {
-                    // Wholly-stacked aggregate: not a register operand at
-                    // pressure, and its byte-copy needs physical registers that do
-                    // not exist yet — so it stays on the Call for callconv to
-                    // MATERIALIZE. Its byte OFFSET is decided here, from the one
-                    // cursor, and STATED on the carrier so callconv reads it
-                    // instead of re-deriving it over a list this pass shortened.
+                    // Wholly-stacked aggregate: its byte OFFSET is decided here,
+                    // from the one cursor, and its bytes are COPIED there before the
+                    // Call (`aggCopies`, emitted below) — so the carrier, whose
+                    // address is a register operand the allocator would otherwise
+                    // have to keep live INTO the Call, leaves it (P69 round 4,
+                    // D-AS-REGALLOC-WIDE-CALL-AGGREGATE-ADDRESS-OPERANDS; see the
+                    // file header).
                     std::uint32_t const aggBytes = ops[k + 1].byValueAggBytes;
                     if (lirByValueStackAggPlacedOffset(ops, k).has_value()) {
                         report(reporter,
@@ -224,16 +291,31 @@ lowerOneFunc(Lir const& src, LirFuncId fn, TargetSchema const& schema,
                     std::uint32_t const aggOffset =
                         stackCursor.placeNamedAggregate(
                             aggBytes, ops[k + 1].byValueAggAlign());
-                    keepOps.push_back(argOp);         // the temp's address Reg
-                    keepOps.push_back(ops[k + 1]);    // size + exhaust class
-                    keepOps.push_back(LirOperand::makeMemOffset(
-                        static_cast<std::int32_t>(aggOffset)));
+                    // The temp's address is a pointer: GPR, or the copy below has
+                    // no register to read it through. Refused by name, never
+                    // copied through a register of another class.
+                    if (argOp.reg.regClass() != LirRegClass::GPR) {
+                        report(reporter,
+                               DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                               DiagnosticSeverity::Error,
+                               std::format(
+                                   "lowerWideCallArgs: call inst {} arg {} is a "
+                                   "by-value stacked aggregate whose address "
+                                   "register is of class '{}', not a general "
+                                   "register — the copy into its outgoing bytes "
+                                   "reads the aggregate through that address",
+                                   inst.v, argRegionIdx,
+                                   lirRegClassName(argOp.reg.regClass())));
+                        return false;
+                    }
+                    aggCopies.push_back({argOp.reg, aggBytes, aggOffset});
                     std::uint8_t const ex = ops[k + 1].byValueAggExhaust;
                     if (ex == kByValueStackArgExhaustGpr)
                         argCursors.exhaust(LirRegClass::GPR);
                     else if (ex == kByValueStackArgExhaustFpr)
                         argCursors.exhaust(LirRegClass::FPR);
-                    noteKeptPosition();
+                    // NOT a kept position: the aggregate left the Call, so the
+                    // restated vararg boundary must not count it.
                     ++argRegionIdx;
                     ++k;   // the marker is consumed with its carrier
                     continue;
@@ -258,7 +340,7 @@ lowerOneFunc(Lir const& src, LirFuncId fn, TargetSchema const& schema,
                 std::uint32_t const argIndex = slot.has_value() ? slot->index : 0u;
                 std::uint32_t const poolSize = slot.has_value() ? slot->poolSize : 0u;
                 bool const forceStack =
-                    variadicForcesStack && argRegionIdx >= fixedOps;
+                    variadicForcesStack && ::dss::call_payload::passesThroughEllipsis(payload, argRegionIdx);
                 if (argIndex < poolSize && !forceStack) {
                     keepOps.push_back(argOp);      // register-resident
                     noteKeptPosition();
@@ -267,11 +349,10 @@ lowerOneFunc(Lir const& src, LirFuncId fn, TargetSchema const& schema,
                     // VARARG and a NAMED scalar are DIFFERENT axes — ✔MEASURED,
                     // Apple packs named scalars naturally and keeps 8-byte slots
                     // for varargs — so the region decides which rule applies. The
-                    // vararg predicate is the SAME `argRegionIdx >= fixedOps` the
-                    // placement + pre-scan use, so all three agree on the boundary.
+                    // vararg predicate is the SAME `call_payload::passesThroughEllipsis`
+                    // the placement + pre-scan ask, so all three agree on the boundary.
                     bool const isVariadicRegion =
-                        ::dss::call_payload::isVariadic(payload)
-                        && argRegionIdx >= fixedOps;
+                        ::dss::call_payload::passesThroughEllipsis(payload, argRegionIdx);
                     std::uint32_t const nat = argOp.argNaturalBytes;
                     // ⚠ FAIL LOUD ON A DROPPED CARRIER. Under NATURAL packing an
                     // unstated natural size would silently revert THIS argument to
@@ -311,6 +392,38 @@ lowerOneFunc(Lir const& src, LirFuncId fn, TargetSchema const& schema,
                 std::array<LirOperand, 1> so{LirOperand::makeReg(s.value)};
                 b.addInst(storeOutgoingOp, InvalidLirReg, so, s.byteOffset,
                           s.widthFlags);
+            }
+            // Then each stacked aggregate, one chunk at a time: a GPR-wide `load`
+            // from [temp + k] into a fresh virtual register and a
+            // `store_outgoing_arg` of it at placement + k. The chunk is the
+            // outgoing SLOT, so the bytes written are exactly the whole slots the
+            // cursor reserved, and the last read stays inside the temp (HIR->MIR
+            // rounds it to an eightbyte multiple; an x87 datum's home is 16).
+            // Each chunk register lives from its load to its store, and the
+            // temp's address only until its last chunk — none of it is live
+            // into the Call.
+            // ⓘ k is bounded by the aggregate's size, and on every shipped
+            // convention the GPR load's short form carries it: SysV x86_64 —
+            // the one convention that stacks an aggregate of any size — reads
+            // through disp32; AAPCS64 and Apple stack at most a 64-byte HFA/HVA
+            // (a larger composite is passed by reference), inside LDUR's
+            // -256..255; Win64 stacks nothing wider than 8 bytes. A displacement
+            // a form cannot carry is refused by the encoder by name, never
+            // mis-encoded.
+            for (auto const& c : aggCopies) {
+                for (std::uint32_t off = 0; off < c.bytes;
+                     off += slotBytes) {
+                    LirReg const chunk = b.newVReg(LirRegClass::GPR);
+                    std::array<LirOperand, 3> const ld{
+                        LirOperand::makeReg(c.address),
+                        LirOperand::makeMemBase(1),
+                        LirOperand::makeMemOffset(static_cast<std::int32_t>(off))};
+                    b.addInst(gprLoadOp, chunk, ld, /*payload=*/0,
+                              chunkWidthFlags);
+                    std::array<LirOperand, 1> const so{LirOperand::makeReg(chunk)};
+                    b.addInst(storeOutgoingOp, InvalidLirReg, so,
+                              c.byteOffset + off, chunkWidthFlags);
+                }
             }
             // D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES: the
             // shrunken Call carries the RENUMBERED vararg boundary and says, in
@@ -366,6 +479,33 @@ lowerWideCallArgs(Lir const& src, TargetSchema const& schema,
                "opcode required for wide-call arg materialization");
         return out;
     }
+    // The general-register class's own LOAD — what a stacked aggregate's bytes
+    // are read from its temp with. Resolved once; a target that declares none is
+    // refused here, by name, before any function is rebuilt.
+    auto const gprLoadOp =
+        schema.regClassOpOpcode(TargetRegClass::GPR, RegClassOp::Load);
+    if (!gprLoadOp.has_value()) {
+        report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+               DiagnosticSeverity::Error,
+               "lowerWideCallArgs: target schema declares no general-register "
+               "load (registerClassOps gpr 'load'), which copying a stacked "
+               "by-value aggregate into its outgoing bytes reads the aggregate "
+               "with");
+        return out;
+    }
+    // The convention's argument-slot quantum, read ONCE at its home, and the access
+    // width of one aggregate-copy chunk taken off it (Q3's one map).
+    std::uint32_t const slotBytes = argumentSlotBytes(schema);
+    std::optional<std::uint8_t> const chunkWidthFlags = lirInstWidthFlagForBits(slotBytes * 8u);
+    if (!chunkWidthFlags.has_value()) {
+        report(reporter, DiagnosticCode::L_StackPassedArgUnsupported,
+               DiagnosticSeverity::Error,
+               std::format("lowerWideCallArgs: the target's argument-slot quantum ({} bytes, its "
+                           "widest general register) is no width a LIR memory access can state, so "
+                           "a stacked argument has no slot to be placed or copied in",
+                           slotBytes));
+        return out;
+    }
 
     LirBuilder b{schema};
     // Carry every module side structure across the rebuild in one call — the
@@ -375,13 +515,22 @@ lowerWideCallArgs(Lir const& src, TargetSchema const& schema,
     // inside `lowerOneFunc`.
     lir_pass_util::copyModuleSideStructures(src, b);
     std::size_t const funcCount = src.moduleFuncCount();
+    out.blockEntryImage.assign(src.blockCount(), 0u);
     for (std::uint32_t fi = 0; fi < funcCount; ++fi) {
         LirFuncId const fn = src.funcAt(fi);
-        if (!lowerOneFunc(src, fn, schema, *cc, *storeOutgoingOp, b, reporter))
+        if (!lowerOneFunc(src, fn, schema, *cc, *storeOutgoingOp, *gprLoadOp, slotBytes,
+                          *chunkWidthFlags, b, out.blockEntryImage, reporter))
             return out;
     }
     out.lir = std::move(b).finish();
     out.ok = out.lir.moduleFuncCount() == funcCount;
+    // ★ THE CARRIER'S STAGE RULE, stated on this pass's own output: no
+    // instruction leaves here carrying a by-value stacked-aggregate marker, so
+    // no later pass holds an arm for one. A terminator Call's operands are
+    // carried verbatim above — were one ever to carry the form, it is refused
+    // here, by name, instead of reaching the allocator.
+    if (out.ok && !verifyLirStackedAggregatesLowered(out.lir, schema, reporter))
+        out.ok = false;
     return out;
 }
 

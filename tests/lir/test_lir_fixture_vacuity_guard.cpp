@@ -300,8 +300,8 @@ TEST(LirFixtureVacuityGuard, EveryHirFunctionDefinitionReachesLirWithInstruction
 // the product never does. It now starts from the pipeline's ONE assembly
 // (`languageMirLoweringConfig`) and threads the mutability map the fold reads a const
 // object's value through. RED-ON-DISABLE: drop `globalsConstantForms` from the helper (the
-// first case gets a module initializer, the second lowers instead of refusing); drop the
-// fixture's mutability map (the first case is refused).
+// first case gets a module initializer); drop the fixture's mutability map (the first case is
+// refused); drop the fixture's pipeline gates (the second reaches MIR, which refuses it again).
 TEST(LirFixtureVacuityGuard, AStaticInitializerLowersAsInTheProduct) {
     {
         auto const out = lowerCToLir(
@@ -319,10 +319,14 @@ TEST(LirFixtureVacuityGuard, AStaticInitializerLowersAsInTheProduct) {
         }
     }
     {
+        // P69 L2b2: the product refuses it at the ANALYSIS (S_StaticInitializerNotConstant) and
+        // its gates stop the unit there; the fixture keeps the same gates, so MIR is never entered.
         auto const out = lowerCToLir("int a = 1;\nint b = a;\nint main(void) { return b; }\n",
                                      "x86_64", /*mirCcIndex=*/0, LoweringExpectation::Refuses);
-        EXPECT_EQ(countCode(out.mirReporter, DiagnosticCode::H_StaticInitializerNotFolded), 1u)
-            << "the unfolded initializer is refused here, as the product refuses it";
+        EXPECT_EQ(countCode(out.model.diagnostics(), DiagnosticCode::S_StaticInitializerNotConstant), 1u)
+            << "the unfolded initializer is refused, as the product refuses it";
+        EXPECT_EQ(countCode(out.mirReporter, DiagnosticCode::H_StaticInitializerNotFolded), 0u)
+            << "MIR is never entered";
     }
 }
 

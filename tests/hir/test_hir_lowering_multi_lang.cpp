@@ -23,6 +23,7 @@
 #include "scratch_dir.hpp"
 
 #include "shipped_schema_or_throw.hpp"   // the ONE load-or-fail-this-test helper
+#include "driver_diagnostics_listener.hpp"   // AskedDriverCodes
 
 #include <gtest/gtest.h>
 
@@ -163,6 +164,7 @@ TEST(HirLoweringMultiLang, MultiSchemaCtorAndDeclOrderFollowsTreeOrder) {
 }
 
 TEST(HirLoweringMultiLang, UnknownExtensionIsLoudInMultiLanguageCu) {
+    dss::test_support::AskedDriverCodes const asked{dss::DiagnosticCode::D_UnknownFileExtension};   // the unrouted extension IS the subject
     // In a multi-language CU, an addFile whose extension matches NO registered
     // language fails loud (D_UnknownFileExtension) and adds no tree — never
     // silently parses under the primary grammar.
@@ -297,6 +299,24 @@ TEST(HirLoweringMultiLang, BuiltinsDoNotLeakAcrossLanguages) {
     auto cu = std::make_shared<CompilationUnit>(std::move(ub).finish());
 
     SemanticModel model = analyze(cu, DiagnosticBudget::libraryDefault());
-    EXPECT_GT(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u)
+    // P69 (lane `cs`, fold f26c): C's call of a name no C declaration names DECLARES it (C90
+    // 6.3.2.2, `int COALESCE()`, warned) — the c tree's OWN function, which another unit must
+    // define, never tsql's builtin: one implicit declaration is minted for the name.
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ImplicitFunctionDeclaration), 1u)
+        << "a c tree must NOT resolve tsql's COALESCE builtin";
+    ASSERT_EQ(model.implicitDeclarations().size(), 1u)
+        << "a c tree must NOT resolve tsql's COALESCE builtin";
+    SymbolRecord const* rec = model.recordFor(model.implicitDeclarations()[0]);
+    ASSERT_NE(rec, nullptr);
+    EXPECT_EQ(rec->name, "COALESCE");
+    // …and a USE that is no call declares nothing: it names an undeclared identifier.
+    auto c2 = shipped("c");
+    UnitBuilder ub2{c2, DiagnosticBudget::libraryDefault()};
+    ub2.registerSchema(sql);
+    ub2.addInMemory("int f(int x) { return x + COALESCE; }\n", "f.c", c2);
+    ub2.addInMemory("CREATE TABLE T (a INT);\n", "t.sql", sql);
+    auto cu2 = std::make_shared<CompilationUnit>(std::move(ub2).finish());
+    SemanticModel model2 = analyze(cu2, DiagnosticBudget::libraryDefault());
+    EXPECT_GT(countCode(model2.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u)
         << "a c tree must NOT resolve tsql's COALESCE builtin";
 }

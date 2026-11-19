@@ -11,7 +11,10 @@ function(dss_add_test)
 
     string(REPLACE "/" "_" target "dss_${DSS_NAME}")
     add_executable(${target} ${DSS_SOURCES})
-    target_link_libraries(${target} PRIVATE dsscp-lib GTest::gtest GTest::gtest_main)
+    # `dss_test_driver_diagnostics` (below): a unit any test builds with a DRIVER error
+    # the test did not ask for fails that test — the one home no fixture can forget.
+    target_link_libraries(${target} PRIVATE dsscp-lib GTest::gtest GTest::gtest_main
+                                            dss_test_driver_diagnostics)
     target_include_directories(${target}
         PRIVATE
             ${CMAKE_SOURCE_DIR}/src
@@ -58,6 +61,10 @@ function(dss_add_test)
         DSS_TEST_REPO_ROOT="${CMAKE_SOURCE_DIR}")
 
     add_test(NAME ${DSS_NAME} COMMAND ${target})
+    # The entry this target runs, kept ON the target: a helper handed the target -- the script
+    # self-test's opt-in, `dss_use_script_selftest`, which gives the entry its `self-test` label --
+    # reads it here rather than spelling the name a second time.
+    set_property(TARGET ${target} PROPERTY DSS_TEST_NAME "${DSS_NAME}")
 
     # Shipped-config discovery: findShippedConfig() — and, since TF-C118, the
     # test-side resolver in tests/test_support/repo_root.hpp — prefers
@@ -116,6 +123,25 @@ target_compile_definitions(dss_test_pch PRIVATE
     DSS_TEST_REPO_ROOT="${CMAKE_SOURCE_DIR}")
 target_precompile_headers(dss_test_pch PRIVATE ${DSS_PCH_HEADERS} <gtest/gtest.h>)
 dss_pch_reproducible(dss_test_pch)  # producer: timestamp-free PCH → ccache hits
+
+# ★ P69 L2b2 (lane `lm`): THE FIXTURE HOME. A CompilationUnit carries the driver's
+# answer (an `#include` that resolved nowhere, a descriptor that would not read), and a
+# fixture that hands the unit on without reading it tests a different program than its
+# source says — ✔MEASURED 2026-11-05: 62 TESTs ran header-less on an `#include
+# <stdarg.h>` nothing resolved. This OBJECT library's static initializer registers an
+# observer with the production `UnitFinishedObservers`, and an unasked driver Error then
+# fails the test that built the unit (test_support/driver_diagnostics_listener.hpp).
+# An OBJECT library, so its object — and so its initializer — is in every binary that
+# links it, never dropped the way an unreferenced archive member is; linked by
+# `dss_add_test` above and by the examples runner's own target.
+add_library(dss_test_driver_diagnostics OBJECT
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_support/driver_diagnostics_listener.cpp)
+target_link_libraries(dss_test_driver_diagnostics PRIVATE dsscp-lib GTest::gtest)
+target_include_directories(dss_test_driver_diagnostics
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/tests/test_support
+)
 
 add_subdirectory(core)
 add_subdirectory(test_support)
@@ -363,7 +389,7 @@ dss_add_shuffle_arm(NAME analysis/preprocess/test_preprocessor REPEAT 20)
 # reported 0 fixtures actually deleted across 12,000 test instances — a green that proved
 # nothing). That is an argument for MORE repeats, not fewer, which is why they sit at 20
 # alongside the suites that redden easily rather than being dialled down.
-dss_add_shuffle_arm(NAME analysis/compilation_unit/test_type_name_oracle REPEAT 20)
+dss_add_shuffle_arm(NAME analysis/compilation_unit/test_unit_type_names REPEAT 20)
 dss_add_shuffle_arm(NAME analysis/compilation_unit/test_import_resolver REPEAT 20)
 dss_add_shuffle_arm(NAME analysis/compilation_unit/test_compilation_unit REPEAT 20)
 dss_add_shuffle_arm(NAME hir/test_hir_lowering_multi_lang REPEAT 20)

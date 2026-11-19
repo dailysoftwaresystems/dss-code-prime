@@ -1,0 +1,1 @@
+    if (!opened) return std::unexpected(core::pathRefusalCode(core::PathRefusal::HostAnsweredNoReason));

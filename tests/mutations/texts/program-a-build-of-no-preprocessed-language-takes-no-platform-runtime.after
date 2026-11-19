@@ -1,0 +1,2 @@
+                if (parsedForRuntime.has_value() && keyPerTarget[i].format.has_value()) {
+                    resolvedArchives = resolveShippedRuntimeArchives(

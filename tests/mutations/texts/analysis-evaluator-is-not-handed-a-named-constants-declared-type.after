@@ -1,0 +1,1 @@
+    return CstResolvedSymbol{*initExpr, rec.scope.v, std::nullopt};

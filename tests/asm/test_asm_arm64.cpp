@@ -2861,7 +2861,7 @@ TEST(EncodingValidate, MultiWordPerWordSlotReuseLoads) {
               } }
         ],
         "relocations": [
-          { "name": "r", "kind": 1, "formula": "linear", "pcRelative": false, "addendBias": 0, "widthBytes": 4 }
+          { "name": "r", "kind": 1, "formula": "linear", "pcRelative": false, "addendBias": 0, "widthBytes": 4, "fieldRange": "unsigned" }
         ]
     })";
     EXPECT_TRUE(TargetSchema::loadFromText(kJson, "x.json").has_value())
@@ -3918,7 +3918,7 @@ struct PipelineOut {
 void runFullPipeline(Mir& mir, TypeInterner const& interner,
                      TargetSchema const& target, PipelineOut& out,
                      std::uint16_t ccIndex = 0) {
-    auto lir = lowerToLir(mir, target, interner, out.rep);
+    auto lir = lowerToLir(mir, target, interner, out.rep, ccIndex);
     ASSERT_TRUE(lir.ok) << "MIR->LIR failed";
     auto const liveness = analyzeLiveness(lir.lir);
     auto const alloc = allocateRegisters(lir.lir, target, liveness,
@@ -3989,6 +3989,8 @@ TEST(Arm64Fpr, FullPipelineDoubleAddToIntEncodesFaddAndFcvtzs) {
     TypeId const params[] = {f64, f64};
     auto const sig = interner.fnSig(params, i32, CallConv::CcAAPCS64);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(sig, SymbolId{1});
     MirBlockId const bb = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(bb);
@@ -4092,6 +4094,8 @@ TEST(Arm64Fpr, FullPipelineDoublePlusRodataConstEncodesLeaFldurFadd) {
     TypeId const params[] = {f64};
     auto const sig = interner.fnSig(params, i32, CallConv::CcAAPCS64);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
+    mb.stateArgCounting(MirArgCounting::PerClass);
     MirLiteralValue quarter; quarter.value = 0.25;
     quarter.core = TypeKind::F64;
     mb.addFunction(sig, SymbolId{1});

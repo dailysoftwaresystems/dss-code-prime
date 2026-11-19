@@ -1,0 +1,1 @@
+    for (auto const& s : schemas_) adoptLanguage_(*s);   // every language, not the primary alone

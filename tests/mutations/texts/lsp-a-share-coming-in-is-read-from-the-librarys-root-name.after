@@ -1,0 +1,1 @@
+    return !fs::path{"//dss-unc-probe/share"}.root_name().empty();

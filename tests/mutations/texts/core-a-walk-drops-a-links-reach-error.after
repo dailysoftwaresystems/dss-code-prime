@@ -1,0 +1,2 @@
+            entry.reaches = reachedKind(entry.at, Use::Leaf, entry.reachError);
+            entry.reachError.clear();

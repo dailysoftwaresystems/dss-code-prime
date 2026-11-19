@@ -1,0 +1,1 @@
+    return ProbeTouch{8u, *flags};   /*S6j*/

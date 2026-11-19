@@ -1,0 +1,2 @@
+        if (interner.kind(mir.instType(id)) == TypeKind::F80) {
+            lowerF80ReturnPiece(id);

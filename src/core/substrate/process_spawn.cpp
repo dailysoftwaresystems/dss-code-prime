@@ -1,6 +1,7 @@
 #include "core/substrate/process_spawn.hpp"
 
-#include "core/substrate/path_identity.hpp"   // absoluteKeepingRoot, genericSpellingU8
+#include "core/substrate/path_identity.hpp"   // absoluteKeepingRoot, reachedKind: a child's image and directory
+#include "core/substrate/host_path_access.hpp"   // the references and the spawn's two forms (the substrate's alone)
 
 #include <algorithm>
 #include <cstddef>
@@ -120,134 +121,17 @@ namespace {
 namespace fs = std::filesystem;
 
 // ── Host error text ────────────────────────────────────────────────────────
-// Both arms report the NUMERIC code as well as the message: the message is
-// localized (and, on Windows, may be absent for some codes), so the number is
-// what a bug report can be searched on.
+// The home's ONE rendering of the OS's reason (`core::reasonText`, P69 H6c2): the NUMERIC code first -- the message
+// is localized (and, on Windows, may be absent for some codes), so the number is what a bug report can be searched
+// on -- then the system's text, as UTF-8. The strerror_r mechanism and its measurement (a thread-safe text for
+// every errno, known to the libc or not) moved there with it.
 
 #if defined(_WIN32)
-
 std::string windowsErrorText(DWORD code) {
-    std::string text;
-    LPSTR       buffer = nullptr;
-    DWORD const len    = ::FormatMessageA(
-        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM
-            | FORMAT_MESSAGE_IGNORE_INSERTS,
-        nullptr, code, 0, reinterpret_cast<LPSTR>(&buffer), 0, nullptr);
-    if (len != 0 && buffer != nullptr) {
-        text.assign(buffer, len);
-        // FormatMessage terminates its text with CRLF; strip it so the
-        // message composes into a single-line diagnostic.
-        while (!text.empty()
-               && (text.back() == '\r' || text.back() == '\n'
-                   || text.back() == ' ')) {
-            text.pop_back();
-        }
-    }
-    if (buffer != nullptr) {
-        ::LocalFree(buffer);
-    }
-    if (text.empty()) {
-        text = "<no message text for this code>";
-    }
-    return "GetLastError=" + std::to_string(code) + ": " + text;
+    return core::reasonText(std::error_code{static_cast<int>(code), std::system_category()});
 }
-
 #else
-
-// ★ WHICH `strerror_r` THIS PLATFORM DECLARED, DECIDED BY OVERLOAD RESOLUTION
-// RATHER THAN BY GUESSING AT FEATURE MACROS. There are two incompatible
-// functions behind one name — GNU's returns `char*` (and is free to hand back
-// an immutable static instead of touching the caller's buffer), XSI's returns
-// `int` (0, or an errno). Which one a header declares depends on `_GNU_SOURCE`,
-// `_POSIX_C_SOURCE`, the libc and the platform, and every `#if` that tries to
-// predict it is a guess that compiles on the host it was written for. Handing
-// the return value to an overload SET asks the compiler instead, and the
-// compiler is reading the actual declaration. MEASURED: glibc 2.39 / g++ 13.3
-// `-std=c++23` selects the GNU arm, Apple clang 21 / Darwin 25.5 selects the
-// XSI arm, and both produce text byte-identical to `std::strerror` across all
-// 145 codes probed (0..140 plus four invalid ones) — which is what keeps the
-// exact-string pins in `test_process_spawn.cpp` green, since they rebuild their
-// expectations through `std::strerror`.
-//
-// A host that declares NEITHER fails to compile here, loudly, which is the same
-// posture the `pipe2` predicate at the top of this file takes: a port to an
-// unforeseen POSIX host should be given the mechanism it does have, not left to
-// discover a silent fallback.
-//
-// `[[maybe_unused]]` on BOTH, because exactly one of them is ever selected and
-// the other is then a defined-but-unused function in an anonymous namespace —
-// which is the whole design working, not a leftover. Marking them is what keeps
-// a `-Wunused-function` leg from reporting the mechanism as a defect.
-[[maybe_unused]] char const* selectStrerrorResult(char* gnuResult,
-                                                  char* buffer) {
-    // GNU: the RETURN VALUE is the message. It may or may not be `buffer`.
-    return gnuResult != nullptr ? gnuResult : buffer;
-}
-
-[[maybe_unused]] char const* selectStrerrorResult(int xsiResult, char* buffer) {
-    // XSI: the BUFFER is the message. A non-zero return is EINVAL (no such
-    // errno) or ERANGE (buffer too small); both still normally leave usable
-    // text, and the caller cleared `buffer[0]` beforehand so a genuinely
-    // untouched buffer reads back as empty and gets the fallback sentence
-    // instead of whatever was on the stack.
-    (void)xsiResult;
-    return buffer;
-}
-
-std::string errnoText(int code) {
-    // ★ `std::strerror` USED TO BE CALLED HERE, under a comment arguing its
-    // thread-safety exposure was "nil" because this is a failure-path call.
-    // ⚠ MEASURED, AND THE ANSWER IS NARROWER AND SHARPER THAN EITHER THE OLD
-    // COMMENT OR A FIRST PROBE SUGGESTED. Darwin 25.5 / Apple clang 21, 12
-    // threads x 20,000 calls each, every thread on its OWN error code:
-    //
-    //   codes the libc KNOWS      0 wrong strings. `strerror` hands back an
-    //                             immutable table entry; there is no buffer to
-    //                             share and nothing to race.
-    //   codes it does NOT know    33,692 wrong strings out of 240,000 — and
-    //                             100,265 when the callers do the string work
-    //                             `errnoText` really does, because that work
-    //                             WIDENS the window between the pointer coming
-    //                             back and being read. "Unknown error: N" is
-    //                             formatted into ONE shared static buffer, so
-    //                             every thread on an unknown code overwrites
-    //                             every other's message.
-    //
-    // glibc 2.39 shows 0 on BOTH populations (its buffer is thread-local) and
-    // the Windows UCRT never reaches this function. So this is one platform,
-    // on one sub-population of inputs — not a "strictest reading" concern, and
-    // not a general one either. Saying which is the whole value of the
-    // measurement.
-    //
-    // ⚠ AND IT IS EXACTLY THE POPULATION THIS FUNCTION CANNOT PROMISE TO AVOID.
-    // Every caller here passes a kernel-supplied errno, which is normally a
-    // code the libc knows — but "the set of errnos a kernel can return" is not
-    // closed and is not ours to bound: `Unknown error: N` exists precisely
-    // because a filesystem or a future release can hand back a number this
-    // libc's table does not cover. Betting the diagnostic on that never
-    // happening is the same shape of bet the old comment made and lost.
-    //
-    // Blast radius stays bounded — garbled TEXT, never a wrong `spawned`
-    // verdict — so this was not a correctness cliff. It is a diagnostic that
-    // LIES, in the substrate whose stated contract is that "every OS failure
-    // carries the platform's own error text" (the header's FAIL LOUD, NEVER
-    // SWALLOW note), and on the host where that text carries the most weight:
-    // macOS takes the `posix_spawn` arm, whose single errno is the entire error
-    // channel and already cannot say whether chdir or exec failed.
-    //
-    // 256 bytes is larger than any message either libc produces; on a host that
-    // disagreed, XSI reports ERANGE and the truncated-but-terminated text is
-    // still better than none. Numeric errno is included first so the message is
-    // never the only clue.
-    char buffer[256];
-    buffer[0] = '\0';
-    char const* const msg =
-        selectStrerrorResult(::strerror_r(code, buffer, sizeof buffer), buffer);
-    return "errno=" + std::to_string(code) + ": "
-         + (msg != nullptr && msg[0] != '\0'
-                ? msg
-                : "<no message text for this errno>");
-}
+std::string errnoText(int code) { return core::reasonText(std::error_code{code, std::generic_category()}); }
 
 // One byte as REAL hex. `"0x" + std::to_string(b)` renders DECIMAL behind a hex
 // prefix and can print `0x200` for a value no byte can hold — the same mistake
@@ -272,17 +156,18 @@ constexpr char kPathListSeparator = ';';
 constexpr char kPathListSeparator = ':';
 #endif
 
-bool hasDirectoryComponent(std::string const& command) {
+bool hasDirectoryComponent(core::HostPath const& image) {
+    auto const& text = core::HostPathAccess::text(image).native();
 #if defined(_WIN32)
     // A drive-qualified name (`C:tool`) is also a path, not a PATH lookup.
-    return command.find_first_of("/\\") != std::string::npos
-        || (command.size() >= 2 && command[1] == ':');
+    return text.find_first_of(L"/\\") != std::wstring::npos || (text.size() >= 2 && text[1] == L':');
 #else
-    return command.find('/') != std::string::npos;
+    return text.find('/') != std::string::npos;
 #endif
 }
 
-// A candidate must be a real regular file — and on POSIX, one this user may
+// A candidate must be a program the OS will start: a real regular file (on
+// Windows, also an App Execution Alias, below) — and on POSIX, one this user may
 // actually exec.
 //
 // ★ "NOT EXECUTABLE" IS ITS OWN ANSWER, NOT A FLAVOUR OF "NOT FOUND". This
@@ -302,17 +187,80 @@ enum class CandidateVerdict : std::uint8_t {
     Executable,
 };
 
-CandidateVerdict classifyCandidate(fs::path const& candidate) {
+// ★ ON WINDOWS THE QUESTION IS THE PROCESS LOADER'S, ASKED OF THE OS. An App Execution Alias
+// (`%LOCALAPPDATA%\Microsoft\WindowsApps\python3.exe` and its kind) is a zero-byte reparse point
+// with the tag IO_REPARSE_TAG_APPEXECLINK, which CreateProcessW resolves and runs -- and which
+// `fs::is_regular_file` cannot follow on MS-STL, so the alias a CMake cache named was refused as
+// "not found as an executable" while the very same path ran from any shell (✔MEASURED 2026-10-16:
+// attributes 0x420, tag 0x8000001B; two self-test entries red on a Windows leg). So the OS is asked
+// what the name is (`FindFirstFileW`, whose record carries a reparse point's tag): a directory is no
+// program, an execution alias is one, and anything else -- a file, or a symbolic link, which
+// CreateProcessW follows -- is one exactly when what it reaches is a regular file. A name holding a
+// wildcard is no file a Windows directory can hold (and would make `FindFirstFileW` a search): the
+// OS reads `<`, `>` and `"` as wildcards too (DOS_STAR, DOS_QM, DOS_DOT), not only `*` and `?` --
+// ✔MEASURED 2026-10-21, both Windows libraries, one probe: "python.ex>" and "python\"exe" each found
+// python.exe, "a<" found abc -- so a candidate holding any of the five is no program.
+// Windows keeps no execute bit, so there is no near-miss to report there.
+#if defined(_WIN32)
+constexpr DWORD kAppExecutionAliasTag = 0x8000001BUL;  // IO_REPARSE_TAG_APPEXECLINK (winnt.h)
+
+// #14 (P69 H6c): the first segment of the container REFERENCE `reference` below its volume root that ends in ONE
+// period (the character before it is not a period), or empty. Only `\` separates a reference (`\\?\`).
+std::wstring segmentEndingInOnePeriod(std::wstring const& reference) {
+    core::RootSpelling const root = core::rootSpelling(std::wstring_view{reference}, core::PathGrammar::Win32);
+    std::size_t              at   = root.volume;
+    while (at < reference.size()) {
+        std::size_t end = reference.find(L'\\', at);
+        if (end == std::wstring::npos) end = reference.size();
+        std::wstring_view const segment{reference.data() + at, end - at};
+        if (!segment.empty() && segment.back() == L'.' && (segment.size() == 1 || segment[segment.size() - 2] != L'.'))
+            return std::wstring{segment};
+        at = end + 1;
+    }
+    return {};
+}
+#endif
+
+CandidateVerdict classifyCandidate(core::HostPath const& candidate) {
     std::error_code ec;
-    if (!fs::is_regular_file(candidate, ec) || ec) {
+#if defined(_WIN32)
+    std::wstring const& wide = core::HostPathAccess::text(candidate).native();
+    // Below its ROOT (P69 H6c): a verbatim or device text's own prefix holds a `?` (`\\?\`) that is no wildcard,
+    // and a listed value below a name the plain rule would change is spelled so.
+    std::size_t const names = core::rootSpelling(std::wstring_view{wide}, core::PathGrammar::Win32).volume;
+    if (wide.find_first_of(L"*?<>\"", names) != std::wstring::npos) {
         return CandidateVerdict::NotAFile;
     }
-#if !defined(_WIN32)
-    if (::access(candidate.c_str(), X_OK) != 0) {
+    WIN32_FIND_DATAW found{};
+    // At any length: the candidate's LEAF reference (the wildcard test above is on the name as given, and the
+    // reference adds none).
+    HANDLE const     search =
+        ::FindFirstFileW(core::HostPathAccess::reference(candidate, core::Use::Leaf).c_str(), &found);
+    if (search == INVALID_HANDLE_VALUE) {
+        return CandidateVerdict::NotAFile;
+    }
+    ::FindClose(search);
+    if ((found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+        return CandidateVerdict::NotAFile;
+    }
+    if ((found.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+        && found.dwReserved0 == kAppExecutionAliasTag) {
+        return CandidateVerdict::Executable;
+    }
+    // What the candidate REACHES (a dangling link reaches nothing): the substrate's answer, which the
+    // MinGW build's library does not give -- it calls a dangling link a regular file.
+    return core::reachedKind(candidate, core::Use::Leaf, ec) == core::EntryKind::File && !ec
+               ? CandidateVerdict::Executable
+               : CandidateVerdict::NotAFile;
+#else
+    if (core::reachedKind(candidate, core::Use::Leaf, ec) != core::EntryKind::File || ec) {
+        return CandidateVerdict::NotAFile;
+    }
+    if (::access(core::HostPathAccess::reference(candidate, core::Use::Leaf).c_str(), X_OK) != 0) {
         return CandidateVerdict::NotExecutable;
     }
-#endif
     return CandidateVerdict::Executable;
+#endif
 }
 
 // Build an `fs::path` out of UTF-8 bytes. `nullopt` = the bytes are not UTF-8.
@@ -338,17 +286,12 @@ CandidateVerdict classifyCandidate(fs::path const& candidate) {
 //
 // POSIX keeps the bytes untouched: a path there IS a byte string, `execv` takes
 // bytes, and there is no re-encoding step available to get wrong.
+// ONE DECODER (P69 H6c2, T4): the home's GIVEN narrow reading (`core::givenText`), which decodes through
+// `decodeUtf8ToWide` -- the same answer a narrow GIVEN `HostPath` takes.
 std::optional<fs::path> pathFromUtf8(std::string const& utf8) {
-#if defined(_WIN32)
-    std::wstring wide;
-    std::string  error;
-    if (!decodeUtf8ToWide(utf8, wide, error)) {
-        return std::nullopt;
-    }
-    return fs::path{wide};
-#else
-    return fs::path{utf8};
-#endif
+    core::GivenText read = core::givenText(utf8);
+    if (read.illFormed) return std::nullopt;
+    return std::move(read.text);
 }
 
 // A PATH entry, which is deliberately NOT held to the rule above.
@@ -411,16 +354,16 @@ std::vector<std::string> pathExtensions() {
 // FIRST rather than last because a left-to-right search reports the entry it
 // would have used had the bits been right; a later shadowing copy is strictly
 // less interesting to the operator.
-std::optional<fs::path> probeCandidate(fs::path const& candidate,
-                                       std::string*    firstNotExecutable) {
-    auto const consider = [&](fs::path const& probe) {
+std::optional<core::HostPath> probeCandidate(core::HostPath const& candidate,
+                                             std::string*          firstNotExecutable) {
+    auto const consider = [&](core::HostPath const& probe) {
         switch (classifyCandidate(probe)) {
             case CandidateVerdict::Executable:
                 return true;
             case CandidateVerdict::NotExecutable:
                 if (firstNotExecutable != nullptr
                     && firstNotExecutable->empty()) {
-                    *firstNotExecutable = probe.string();
+                    *firstNotExecutable = probe.spelling().display();
                 }
                 return false;
             case CandidateVerdict::NotAFile:
@@ -430,18 +373,22 @@ std::optional<fs::path> probeCandidate(fs::path const& candidate,
     };
 #if defined(_WIN32)
     // A name that already carries an extension is tried AS GIVEN first —
-    // `git.exe` must not become `git.exe.COM`. (`has_extension` is false for
+    // `git.exe` must not become `git.exe.COM`. (The extension is empty for
     // a bare `git`, which is the case PATHEXT exists for.)
-    if (candidate.has_extension() && consider(candidate)) {
+    if (!candidate.extension().empty() && consider(candidate)) {
         return candidate;
     }
     for (auto const& ext : pathExtensions()) {
-        fs::path withExt = candidate;
-        // `+=` CONCATENATES; `replace_extension` would eat a legitimate dot
-        // in the name (`python3.11` → `python3.EXE`).
-        withExt += ext;
-        if (consider(withExt)) {
-            return withExt;
+        // The SIBLING by suffix (`withSuffix`): the last name CONCATENATED with
+        // the extension, cut from the candidate's reference and extended
+        // literally; `replace_extension` would eat a legitimate dot in the name
+        // (`python3.11` → `python3.EXE`).
+        // A candidate that names no last name (a volume root; a first-level PATH entry `C:\Windows` and `..`) has
+        // no sibling by any extension: nothing is found by it (H1 -- the refusal by name, never a throw).
+        auto const withExt = candidate.withSuffix(fs::path{ext}.native());
+        if (!withExt) return std::nullopt;
+        if (consider(*withExt)) {
+            return *withExt;
         }
     }
     return std::nullopt;
@@ -454,9 +401,9 @@ std::optional<fs::path> probeCandidate(fs::path const& candidate,
 }
 
 // Make a hit absolute so it stays valid after the child changes directory
-// (`spawnAndWaitInherit(argv, cwd)` resolves argv[0] against the CALLER's cwd
-// and must not silently re-root it against the child's).
-fs::path makeAbsolute(fs::path const& hit) {
+// (`spawnAndWaitInherit(image, argv, cwd)` resolves the image against the CALLER's
+// cwd and must not silently re-root it against the child's).
+core::HostPath makeAbsolute(core::HostPath const& hit) {
     std::error_code ec;
     // [[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]]: NOT bare `fs::absolute`,
     // and this is the site where that mattered most. ✔MEASURED — the bare call
@@ -464,7 +411,7 @@ fs::path makeAbsolute(fs::path const& hit) {
     // error, so a tool on a UNC share became a path on the local drive. That does
     // not merely fail to spawn: if anything happens to exist at the re-rooted
     // name, this spawns THE WRONG BINARY with no diagnostic anywhere.
-    fs::path const  abs = core::absoluteKeepingRoot(hit, ec);
+    core::HostPath const abs = core::absoluteKeepingRoot(hit, core::Use::Leaf, ec);
     // `absolute` is a pure lexical/cwd operation; a failure here means the
     // cwd itself is gone. The un-absolute hit is still a real file relative
     // to that same cwd, so returning it is strictly better than losing the
@@ -480,29 +427,18 @@ fs::path makeAbsolute(fs::path const& hit) {
 // for the question "is this program here", and only `spawnAndWaitInherit` has
 // anywhere to put the extra sentence — putting it in the public signature would
 // make every caller carry a parameter for one caller's need.
-std::optional<fs::path> resolveDetailed(std::string const& command,
-                                        std::string*       firstNotExecutable) {
-    if (command.empty()) {
-        return std::nullopt;
-    }
-
-    // UTF-8 by contract on Windows; bytes on POSIX. A `nullopt` here means the
-    // bytes are not UTF-8 at all, which `spawnAndWaitInherit` reports as itself
-    // rather than as "not found" (this function has no channel to say it).
-    auto const commandPath = pathFromUtf8(command);
-    if (!commandPath.has_value()) {
+std::optional<core::HostPath> resolveDetailed(core::HostPath const& image,
+                                              std::string*          firstNotExecutable) {
+    if (image.empty()) {
         return std::nullopt;
     }
 
     // A path was given: no search happens, exactly as with execvp /
     // CreateProcess. Extension probing still applies on Windows so
-    // `.\tools\git` finds `.\tools\git.exe`. The separator scan stays on the
-    // RAW BYTES on purpose: '/', '\' and ':' are ASCII, and no ASCII byte can
-    // occur inside a UTF-8 multi-byte sequence, so scanning the bytes gives the
-    // same answer as scanning the decoded form and costs no decode.
-    if (hasDirectoryComponent(command)) {
-        auto const hit = probeCandidate(*commandPath, firstNotExecutable);
-        return hit.has_value() ? std::optional<fs::path>{makeAbsolute(*hit)}
+    // `.\tools\git` finds `.\tools\git.exe`.
+    if (hasDirectoryComponent(image)) {
+        auto const hit = probeCandidate(image, firstNotExecutable);
+        return hit.has_value() ? std::optional<core::HostPath>{makeAbsolute(*hit)}
                                : std::nullopt;
     }
 
@@ -531,8 +467,9 @@ std::optional<fs::path> resolveDetailed(std::string const& command,
         // file is the injection hazard called out in the header, so this
         // facility never does it.
         if (!entry.empty()) {
+            // A bare name below the entry: a TYPED relative right side (B1).
             auto const hit = probeCandidate(
-                pathFromEnvironmentEntry(entry) / *commandPath,
+                core::HostPath{pathFromEnvironmentEntry(entry)} / core::HostPathAccess::text(image),
                 firstNotExecutable);
             if (hit.has_value()) {
                 return makeAbsolute(*hit);
@@ -575,33 +512,22 @@ std::optional<fs::path> resolveDetailed(std::string const& command,
 // `foundNonExecutable` = the caller already named a file that IS there (POSIX
 // permission bits), so the "no regular file exists there" clause would
 // contradict it and is left out.
-std::string whereItWasLookedFor(std::string const& command,
-                                bool               foundNonExecutable) {
-    if (!hasDirectoryComponent(command)) {
+std::string whereItWasLookedFor(core::HostPath const& image,
+                                bool                  foundNonExecutable) {
+    if (!hasDirectoryComponent(image)) {
         return "It was looked up in PATH (the current directory is "
                "deliberately never searched); pass a path containing a "
                "directory separator to run a local tool.";
     }
-    // `spawnAndWaitInherit` decoded argv[0] before resolving it, so this
-    // decode succeeds there; the fallback only keeps the function total.
-    auto const  commandPath = pathFromUtf8(command);
-    std::string probed      = command;
-    if (commandPath.has_value()) {
-        try {
-            std::u8string const u8 =
-                core::genericSpellingU8(makeAbsolute(*commandPath));
-            probed.assign(reinterpret_cast<char const*>(u8.data()), u8.size());
-        } catch (std::exception const&) {
-            probed = command;
-        }
-    }
+    // The value's rendering, which never throws (a name no encoding accepts is
+    // rendered losslessly: PathText).
+    std::string const probed = makeAbsolute(image).spelling().generic();
     std::string text = "It contains a directory separator, so it names one "
                        "file and was NOT searched for in PATH. The path probed "
                        "was '" + probed + "'";
 #if defined(_WIN32)
     // The same test `probeCandidate` applies, on the same decoded path.
-    bool const hasOwnExtension =
-        commandPath.has_value() && commandPath->has_extension();
+    bool const hasOwnExtension = !image.extension().empty();
     std::string extensions;
     for (auto const& ext : pathExtensions()) {
         extensions += (extensions.empty() ? "" : " ") + ext;
@@ -686,9 +612,16 @@ void closeStdioHandles(HANDLE redirect, HANDLE childStdin, HANDLE childStderr) {
 
 // ── Public surface ─────────────────────────────────────────────────────────
 
-std::optional<fs::path> resolveExecutableOnPath(std::string const& command) {
-    return resolveDetailed(command, /*firstNotExecutable=*/nullptr);
+std::optional<core::HostPath> resolveExecutableOnPath(std::string const& command) {
+    // UTF-8 by contract on Windows; bytes on POSIX. Bytes that are not UTF-8 name no program here.
+    auto const commandPath = pathFromUtf8(command);
+    if (!commandPath.has_value()) {
+        return std::nullopt;
+    }
+    return resolveDetailed(core::HostPath{*commandPath}, /*firstNotExecutable=*/nullptr);
 }
+
+std::optional<fs::path> programPathFromUtf8(std::string const& utf8) { return pathFromUtf8(utf8); }
 
 // `buildWindowsCommandLine` and its `try` / decode companions are defined
 // inline in `core/substrate/windows_command_line.hpp` — header-only so the test
@@ -924,9 +857,10 @@ void filteredEnvironment(std::vector<std::string> const& withheld,
 // only branches below that ask about `stdoutFile`. The environment arm is the
 // same kind of thing — one decision (which entries the child gets), made by the
 // helpers above and handed to whichever OS call creates the process.
-SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
-                             fs::path const&                 cwd,
-                             fs::path const&                 stdoutFile,
+SpawnResult spawnAndWaitImpl(core::HostPath const&           image,
+                             std::vector<std::string> const& argv,
+                             core::HostPath const&           cwd,
+                             core::HostPath const&           stdoutFile,
                              std::vector<std::string> const& withheldVariables,
                              char const*                     entryPoint) {
     SpawnResult out;
@@ -938,6 +872,17 @@ SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
     if (argv.empty()) {
         out.diagnostic = self + "empty argv — there is no program to run";
         return out;
+    }
+    // ★ A VALUE THAT NAMES NOTHING IS REFUSED BY NAME (P69 H6c2, T4): a GIVEN narrow spelling that is no UTF-8 has no
+    // reference, and an empty working directory or stdout file would read as "inherit".
+    for (auto const& [what, value] : {std::pair<char const*, core::HostPath const*>{"image", &image},
+                                      {"working directory", &cwd},
+                                      {"stdout file", &stdoutFile}}) {
+        if (core::HostPathAccess::illFormed(*value)) {
+            out.diagnostic = self + "the " + what + " '" + value->spelling().display() + "' is refused: "
+                           + core::pathRefusalName(core::PathRefusal::IllFormedSpelling);
+            return out;
+        }
     }
 
     // ★ AN EMBEDDED NUL IS A TOTAL-FUNCTION GUARD, NOT A PEDANTRY. `std::string`
@@ -978,12 +923,10 @@ SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
     }
 
 #if defined(_WIN32)
-    // argv[0] must decode BEFORE the PATH search, because the search is where a
-    // bad decode turns into the wrong story. `resolveDetailed` builds its
-    // candidate paths with `pathFromUtf8`, so non-UTF-8 bytes make it return
-    // "no such program" — and the operator would then be told to fix a PATH
-    // that is fine. Say what is actually wrong instead. (POSIX has no such
-    // case: argv there is bytes, and a non-UTF-8 program name is legal.)
+    // argv[0] -- the CHILD's first argument, the image being a value (H6c) --
+    // must decode, and says so by itself rather than through the command
+    // line's general refusal below. (POSIX has no such case: argv there is
+    // bytes.)
     {
         std::wstring probe;
         std::string  decodeError;
@@ -998,14 +941,54 @@ SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
     // Validate the working directory BEFORE spawning, so "the directory does
     // not exist" reports as itself rather than as an opaque CreateProcess
     // failure (Windows) or as a child that dies after fork (POSIX).
+    // ★ THE WORKING DIRECTORY IS A CONTAINER, ITS REFERENCE TAKEN ONCE (P69 H6b; H6c A2, A3, A12, #14): the kind is
+    // asked, the period refused, the length measured and the form handed all through `cwdValue` -- never `cwd`
+    // re-resolved as a leaf, which is ANOTHER directory for a last name ending in a space (✔MEASURED).
+    core::HostPath cwdValue;
     if (!cwd.empty()) {
-        std::error_code ec;
-        if (!fs::is_directory(cwd, ec) || ec) {
-            out.diagnostic = self + "working directory '" + cwd.string()
-                           + "' is not a directory"
-                           + (ec ? ": " + ec.message() : std::string{});
+        auto const reference = core::HostPathAccess::reference(cwd, core::Use::Container);
+        cwdValue             = core::HostPathAccess::made(core::HostPathAccess::text(cwd), reference, reference,
+                                                          core::HostPath::Origin::Composed);
+        std::error_code       ec;
+        core::EntryKind const kind = core::reachedKind(cwdValue, core::Use::Container, ec);
+        if (ec || kind != core::EntryKind::Directory) {
+            out.diagnostic = self + "working directory '" + cwd.spelling().display() + "' "
+                           + (kind == core::EntryKind::Absent && !ec ? "does not exist" : "is not a directory")
+                           + (ec ? ": " + core::reasonText(ec) : std::string{});
             return out;
         }
+#if defined(_WIN32)
+        // ★ #14 (H6c, A13/N1): NO SPELLING DSS HANDS STARTS A PROCESS IN A DIRECTORY ANY SEGMENT OF WHOSE REFERENCE ENDS
+        // IN ONE PERIOD. ✔MEASURED, H6c u3 parts 2-3 (both Windows libraries): CreateProcessW removes that period in
+        // every spelling, `\\?\` included, last and middle -- with the trimmed twin there the child starts IN THE TWIN,
+        // without it nothing starts (ERROR_DIRECTORY); `e..` and `...` are kept with a separator. The 8.3 alias of
+        // such a directory is UNMEASURED. Refused here, by name.
+        if (std::wstring const segment = segmentEndingInOnePeriod(reference); !segment.empty()) {
+            std::string const name = core::HostPath{fs::path{segment}}.spelling().display();
+            out.diagnostic = self + "working directory '" + cwd.spelling().display() + "' has the segment '" + name
+                           + "', which ends in ONE period, and Windows starts no process in such a directory: "
+                             "CreateProcessW removes that period in every spelling, the extended-length one "
+                             "included, so the child would start in the directory without it, or not at all";
+            return out;
+        }
+        // ★ THE OS'S OWN LIMIT ON A CHILD'S CURRENT DIRECTORY, refused HERE and named (P69 H6), never left to an
+        // opaque CreateProcessW failure -- measured on the FORM HANDED (H6c, A3). ✔MEASURED (H6, run
+        // 20261104-220446-62443cb7; H6c u3 part 4, both libraries, a drive's and a share's): CreateProcessW starts in
+        // a current directory of at most MAX_PATH - 2 = 258 characters WITH its trailing separator, and refuses a
+        // longer one in EVERY spelling (`\\?\` counts its prefix: the verbatim form loses 4, a share's 6), so the
+        // DOS form is handed wherever one exists.
+        std::wstring const handed = core::HostPathAccess::spawnDirectory(cwdValue);
+        if (handed.size() > std::size_t{MAX_PATH - 2}) {
+            out.diagnostic = self + "working directory '" + cwd.spelling().display() + "' is "
+                           + std::to_string(handed.size())
+                           + " characters in the spelling a process is started in, its trailing separator included, "
+                             "and Windows starts no process in a current directory longer than "
+                           + std::to_string(MAX_PATH - 2)
+                           + " (CreateProcessW refuses it in every spelling, the extended-length one included: "
+                             "ERROR_DIRECTORY)";
+            return out;
+        }
+#endif
     }
 
     // Resolving here (rather than letting the OS search) is what makes
@@ -1021,17 +1004,17 @@ SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
     // argv[0]" and `build_scripts.cpp` keys its two diagnostic codes off
     // `spawned`, not off why the resolution missed.
     std::string notExecutable;
-    auto const  exe = resolveDetailed(argv[0], &notExecutable);
+    auto const  exe = resolveDetailed(image, &notExecutable);
     if (!exe.has_value()) {
         out.diagnostic =
-            self + "'" + argv[0] + "' was not found as an executable"
+            self + "'" + image.spelling().display() + "' was not found as an executable"
             + (notExecutable.empty()
                    ? std::string{". "}
                    : ": '" + notExecutable
                          + "' exists and is a regular file but is not "
                            "executable by this user (check its permission "
                            "bits). ")
-            + whereItWasLookedFor(argv[0], !notExecutable.empty());
+            + whereItWasLookedFor(image, !notExecutable.empty());
         return out;
     }
 
@@ -1051,8 +1034,11 @@ SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
     std::vector<wchar_t> commandBuffer(cmdLine.begin(), cmdLine.end());
     commandBuffer.push_back(L'\0');
 
-    std::wstring const exePath = exe->wstring();
-    std::wstring const cwdPath = cwd.empty() ? std::wstring{} : cwd.wstring();
+    // The working directory's form handed (`spawnDirectory`: the DOS container spelling with its separator, the
+    // verbatim one where no DOS form exists) and the image's (`spawnImage`: its DOS form exactly where that names the
+    // same file and is under MAX_PATH, the verbatim reference otherwise, at any length) -- the header measures both.
+    std::wstring const cwdPath   = cwd.empty() ? std::wstring{} : core::HostPathAccess::spawnDirectory(cwdValue);
+    std::wstring const startPath = core::HostPathAccess::spawnImage(*exe);
 
     // The environment arm: the child's own block when something is withheld,
     // built BEFORE any handle is opened so a failure here has nothing to clean
@@ -1078,7 +1064,7 @@ SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
         if (!withheldEnvironmentBlock(withheldWide, environmentBlock,
                                       blockError)) {
             out.diagnostic = self + "could not read this process's environment ("
-                           + blockError + "), so '" + exe->string()
+                           + blockError + "), so '" + exe->spelling().display()
                            + "' was not started — running it with every "
                              "variable inherited would hand it the ones the "
                              "caller withheld";
@@ -1121,15 +1107,18 @@ SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
         inheritable.nLength              = sizeof(inheritable);
         inheritable.lpSecurityDescriptor = nullptr;
         inheritable.bInheritHandle       = TRUE;
-        redirectHandle = ::CreateFileW(stdoutFile.c_str(), GENERIC_WRITE,
+        redirectHandle = ::CreateFileW(core::HostPathAccess::reference(stdoutFile, core::Use::Leaf).c_str(), GENERIC_WRITE,
                                        FILE_SHARE_READ, &inheritable,
                                        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
                                        nullptr);
         if (redirectHandle == INVALID_HANDLE_VALUE) {
+            // The code is read FIRST, before the message's other operands run: C++ leaves the operands of a `+`
+            // chain unordered, so a `GetLastError()` among them may be read after a call that reset it (H6c2).
+            DWORD const createFailure = ::GetLastError();
             out.diagnostic = self + "could not create the stdout redirect file '"
-                           + stdoutFile.string() + "' ("
-                           + windowsErrorText(::GetLastError())
-                           + "), so '" + exe->string() + "' was not started — "
+                           + stdoutFile.spelling().display() + "' ("
+                           + windowsErrorText(createFailure)
+                           + "), so '" + exe->spelling().display() + "' was not started — "
                              "running it with our own stdout attached would "
                              "have left nothing to read and no error to see";
             return out;
@@ -1152,12 +1141,12 @@ SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
             closeStdioHandles(redirectHandle, childStdin, childStderr);
             out.diagnostic =
                 self + "could not hand this process's own " + dupWhich
-                + " on to the child of '" + exe->string() + "' ("
+                + " on to the child of '" + exe->spelling().display() + "' ("
                 + windowsErrorText(dupError)
                 + "). STARTF_USESTDHANDLES supplies all three descriptors or "
                   "none, so the child would have run with that stream closed "
                   "while stdout went to '"
-                + stdoutFile.string() + "'";
+                + stdoutFile.spelling().display() + "'";
             return out;
         }
 
@@ -1171,7 +1160,7 @@ SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
     // as the CALLER wrote it, matching execv's semantics on the POSIX arm
     // (the child sees the argv[0] it was given, not our resolution of it).
     BOOL const created = ::CreateProcessW(
-        exePath.c_str(), commandBuffer.data(),
+        startPath.c_str(), commandBuffer.data(),
         /*lpProcessAttributes*/ nullptr,
         /*lpThreadAttributes*/  nullptr,
         /*bInheritHandles*/     TRUE,
@@ -1194,7 +1183,7 @@ SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
         // Includes the honest PATHEXT edge documented in the header: a
         // `.BAT`/`.CMD` hit resolves as a file but is not an executable
         // image, and lands here as ERROR_BAD_EXE_FORMAT with real text.
-        out.diagnostic = self + "CreateProcessW failed for '" + exe->string()
+        out.diagnostic = self + "CreateProcessW failed for '" + exe->spelling().display()
                        + "' (" + windowsErrorText(createError) + ")";
         return out;
     }
@@ -1202,6 +1191,8 @@ SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
 
     DWORD const waitResult = ::WaitForSingleObject(pi.hProcess, INFINITE);
     if (waitResult != WAIT_OBJECT_0) {
+        // Read first, as at the redirect's create: no other call between the failure and its code.
+        DWORD const waitFailure = ::GetLastError();
         // The process WAS created (so `spawned` stays true — that is a fact
         // about the OS, not about our bookkeeping), but we cannot report an
         // exit code we never obtained. -1 plus a loud diagnostic beats 0,
@@ -1209,8 +1200,8 @@ SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
         out.exitCode   = -1;
         out.diagnostic = self
                        + "WaitForSingleObject did not signal completion for '"
-                       + exe->string() + "' ("
-                       + windowsErrorText(::GetLastError()) + ")";
+                       + exe->spelling().display() + "' ("
+                       + windowsErrorText(waitFailure) + ")";
         ::CloseHandle(pi.hThread);
         ::CloseHandle(pi.hProcess);
         return out;
@@ -1218,9 +1209,10 @@ SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
 
     DWORD exitCode = 0;
     if (::GetExitCodeProcess(pi.hProcess, &exitCode) == 0) {
+        DWORD const exitCodeFailure = ::GetLastError();   // read first, as at the redirect's create
         out.exitCode   = -1;
-        out.diagnostic = self + "GetExitCodeProcess failed for '" + exe->string()
-                       + "' (" + windowsErrorText(::GetLastError()) + ")";
+        out.diagnostic = self + "GetExitCodeProcess failed for '" + exe->spelling().display()
+                       + "' (" + windowsErrorText(exitCodeFailure) + ")";
     } else {
         // Windows exit codes are DWORD; the struct exposes `int` so that the
         // POSIX 0..255 range and the Windows range share one field. The cast
@@ -1274,10 +1266,11 @@ SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
     //     can produce either on demand.
     // Code whose correctness cannot be re-derived from a red test must never be
     // made to rest on a call-graph accident.
-    std::string const        exePath = exe->string();
-    std::string const        cwdPath = cwd.empty() ? std::string{} : cwd.string();
+    std::string const        exePath = core::HostPathAccess::reference(*exe, core::Use::Leaf);
+    std::string const        cwdPath =
+        cwd.empty() ? std::string{} : core::HostPathAccess::reference(cwdValue, core::Use::Container);
     std::string const        outPath =
-        stdoutFile.empty() ? std::string{} : stdoutFile.string();
+        stdoutFile.empty() ? std::string{} : core::HostPathAccess::reference(stdoutFile, core::Use::Leaf);
     std::vector<std::string> storage = argv;
     std::vector<char*>       argvPtrs;
     argvPtrs.reserve(storage.size() + 1);
@@ -1823,16 +1816,18 @@ SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
 
 } // namespace
 
-SpawnResult spawnAndWaitInherit(std::vector<std::string> const& argv,
-                                fs::path const&                 cwd,
+SpawnResult spawnAndWaitInherit(core::HostPath const&           image,
+                                std::vector<std::string> const& argv,
+                                core::HostPath const&           cwd,
                                 std::vector<std::string> const& withheldVariables) {
-    return spawnAndWaitImpl(argv, cwd, /*stdoutFile=*/{}, withheldVariables,
+    return spawnAndWaitImpl(image, argv, cwd, /*stdoutFile=*/{}, withheldVariables,
                             "spawnAndWaitInherit");
 }
 
-SpawnResult spawnAndWaitRedirectStdout(std::vector<std::string> const& argv,
-                                       fs::path const&                 cwd,
-                                       fs::path const& stdoutFile,
+SpawnResult spawnAndWaitRedirectStdout(core::HostPath const&           image,
+                                       std::vector<std::string> const& argv,
+                                       core::HostPath const&           cwd,
+                                       core::HostPath const&           stdoutFile,
                                        std::vector<std::string> const& withheldVariables) {
     // ★ THE EMPTY PATH IS REFUSED, NOT REINTERPRETED. Internally an empty
     // `stdoutFile` is the sentinel for "inherit", and letting it through here
@@ -1850,8 +1845,31 @@ SpawnResult spawnAndWaitRedirectStdout(std::vector<std::string> const& argv,
             "is what is wanted.";
         return out;
     }
-    return spawnAndWaitImpl(argv, cwd, stdoutFile, withheldVariables,
+    return spawnAndWaitImpl(image, argv, cwd, stdoutFile, withheldVariables,
                             "spawnAndWaitRedirectStdout");
 }
+
+#if defined(_WIN32)
+unsigned long startImageInheriting(core::HostPath const& image, std::wstring const& commandLine, void* startupInfo,
+                                   void* processInformation) {
+    if (image.empty()) return ERROR_INVALID_PARAMETER;   // the empty spelling names no image (B2)
+    if (core::HostPathAccess::illFormed(image)) return ERROR_INVALID_NAME;   // T4: it names nothing
+    // The image's form handed: the spawn's own (the header), taken ONCE from the value's leaf reference.
+    std::wstring const startPath = core::HostPathAccess::spawnImage(image);
+    // CreateProcessW WRITES THROUGH lpCommandLine: a mutable, NUL-terminated buffer of our own.
+    std::vector<wchar_t> commandBuffer(commandLine.begin(), commandLine.end());
+    commandBuffer.push_back(L'\0');
+    BOOL const created = ::CreateProcessW(startPath.c_str(), commandBuffer.data(),
+                                          /*lpProcessAttributes*/ nullptr,
+                                          /*lpThreadAttributes*/  nullptr,
+                                          /*bInheritHandles*/     TRUE,
+                                          /*dwCreationFlags*/     0u,
+                                          /*lpEnvironment*/       nullptr,
+                                          /*lpCurrentDirectory*/  nullptr,
+                                          static_cast<STARTUPINFOW*>(startupInfo),
+                                          static_cast<PROCESS_INFORMATION*>(processInformation));
+    return created != 0 ? ERROR_SUCCESS : ::GetLastError();
+}
+#endif
 
 } // namespace dss::substrate

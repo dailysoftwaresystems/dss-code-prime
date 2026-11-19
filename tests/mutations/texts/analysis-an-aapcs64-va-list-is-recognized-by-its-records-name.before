@@ -1,0 +1,1 @@
+                    return k == TypeKind::Struct && ty == vaRecord;

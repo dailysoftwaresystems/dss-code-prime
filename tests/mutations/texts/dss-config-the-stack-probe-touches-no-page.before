@@ -1,0 +1,4 @@
+	subq	$4096, %r10
+	orq	$0, (%r10)
+	jmp	2b
+3:	ret

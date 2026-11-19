@@ -693,7 +693,7 @@ TEST(CrossCuLinkFormats, Abs64GateFiresOnlyOnTheIndirectSlotArm) {
       "target": {"name":"x86_64-no-abs64","version":"0.0"},
       "opcodes": [ {"mnemonic":"invalid","result":"none"} ],
       "relocations": [
-        { "name":"rel32", "kind":1, "pcRelative":true, "addendBias":-4, "widthBytes":4 }
+        { "name":"rel32", "kind":1, "pcRelative":true, "addendBias":-4, "widthBytes":4, "fieldRange":"signed" }
       ]
     })");
     ASSERT_TRUE(target.has_value());

@@ -1,0 +1,1 @@
+                    alignment = std::max(alignment, e.commonAlignment);

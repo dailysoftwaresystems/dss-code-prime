@@ -1,0 +1,1 @@
+            if (firstUnclaimed.has_value()) {

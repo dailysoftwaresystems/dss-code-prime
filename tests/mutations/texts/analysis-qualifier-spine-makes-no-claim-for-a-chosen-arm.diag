@@ -1,0 +1,1 @@
+countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed)

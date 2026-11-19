@@ -350,7 +350,7 @@ TEST(CheckpointIdentity, RolledBackScopeChurnRestoresTheScopeStack) {
     auto root = b.open(h.root);
     b.pushScope(ScopeKind::Block);
     b.pushScope(ScopeKind::Paren);
-    const std::vector<ScopeKind> before(b.scopeStack().begin(), b.scopeStack().end());
+    const std::vector<ScopeKind> before = b.scopeStack().kinds();
 
     auto cp = b.checkpoint();
     b.popScope();
@@ -360,7 +360,7 @@ TEST(CheckpointIdentity, RolledBackScopeChurnRestoresTheScopeStack) {
     b.pushScope(ScopeKind::Generic);
     b.rollback(std::move(cp));
 
-    const std::vector<ScopeKind> after(b.scopeStack().begin(), b.scopeStack().end());
+    const std::vector<ScopeKind> after = b.scopeStack().kinds();
     EXPECT_EQ(before, after)
         << "a branch that drained the scope stack below the checkpoint and "
            "refilled it left the wrong kinds behind";

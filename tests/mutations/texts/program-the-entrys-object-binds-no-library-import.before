@@ -1,0 +1,1 @@
+std::span<AssembledModule>{combined.data() + compiledCount, objectCount}

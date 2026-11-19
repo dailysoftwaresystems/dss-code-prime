@@ -1,0 +1,2 @@
+                    MirInstId const bytes =
+                        convertScalar(operands[0], hir.typeId(kids[0]), i64Ty(), node);

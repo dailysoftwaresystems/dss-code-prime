@@ -1,0 +1,43 @@
+# PURPOSE: refuse a registry row whose text a fold made untrue -- a reference claim with no carrier, or a name, key, path or decision the fold removed cited as current.
+name: check-row-truth
+description: >-
+  The action proves every check can fire and stay silent, then judges the rows a fold changed against the fold's
+  parent: each reference claim carried by how it is known, nothing the fold removed or reversed cited as current,
+  and every TEST that names what the fold removed or reversed listed as a lead to RUN. The program documents itself
+  in its own header; this file declares only how a runner starts it and what witnesses that it ran.
+steps:
+  - name: self-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-row-truth.py --selftest
+    successPattern: '^check-row-truth: selftest: OK \(\d+ arm\(s\), 0 failure\(s\)\)$'
+    requireInputsUnmoved: true
+
+  # The JUDGE: the rows changed since `base` (or the rows named), CHECK 1 over them and over the comments of the files
+  # named, CHECK 2 over every row of both registries. A finding fails the step; a LEAD (a TEST to run, a code whose
+  # corpus witnesses moved) is printed and judged by its run.
+  - name: judge
+    workingDirectoryRoot: action
+    inputs:
+      base:
+        description: "the fold's parent commit: CHECK 2's base, and the rows changed since it"
+        default: ''
+      rows:
+        description: 'row ids, comma-separated; empty = every row whose text differs from base'
+        default: ''
+      files:
+        description: 'a file naming the tree files whose comments CHECK 1 reads, one per line, relative to the tree; empty = none'
+        default: ''
+      reversals:
+        description: "a file of the fold's reversals, one per line: <what> :: <subject words>; empty = none"
+        default: ''
+      cells:
+        description: "a lane's rows directory (<ROW-ID>/trigger.txt, closing.txt, cross-refs.txt), laid over the registries; empty = none"
+        default: ''
+      adjudications:
+        description: "the fold's adjudication record, one per line: claim|kept <owner> :: <key> :: <why>; empty = none"
+        default: ''
+    run: |
+      python3 ./check-row-truth.py --base="{base}" --rows="{rows}" --files="{files}" --reversals="{reversals}" --cells="{cells}" --adjudications="{adjudications}"
+    successPattern: '^check-row-truth: 0 finding\(s\) over \d+ row\(s\) and \d+ file\(s\)'
+    requireInputsUnmoved: true

@@ -1,0 +1,2 @@
+        if (m != WhenMatch::Error) {
+            matched.push_back(fmt);

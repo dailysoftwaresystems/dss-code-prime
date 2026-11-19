@@ -1,0 +1,2 @@
+        bool const everyNameRegistered = substrate::runEveryUnit(
+            entries.size(), substrate::namingSilentUnits(rep_, "the git dependency registration", entryName,

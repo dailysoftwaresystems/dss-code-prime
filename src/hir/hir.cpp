@@ -418,8 +418,8 @@ HirNodeId HirBuilder::makeSwizzle(HirNodeId base, std::uint32_t componentMask, T
 }
 
 HirNodeId HirBuilder::makeConstructAggregate(std::span<HirNodeId const> fields, TypeId type,
-                                             HirFlags flags) {
-    return addParent(HirKind::ConstructAggregate, fields, type, /*payload=*/0, flags);
+                                             HirFlags flags, std::uint32_t unionMember) {
+    return addParent(HirKind::ConstructAggregate, fields, type, /*payload=*/unionMember, flags);
 }
 
 HirNodeId HirBuilder::makeTernary(HirNodeId cond, HirNodeId thenExpr, HirNodeId elseExpr,
@@ -469,6 +469,12 @@ HirNodeId HirBuilder::makeVaArg(HirNodeId apExpr, HirNodeId typeRef, TypeId type
 HirNodeId HirBuilder::makeVaEnd(HirNodeId apExpr, TypeId type, HirFlags flags) {
     HirNodeId const kids[] = {apExpr};
     return addParent(HirKind::VaEnd, kids, type, /*payload=*/0, flags);
+}
+
+HirNodeId HirBuilder::makeVaCopy(HirNodeId dest, HirNodeId src, TypeId type,
+                                 HirFlags flags) {
+    HirNodeId const kids[] = {dest, src};
+    return addParent(HirKind::VaCopy, kids, type, /*payload=*/0, flags);
 }
 
 HirNodeId HirBuilder::makeAddressOf(HirNodeId operand, TypeId type, HirFlags flags) {
@@ -623,6 +629,13 @@ HirNodeId HirBuilder::makeReadModifyWrite(HirNodeId target, HirNodeId update,
                                           HirFlags flags) {
     HirNodeId const kids[] = {target, update};
     return addParent(HirKind::ReadModifyWrite, kids, type, oldValueSymbol, flags);
+}
+
+HirNodeId HirBuilder::makeUnnamedObject(HirNodeId init, TypeId type, HirObjectStorage storage,
+                                        HirFlags flags) {
+    HirNodeId const kids[] = {init};
+    return addParent(HirKind::UnnamedObject, kids, type,
+                     static_cast<std::uint32_t>(storage), flags);
 }
 
 // ── typed declaration helpers (HR4) ─────────────────────────────────────────
@@ -858,6 +871,23 @@ HirNodeId Hir::rmwUpdate(HirNodeId id) const {
 SymbolId Hir::rmwOldValueSymbol(HirNodeId id) const {
     assert(kind(id) == HirKind::ReadModifyWrite);
     return SymbolId{payload(id)};
+}
+
+HirNodeId Hir::unnamedObjectInit(HirNodeId id) const {
+    assert(kind(id) == HirKind::UnnamedObject);
+    return childAt(id, 0);
+}
+HirObjectStorage Hir::unnamedObjectStorage(HirNodeId id) const {
+    assert(kind(id) == HirKind::UnnamedObject);
+    return static_cast<HirObjectStorage>(payload(id));
+}
+HirNodeId Hir::unnamedObjectValue(HirNodeId id) const {
+    // A plain loop: the chain is as long as the source nests literals inside literals
+    // (feedback-no-input-proportional-recursion). Each step moves to a strict
+    // descendant of a frozen tree, so it ends.
+    while (id.valid() && kind(id) == HirKind::UnnamedObject && !children(id).empty())
+        id = childAt(id, 0);
+    return id;
 }
 
 // ── declaration accessors (HR4) ─────────────────────────────────────────────

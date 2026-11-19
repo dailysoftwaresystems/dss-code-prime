@@ -1,0 +1,5 @@
+            row.documentGate = docFormats;
+            for (json const* o : {static_cast<json const*>(&j), &sym})   // M44b
+                if (auto const r = o->find("realization"); r != o->end() && r->is_object())
+                    for (auto const& item : r->items())
+                        row.shippedSourceFormats.push_back(item.key());

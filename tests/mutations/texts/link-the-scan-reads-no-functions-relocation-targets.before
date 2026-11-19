@@ -1,0 +1,2 @@
+         for (auto const& f : m.functions)
+             for (auto const& r : f.relocations) seeHeldSymbolId(h, r.target);

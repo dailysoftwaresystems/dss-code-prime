@@ -35,6 +35,8 @@
  * a missing caller exhaustion check (H8), or a wrong overflow stride (H6) knocks the
  * exit off 135. arm64-ELF under qemu-aarch64 (the linux-arm64 CI leg / local qemu).
  */
+#include <stdarg.h>
+
 typedef struct { double a; double b; }        PairD;
 typedef struct { long   a; long   b; }        LL;
 typedef struct { long   a; long   b; long c; } Big;

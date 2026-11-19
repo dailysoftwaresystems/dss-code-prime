@@ -1,0 +1,1 @@
+    if (!link::format::addImageDefinedSymbolVas(module.imageDefinedSymbols, 0, symbolVa,

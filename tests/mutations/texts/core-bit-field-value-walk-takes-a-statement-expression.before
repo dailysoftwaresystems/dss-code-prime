@@ -1,0 +1,2 @@
+        if (nodeSaysSomethingItself(cfg, hirCfg, tree, n)) return std::nullopt;
+        NodeId sole{};

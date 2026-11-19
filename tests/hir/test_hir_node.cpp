@@ -69,6 +69,17 @@ static_assert(dss::childArity(HirKind::Module).max == dss::kUnboundedArity);    
 static_assert(dss::childArity(HirKind::ReadModifyWrite).min == 2
               && dss::childArity(HirKind::ReadModifyWrite).max == 2);
 static_assert(dss::requiresValidType(HirKind::ReadModifyWrite));
+// P69 (D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT): an unnamed object is
+// exactly [its initializer], typed as the object, and it names three storage durations.
+static_assert(dss::childArity(HirKind::UnnamedObject).min == 1
+              && dss::childArity(HirKind::UnnamedObject).max == 1);
+static_assert(dss::requiresValidType(HirKind::UnnamedObject));
+static_assert(dss::kHirObjectStorageCount == 3);
+// P69 (D-C-STDARG-VA-COPY-MISSING): `va_copy` is exactly [dest, src], typed `void` as
+// VaStart/VaEnd are.
+static_assert(dss::childArity(HirKind::VaCopy).min == 2
+              && dss::childArity(HirKind::VaCopy).max == 2);
+static_assert(dss::requiresValidType(HirKind::VaCopy));
 
 // ── structured-CF kind predicates (compile-time) ──
 static_assert(dss::isLoopKind(HirKind::WhileStmt) && dss::isLoopKind(HirKind::ForStmt));

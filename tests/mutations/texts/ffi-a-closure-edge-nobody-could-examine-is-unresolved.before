@@ -1,0 +1,4 @@
+            if (result.status == HeaderSearchStatus::Unexaminable) {
+                outS.unexaminableEdges.emplace_back(headerName, describeUnexaminable(result));
+                return;
+            }

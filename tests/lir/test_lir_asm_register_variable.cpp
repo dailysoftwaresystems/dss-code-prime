@@ -559,12 +559,13 @@ TEST(LirAsmRegisterVariable, SvcIsTheSupervisorCallWithItsImmediate) {
 // ── (H) THE REFUSALS BOTH REFERENCES SHARE ─────────────────────────────────
 
 TEST(LirAsmRegisterVariable, AnUnknownRegisterNameIsRefusedAtTheDeclaration) {
+    // A refusal pin states it: the analysis refuses the label, so no tier after it is entered.
     auto r = lowerCToLir(
         "long f(long k) {\n"
         "    register long v __asm__(\"x99\") = k;\n"
         "    return v;\n"
         "}\n",
-        "arm64");
+        "arm64", 0, LoweringExpectation::Refuses);
     EXPECT_TRUE(anyCode(r, DiagnosticCode::S_AsmRegisterNameUnknown)) << summarize(r);
 }
 

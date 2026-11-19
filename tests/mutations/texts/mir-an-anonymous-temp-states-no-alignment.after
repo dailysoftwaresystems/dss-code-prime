@@ -1,0 +1,2 @@
+                           static_cast<std::uint32_t>(*sz), MirInstFlags::None,
+                           /*payload2=*/0u);

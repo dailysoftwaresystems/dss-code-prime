@@ -1,0 +1,2 @@
+                                        "is the warning's own text");
+                                } else if (out.appliesTo.empty()) {

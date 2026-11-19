@@ -12,13 +12,14 @@ staticInitOrder(AssembledModule const& module, StaticInitPhase phase) {
         if (!prio.has_value()) continue;
         out.push_back(StaticInitOrderEntry{e.symbol, *prio});
     }
-    // Ascending priority; ties broken by merged SymbolId so the image is
-    // DETERMINISTIC. See this file's header for why determinism — not agreement
-    // with any one reference — is the contract for equal priorities.
-    std::ranges::sort(out, [](StaticInitOrderEntry const& a,
-                              StaticInitOrderEntry const& b) {
-        if (a.priority != b.priority) return a.priority < b.priority;
-        return a.symbol.v < b.symbol.v;
+    // Ascending priority, and a TIE KEEPS THE SCHEDULE'S ORDER: each unit's
+    // definition order, the units in the link's input order (the header says
+    // why, and what was decided). A STABLE sort, and no SymbolId read: an
+    // unstable sort, or a tie broken by id, makes the order a fact of how the
+    // module was numbered -- the host-dependent order this replaced.
+    std::stable_sort(out.begin(), out.end(), [](StaticInitOrderEntry const& a,
+                                                StaticInitOrderEntry const& b) {
+        return a.priority < b.priority;
     });
     // The after-entry channel runs the same sequence BACKWARD (measured — see the
     // header). Reversing HERE, once, is what keeps every consumer in agreement.

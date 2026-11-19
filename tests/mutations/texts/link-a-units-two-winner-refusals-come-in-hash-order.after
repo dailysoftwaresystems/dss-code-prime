@@ -1,0 +1,8 @@
+            for (auto const& s : m.symbols) {
+                if (s.binding == SymbolBinding::Local || s.name.empty()) continue;
+                auto& names = externalNamesOf[s.symbol.v];
+                bool const repeated = std::any_of(names.begin(), names.end(),
+                                                  [&](ModuleSymbol const* n) { return n->name == s.name; });
+                if (!repeated) names.push_back(&s);
+            }
+            for (auto const& [id, names] : externalNamesOf) {

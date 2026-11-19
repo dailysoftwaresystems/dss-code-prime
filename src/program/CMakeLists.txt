@@ -2,6 +2,7 @@ add_library(program OBJECT
     program.cpp
     target_spec.cpp
     compile_pipeline.cpp
+    model_to_hir.cpp
     cli_args.cpp
     input_resolver.cpp
     cross_validate_target_format.cpp

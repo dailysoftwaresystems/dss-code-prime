@@ -9,7 +9,7 @@
 // ([[D-FFI-DESCRIPTOR-EAGER-IMPORT]]).
 //
 // So every arm here runs the real front half (`buildCuMir`) over the REAL
-// shipped corpus (`applySystemDirs` — the migrated `stdio.json`, `math.json`,
+// shipped corpus (the unit's own system dirs — the migrated `stdio.json`, `math.json`,
 // `windows.json`) and reads `externImports[].libraryPath`, which IS the
 // linker's input; the repoint arms then LINK the module and read the emitted
 // image's own dependency table. No C++ recompiles between the two halves of
@@ -147,7 +147,6 @@ struct FrontHalf {
     }
     UnitBuilder builder{tc.grammar, DiagnosticBudget::libraryDefault()};
     if (extraSystemDir.has_value()) builder.addSystemDir(*extraSystemDir);
-    dss::applySystemDirs(builder, *tc.grammar);
     builder.addInMemory(source, "witness.c");
     CompilationUnit cu = std::move(builder).finish();
     auto mir = buildCuMir(cu, *tc.grammar, *tc.target, format, *ccIndex, rep,
@@ -170,7 +169,6 @@ linkedImage(Toolchain const& tc, ObjectFormatSchema const& format,
     auto const ccIndex = callingConventionIndex(tc, format, rep);
     if (!ccIndex.has_value()) { why = "no calling convention"; return {}; }
     UnitBuilder builder{tc.grammar, DiagnosticBudget::libraryDefault()};
-    dss::applySystemDirs(builder, *tc.grammar);
     builder.addInMemory(source, "witness.c");
     CompilationUnit cu = std::move(builder).finish();
     auto mod = assembleUnit(cu, *tc.grammar, *tc.target, format, *ccIndex, rep,

@@ -255,6 +255,76 @@ TEST(InputSectionUnits, ADataUnitWithOverlappingMembersIsRefused) {
     EXPECT_EQ(countCode(rep, DiagnosticCode::K_InputSectionSplit), 1u);
 }
 
+// Several units that each refuse are reported in ASCENDING unit order, the
+// module's own data, however the units' map iterates on this host's library.
+// The items meet the units in neither ascending nor descending order, so a walk
+// in the map's insertion order and one in its reverse are both told apart.
+TEST(InputSectionUnits, SeveralRefusingUnitsAreReportedInUnitOrder) {
+    AssembledModule m;
+    for (std::uint32_t const unit : {5u, 14u, 2u, 9u}) {
+        m.dataItems.push_back(dataItem(10 * unit, DataSectionKind::Data, 8, 4, InputSectionSlice{unit, 0}));
+        m.dataItems.push_back(dataItem(10 * unit + 1, DataSectionKind::Data, 4, 4, InputSectionSlice{unit, 4}));
+    }
+    DiagnosticReporter rep;
+    EXPECT_FALSE(validateInputSectionUnits(m, rep));
+    std::vector<std::string> units;
+    for (auto const& d : rep.all()) {
+        if (d.code != DiagnosticCode::K_InputSectionSplit) continue;
+        auto const at = d.actual.find("data unit #");
+        ASSERT_NE(at, std::string::npos) << d.actual;
+        units.push_back(d.actual.substr(at + 11, d.actual.find(' ', at + 11) - (at + 11)));
+    }
+    EXPECT_EQ(units, (std::vector<std::string>{"2", "5", "9", "14"}))
+        << "the refusing units are not reported in ascending unit order";
+}
+
+// Items of one unit that overlap at ONE offset are named in item order: the
+// refusal names the first two items by (offset, item index), the module's
+// data, never the order an unstable sort leaves equal offsets in. Sixty-four of
+// them are more than any of the three libraries' sorts hands to its insertion
+// sort.
+TEST(InputSectionUnits, OverlappingItemsAtOneOffsetAreNamedInItemOrder) {
+    constexpr std::uint32_t kItems = 64;
+    AssembledModule m;
+    for (std::uint32_t id = 1; id <= kItems; ++id) {
+        m.dataItems.push_back(dataItem(id, DataSectionKind::Data, 4, 4, InputSectionSlice{6, 0}));
+    }
+    DiagnosticReporter rep;
+    EXPECT_FALSE(validateInputSectionUnits(m, rep));
+    ASSERT_EQ(countCode(rep, DiagnosticCode::K_InputSectionSplit), 1u);
+    std::string said;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_InputSectionSplit) said = d.actual;
+    }
+    EXPECT_NE(said.find("item #1 at section offset 0 overlaps item #0,"), std::string::npos)
+        << "the overlap among items at one offset is not named in item order: " << said;
+}
+
+// Members of one unit that share an offset (zero-size items beside one that
+// holds bytes) are laid out in item order: the order among equal offsets is the
+// module's, never the sort's. Sixty-four of them are more than any of the three
+// libraries' sorts hands to its insertion sort, so an unstable sort on the
+// offset alone is free to reorder them.
+TEST(InputSectionUnits, MembersAtOneOffsetAreLaidOutInItemOrder) {
+    constexpr std::uint32_t kZeroSize = 64;
+    AssembledModule m;
+    for (std::uint32_t id = 1; id <= kZeroSize; ++id) {
+        m.dataItems.push_back(dataItem(id, DataSectionKind::Data, 0, 4, InputSectionSlice{3, 0}));
+    }
+    m.dataItems.push_back(dataItem(kZeroSize + 1, DataSectionKind::Data, 4, 4, InputSectionSlice{3, 0}));
+    DiagnosticReporter rep;
+    auto const layout = link::format::buildExecDataSection(
+        m.dataItems, DataSectionKind::Data, 1, "input-section-units test", rep,
+        /*allowItemRelocations=*/true);
+    std::vector<std::size_t> expected(kZeroSize + 1);
+    for (std::size_t i = 0; i < expected.size(); ++i) expected[i] = i;
+    std::vector<std::size_t> const laidOut =
+        layout.has_value() ? layout->itemIndices : std::vector<std::size_t>{};
+    EXPECT_EQ(laidOut, expected)
+        << "the members at one offset are not laid out in item order ("
+        << rep.errorCount() << " error(s) reported)";
+}
+
 TEST(InputSectionUnits, AUnitSplitByExcludedItemsIsRefused) {
     AssembledModule m;
     m.dataItems.push_back(dataItem(1, DataSectionKind::Data, 4, 4, InputSectionSlice{2, 0}));
@@ -603,7 +673,13 @@ struct MingwWitness {
 [[nodiscard]] MingwWitness mingwWitness(std::filesystem::path const& dir) {
     MingwWitness w;
     w.dir = dir;
+#if defined(_WIN32)
     if (std::system("where gcc >nul 2>&1") != 0) return w;
+#else
+    // `where` and `nul` are cmd.exe's: on a POSIX shell `>nul` creates a FILE
+    // named `nul` in the working directory (P69, found in passing).
+    return w;
+#endif
     std::filesystem::path probe;
     w.usable = w.build("toolchain_check.c", "int p(void){return 0;}\n", "-O0", probe);
     return w;

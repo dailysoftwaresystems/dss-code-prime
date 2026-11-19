@@ -122,6 +122,26 @@ struct DSS_EXPORT WorkspaceProjectError {
     [[nodiscard]] bool operator==(WorkspaceProjectError const&) const = default;
 };
 
+// ★ A WORKSPACE IS REFUSED WITH EVERY REASON, NOT ITS FIRST (P69 H6c2; the several-unit class's one home,
+// `core/substrate/every_unit.hpp`): every workspace root, every manifest and every manifest's every target is read,
+// and each one that fails is one refusal here, before the answer is a refusal -- as gcc, clang and cl each give one
+// diagnostic PER failed input. NON-EMPTY, in unit order: the roots, then the manifests in sorted order, each
+// manifest's own refusals followed by its targets' in `targets[]` order. The two "there is no build" answers
+// (`NoWorkspaceRoot`, `ProjectFileNotFound`) are a list of exactly one.
+struct DSS_EXPORT WorkspaceProjectRefusals {
+    std::vector<WorkspaceProjectError> refusals;
+
+    // Over the whole list, in order: a refresh that half-fixed a workspace changes it.
+    [[nodiscard]] bool operator==(WorkspaceProjectRefusals const&) const = default;
+
+    // Is this the "there is no build" answer -- no workspace folder, no manifest -- rather than a refusal?
+    [[nodiscard]] bool namesNoBuild() const noexcept {
+        return refusals.size() == 1
+            && (refusals.front().kind == WorkspaceProjectErrorKind::NoWorkspaceRoot
+                || refusals.front().kind == WorkspaceProjectErrorKind::ProjectFileNotFound);
+    }
+};
+
 // What the workspace's declared targets prefer, and which manifests said so.
 // `languages` is deduplicated, in first-seen order over
 // (manifest order × that manifest's `targets[]` order).
@@ -146,7 +166,7 @@ struct DSS_EXPORT WorkspaceLanguagePreference {
 };
 
 using WorkspacePreferenceResult =
-    std::expected<WorkspaceLanguagePreference, WorkspaceProjectError>;
+    std::expected<WorkspaceLanguagePreference, WorkspaceProjectRefusals>;
 
 // Filename suffix that marks a project manifest. A SUFFIX, not a fixed name:
 // the shipped convention is `<artifact>.<leg>.dss-project.json` (see the
@@ -159,7 +179,8 @@ inline constexpr std::string_view kProjectFileSuffix = ".dss-project.json";
 // Read every `*.dss-project.json` directly inside each workspace root and
 // return the union of its targets' `defaultAssemblyLanguage` names.
 //
-// FAIL-CLOSED on every partial answer:
+// FAIL-CLOSED on every partial answer, each one refusal of the list (every
+// root, manifest and target is read first):
 //   * a manifest that will not parse            → ProjectFileLoadFailed
 //   * a `targets[]` entry that will not split   → TargetSpecMalformed
 //   * a target whose document will not load     → TargetConfigLoadFailed
@@ -289,7 +310,7 @@ struct DSS_EXPORT WorkspaceBuild {
     std::vector<WorkspaceBuildManifest> manifests;    // in sorted manifest order
 };
 
-using WorkspaceBuildResult = std::expected<WorkspaceBuild, WorkspaceProjectError>;
+using WorkspaceBuildResult = std::expected<WorkspaceBuild, WorkspaceProjectRefusals>;
 
 // Read every `*.dss-project.json` directly inside each workspace root (the
 // preference's set, in the same sorted order) and load everything the build
@@ -298,7 +319,9 @@ using WorkspaceBuildResult = std::expected<WorkspaceBuild, WorkspaceProjectError
 // expansion of `sources[]`.
 //
 // FAIL-CLOSED, as the preference is: a manifest the build would refuse makes
-// the whole result an error naming it, under the build's own diagnostic code.
+// the whole result a refusal naming it, under the build's own diagnostic code
+// -- and every manifest and target is read first, each failed one a refusal of
+// the list, and every cause of a `sources[]` expansion one refusal each.
 // `NoWorkspaceRoot` / `ProjectFileNotFound` are the two "there is no build"
 // answers, and they are not refusals — a workspace with no manifest has no
 // configuration to agree with, and its documents are analyzed under their

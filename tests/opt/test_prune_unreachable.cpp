@@ -45,8 +45,10 @@
 #include "core/types/symbol_attrs.hpp"
 #include "hir/hir.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
+#include "link/object_format_schema.hpp"
 #include "mir/lowering/hir_to_mir.hpp"
 #include "mir/mir.hpp"
+#include "program/model_to_hir.hpp"   // lowerModelToHir — the pipeline's gates
 #include "mir/mir_cfg.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
@@ -59,6 +61,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <unordered_set>
 #include <utility>
@@ -86,13 +89,31 @@ struct Lowered {
     builder.addInMemory(std::move(src), "<mem>");
     auto cu    = std::make_shared<CompilationUnit>(std::move(builder).finish());
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
+    auto const format = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-exec");
+    // A miss THROWS (`no_abort_in_tests_guard`): GoogleTest reports it as a failure of the one test.
+    if (!format) throw std::runtime_error("ObjectFormatSchema::loadShipped(elf64-x86_64-linux-exec) failed");
     DiagnosticReporter hirReporter;
-    auto hir = lowerToHir(model, hirReporter);
+    ModelLoweredToHir lowered = lowerModelToHir(model, **format, hirReporter);   // the pipeline's gates
+    auto hir = std::move(lowered.hir);
     DiagnosticReporter mirReporter;
+    if (!lowered.lowersToMir) {   // the build stops here, and so does the fixture: MIR never entered
+        HirToMirResult notEntered;
+        notEntered.ok = false;
+        return Lowered{
+            .model       = std::move(model),
+            .hir         = std::move(hir),
+            .hirReporter = std::move(hirReporter),
+            .mir         = std::move(notEntered),
+            .mirReporter = std::move(mirReporter),
+        };
+    }
     // The language's policy through the pipeline's ONE assembly, and the mutability map the
     // constrained static-initializer fold reads a const object's value through (P68 round 13
     // fold F7: the constraint was threaded here without it).
     MirLoweringConfig mirCfg = languageMirLoweringConfig(**loaded);
+    mirCfg.dataModel = DataModel::Lp64;   // a config states its unit's data model
+    mirCfg.symbolIdSpace = MirSymbolIdSpace::endingAt(   // the unit's name table, as the driver states it
+        static_cast<std::uint32_t>(model.symbols().size()));
     HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
                                     model.lattice().interner(), mirReporter,
                                     &hir->sourceMap, mirCfg, /*ffiMap=*/nullptr,

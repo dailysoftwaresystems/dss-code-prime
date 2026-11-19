@@ -43,6 +43,7 @@
 #include "mir/mir.hpp"
 #include "mir/mir_opcode.hpp"
 #include "repo_root.hpp"
+#include "text_scan.hpp"
 
 #include <gtest/gtest.h>
 
@@ -52,7 +53,6 @@
 #include <filesystem>
 #include <fstream>
 #include <optional>
-#include <regex>
 #include <set>
 #include <sstream>
 #include <string>
@@ -83,6 +83,7 @@ struct Fixture {
     MirInstId  arg{}, konst{}, globalAddr{}, blockAddr{}, phi{};
 
     Fixture() {
+        b.stateArgCounting(MirArgCounting::PerClass);
         b.addFunction(kFnSig, SymbolId{1});
         MirBlockId const entry  = b.createBlock(StructCfMarker::EntryBlock);
         MirBlockId const header = b.createBlock(StructCfMarker::LoopHeader);
@@ -322,13 +323,19 @@ TEST(MirTryAccessors, EveryAbortingPayloadAccessorHasANonFatalTwin) {
     // accessor-name argument. The fatal FORMAT strings carry spaces and colons,
     // so they cannot match; `MirBuilder::` members cannot match either, because
     // the probe demands the literal `Mir::` prefix.
+    // The literals are read by a loop (text_scan.hpp), never `std::regex` over a whole
+    // file: `"ident"` left to right, resuming after each closing quote.
     auto abortingAccessorsIn = [](std::string const& text) {
         std::set<std::string> names;
-        std::regex const ident{"\"([A-Za-z_][A-Za-z0-9_]*)\""};
-        for (auto it = std::sregex_iterator(text.begin(), text.end(), ident);
-             it != std::sregex_iterator(); ++it) {
-            std::string const n = (*it)[1].str();
+        for (std::size_t p = text.find('"'); p != std::string::npos;) {
+            std::size_t const end = dss::test::identEnd(text, p + 1);
+            if (end == p + 1 || end >= text.size() || text[end] != '"') {
+                p = text.find('"', p + 1);
+                continue;
+            }
+            std::string const n = text.substr(p + 1, end - p - 1);
             if (text.find("Mir::" + n + "(") != std::string::npos) names.insert(n);
+            p = text.find('"', end + 1);
         }
         return names;
     };
@@ -523,9 +530,10 @@ struct ScanResult {
 // subject cannot reach the read past it. Conservative by construction — it can
 // only shrink the refusal, never widen it.
 [[nodiscard]] bool endsTheWindow(std::string const& s) {
-    static std::regex const stop{
-        R"(\b(continue|return|break|if|for|while|switch)\b|ASSERT_)"};
-    return std::regex_search(s, stop);
+    if (s.find("ASSERT_") != std::string::npos) return true;
+    for (std::string_view const word : {"continue", "return", "break", "if", "for", "while", "switch"})
+        if (dss::test::holdsWord(s, word)) return true;
+    return false;
 }
 
 [[nodiscard]] ScanResult expectThenFatalIn(std::string_view text,

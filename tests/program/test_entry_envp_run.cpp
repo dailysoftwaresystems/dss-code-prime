@@ -17,10 +17,17 @@
 // ★ LIVE ON EVERY HOST, never skipped. It builds for the host's own exec format
 // (`hostNativeTarget()`), which is a different mechanism on each: the elf entry
 // stack, the pe UCRT environment accessors, Mach-O's dyld registers. The two
-// platform-specific forms are asserted on every host too — RUN where the host's
-// format realizes them, and REFUSED (K_ProgramEntryUndefined) where it does not —
-// because "this form is not a program entry here" is behaviour, not an absence of
-// coverage.
+// platform-specific forms are asserted on every host too, because what a form IS
+// where its format realizes no row of it is behaviour, not an absence of coverage:
+//   * MSVC's `wmain` RUNS where the host's format realizes a wide row, and elsewhere
+//     is an ordinary function, so the program is REFUSED (K_ProgramEntryUndefined);
+//   * Darwin's four-parameter `main` RUNS with its fourth vector on Mach-O, and
+//     elsewhere is the program's entry all the same: entered with the richest row
+//     the format realizes (`argc-argv-envp`), WARNED (S_EntryShapeNotDeclared), and
+//     RUN, argv and the environment intact. It was REFUSED there
+//     (K_ProgramEntryUndefined) until the entry gate read the rows a format realizes
+//     (P69 fold 3e, class C's N3); this file's case kept the refusal until fold 3f
+//     restated it, measured against gcc and MSVC, which link and run it.
 
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -66,6 +73,21 @@ constexpr char const* kEchoEnvpSource =
     "#include <stdio.h>\n"
     "int main(int argc, char **argv, char **envp) {\n"
     "    int i = 0;\n"
+    "    while (i < argc) { puts(argv[i]); i = i + 1; }\n"
+    "    puts(\"--\");\n"
+    "    while (*envp) { puts(*envp); envp = envp + 1; }\n"
+    "    return argc;\n"
+    "}\n";
+
+// Darwin's four-parameter form where no loader hands an entry a fourth vector: the
+// same echo as kEchoEnvpSource, and the fourth parameter never read (off Darwin it
+// holds what the startup left in its register or slot, under gcc's and MSVC's links
+// as under DSS's).
+constexpr char const* kFourParamEchoEnvpSource =
+    "#include <stdio.h>\n"
+    "int main(int argc, char **argv, char **envp, char **apple) {\n"
+    "    int i = 0;\n"
+    "    (void)apple;\n"
     "    while (i < argc) { puts(argv[i]); i = i + 1; }\n"
     "    puts(\"--\");\n"
     "    while (*envp) { puts(*envp); envp = envp + 1; }\n"
@@ -150,19 +172,26 @@ struct Built {
         != std::string_view::npos;
 }
 
-}  // namespace
+// Every diagnostic of a build, one per line, for a failure's message.
+[[nodiscard]] std::string diagnosticsOf(DiagnosticReporter const& rep) {
+    std::string s;
+    for (auto const& d : rep.all()) {
+        s += "\n  " + std::string{dss::diagnosticCodeName(d.code)} + ": " + d.actual;
+    }
+    return s.empty() ? std::string{"\n  <no diagnostic>"} : s;
+}
 
-TEST(EntryEnvpRun, TheProcessEnvironmentReachesMainWithRealArguments) {
-    ScopedEnv const witness{kWitnessName, kWitnessValue};
-    ScratchDir scratch{Location::InsideRepo, "entry-envp"};
-    DiagnosticReporter rep;
-    auto const b = buildForHost(scratch, "echo_envp", kEchoEnvpSource, rep);
-    ASSERT_EQ(b.rc, 0) << "the 3-parameter main must BUILD for "
-                       << hostNativeTarget().execTarget;
-    ASSERT_TRUE(fs::exists(b.exe)) << b.exe.string();
-
+// Run an echo program (argv, a separator, every envp entry; it returns argc) with
+// the three real arguments, and assert what it printed: argc is 4, argv ends after
+// argc entries, and the variable the test set reaches envp EXACTLY ONCE, byte-exact.
+// On elf the vector starts argc + 1 slots past argv, so with argc == 4 an init that
+// ignored the runtime argc would land inside argv and print the arguments again
+// after the separator instead. (Each entry's NAME=VALUE structure is checked
+// in-process by examples/c/entry_main_envp; a line-based check here would misread a
+// value that itself contains a line end, which a CI host's environment may carry.)
+void expectArgvThenTheWitnessOnce(fs::path const& exe) {
     auto const run = dss::test_support::runBinary(
-        b.exe, dss::test_support::kRunBudget, /*captureStdout=*/true,
+        exe, dss::test_support::kRunBudget, /*captureStdout=*/true,
         /*launcherPrefix=*/{}, /*programArgs=*/{kArg1, kArg2, kArg3});
     ASSERT_TRUE(run.spawned) << run.diagnostic;
     ASSERT_FALSE(run.timedOut) << run.diagnostic;
@@ -179,12 +208,6 @@ TEST(EntryEnvpRun, TheProcessEnvironmentReachesMainWithRealArguments) {
         << "argv must end after argc entries — the separator is where argv[argc]'s "
            "NULL stopped the walk; stdout was:\n" << run.capturedStdout;
 
-    // The environment: the variable THIS test set appears EXACTLY ONCE, byte-exact.
-    // On elf the vector starts argc + 1 slots past argv, so with argc == 4 an init
-    // that ignored the runtime argc would land inside argv and print the arguments
-    // again here instead. (Each entry's NAME=VALUE structure is checked in-process by
-    // examples/c/entry_main_envp; a line-based check here would misread a value that
-    // itself contains a line end, which a CI host's environment may carry.)
     std::string const want = std::string{kWitnessName} + "=" + kWitnessValue;
     std::size_t hits = 0;
     for (std::size_t i = 5; i < lines.size(); ++i) {
@@ -199,22 +222,59 @@ TEST(EntryEnvpRun, TheProcessEnvironmentReachesMainWithRealArguments) {
            "once; stdout was:\n" << run.capturedStdout;
 }
 
-TEST(EntryEnvpRun, DarwinsFourthVectorRunsOnMachoAndIsRefusedElsewhere) {
+}  // namespace
+
+TEST(EntryEnvpRun, TheProcessEnvironmentReachesMainWithRealArguments) {
+    ScopedEnv const witness{kWitnessName, kWitnessValue};
+    ScratchDir scratch{Location::InsideRepo, "entry-envp"};
+    DiagnosticReporter rep;
+    auto const b = buildForHost(scratch, "echo_envp", kEchoEnvpSource, rep);
+    ASSERT_EQ(b.rc, 0) << "the 3-parameter main must BUILD for "
+                       << hostNativeTarget().execTarget;
+    ASSERT_TRUE(fs::exists(b.exe)) << b.exe.string();
+    expectArgvThenTheWitnessOnce(b.exe);
+}
+
+// Off Mach-O no loader hands an entry a fourth vector, so the host's format realizes
+// no `argc-argv-envp-apple` row and this definition is none of the rows it realizes:
+// it is entered all the same with the richest of them, `argc-argv-envp` -- as gcc
+// (-Wmain under -Wall), MinGW-w64 gcc and cl link it and run it with argv and the
+// environment intact, and clang refuses it (MEASURED, fold 3f; the record is
+// test_object_entry_grammars.cpp's class C table, which holds the in-process cell of
+// every format) -- warned once at its declarator, and RUN here with real arguments
+// and a variable the test set. On Mach-O the fourth vector is dyld's, and is read.
+TEST(EntryEnvpRun, DarwinsFourthVectorRunsOnMachoAndIsEnteredWithTheRichestRealizedRowElsewhere) {
+    ScopedEnv const witness{kWitnessName, kWitnessValue};
     ScratchDir scratch{Location::InsideRepo, "entry-envp-apple"};
     DiagnosticReporter rep;
-    auto const b = buildForHost(scratch, "echo_apple", kEchoAppleSource, rep);
-    if (!hostRealizes("macho64-")) {
-        // No ELF or Windows loader hands an entry a fourth vector, so the host's
-        // format does not realize `argc-argv-envp-apple`: the signature is legal
-        // (the language declares the row) but no candidate survives.
-        EXPECT_NE(b.rc, 0) << "the four-parameter main must be REFUSED on "
-                           << hostNativeTarget().execTarget;
+    bool const fourthVector = hostRealizes("macho64-");
+    auto const b = buildForHost(scratch, "echo_apple",
+                                fourthVector ? kEchoAppleSource : kFourParamEchoEnvpSource, rep);
+    if (!fourthVector) {
+        ASSERT_EQ(b.rc, 0) << "the four-parameter main must BUILD on "
+                           << hostNativeTarget().execTarget << diagnosticsOf(rep);
         EXPECT_EQ(dss::test_support::countCode(
-                      rep, DiagnosticCode::K_ProgramEntryUndefined), 1u);
-        EXPECT_FALSE(fs::exists(b.exe)) << "a refused build must write no image";
+                      rep, DiagnosticCode::K_ProgramEntryUndefined), 0u) << diagnosticsOf(rep);
+        ASSERT_EQ(dss::test_support::countCode(
+                      rep, DiagnosticCode::S_EntryShapeNotDeclared), 1u) << diagnosticsOf(rep);
+        for (auto const& d : rep.all()) {
+            if (d.code != DiagnosticCode::S_EntryShapeNotDeclared) continue;
+            EXPECT_EQ(d.severity, dss::DiagnosticSeverity::Warning) << diagnosticsOf(rep);
+            EXPECT_NE(d.actual.find("'main' is a PROGRAM ENTRY on this format"), std::string::npos)
+                << diagnosticsOf(rep);
+            EXPECT_NE(d.actual.find("called with the richest of them, 'argc-argv-envp'"),
+                      std::string::npos)
+                << diagnosticsOf(rep);
+        }
+        ASSERT_TRUE(fs::exists(b.exe)) << b.exe.string();
+        expectArgvThenTheWitnessOnce(b.exe);
         return;
     }
-    ASSERT_EQ(b.rc, 0);
+    ASSERT_EQ(b.rc, 0) << diagnosticsOf(rep);
+    EXPECT_EQ(dss::test_support::countCode(
+                  rep, DiagnosticCode::S_EntryShapeNotDeclared), 0u)
+        << "Mach-O realizes the four-value row, so the definition is that row, silent:"
+        << diagnosticsOf(rep);
     auto const run = dss::test_support::runBinary(
         b.exe, dss::test_support::kRunBudget, /*captureStdout=*/true);
     ASSERT_TRUE(run.spawned) << run.diagnostic;

@@ -1,0 +1,33 @@
+{
+  "$comment": "AN ARRAY OF UNKNOWN SIZE (P69, lane cs). An absent bound always makes an incomplete array type: the type of a flexible member, of the type name `int[]`, the pointee of `int (*)[]` (a complete pointer object, compatible with a pointer to an array of any size of the same element, C 6.7.6.2p6), and of the file-scope tentative definition `int dss_cells[];`, which the unit completes to ONE element when nothing else completes it (C 6.9.2p5, with its own warning). `sizeof` of an array of unknown size is a constraint violation in ISO C that gcc and clang refuse and cl accepts as 0 with C4034 (MEASURED, lane cs probe sz, cl 19.51: a flexible member, `int[]`, a tentative `int v[]`, an extern array never defined, `*p` of `int (*p)[]`, a typedef `int T[]`); DSS accepts it as cl does, on every target, with a warning of its own. Returns 1 to 3 name the size fact that failed; 42 = the one element written through the pointer to the array of unknown size. The `release` arm pins that the folded zeros and the completed object survive the optimizer.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

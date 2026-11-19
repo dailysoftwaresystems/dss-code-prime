@@ -1,0 +1,2 @@
+        bool const everyCheckoutAcquired = substrate::runEveryUnit(
+            entries.size(), substrate::namingSilentUnits(rep_, "the git checkout acquisition", entryName,

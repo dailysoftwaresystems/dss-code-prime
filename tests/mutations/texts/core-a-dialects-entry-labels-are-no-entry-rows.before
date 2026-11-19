@@ -1,0 +1,1 @@
+        for (EntryMaterialization const verb : label.verbs) take(std::string_view{label.name}, verb);

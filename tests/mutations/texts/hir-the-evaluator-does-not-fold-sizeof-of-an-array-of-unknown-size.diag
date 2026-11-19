@@ -1,0 +1,1 @@
+the lowering's own constant evaluator folds sizeof of an array of unknown size to the language's value

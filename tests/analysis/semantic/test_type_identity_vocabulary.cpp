@@ -41,6 +41,7 @@
 #include "core/types/type_name_resolve.hpp"   // resolveLanguageTypeName: each rung is the spelled type
 #include "repo_root.hpp"
 #include "scratch_dir.hpp"
+#include "driver_diagnostics_listener.hpp"   // AskedDriverCodes
 
 #include <nlohmann/json.hpp>
 
@@ -136,7 +137,7 @@ void expectGenericClean(SemanticModel const& m) {
 // first two sources, so an out-of-tree build — whose cwd has no `src/dss-config`
 // in its ancestry — missed on every hop. It THROWS rather than returning `{}`:
 // GoogleTest turns a throw into a failure of the ONE running test, and an empty
-// path here used to propagate SILENTLY through `findShippedLibDir()` below.
+// path here used to propagate SILENTLY into the system-include path.
 [[nodiscard]] std::filesystem::path findShippedSourceConfig() {
     std::filesystem::path const path =
         dss::test::configRoot() / "sources" / "c.lang.json";
@@ -147,18 +148,6 @@ void expectGenericClean(SemanticModel const& m) {
     return path;
 }
 
-// The REAL shipped-descriptor directory (`src/dss-config/shippedLibs`), so a
-// test can drive `#include <stdint.h>` against the descriptors that actually
-// ship rather than a scratch stand-in — the point of the size_t/uint64_t pins is
-// that the SHIPPED spelling resolves to the right vocabulary entry.
-//
-// Asked of the resolver directly instead of being derived by walking two levels
-// UP from the lang.json above: on a miss that derivation produced the RELATIVE
-// path `shippedLibs` from an empty base and handed it to `addSystemDir`, so the
-// system-include path silently pointed at nothing.
-[[nodiscard]] std::filesystem::path findShippedLibDir() {
-    return dss::test::configRoot() / "shippedLibs";
-}
 
 // Analyze through the FULL front end with the shipped descriptors on the system
 // include path — `analyzeC` above never runs `#include`.
@@ -166,7 +155,6 @@ void expectGenericClean(SemanticModel const& m) {
     std::string src, DataModel dm, ObjectFormatKind fmt, std::string_view arch) {
     auto schema = loadShippedSchema("c");
     UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
-    builder.addSystemDir(findShippedLibDir());
     builder.setActiveFormat(fmt);
     builder.addInMemory(std::move(src), "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
@@ -230,6 +218,8 @@ constexpr char const* kFfiWideDescriptorJson = R"JSON({
         << kFfiWideDescriptorJson;
     auto build = [&](auto const& schema) {
         UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
+        dss::test_support::AskedDriverCodes const clearedDirs{dss::DiagnosticCode::C_UnbackedPredefinedMacro};   // no shipped dirs: the language's predefines are unbacked
+        builder.clearSystemDirs();   // the test's own system dirs, not the shipped ones
         builder.addSystemDir(sysDir.path());
         builder.setActiveFormat(ax.fmt);
         builder.addInMemory(mainSrc, "main.c");
@@ -1684,7 +1674,8 @@ TEST(TypeIdentityVocabulary, MalformedInactiveSignatureArmFailsOnEveryPair) {
 // could not tell a builtin refusal from the data-model one.
 TEST(TypeIdentityVocabulary, PerPairBuiltinSignatureSelectionIsExact) {
     auto const noChange = [](nlohmann::json&) {};
-    // The shipped row declares LP64 and LLP64 arms and no default: both select.
+    // The shipped row declares LP64, LLP64 and ILP32 arms and no default: LP64 and LLP64
+    // each select their own (ILP32 is refused by the analyzer on its own, see above).
     EXPECT_FALSE(analyzeWithBuiltins(noChange, kCasProbe, DataModel::Lp64).hasErrors());
     EXPECT_FALSE(analyzeWithBuiltins(noChange, kCasProbe, DataModel::Llp64).hasErrors());
     // One arm, for x87-80 alone, and no default.
@@ -1710,17 +1701,39 @@ TEST(TypeIdentityVocabulary, PerPairBuiltinSignatureSelectionIsExact) {
     EXPECT_FALSE(analyzeWithBuiltins(x87AndDefault, kCasProbe, DataModel::Lp64,
                                      LongDoubleFormat::F64).hasErrors())
         << "the default serves the pair no arm selects";
+    // Two arms that can select ONE pair are refused at LOAD, for every pair at once
+    // (P69 round 4, the review's NIT 14): whether two arms can co-match is a property of
+    // the arms, so it no longer waits for a pair both select — injection used to refuse
+    // this row on LP64 alone, and LLP64 loaded it clean.
     auto const withSecondLp64Arm = [](nlohmann::json& arr) {
         perPairBuiltin(arr)["signature"]["variants"].push_back(
             {{"when", {{"dataModel", "LP64"}}}, {"value", "fn(ptr<i32>, i32, i32) -> i32"}});
     };
-    {
-        auto const m = analyzeWithBuiltins(withSecondLp64Arm, kCasProbe, DataModel::Lp64);
-        EXPECT_TRUE(m.hasErrors()) << "two arms select LP64";
-        EXPECT_TRUE(mentions(m, "2 'signature' variants match this pair"));
-    }
-    EXPECT_FALSE(analyzeWithBuiltins(withSecondLp64Arm, kCasProbe, DataModel::Llp64).hasErrors())
-        << "control: LLP64 still selects exactly one";
+    EXPECT_FALSE(builtinFunctionsLoad(withSecondLp64Arm))
+        << "two arms that can both select LP64 are refused where they are written";
+    // ... and an arm that names a key the others do not, but agrees with one of them on
+    // every key both name, is the case a pair missing that key could not see.
+    auto const withLp64X87Arm = [](nlohmann::json& arr) {
+        perPairBuiltin(arr)["signature"]["variants"].push_back(
+            {{"when", {{"dataModel", "LP64"}, {"longDoubleFormat", "x87-80"}}},
+             {"value", "fn(ptr<i32>, i32, i32) -> i32"}});
+    };
+    EXPECT_FALSE(builtinFunctionsLoad(withLp64X87Arm))
+        << "an LP64 x87-80 arm beside the shipped LP64 arm can co-match with it";
+    // CONTROL: arms that AGREE on one key and DIFFER on another key both name are disjoint,
+    // and load. (The shipped row already uses all three data models — LP64, LLP64 and ILP32 —
+    // so an added data-model arm always co-matches one of them; ✔MEASURED, the first draft of
+    // this control added a second ILP32 arm and the rule refused it, correctly.)
+    auto const disjointOnASecondKey = [](nlohmann::json& arr) {
+        perPairBuiltin(arr)["signature"]["variants"] = nlohmann::json::array({
+            {{"when", {{"dataModel", "LP64"}, {"longDoubleFormat", "x87-80"}}},
+             {"value", "fn(ptr<i32>, i32, i32) -> i32"}},
+            {{"when", {{"dataModel", "LP64"}, {"longDoubleFormat", "f64"}}},
+             {"value", "fn(ptr<i32>, i32, i32) -> i32"}},
+            {{"when", {{"dataModel", "LLP64"}}}, {"value", "fn(ptr<i32>, i32, i32) -> i32"}}});
+    };
+    EXPECT_TRUE(builtinFunctionsLoad(disjointOnASecondKey))
+        << "arms differing on a key both name can never match one pair: no ambiguity";
 }
 
 // The long-double format selects too — the axis S2a-1 added, observed through

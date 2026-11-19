@@ -13,7 +13,7 @@
 //     call discarded inside enough parentheses drew no warning.
 // Each walk now goes step by step to a strict descendant (or ancestor), so it ends on any
 // tree; the tree's own node count bounds it, and only a cyclic (malformed) tree could
-// exceed that — which stops the process loud (`failOnCyclicTree`), never an answer as if
+// exceed that — which stops the process loud (`substrate::failOnCyclicWalk`), never an answer as if
 // the walk had ended. No input-proportional recursion anywhere: every walk is a loop.
 //
 // Each pin is RED-ON-DISABLE against its cap restored.

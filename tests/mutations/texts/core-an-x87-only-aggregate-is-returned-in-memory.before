@@ -1,0 +1,2 @@
+            if (position == AggregatePosition::Result) {
+                // One x87 value, at offset 0, in %st0

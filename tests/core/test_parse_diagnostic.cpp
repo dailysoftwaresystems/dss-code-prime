@@ -284,6 +284,7 @@ TEST(DiagnosticCode, PrefixIsPhaseLetterPlusHexNumber) {
     EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::X_PipelineVersionMismatch), "X0002");
     EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::X_InlineMalformedCallSite), "X0008");
     EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::X_OptFixpointTruncated),    "X0009");
+    EXPECT_EQ(diagnosticCodePrefix(DiagnosticCode::X_OptImportBoundReached),   "X000A");
 }
 
 // D-DIAG-OPT-FAMILY-NIBBLE-CLAIMED-IN-HEADER-BUT-NOT-IN-RENDERER.
@@ -325,7 +326,7 @@ TEST(DiagnosticCode, PrefixOptimizerBandRendersAsXWithNibbleStripped) {
             << diagnosticCodeName(code) << " rendered as " << rendered;
     };
 
-    // (1) Every X_* code allocated as of TF-C118, 0x2001..0x2008.
+    // (1) Every X_* code allocated, 0x2001..0x200A (0x2009 from P36, 0x200A from P69 H6).
     constexpr DiagnosticCode kOptimizerBand[] = {
         DiagnosticCode::X_UnknownPassId,
         DiagnosticCode::X_PipelineVersionMismatch,
@@ -340,6 +341,8 @@ TEST(DiagnosticCode, PrefixOptimizerBandRendersAsXWithNibbleStripped) {
         // from a lane that had never read this file — which is the only way to
         // find out whether the guarantee actually holds for an outsider.
         DiagnosticCode::X_OptFixpointTruncated,
+        // P69 H6 (ledger 506): the thin-LTO import fixpoint's bound, a compiler defect by name.
+        DiagnosticCode::X_OptImportBoundReached,
     };
 
     int named = 0;
@@ -353,7 +356,7 @@ TEST(DiagnosticCode, PrefixOptimizerBandRendersAsXWithNibbleStripped) {
     // Non-vacuity: a COUNTER incremented in the loop, not sizeof the array —
     // the latter is a compile-time tautology that stays green even if the loop
     // never executes.
-    EXPECT_EQ(named, 9);
+    EXPECT_EQ(named, 10);
 
     // (2) Discovery scan of the entire band — catches any X_* code that exists
     // but is missing from the list above.

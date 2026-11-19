@@ -2,6 +2,7 @@
 
 #include "core/types/cfi.hpp"
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/type_lattice/type_layout.hpp"   // scalarByteSize -- the reading object's address width
 #include "link/format/dwarf_cfi.hpp"
 
 #include <cstdint>
@@ -59,12 +60,16 @@
 // absent, because the unwinder trusts it. Every construct below is
 // therefore refused BY NAME rather than approximated:
 //
-//   * a `P` (personality) or `L` (LSDA) augmentation, and any non-empty
-//     FDE augmentation data. `CfiFunction` carries neither pointer, so
-//     accepting them would silently zero a language-specific handler and
-//     turn a catch into a terminate. The row that anchors this file states
-//     the constraint outright: personality / LSDA must FAIL LOUD until
-//     they are carried, never be zeroed.
+//   * FDE augmentation data its CIE does not account for. A `P`
+//     (personality) and an `L` (language-specific data area) augmentation
+//     are READ since P69 fold 3d -- each is a POINTER FIELD this file
+//     reports exactly as it reports `initial_location` (where the field is,
+//     how it is encoded, what it holds) and the caller binds, because only
+//     the caller knows whether a relocation carries the reference. What
+//     stays refused is what nothing here can account for: an encoding whose
+//     width or meaning this file does not read, and augmentation bytes past
+//     the data-area field (or any, under a CIE with no `L`) -- a field that
+//     is skipped is a handler that is dropped.
 //   * an `S` (signal-frame) augmentation. `CfiFunction::signalFrame`
 //     exists but `buildEhFrame` does not emit it (it is a CIE-level
 //     property and DSS emits ONE shared CIE per module — the same
@@ -137,21 +142,81 @@ inline constexpr std::uint8_t kDwEhPeAbsPtr = 0x00;
 //   encodings every measured producer emits". ✔MEASURED 2026-08-25 on real
 //   Apple Silicon (macOS 26.5.2), `/usr/bin/cc -arch x86_64 -c` with no other
 //   flag: the CIE's `R` augmentation byte is **0x10** — pcrel like gcc's, but
-//   with the FORMAT half left at absptr, so the field is EIGHT bytes and not
-//   four. It was refused outright, which is the fail-loud arm working: this
-//   decoder read no field of the wrong width, it declined to read at all. The
-//   fix is one row here, because the two halves were already separate concerns
-//   — the 8-byte read arm below is the `absptr` arm unchanged, and `pcrel` is
-//   the CALLER'S half (this file never resolves an address; see the header's
-//   note on why the pointer's APPLICATION cannot be decided here).
-inline constexpr std::uint8_t kDwEhPePcRel8 = 0x10;  // pcrel | absptr (8-byte)
+//   with the FORMAT half left at absptr, so the field is one ADDRESS wide (8
+//   bytes in that Mach-O 64 object) and not four. It was refused outright,
+//   which is the fail-loud arm working: this decoder read no field of the
+//   wrong width, it declined to read at all. The fix is one row here, because
+//   the two halves were already separate concerns — the address-width read arm
+//   below is the `absptr` arm unchanged, and `pcrel` is the CALLER'S half (this
+//   file never resolves an address; see the header's note on why the pointer's
+//   APPLICATION cannot be decided here). Its name said "8-byte" until P69 fold
+//   3f: a width the encoding does not state.
+inline constexpr std::uint8_t kDwEhPePcRelAbsPtr = 0x10;  // pcrel | absptr (one address)
 inline constexpr std::uint8_t kDwEhPeOmit   = 0xff;
 
-// Is `enc` a pointer encoding whose field is EIGHT bytes wide? The one place
-// the format half is interpreted — the gate and the reader must agree about
-// the width or the gate admits an encoding the reader mis-reads.
-[[nodiscard]] constexpr bool dwEhPeIsEightByteField(std::uint8_t enc) noexcept {
-    return enc == kDwEhPeAbsPtr || enc == kDwEhPePcRel8;
+// The three parts of a pointer encoding byte (LSB, "DWARF Exception Header
+// Encoding"): the FORMAT half says how many bytes the field is and whether
+// they are signed, the APPLICATION half what the value is measured from,
+// and the top bit that the field holds the address of a SLOT holding the
+// pointer rather than the pointer itself.
+inline constexpr std::uint8_t kDwEhPeFormatMask      = 0x0f;
+inline constexpr std::uint8_t kDwEhPeApplicationMask = 0x70;
+inline constexpr std::uint8_t kDwEhPeIndirect        = 0x80;
+inline constexpr std::uint8_t kDwEhPeSignedBit       = 0x08;
+
+// ★ THE WIDTH OF A FIELD OF ENCODING `enc`'S FORMAT HALF, or 0 for a format
+// this decoder does not read. `addressBytes` is the READING OBJECT'S address
+// width: DW_EH_PE_absptr is "the size of an address" on the target (LSB,
+// "DWARF Exception Header Encoding"; LLVM's DWARFDebugFrame reads it at the
+// object's address size), so an absptr field is as wide as the reading
+// object's data model says a pointer is. Until P69 fold 3f (review-xa3e F3,
+// P17) this arm was a literal 8 ("absptr (64-bit)"): right for every shipped
+// reader, and an absptr field of an object whose addresses are 4 bytes would
+// have been read 8 bytes wide. The one place the format half is interpreted:
+// every gate and every reader below asks it, or a gate admits what a reader
+// mis-reads.
+[[nodiscard]] constexpr std::uint32_t dwEhPeFormatFieldWidth(std::uint8_t enc,
+                                                             std::uint32_t addressBytes) noexcept {
+    switch (enc & kDwEhPeFormatMask) {
+    case 0x00: return addressBytes;   // absptr: one address of the reading object
+    case 0x04: case 0x0c: return 8;   // udata8, sdata8
+    case 0x03: case 0x0b: return 4;   // udata4, sdata4
+    default: return 0;
+    }
+}
+
+// The width in bytes of a PERSONALITY or DATA-AREA field, or 0 for an
+// encoding this decoder does not read. It reads the absolute and the
+// pc-relative application of the absptr, 4- and 8-byte formats, indirect or
+// not -- every form a measured producer writes (✔MEASURED P69 fold 3d, the
+// `elf_cleanup_handler_*.o` fixtures: gcc and clang write the personality
+// as 0x9b and the area as 0x1b under -fPIC, both as 0x03 under x86_64
+// -fno-pic). `datarel`, `textrel`, `funcrel`, `aligned`, the LEB128 and the
+// 2-byte formats are refused rather than read at a guessed width.
+[[nodiscard]] constexpr std::uint32_t dwEhPeHandlerFieldWidth(std::uint8_t enc,
+                                                              std::uint32_t addressBytes) noexcept {
+    std::uint8_t const application = enc & kDwEhPeApplicationMask;
+    if (application != 0x00u && application != 0x10u) return 0;
+    return dwEhPeFormatFieldWidth(enc, addressBytes);
+}
+
+// Does the field hold the address of a SLOT that holds the pointer?
+[[nodiscard]] constexpr bool dwEhPeIsIndirect(std::uint8_t enc) noexcept {
+    return (enc & kDwEhPeIndirect) != 0;
+}
+
+// The width in bytes of an FDE's `initial_location` and of its
+// `address_range` under its CIE's `R` encoding `enc`, or 0 for an encoding
+// this decoder does not resolve. It resolves the three encodings every
+// measured producer emits -- pcrel|sdata4 (0x1b, gcc on ELF), pcrel|absptr
+// (0x10, Apple clang on Mach-O) and absptr (0x00) -- each at its format's
+// width, so an absptr pair is one address of the reading object each. The
+// CIE gate and the FDE reader both ask it (until P69 fold 3f it answered "is
+// the field EIGHT bytes?").
+[[nodiscard]] constexpr std::uint32_t dwEhPeFdePointerFieldWidth(std::uint8_t enc,
+                                                                 std::uint32_t addressBytes) noexcept {
+    if (enc != kDwEhPePcRel4 && enc != kDwEhPePcRelAbsPtr && enc != kDwEhPeAbsPtr) return 0;
+    return dwEhPeFormatFieldWidth(enc, addressBytes);
 }
 
 // Is the stored value a DELTA FROM ITS OWN FIELD'S ADDRESS (pcrel), rather
@@ -160,8 +225,30 @@ inline constexpr std::uint8_t kDwEhPeOmit   = 0xff;
 // here beside the encodings themselves so a caller cannot reach for a bit
 // test of its own and get the mask subtly wrong.
 [[nodiscard]] constexpr bool dwEhPeIsPcRelative(std::uint8_t enc) noexcept {
-    return enc == kDwEhPePcRel4 || enc == kDwEhPePcRel8;
+    return (enc & kDwEhPeApplicationMask) == 0x10u;
 }
+
+// A POINTER FIELD a CIE or an FDE carries beside the function reference: the
+// personality routine's (`P`) and the language-specific data area's (`L`).
+// Reported and never resolved here, for the reason the header gives for
+// `initial_location`: in a relocatable object the field holds nothing and a
+// relocation carries the reference, and only the caller knows which form
+// its object took.
+struct DecodedPointerField {
+    // Byte offset WITHIN the decoded section of the field's first byte.
+    std::uint32_t fieldOffset = 0;
+    // The field's pointer encoding (its width, its application, whether it
+    // is indirect).
+    std::uint8_t  encoding = kDwEhPeOmit;
+    // The bytes the field occupies: its format's width, an absptr field's one
+    // address of the reading object (`dwEhPeHandlerFieldWidth`). A caller that
+    // checks the relocation patching the field reads this, never the encoding
+    // again.
+    std::uint32_t width = 0;
+    // The value the field holds: sign-extended for a signed 4-byte format,
+    // zero-extended for an unsigned one, the raw 8 bytes otherwise.
+    std::int64_t  stored = 0;
+};
 
 // One decoded FDE: the function's unwind description plus everything the
 // caller needs to bind it to a reconstructed function.
@@ -170,7 +257,8 @@ struct DecodedFde {
     // `initial_location` field. In a relocatable object this is the
     // `r_offset` of the relocation that carries the reference.
     std::uint32_t initialLocationFieldOffset = 0;
-    // The value STORED in that field, sign-extended. Zero in a relocatable
+    // The value STORED in that field (sign-extended for sdata4, a 4-byte absptr
+    // unsigned). Zero in a relocatable
     // object whose reference is a relocation; a pcrel delta in an object
     // that resolves the reference within its own flat address space.
     std::int64_t  storedInitialLocation = 0;
@@ -180,6 +268,13 @@ struct DecodedFde {
     // The function's unwind description. `codeLength` is the FDE's
     // `address_range`.
     CfiFunction   cfi;
+    // The personality routine's field, which lives in the FDE's CIE: every
+    // FDE of one CIE reports the same field. Absent when the CIE carries no
+    // `P` (or states it omitted).
+    std::optional<DecodedPointerField> personality;
+    // The language-specific data area's field, in this FDE's augmentation
+    // data. Absent when the CIE carries no `L` (or states it omitted).
+    std::optional<DecodedPointerField> dataArea;
 };
 
 struct DecodedEhFrame {
@@ -258,7 +353,43 @@ struct DecodedCie {
     std::uint8_t  fdePointerEncoding  = kDwEhPeOmit;
     bool          hasZAugmentation    = false;
     CfiInitialState initial{};
+    // `P`: the personality routine's field, in this CIE's augmentation data.
+    std::optional<DecodedPointerField> personality;
+    // `L`: the encoding of the data-area field each of its FDEs carries
+    // (`kDwEhPeOmit` when the CIE has no `L`, or states the field omitted).
+    std::uint8_t  dataAreaEncoding    = kDwEhPeOmit;
 };
+
+// Read one personality or data-area field of `enc` at `pos`, advancing it;
+// `addressBytes` is the reading object's address width (an absptr field's).
+// Returns false when the field runs past `end` (the caller names the field).
+[[nodiscard]] inline bool readHandlerField(std::span<std::uint8_t const> b, std::size_t& pos,
+                                           std::size_t end, std::uint8_t enc,
+                                           std::uint32_t addressBytes,
+                                           DecodedPointerField& out) {
+    std::uint32_t const width = dwEhPeHandlerFieldWidth(enc, addressBytes);
+    if (width == 0 || pos + width > end) return false;
+    out.fieldOffset = static_cast<std::uint32_t>(pos);
+    out.encoding    = enc;
+    out.width       = width;
+    if (width == 8u) {
+        std::uint64_t raw = 0;
+        if (!readU64LE(b, pos, raw)) return false;
+        out.stored = static_cast<std::int64_t>(raw);
+        return true;
+    }
+    std::uint32_t raw = 0;
+    if (!readU32LE(b, pos, raw)) return false;
+    out.stored = (enc & kDwEhPeSignedBit) != 0
+                     ? static_cast<std::int64_t>(static_cast<std::int32_t>(raw))
+                     : static_cast<std::int64_t>(raw);
+    return true;
+}
+
+// Name an encoding byte in a refusal.
+[[nodiscard]] inline std::string encodingHex(std::uint8_t enc) {
+    return std::string("0x") + "0123456789abcdef"[(enc >> 4) & 0xFu] + "0123456789abcdef"[enc & 0xFu];
+}
 
 } // namespace detail
 
@@ -721,20 +852,39 @@ decodeCfaInstructions(std::span<std::uint8_t const> body, DecodedCie const& cie,
 
 // Decode a whole `.eh_frame` section body into one `DecodedFde` per FDE.
 //
-// Returns nullopt after reporting exactly one refusal naming the specific
-// construct. `contextLabel` prefixes the diagnostic with the reader that
-// asked ("elf::readRelocatableObject"), so the user sees which tier
-// refused and on which object.
+// `dataModel` is the READING OBJECT'S (its format document's): an absptr field
+// is one of its addresses wide. Returns nullopt after reporting exactly one
+// refusal naming the specific construct. `contextLabel` prefixes the
+// diagnostic with the reader that asked ("elf::readRelocatableObject"), so the
+// user sees which tier refused and on which object.
 [[nodiscard]] inline std::optional<DecodedEhFrame>
 decodeEhFrame(std::span<std::uint8_t const> section,
-              DwarfRegisterMapping const& regs, std::string_view contextLabel,
-              DiagnosticReporter& reporter) {
+              DwarfRegisterMapping const& regs, DataModel dataModel,
+              std::string_view contextLabel, DiagnosticReporter& reporter) {
     auto fail = [&](std::string const& msg) -> std::optional<DecodedEhFrame> {
         emit(reporter, DiagnosticCode::K_UnwindRuleUnrepresentable,
-             std::string(contextLabel) + ": " + msg
-                 + " (D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE)");
+             std::string(contextLabel) + ": " + msg);
         return std::nullopt;
     };
+
+    // ★ THE READING OBJECT'S ADDRESS WIDTH, asked once of the one home (P69
+    // fold 3f, review-xa3e F3, P17): the decoder reads no field without knowing
+    // how wide an address is. A model that states no pointer size, or one these
+    // 4- and 8-byte reads cannot hold, is refused by name rather than read at a
+    // guess.
+    std::string const                  model        = dataModelSpelled(dataModel);
+    std::optional<std::uint64_t> const pointerBytes = scalarByteSize(TypeKind::Ptr, dataModel);
+    if (!pointerBytes.has_value()) {
+        return fail("the reading object's " + model + " states no pointer size, and an absptr "
+                    "field (DW_EH_PE_absptr) is one address wide, so no field of the unwind "
+                    "section could be read at a width it states");
+    }
+    if (*pointerBytes != 4u && *pointerBytes != 8u) {
+        return fail("the reading object's " + model + " has " + std::to_string(*pointerBytes)
+                    + "-byte pointers, and this decoder reads 4- and 8-byte fields only, so an "
+                      "absptr field (DW_EH_PE_absptr) could not be read");
+    }
+    std::uint32_t const addressBytes = static_cast<std::uint32_t>(*pointerBytes);
 
     std::string revErr;
     auto revOpt = DwarfRegisterReverseMap::build(regs, revErr);
@@ -796,6 +946,34 @@ decodeEhFrame(std::span<std::uint8_t const> section,
             }
             if (pos >= recEnd) return fail("unterminated CIE augmentation string");
             ++pos;                                   // the NUL
+            if (version == 4u) {
+                // ★ A DWARF 4 CIE STATES ITS ADDRESS SIZE AND ITS SEGMENT
+                //   SELECTOR SIZE HERE, after the augmentation string and before
+                //   the code alignment factor (DWARF 4 §6.4.1; LLVM's
+                //   DWARFDebugFrame reads both here). Until P69 fold 3f this
+                //   decoder skipped two bytes AFTER the return-address column,
+                //   so a version-4 CIE's factors were read from these two. The
+                //   stated size is held to the reading object's, and a segment
+                //   selector -- which every FDE's location would then carry -- is
+                //   refused rather than skipped.
+                if (pos + 2u > recEnd) return fail("truncated CIE address size");
+                std::uint8_t const statedAddressSize   = section[pos++];
+                std::uint8_t const segmentSelectorSize = section[pos++];
+                if (statedAddressSize != addressBytes) {
+                    return fail("CIE at byte offset " + std::to_string(recStart)
+                                + " states a " + std::to_string(statedAddressSize)
+                                + "-byte address size, and the reading object's addresses are "
+                                + std::to_string(addressBytes) + " bytes (" + model
+                                + "), so its fields would be read at a width the object "
+                                  "does not have");
+                }
+                if (segmentSelectorSize != 0u) {
+                    return fail("CIE at byte offset " + std::to_string(recStart)
+                                + " states a " + std::to_string(segmentSelectorSize)
+                                + "-byte segment selector, which every FDE's initial location "
+                                  "would carry and this decoder does not read");
+                }
+            }
             std::uint64_t caf = 0;
             if (!detail::readULeb(section, pos, caf)) {
                 return fail("truncated CIE code alignment factor");
@@ -825,11 +1003,6 @@ decodeEhFrame(std::span<std::uint8_t const> section,
             } else if (!detail::readULeb(section, pos, cie.returnAddressColumn)) {
                 return fail("truncated CIE return address column");
             }
-            if (version == 4u) {
-                // DWARF 4 inserted address_size + segment_selector_size.
-                if (pos + 2u > recEnd) return fail("truncated CIE address size");
-                pos += 2u;
-            }
 
             // ── The augmentation string decides what follows ──
             if (!aug.empty() && aug[0] == 'z') {
@@ -850,24 +1023,53 @@ decodeEhFrame(std::span<std::uint8_t const> section,
                         }
                         cie.fdePointerEncoding = section[pos++];
                         break;
-                    case 'P':
-                        return fail(
-                            "CIE at byte offset " + std::to_string(recStart)
-                            + " carries a 'P' (personality routine) augmentation. "
-                              "The neutral call-frame representation this project "
-                              "encodes every format's unwind table from carries no "
-                              "personality pointer, so accepting it would drop the "
-                              "language-specific handler and silently turn a caught "
-                              "exception into a terminate. Refusing until the "
-                              "pointer is carried");
-                    case 'L':
-                        return fail(
-                            "CIE at byte offset " + std::to_string(recStart)
-                            + " carries an 'L' (LSDA) augmentation. Each FDE then "
-                              "points at a language-specific data area this project's "
-                              "neutral call-frame representation cannot carry, and "
-                              "zeroing it would leave every catch clause in the "
-                              "merged function unreachable at run time");
+                    case 'P': {
+                        // The personality routine: an encoding byte, then the
+                        // field. Reported, never resolved (see the struct).
+                        if (pos >= augEnd) {
+                            return fail("CIE augmentation 'P' has no encoding byte");
+                        }
+                        std::uint8_t const enc = section[pos++];
+                        if (enc == kDwEhPeOmit) break;   // stated omitted: no field follows
+                        DecodedPointerField field;
+                        if (dwEhPeHandlerFieldWidth(enc, addressBytes) == 0) {
+                            return fail(
+                                "CIE at byte offset " + std::to_string(recStart)
+                                + " names its personality routine in pointer encoding "
+                                + detail::encodingHex(enc)
+                                + ". This decoder reads the absolute and pc-relative "
+                                  "4- and 8-byte encodings, indirect or not, and refuses "
+                                  "the rest rather than read the field at a guessed width "
+                                  "and name the wrong routine");
+                        }
+                        if (!detail::readHandlerField(section, pos, augEnd, enc, addressBytes,
+                                                      field)) {
+                            return fail("CIE at byte offset " + std::to_string(recStart)
+                                        + ": its personality field runs past the "
+                                          "augmentation data");
+                        }
+                        cie.personality = field;
+                        break;
+                    }
+                    case 'L': {
+                        // Only the ENCODING lives here; each FDE carries its own
+                        // data-area field in its augmentation data.
+                        if (pos >= augEnd) {
+                            return fail("CIE augmentation 'L' has no encoding byte");
+                        }
+                        std::uint8_t const enc = section[pos++];
+                        if (enc != kDwEhPeOmit && dwEhPeHandlerFieldWidth(enc, addressBytes) == 0) {
+                            return fail(
+                                "CIE at byte offset " + std::to_string(recStart)
+                                + " states its FDEs' language-specific data areas in "
+                                  "pointer encoding " + detail::encodingHex(enc)
+                                + ". This decoder reads the absolute and pc-relative "
+                                  "4- and 8-byte encodings and refuses the rest rather "
+                                  "than point a function at the wrong data");
+                        }
+                        cie.dataAreaEncoding = enc;
+                        break;
+                    }
                     case 'S':
                         return fail(
                             "CIE at byte offset " + std::to_string(recStart)
@@ -899,8 +1101,7 @@ decodeEhFrame(std::span<std::uint8_t const> section,
                 // No 'R' ⇒ the LSB default: an absolute, address-sized pointer.
                 cie.fdePointerEncoding = kDwEhPeAbsPtr;
             }
-            if (cie.fdePointerEncoding != kDwEhPePcRel4
-                && !dwEhPeIsEightByteField(cie.fdePointerEncoding)) {
+            if (dwEhPeFdePointerFieldWidth(cie.fdePointerEncoding, addressBytes) == 0) {
                 return fail(
                     "CIE at byte offset " + std::to_string(recStart)
                     + " declares FDE pointer encoding 0x"
@@ -984,12 +1185,13 @@ decodeEhFrame(std::span<std::uint8_t const> section,
             fde.pointerEncoding = cie->fdePointerEncoding;
             fde.initialLocationFieldOffset = static_cast<std::uint32_t>(pos);
             std::uint64_t addressRange = 0;
-            // ⚠ THE WIDTH IS DECIDED BY THE ONE PREDICATE, at this site AND at
+            // ⚠ THE WIDTH IS DECIDED BY THE ONE FUNCTION, at this site AND at
             // the CIE gate above. Spelling the set twice is how the gate comes
             // to admit an encoding this arm then reads at the wrong width —
             // and a mis-read `initial_location` binds every FDE to the wrong
-            // function while reporting success.
-            if (dwEhPeIsEightByteField(cie->fdePointerEncoding)) {
+            // function while reporting success. An absptr pair is one address
+            // of the reading object each: 4 bytes on a 4-byte object.
+            if (dwEhPeFdePointerFieldWidth(cie->fdePointerEncoding, addressBytes) == 8u) {
                 std::uint64_t abs64 = 0;
                 if (!detail::readU64LE(section, pos, abs64)) {
                     return fail("truncated FDE initial_location");
@@ -1003,8 +1205,11 @@ decodeEhFrame(std::span<std::uint8_t const> section,
                 if (!detail::readU32LE(section, pos, lo32)) {
                     return fail("truncated FDE initial_location");
                 }
+                // sdata4 sign-extends; a 4-byte absptr is an unsigned address.
                 fde.storedInitialLocation =
-                    static_cast<std::int64_t>(static_cast<std::int32_t>(lo32));
+                    (cie->fdePointerEncoding & kDwEhPeSignedBit) != 0
+                        ? static_cast<std::int64_t>(static_cast<std::int32_t>(lo32))
+                        : static_cast<std::int64_t>(lo32);
                 std::uint32_t range = 0;
                 if (!detail::readU32LE(section, pos, range)) {
                     return fail("truncated FDE address_range");
@@ -1020,20 +1225,40 @@ decodeEhFrame(std::span<std::uint8_t const> section,
             fde.cfi.codeLength = static_cast<std::uint32_t>(addressRange);
             fde.cfi.initial    = cie->initial;
 
+            fde.personality = cie->personality;
             if (cie->hasZAugmentation) {
                 std::uint64_t augLen = 0;
                 if (!detail::readULeb(section, pos, augLen)) {
                     return fail("truncated FDE augmentation data length");
                 }
-                if (augLen != 0u) {
+                // The CIE's `L` is the only thing that gives an FDE's
+                // augmentation data a meaning: exactly one data-area field of
+                // its encoding's width. Anything else is bytes nothing here can
+                // account for, and skipping them could skip a handler's data.
+                std::uint32_t const expected =
+                    cie->dataAreaEncoding == kDwEhPeOmit
+                        ? 0u
+                        : dwEhPeHandlerFieldWidth(cie->dataAreaEncoding, addressBytes);
+                if (augLen != expected) {
                     return fail(
                         "FDE at byte offset " + std::to_string(recStart)
                         + " carries " + std::to_string(augLen)
-                        + " bytes of augmentation data (a language-specific data "
-                          "area pointer). The neutral call-frame representation "
-                          "carries no LSDA pointer, and dropping it would leave "
-                          "the function's catch clauses unreachable at run time "
-                          "while the table still looked complete");
+                        + " bytes of augmentation data where its CIE accounts for "
+                        + std::to_string(expected)
+                        + (expected == 0u
+                               ? " (it states no language-specific data area)"
+                               : " (one language-specific data-area field)")
+                        + "; bytes nothing here can read could be a handler's "
+                          "data, and the table would still look complete");
+                }
+                if (expected != 0u) {
+                    DecodedPointerField field;
+                    if (!detail::readHandlerField(section, pos, recEnd,
+                                                  cie->dataAreaEncoding, addressBytes, field)) {
+                        return fail("FDE at byte offset " + std::to_string(recStart)
+                                    + ": its data-area field runs past its record");
+                    }
+                    fde.dataArea = field;
                 }
             }
 

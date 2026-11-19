@@ -28,6 +28,7 @@
 #include "repo_root.hpp"
 #include "scratch_dir.hpp"
 #include "shipped_read_pairs.hpp"   // the real pairs a REAL descriptor is read on
+#include "validation_va_list_binding.hpp"   // the descriptor word a validation read binds (c82)
 
 #include <nlohmann/json.hpp>
 
@@ -403,12 +404,12 @@ TEST(Fc3WidthSemantics, LiteralBeyondEveryCandidateFailsLoud) {
         "return 0; }\n");
     EXPECT_EQ(countCode(m.diagnostics(),
                         DiagnosticCode::S_IntegerLiteralTooLarge), 1u);
-    // Ladder exhaustion (decodable, but beyond every SIGNED decimal
-    // candidate): 2^63 has no decimal-unsuffixed candidate in C.
-    auto m2 = analyzeC(
-        "int main() { long long x; x = 9223372036854775808; return 0; }\n");
-    EXPECT_EQ(countCode(m2.diagnostics(),
-                        DiagnosticCode::S_IntegerLiteralTooLarge), 1u);
+    // Ladder exhaustion (decodable, but beyond every SIGNED decimal candidate) is
+    // no longer reachable in the shipped C document: since P69 its unsuffixed, `l`
+    // and `ll` rules declare `decimalPastRange`, so 2^63 is READ as `unsigned long
+    // long` with a warning (every reference accepts it). The exhaustion refusal is
+    // pinned where it still lives — a rule WITHOUT that reading:
+    // `Fc3DecimalPastRange.WithoutTheReadingTheConstantHasNoTypeInEitherPhase`.
 }
 
 TEST(Fc3WidthSemantics, FloatSuffixedLiteralTypesF32) {
@@ -721,9 +722,12 @@ namespace {
 } // namespace
 
 TEST(Fc3SizedSuffix, ReductionIsModuloTheWidthReadAtTheTypesSign) {
+    // The shipped sized rules' verb (`wrap`) — what `typeIntegerLiteral` hands over for a
+    // fixed-type rule (P69: the reduction now READS it).
     auto const bits = [](TypeKind k, std::uint64_t m,
                          std::optional<bool> charIsUnsigned = false) {
-        return reducedIntegerLiteralBits(k, m, charIsUnsigned);
+        return reducedIntegerLiteralBits(k, m, charIsUnsigned,
+                                         IntegerLiteralOutOfRange::Wrap);
     };
     auto const neg = [](std::int64_t v) { return static_cast<std::uint64_t>(v); };
     EXPECT_EQ(bits(TypeKind::I8, 300), std::optional<std::uint64_t>{44});
@@ -911,6 +915,55 @@ TEST(Fc3LoaderRejects, AnUncoveredSizedSuffixRejects) {
     }
     EXPECT_NE(loadDiagnostics(doc).find("declares 'ui64' but no 'integerLiteralTyping' rule covers it"),
               std::string::npos) << loadDiagnostics(doc);
+}
+
+// ★ A LOAD'S REFUSALS COME IN THE ORDER OF THE SUFFIXES THEY NAME (P69 fold 3f, lane `xa`). The loader
+// counts each suffix's claims in a hash table and reports every suffix that is claimed twice or that the
+// lexer does not admit, so the ORDER of those refusals was the host library's iteration order. It walks
+// the claims in ascending suffix order. The rule each case adds names its three unknown suffixes in
+// neither that order nor its reverse, so neither an insertion-order walk nor its reverse reads as sorted.
+namespace {
+
+// The first suffixed rule of a ladder, with its suffixes replaced by three the lexer does not admit.
+[[nodiscard]] nlohmann::json withThreeUnknownSuffixes(nlohmann::json const& ladder) {
+    for (auto const& rule : ladder) {
+        if (rule["suffixes"].empty()) continue;
+        nlohmann::json extra = rule;
+        extra["suffixes"] = {"zq", "aq", "mq"};
+        return extra;
+    }
+    throw std::runtime_error("the shipped C document's ladder has no suffixed rule");
+}
+
+// Each named suffix's first mention in a load's refusals, in suffix order; npos where none.
+[[nodiscard]] std::vector<std::size_t> mentionsOf(std::string const& said) {
+    std::vector<std::size_t> at;
+    for (char const* sfx : {"aq", "mq", "zq"}) at.push_back(said.find(std::string{"suffix '"} + sfx + "'"));
+    return at;
+}
+
+}  // namespace
+
+TEST(Fc3LoaderRejects, IntegerSuffixRefusalsComeInSuffixOrder) {
+    auto doc = loadShippedCJson();
+    auto& ladder = doc["semantics"]["integerLiteralTyping"];
+    ladder.push_back(withThreeUnknownSuffixes(ladder));
+    std::string const said = loadDiagnostics(doc);
+    std::vector<std::size_t> const at = mentionsOf(said);
+    for (std::size_t const pos : at) ASSERT_NE(pos, std::string::npos) << said;
+    EXPECT_LT(at[0], at[1]) << "the refusals come in suffix order:\n" << said;
+    EXPECT_LT(at[1], at[2]) << "the refusals come in suffix order:\n" << said;
+}
+
+TEST(Fc3LoaderRejects, FloatSuffixRefusalsComeInSuffixOrder) {
+    auto doc = loadShippedCJson();
+    auto& ladder = doc["semantics"]["floatLiteralTyping"];
+    ladder.push_back(withThreeUnknownSuffixes(ladder));
+    std::string const said = loadDiagnostics(doc);
+    std::vector<std::size_t> const at = mentionsOf(said);
+    for (std::size_t const pos : at) ASSERT_NE(pos, std::string::npos) << said;
+    EXPECT_LT(at[0], at[1]) << "the refusals come in suffix order:\n" << said;
+    EXPECT_LT(at[1], at[2]) << "the refusals come in suffix order:\n" << said;
 }
 
 // ── The shift-result rule is a config verb ──────────────────────────────
@@ -1240,18 +1293,10 @@ TEST(Fc3Descriptor, FseekOffsetFollowsTheDataModel) {
         TypeInterner interner{CompilationUnitId{1}};
         TypeRegistry registry;
         DiagnosticReporter rep;
-        // c82: stdio.json's vfprintf spells `va_list` — bind it (the SysV
-        // shape) exactly as the analyzer threads it in production; this
-        // test's subject (fseek's per-model offset) is unchanged.
-        TypeId const voidPtr =
-            interner.pointer(interner.primitive(TypeKind::Void));
-        std::array<TypeId, 4> vaTagFields{
-            interner.primitive(TypeKind::U32),
-            interner.primitive(TypeKind::U32), voidPtr, voidPtr};
-        TypeId const vaListTy = interner.array(
-            interner.structType("__va_list_tag", vaTagFields), 1);
-        std::array<NamedTypeBinding, 1> namedTypes{
-            NamedTypeBinding{"va_list", vaListTy}};
+        // c82: stdio.json's vfprintf spells the descriptor word `va_list` — the
+        // read binds it as every validation read does; this test's subject
+        // (fseek's per-model offset) is unchanged.
+        auto const namedTypes = dss::test_support::validationVaListBinding(interner);
         ffi::ShippedPairFacts const facts = pair.pairFacts();
         auto d = ffi::readShippedLibDescriptor(desc, interner, registry, rep,
                                                pair.dataModel(), pair.activeTarget(),
@@ -1736,4 +1781,164 @@ TEST(Fc3ReTypingBitInt, CompoundLiteralBitIntZeroDiagnosesExactlyOnce) {
     EXPECT_EQ(countCode(m.diagnostics(),
                         DiagnosticCode::S_BitIntWidthNotPositive), 1u)
         << "the Pass-1.5 compound-literal resolve is rolled back; only Pass 2 emits";
+}
+
+// ── P69 (lane `cs`, D-C-INTEGER-LITERAL-OUT-OF-RANGE-VERB-IS-NEVER-READ) ──────────────────────
+// The reduction READS the rule's out-of-range verb: a magnitude its type cannot represent is
+// reduced only as the verb says, and with NO verb — a ladder or bit-precise type, which holds
+// its magnitude by construction — it is REFUSED, never wrapped in silence. In range, no verb is
+// consulted. And the ladder hands a fixed-type rule's verb over (`IntegerLadderResult::outOfRange`).
+// RED-ON-DISABLE: make the reduction ignore `outOfRange` (always wrap) → the two nullopt rows fail.
+TEST(Fc3SizedSuffix, AnOutOfRangeMagnitudeIsReducedOnlyAsTheRulesVerbSays) {
+    EXPECT_FALSE(reducedIntegerLiteralBits(TypeKind::I8, 300, false, std::nullopt).has_value())
+        << "no verb: an out-of-range magnitude is refused, never wrapped";
+    EXPECT_FALSE(
+        reducedIntegerLiteralBits(TypeKind::I64, ~std::uint64_t{0}, false, std::nullopt).has_value());
+    EXPECT_EQ(reducedIntegerLiteralBits(TypeKind::I8, 100, false, std::nullopt),
+              std::optional<std::uint64_t>{100});
+    EXPECT_EQ(reducedIntegerLiteralBits(TypeKind::U64, ~std::uint64_t{0}, false, std::nullopt),
+              ~std::uint64_t{0});
+    EXPECT_EQ(reducedIntegerLiteralBits(TypeKind::I8, 300, false, IntegerLiteralOutOfRange::Wrap),
+              std::optional<std::uint64_t>{44});
+    auto const schema = GrammarSchema::loadFromText(loadShippedCJson().dump(), "<fc3-shipped>");
+    ASSERT_TRUE(schema.has_value());
+    auto const& rules = (*schema)->semantics().integerLiteralTyping;
+    NumberStyle const* ns = (*schema)->numberStyle();
+    auto const sized = typeIntegerLiteral("300i8", ns, rules, DataModel::Lp64, 300);
+    ASSERT_EQ(sized.status, IntegerLadderStatus::Typed);
+    EXPECT_EQ(sized.outOfRange, std::optional<IntegerLiteralOutOfRange>{IntegerLiteralOutOfRange::Wrap})
+        << "a fixed-type rule's verb must reach the value tiers";
+    auto const ladder = typeIntegerLiteral("300", ns, rules, DataModel::Lp64, 300);
+    ASSERT_EQ(ladder.status, IntegerLadderStatus::Typed);
+    EXPECT_FALSE(ladder.outOfRange.has_value()) << "a ladder type carries no verb";
+}
+
+// ── P69 (lane `cs`, D-C-DECIMAL-CONSTANT-PAST-LONG-LONG-IS-REFUSED-WHERE-EVERY-REFERENCE-ACCEPTS-IT) ──
+// A DECIMAL constant past every signed type its suffix admits — `9223372036854775808`,
+// `...L`, `...LL` — is READ as the rule's `decimalPastRange` type (`unsigned long long` in
+// the C document) with the S_IntegerLiteralImplicitlyUnsigned warning, in phase 7 and phase 4
+// alike; a rule that declares no such reading leaves the constant without a type in BOTH.
+// ✔MEASURED 2026-10-01 (lane `cs`'s probe x3): every reference builds
+// `unsigned long long v = 9223372036854775808LL;`; clang 18.1.3 types all three spellings
+// `unsigned long long` and warns "interpreting as unsigned"; gcc 13.3.0 warns "so large that it
+// is unsigned" (its documented reading) yet types them `__int128`; MSVC 19.51 wraps the `LL` one.
+// RED-ON-DISABLE: drop step 5 of `typeIntegerLiteral` → every test below but the last fails.
+namespace {
+
+// Analyze under a C document whose `integerLiteralTyping` array is `mutate`d first.
+[[nodiscard]] SemanticModel analyzeWithLadderMutation(
+    std::string src, std::function<void(nlohmann::json&)> const& mutate,
+    DataModel dm = DataModel::Lp64) {
+    nlohmann::json doc = loadShippedCJson();
+    mutate(doc["semantics"]["integerLiteralTyping"]);
+    auto schema = GrammarSchema::loadFromText(doc.dump(), "<ladder-perturbed>");
+    if (!schema) throw std::runtime_error(loadDiagnostics(doc));
+    UnitBuilder builder{*schema, DiagnosticBudget::libraryDefault()};
+    builder.addInMemory(std::move(src), "<mem>");
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    assertNoBuilderErrors(*cu);
+    return analyze(cu, DiagnosticBudget::libraryDefault(), dm);
+}
+
+} // namespace
+
+TEST(Fc3DecimalPastRange, ADecimalPastEverySignedCandidateIsReadAsUnsignedLongLong) {
+    for (DataModel const dm : {DataModel::Lp64, DataModel::Llp64}) {
+        expectLiteralTypes("9223372036854775808", TypeKind::U64, dm);
+        expectLiteralTypes("9223372036854775808L", TypeKind::U64, dm);
+        expectLiteralTypes("9223372036854775808LL", TypeKind::U64, dm);
+        expectLiteralTypes("18446744073709551615", TypeKind::U64, dm);
+        // `unsigned long long` BY NAME — on LP64 `unsigned long` shares the core.
+        auto m = analyzeC(
+            "int f(void) { return _Generic(9223372036854775808, unsigned long long: 1, "
+            "unsigned long: 2, long long: 3, default: 4) + _Generic(9223372036854775808L, "
+            "unsigned long long: 10, unsigned long: 20, default: 30) + "
+            "_Generic(9223372036854775808LL, unsigned long long: 100, long long: 200, "
+            "default: 300); }\n", dm);
+        EXPECT_FALSE(m.hasErrors());
+        EXPECT_EQ(selectedGenericArms(m), (std::vector<std::string>{"1", "10", "100"}));
+        EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_IntegerLiteralImplicitlyUnsigned),
+                  3u) << "one warning per literal";
+        EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_IntegerLiteralTooLarge), 0u);
+    }
+    // In range, and every non-decimal spelling, is untouched — and silent.
+    auto quiet = analyzeC("unsigned long long a = 9223372036854775807;\n"
+                          "unsigned long long b = 0x8000000000000000;\n"
+                          "unsigned long long c = 9223372036854775808u;\n");
+    EXPECT_EQ(countCode(quiet.diagnostics(), DiagnosticCode::S_IntegerLiteralImplicitlyUnsigned), 0u);
+    EXPECT_FALSE(quiet.hasErrors());
+}
+
+TEST(Fc3DecimalPastRange, ADeclarationsConstantSeesTheSameTypeAndWarnsOnce) {
+    // Pass 1.5 folds the bound (the literal pre-stamp visits each literal) and Pass 2
+    // types it again: ONE warning per literal (the reporter's duplicate window), and
+    // the unsigned reading in the constant — `-x > 0` holds only for an unsigned type.
+    auto m = analyzeWithArithMutation(
+        "static char b[sizeof(9223372036854775808) + (-9223372036854775808LL > 0)];\n"
+        "_Static_assert(-9223372036854775808L > 0, \"read unsigned\");\n",
+        [](nlohmann::json&) {});
+    EXPECT_FALSE(m.hasErrors());
+    EXPECT_EQ(arrayDimOf(m, "b"), 9);
+    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_IntegerLiteralImplicitlyUnsigned), 3u);
+}
+
+TEST(Fc3DecimalPastRange, WithoutTheReadingTheConstantHasNoTypeInEitherPhase) {
+    auto const unread = [](nlohmann::json& ladder) {
+        for (auto& rule : ladder) rule.erase("decimalPastRange");
+    };
+    auto m = analyzeWithLadderMutation(
+        "int main() { long long x; x = 9223372036854775808; return 0; }\n", unread);
+    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_IntegerLiteralTooLarge), 1u);
+    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_IntegerLiteralImplicitlyUnsigned), 0u);
+
+    // The ladder's report, and phase 4's reading, from the SAME rule.
+    std::uint64_t const past = std::uint64_t{1} << 63;
+    auto const shipped = GrammarSchema::loadFromText(loadShippedCJson().dump(), "<fc3-shipped>");
+    ASSERT_TRUE(shipped.has_value());
+    NumberStyle const* ns = (*shipped)->numberStyle();
+    auto const& rules = (*shipped)->semantics().integerLiteralTyping;
+    auto const read = typeIntegerLiteral("9223372036854775808LL", ns, rules, DataModel::Lp64, past);
+    ASSERT_EQ(read.status, IntegerLadderStatus::Typed);
+    EXPECT_EQ(read.kind, TypeKind::U64);
+    EXPECT_EQ(read.vocabularyName, "unsigned long long");
+    EXPECT_TRUE(read.reinterpretedUnsigned);
+    auto const hex = typeIntegerLiteral("0x8000000000000000", ns, rules, DataModel::Lp64, past);
+    ASSERT_EQ(hex.status, IntegerLadderStatus::Typed);
+    EXPECT_FALSE(hex.reinterpretedUnsigned) << "a hex list admits unsigned: nothing reinterpreted";
+    auto const pp = preprocessorLiteral("9223372036854775808", ns, rules, past, std::nullopt);
+    ASSERT_EQ(pp.status, PhaseFourLiteralStatus::Operand);
+    EXPECT_FALSE(pp.isSigned);
+    EXPECT_TRUE(pp.reinterpretedUnsigned);
+
+    nlohmann::json doc = loadShippedCJson();
+    unread(doc["semantics"]["integerLiteralTyping"]);
+    auto const bare = GrammarSchema::loadFromText(doc.dump(), "<fc3-unread>");
+    ASSERT_TRUE(bare.has_value());
+    auto const& bareRules = (*bare)->semantics().integerLiteralTyping;
+    EXPECT_EQ(typeIntegerLiteral("9223372036854775808", (*bare)->numberStyle(), bareRules,
+                                 DataModel::Lp64, past).status,
+              IntegerLadderStatus::TooLarge);
+    EXPECT_EQ(preprocessorLiteral("9223372036854775808", (*bare)->numberStyle(), bareRules, past,
+                                  std::nullopt).status,
+              PhaseFourLiteralStatus::TooLarge)
+        << "phase 4 must not read a constant the language gave no type";
+}
+
+TEST(Fc3LoaderRejects, DecimalPastRangeIsOnlyAnUnsignedReadingOfASignedList) {
+    struct Case { char const* lead; nlohmann::json value; char const* needle; };
+    Case const cases[] = {
+        {"l", "long long", "'decimalPastRange' 'long long' must resolve"},          // signed
+        {"l", "unsigned int", "'decimalPastRange' 'unsigned int' must resolve"},    // narrower
+        {"u", "unsigned long long", "'decimalPastRange' 'unsigned long long' must resolve"},
+        {"l", 5, "'decimalPastRange' must be a type-name string"},
+        {"l", "no such type", "/decimalPastRange"},
+        {"i16", "unsigned long long", "a fixed-type rule ('type') types every literal"},
+        {"wb", "unsigned long long", "a 'bitPrecise' rule derives its type"},
+    };
+    for (Case const& c : cases) {
+        auto doc = loadShippedCJson();
+        sizedRule(doc, c.lead)["decimalPastRange"] = c.value;
+        EXPECT_NE(loadDiagnostics(doc).find(c.needle), std::string::npos)
+            << c.lead << " / " << c.value.dump() << "\n" << loadDiagnostics(doc);
+    }
 }

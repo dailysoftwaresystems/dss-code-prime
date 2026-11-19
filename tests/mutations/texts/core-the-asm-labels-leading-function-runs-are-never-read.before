@@ -1,0 +1,2 @@
+                                dc.asmLabelLeadingFunctionOnlyRules.push_back(
+                                    data.rules->find(name));

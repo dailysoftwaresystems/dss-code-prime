@@ -1,0 +1,2 @@
+            if (false && entry.reachError) {
+                unreadable = ManifestScanFailure{

@@ -1,0 +1,2 @@
+                            preStampLiteralLeaves(s, *cfg, tree, opnd);
+                            // P69 (lane `cs`, fold f26e): a declaration's own request first

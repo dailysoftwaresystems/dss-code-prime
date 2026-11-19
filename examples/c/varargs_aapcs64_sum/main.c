@@ -20,6 +20,8 @@
 // witnessed by varargs_aapcs64_overflow (>7 varargs); the VR path by
 // varargs_aapcs64_double. Runs under qemu-aarch64 (the linux-arm64 CI leg / local qemu).
 
+#include <stdarg.h>
+
 int sum(int n, ...) {
     va_list ap;
     va_start(ap, n);

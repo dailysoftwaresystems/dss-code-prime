@@ -1,10 +1,13 @@
 #include "mir/merge/synth_pe_startup.hpp"
 
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/entry_param_types.hpp"   // typeOfEntryParamShape -- the ONE shape <-> type correspondence
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/type_lattice/core_type.hpp"       // TypeKind, CallConv
 #include "core/types/type_lattice/type_interner.hpp"
+#include "core/types/type_lattice/type_layout.hpp"   // the pointer width of the module's data model (envp's slot)
 #include "ffi/mangling/c_mangle.hpp"   // applyCMangling (per-format CRT import names)
+#include "mir/merge/synth_symbol_floor.hpp"  // continueSymbolIdsPastImports (the rebuild continues the module's ids)
 #include "mir/mir.hpp"
 #include "mir/mir_opcode.hpp"
 #include "mir/mir_struct_markers.hpp"   // rederiveStructCfMarkers (multi-block synth body)
@@ -17,6 +20,7 @@
 #include <string>
 #include <string_view>
 #include <utility>     // std::move
+#include <vector>
 
 namespace dss {
 
@@ -58,33 +62,17 @@ void emitErr(DiagnosticReporter& rep, DiagnosticCode code, std::string msg) {
     rep.report(std::move(d));
 }
 
-// Max SymbolId.v across every defined function, every module GLOBAL, AND every
-// extern import — the floor for minting fresh synthetic symbols (mirrors the
-// entry-trampoline's maxExistingSymbolIdV, but at the MIR tier where there is no
-// AssembledModule).
-//
-// The globals scan is LOAD-BEARING, not defensive: the merged SymbolId space is
-// unified + monotonic, and synthetic string-literal globals are minted ABOVE every
-// function/extern id (compile_pipeline's `syntheticSymbolFloor`). So in a real
-// program (sqlite) the single HIGHEST SymbolId is almost always a global, not a
-// function. Omitting globals here (as the sibling entry_trampoline's maxExisting…
-// pointedly does NOT — it scans dataItems for exactly this reason) would let
-// synthetic symbols duplicate a real global's id, and the linker would silently
-// mis-bind the entry onto that DATA symbol — an entry that "runs" a string literal.
-[[nodiscard]] std::uint32_t
-maxSymbolIdV(Mir const& mir, std::vector<ExternImport> const& externs) {
-    std::uint32_t maxV = 0;
-    std::size_t const nf = mir.moduleFuncCount();
-    for (std::uint32_t i = 0; i < nf; ++i) {
-        maxV = std::max(maxV, mir.funcSymbol(mir.funcAt(i)).v);
-    }
-    std::size_t const ng = mir.moduleGlobalCount();
-    for (std::uint32_t i = 0; i < ng; ++i) {
-        maxV = std::max(maxV, mir.globalSymbol(mir.globalAt(i)).v);
-    }
-    for (auto const& e : externs) maxV = std::max(maxV, e.symbol.v);
-    return maxV;
-}
+// ⓘ THE INIT'S SYMBOL AND ITS IMPORTS' COME FROM THE MODULE (`MirBuilder::mintSymbolOrAbort`,
+// the one door — see mir/merge/synth_symbol_floor.hpp), as the SEH-funclet and
+// threads-shim passes' do. The module's end is past every id it holds — its GLOBALS
+// matter: synthetic string-literal globals are minted ABOVE every function/extern id, so
+// an id that cleared only those would let the init duplicate a real global's, and the
+// linker would silently mis-bind the entry onto that DATA symbol, an entry that "runs" a
+// string literal — and past every id the NAME TABLE the module was made from holds, which
+// a scan of the module cannot see: the init is a GLOBAL definition the lower half
+// publishes under whatever name the table gives its id — ✔MEASURED P69 round 4, an x86_64
+// Linux image of `int main(int argc, char **argv, char **envp)` carried this init as
+// `T __func__`.
 
 // ⓘ THE SIGNATURE CLASSIFIER AND THE DECLARED-SET RENDERER USED TO LIVE HERE
 // AND ARE DELIBERATELY GONE. This pass classified the resolved entry's MIR
@@ -125,37 +113,78 @@ entryCallConv(TypeInterner const& interner, TypeId entrySig) {
     return static_cast<CallConv>(raw);
 }
 
-} // namespace
+// The type a parameter of an entry verb's slot has is `typeOfEntryParamShape`
+// (core/types/entry_param_types.hpp): the inverse of the classifier the semantic
+// tier matches a definition with, so the two can never learn different shapes.
 
-bool realizeEntryShape(Mir&                              mir,
-                       TypeInterner&                     interner,
-                       std::optional<SymbolId>&          userEntrySymbol,
-                       std::vector<ExternImport>&        externImports,
-                       EntryMaterialization              verb,
-                       std::optional<ProcessArgs> const& processArgs,
-                       CSymbolDecorationScheme           scheme,
-                       std::string_view                  formatName,
-                       DiagnosticReporter&               reporter) {
+
+// The one body of the three doors below. `userEntrySymbol` set: the entry is a
+// function of `mir`, called with its own signature, or -- `callWithTheVerbs-
+// Signature` -- with the verb's. Unset with `foreignEntryName` named: the entry is
+// a function ANOTHER input of the link defines under that name, and the init calls
+// it through an import row of the module, by that name, with the verb's signature.
+[[nodiscard]] bool materializeEntryShape(Mir&                              mir,
+                                         TypeInterner&                     interner,
+                                         std::optional<SymbolId>&          userEntrySymbol,
+                                         std::string_view                  foreignEntryName,
+                                         bool                              callWithTheVerbsSignature,
+                                         std::vector<ExternImport>&        externImports,
+                                         EntryMaterialization              verb,
+                                         std::optional<ProcessArgs> const& processArgs,
+                                         CSymbolDecorationScheme           scheme,
+                                         std::string_view                  formatName,
+                                         DiagnosticReporter&               reporter) {
+    bool const foreign = !userEntrySymbol.has_value() && !foreignEntryName.empty();
     // No resolved entry (a library TU with no `main`) — nothing to gate and
     // nothing to materialize.
-    if (!userEntrySymbol.has_value()) return true;
+    if (!userEntrySymbol.has_value() && !foreign) return true;
 
-    // Locate the entry function + its signature in the module.
+    // ★ THE VERB'S OWN SIGNATURE: the language row's parameter shapes and `int`,
+    // the row's result. Its convention is the one the semantic tier gives every
+    // function it types, the canonical MIR-tier placeholder the calling-convention
+    // pass replaces with the target's at materialize time (`functionTypeOfParams`),
+    // so the init and the call it makes are given the target's C convention exactly
+    // as a source entry's are.
+    auto const verbsSignature = [&] {
+        std::vector<TypeId> params;
+        for (EntryParamShape const shape : entryVerbParams(verb)) {
+            params.push_back(typeOfEntryParamShape(interner, shape));
+        }
+        return interner.fnSig(params, interner.primitive(TypeKind::I32), CallConv::CcSysV);
+    };
+
+    // Locate the entry function + its signature in the module — or, for an
+    // entry another input defines, its signature from the verb (below).
     MirFuncId entryFn{};
     TypeId    entrySig = InvalidType;
     std::size_t const nf = mir.moduleFuncCount();
-    for (std::uint32_t i = 0; i < nf; ++i) {
-        MirFuncId const f = mir.funcAt(i);
-        if (mir.funcSymbol(f).v == userEntrySymbol->v) {
-            entryFn  = f;
-            entrySig = mir.funcSignature(f);
-            break;
+    if (!foreign) {
+        for (std::uint32_t i = 0; i < nf; ++i) {
+            MirFuncId const f = mir.funcAt(i);
+            if (mir.funcSymbol(f).v == userEntrySymbol->v) {
+                entryFn  = f;
+                entrySig = mir.funcSignature(f);
+                break;
+            }
         }
+        // The entry symbol isn't a defined function here (e.g. resolved to an
+        // extern) — leave it; the trampoline's own resolution reports that case
+        // with `K_EntryPointResolvesToExtern`, which is the accurate diagnostic.
+        if (!entryFn.valid() || !entrySig.valid()) return true;
+        // ★ A DEFINITION WHOSE SIGNATURE IS NONE OF ITS NAME'S ROWS (P69 fold 3e,
+        // class C's N3: the semantic tier's `entryCalledWithTheVerbsSignature`) is
+        // called as every reference's startup calls any `main` -- with the verb's
+        // signature, its own parameters receiving those arguments. ✔MEASURED
+        // before: gcc 13.3 and cl 19.44 link `int main(int, double)` and run it.
+        if (callWithTheVerbsSignature) entrySig = verbsSignature();
+    } else {
+        // ★ AN ENTRY FROM AN OBJECT HAS NO SIGNATURE IN THE INPUT — an assembled
+        // function carries no type — so the init calls it with the signature of
+        // the verb it was elected with (P69 fold 3d,
+        // D-PROGRAM-AN-OBJECTS-ENTRY-IS-CALLED-WITHOUT-ITS-ARGUMENTS; the verb is
+        // the richest the format realizes, `collectObjectEntryCandidates`).
+        entrySig = verbsSignature();
     }
-    // The entry symbol isn't a defined function here (e.g. resolved to an extern)
-    // — leave it; the trampoline's own resolution reports that case with
-    // `K_EntryPointResolvesToExtern`, which is the accurate diagnostic.
-    if (!entryFn.valid() || !entrySig.valid()) return true;
 
     // ── MATERIALIZE: dispatch on the DECIDED verb × the declared MECHANISM ──
     //
@@ -210,14 +239,16 @@ bool realizeEntryShape(Mir&                              mir,
     ProcessArgs const& pa = *processArgs;
     bool const stackVector = pa.mechanism == ArgsMechanism::StackVector;
 
-    // WHAT the verb materializes comes from the ONE verb → parameter-shapes table
-    // (`entryVerbParams`): WIDE vs NARROW off its second shape, the environment off
-    // its count. That is still the RESOLVED ENTRY'S SIGNATURE deciding, exactly as
-    // c111 required — the language row that matched the entry carries the verb —
-    // and never a format flag or a second classification here. argc is SHARED
-    // between the narrow and wide worlds (MEASURED, PROBE-0), so one accessor name
-    // serves both.
+    // WHAT the verb materializes comes from the ONE verb → slots table
+    // (`entryVerbSlots`): each slot's parameter shape and the VALUE it holds --
+    // wide vs narrow, an environment, the GUI startups' four -- read per slot,
+    // never off a position or a count. That is still the RESOLVED ENTRY'S
+    // SIGNATURE deciding, exactly as c111 required — the language row that matched
+    // the entry carries the verb — and never a format flag or a second
+    // classification here. argc is SHARED between the narrow and wide worlds
+    // (MEASURED, PROBE-0), so one accessor name serves both.
     auto const verbParams = entryVerbParams(verb);
+    auto const verbSlots  = entryVerbSlots(verb);
     bool const wide = entryVerbIsWide(verb);
 
     // ── THE MECHANISM BACKSTOP ─────────────────────────────────────────────
@@ -226,38 +257,20 @@ bool realizeEntryShape(Mir&                              mir,
     // for a format document, so a loaded format cannot reach them. A hand-built
     // `ProcessArgs` can, and the alternative to refusing here is materializing
     // values the mechanism never produced — the entry would read them from the
-    // argument registers.
-    constexpr std::size_t kMechanismValuesMax = 3;   // (argc, argv, envp)
-    std::string unrealizable;
-    if (verbParams.size() > kMechanismValuesMax) {
-        unrealizable = std::format(
-            "it materializes {} values and a `processArgs` mechanism produces at "
-            "most {}; only a loader that delivers the arguments itself (no "
-            "`processArgs` block) realizes more", verbParams.size(),
-            kMechanismValuesMax);
-    } else if (stackVector && wide) {
-        unrealizable = "the entry-stack vector holds narrow strings only";
-    } else if (stackVector && passesEnvironment
-               && !(pa.envpFollowsArgvTerminator && pa.vectorSlotBytes != 0)) {
-        unrealizable = "the block does not declare where the environment vector "
-                       "sits (`envpFollowsArgvTerminator` + `vectorSlotBytes`)";
-    } else if (!stackVector && passesEnvironment
-               && (wide ? (pa.initializeWideEnvironmentFn.empty()
-                           || pa.wideEnvironmentAccessorFn.empty())
-                        : (pa.initializeNarrowEnvironmentFn.empty()
-                           || pa.narrowEnvironmentAccessorFn.empty()))) {
-        unrealizable = "the block does not declare that width's environment "
-                       "initialize/accessor pair";
-    }
-    if (!unrealizable.empty()) {
+    // argument registers. Both tiers ask the ONE statement of what a mechanism
+    // produces, per value (`processArgsCannotProduce`, target_schema.cpp).
+    for (EntryVerbSlot const& slot : verbSlots) {
+        std::string const why = processArgsCannotProduce(pa, slot.value);
+        if (why.empty()) continue;
         emitErr(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
                 std::format(
                     "realizeEntryShape: format '{}' declares the `{}` "
                     "`processArgs` mechanism, which cannot realize the resolved "
-                    "program entry's '{}' verb: {}. Refusing rather than handing "
-                    "the entry values nothing produced.",
+                    "program entry's '{}' verb -- its {}: {}. Refusing rather "
+                    "than handing the entry values nothing produced.",
                     formatName, argsMechanismName(pa.mechanism),
-                    entryMaterializationName(verb), unrealizable));
+                    entryMaterializationName(verb),
+                    entryArgumentValueName(slot.value), why));
         return false;
     }
 
@@ -287,10 +300,14 @@ bool realizeEntryShape(Mir&                              mir,
     // MIR in hand and about nothing declared anywhere. Without it, `params[k]`
     // below is an out-of-bounds read — a silent one, on the program entry.
     //
-    // ⚠ AND IT CANNOT COVER THE FOREIGN-OBJECT CASE, so do not read it as
-    // closing that gap. `AssembledFunction` carries no TypeId and no signature;
-    // a pre-built `.obj`/`.lib` member's entry has no C signature IN THE INPUT at
-    // all, so there is nothing here to check its arity against.
+    // ⓘ IT HAS NOTHING TO CHECK FOR AN ENTRY ANOTHER INPUT DEFINES. An assembled
+    // function carries no TypeId and no signature, so a pre-built object's entry
+    // has no C signature IN THE INPUT; its signature above is BUILT from the verb,
+    // and agrees with it by construction. Whether the object's `main` declares
+    // fewer parameters is the case every reference startup also passes through
+    // (it passes every value to every `main`). The same holds for a definition
+    // whose signature is none of its name's rows (`callWithTheVerbsSignature`,
+    // P69 fold 3e): it is called with the verb's signature, built the same way.
     auto const params = interner.fnParams(entrySig);
     if (params.size() < verbParams.size()) {
         // Anchored: D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE.
@@ -312,9 +329,20 @@ bool realizeEntryShape(Mir&                              mir,
         return false;
     }
 
-    TypeId const argcTy = params[0];   // int      (language-row-matched: I32)
-    TypeId const argvTy = params[1];   // char**   (language-row-matched: ptr→ptr→…)
-    TypeId const envpTy = passesEnvironment ? params[2] : InvalidType;
+    // Each slot's parameter type, copied out of the interner's pool BEFORE anything
+    // below interns a type (a view into the pool does not survive its growth): the
+    // entry's own parameter there, or the verb's for an entry called with the
+    // verb's signature.
+    std::vector<TypeId> slotTypes;
+    slotTypes.reserve(verbParams.size());
+    for (std::size_t i = 0; i < verbParams.size(); ++i) slotTypes.push_back(params[i]);
+    // The type of the slot holding `value`; InvalidType where the verb hands none.
+    auto const slotType = [&](EntryArgumentValue value) -> TypeId {
+        for (std::size_t i = 0; i < verbSlots.size(); ++i) {
+            if (verbSlots[i].value == value) return slotTypes[i];
+        }
+        return InvalidType;
+    };
 
     auto const ccOpt = entryCallConv(interner, entrySig);
     if (!ccOpt.has_value()) {
@@ -336,10 +364,26 @@ bool realizeEntryShape(Mir&                              mir,
 
     // Rebuild the module (Mir is frozen): clone every existing function verbatim,
     // then APPEND the synth function, then clone globals — the prune_unreachable
-    // rebuild idiom. The mint floor is read BEFORE any import is appended.
-    std::uint32_t const maxV = maxSymbolIdV(mir, externImports);
-    SymbolId const synthSym{maxV + 1};
+    // rebuild idiom. The rebuilt module continues the source's symbol ids, and the
+    // new symbols are minted from it.
+    constexpr char const* kMinter = "realizeEntryShape";
     MirBuilder builder;
+    continueSymbolIdsPastImports(builder, mir, externImports);
+    SymbolId const synthSym = builder.mintSymbolOrAbort(kMinter);
+    // What the init calls: the module's entry, or — for an entry another input
+    // defines — an import row of the module naming it, which the link's merge
+    // binds to that input's definition as it binds any reference between units.
+    SymbolId calleeSym{};
+    if (foreign) {
+        calleeSym = builder.mintSymbolOrAbort(kMinter);
+        ExternImport entryImport;
+        entryImport.symbol      = calleeSym;
+        entryImport.mangledName = std::string{foreignEntryName};   // already the format's spelling
+        entryImport.isData      = false;
+        externImports.push_back(std::move(entryImport));
+    } else {
+        calleeSym = *userEntrySymbol;
+    }
     IdentityClonePolicy policy;
     for (std::uint32_t i = 0; i < nf; ++i) {
         opt::passes::MirFunctionRebuilder rb{mir, builder, policy};
@@ -367,9 +411,24 @@ bool realizeEntryShape(Mir&                              mir,
         // `processArgs` can name it, and why it is ordinary pointer arithmetic here
         // rather than per-architecture trampoline code. ✔MEASURED 2026-09-24, gcc
         // 13.3.0 and clang 18.1.3 on x86_64 Linux: `envp - argv == argc + 1` under
-        // glibc's own startup. The slot width is DECLARED (`vectorSlotBytes`), never
-        // derived here. The synth takes exactly the two values the trampoline
+        // glibc's own startup. Each slot is a POINTER, so its width is the module's
+        // data model's (`MirModuleFacts::dataModel`, the one home of the pointer width;
+        // P69 fold 3f, F3 P16 -- it was a document key, `vectorSlotBytes`, a second
+        // statement of it). The synth takes exactly the two values the trampoline
         // materializes, so the trampoline and its before-entry park are unchanged.
+        std::optional<std::uint64_t> const slotBytes =
+            scalarByteSize(TypeKind::Ptr, builder.moduleFacts().dataModel);
+        if (!slotBytes.has_value()) {
+            emitErr(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                    std::format("realizeEntryShape: the module states no data model with a pointer "
+                                "size ({}), so the environment vector's slot past argv has no width "
+                                "-- refusing rather than placing envp by a guessed one",
+                                dataModelSpelled(builder.moduleFacts().dataModel)));
+            return false;
+        }
+        TypeId const argcTy = slotType(EntryArgumentValue::ArgumentCount);         // int
+        TypeId const argvTy = slotType(EntryArgumentValue::NarrowArgumentVector);  // char**
+        TypeId const envpTy = slotType(EntryArgumentValue::NarrowEnvironment);     // char**
         TypeId const synthSig = interner.fnSig(
             std::array<TypeId, 2>{argcTy, argvTy}, i32Ty, cc);
         (void)builder.addFunction(synthSig, synthSym, SymbolBinding::Global,
@@ -388,7 +447,7 @@ bool realizeEntryShape(Mir&                              mir,
             MirOpcode::Mul,
             std::array<MirInstId, 2>{
                 slots,
-                konst(static_cast<std::int64_t>(pa.vectorSlotBytes),
+                konst(static_cast<std::int64_t>(*slotBytes),
                       TypeKind::I64, i64Ty)},
             i64Ty);
         // A BYTE-offset Gep — the MIR Gep index contract (the lowering emits
@@ -396,7 +455,7 @@ bool realizeEntryShape(Mir&                              mir,
         MirInstId const envp = builder.addInst(
             MirOpcode::Gep, std::array<MirInstId, 2>{argv, bytes}, envpTy);
         MirInstId const entryAddr =
-            builder.addGlobalAddr(*userEntrySymbol, pEntrySig);
+            builder.addGlobalAddr(calleeSym, pEntrySig);
         MirInstId const ret = builder.addInst(
             MirOpcode::Call,
             std::array<MirInstId, 4>{entryAddr, argc, argv, envp},
@@ -404,18 +463,51 @@ bool realizeEntryShape(Mir&                              mir,
         builder.addReturn(ret);
     } else {
         // ── THE CRT INIT (mechanism `crt-argv-accessors`) ──────────────────────
+        //
+        // ★ EVERY VERB CONFIGURES THE ARGUMENT VECTOR AND PASSES ITS GATE, THE GUI
+        // ONES TOO (P69 fold 3f, lane `xa`). ✔MEASURED 2026-11-17 (probe-reference-cc runs 20261117-082204-1f9ca84b, 20261117-082259-45497930):
+        // inside WinMain and wWinMain `__argc` is 1 under cl 19.52 + link.exe and
+        // MinGW-w64 gcc 13.2 alike, and MSVC's GUI startup imports the configure
+        // call and the accessors -- so a GUI program that reads `__argc` / `__argv`
+        // reads the configured vector under DSS as under the references. Then each
+        // SLOT of the verb is fetched by the VALUE it holds:
+        //   argument count / vector  -> one dereference of its accessor
+        //   environment              -> the width's accessor; its result IS the vector
+        //   command line             -> the width's `{narrow,wide}WinMainCommandLineFn`
+        //   module instance, show    -> the `winMainStartupRoutines` (the format's
+        //                               C runtime's static startup half)
+        //   previous instance        -> a null pointer (the Win32 contract)
+        bool const handsCount   = entryVerbHands(verb, EntryArgumentValue::ArgumentCount);
+        bool const handsCommand = entryVerbHands(verb, EntryArgumentValue::NarrowCommandLine)
+                               || entryVerbHands(verb, EntryArgumentValue::WideCommandLine);
+        bool const handsInstance = entryVerbHands(verb, EntryArgumentValue::ModuleInstance);
+        bool const handsShow     = entryVerbHands(verb, EntryArgumentValue::ShowWindow);
+        // The argument vector the gate reads: the entry's own where the verb hands
+        // one, else the width's vector shape (a GUI verb reads it for the gate only).
+        TypeId const argvTy = entryVerbPassesArgumentVector(verb)
+            ? slotType(wide ? EntryArgumentValue::WideArgumentVector
+                            : EntryArgumentValue::NarrowArgumentVector)
+            : typeOfEntryParamShape(interner, wide ? EntryParamShape::PtrPtrU16
+                                                   : EntryParamShape::PtrPtrChar);
+        TypeId const argcTy  = handsCount ? slotType(EntryArgumentValue::ArgumentCount)
+                                          : InvalidType;
+        // Interned in the order they always were, so a verb that hands argc and
+        // argv mints the same types in the same order as before the slots.
         TypeId const boolTy  = interner.primitive(TypeKind::Bool);
-        TypeId const pArgcTy = interner.pointer(argcTy);   // int*    (__p___argc)
+        TypeId const pArgcTy = handsCount ? interner.pointer(argcTy)   // int*    (__p___argc)
+                                          : InvalidType;
         TypeId const pArgvTy = interner.pointer(argvTy);   // char*** (__p___argv)
         // errno_t _configure_{narrow,wide}_argv(int mode)
         std::array<TypeId, 1> const cfgParams{i32Ty};
         TypeId const cfgSig      = interner.fnSig(cfgParams, i32Ty, cc);
         // int* __p___argc(void) / char*** __p___argv(void)
-        TypeId const argcAccSig  = interner.fnSig({}, pArgcTy, cc);
+        TypeId const argcAccSig  = handsCount ? interner.fnSig({}, pArgcTy, cc)
+                                              : InvalidType;
         TypeId const argvAccSig  = interner.fnSig({}, pArgvTy, cc);
         TypeId const synthSig    = interner.fnSig({}, i32Ty, cc);
         TypeId const pCfgSig     = interner.pointer(cfgSig);
-        TypeId const pArgcAccSig = interner.pointer(argcAccSig);
+        TypeId const pArgcAccSig = handsCount ? interner.pointer(argcAccSig)
+                                              : InvalidType;
         TypeId const pArgvAccSig = interner.pointer(argvAccSig);
 
         std::string const configureName =
@@ -423,12 +515,22 @@ bool realizeEntryShape(Mir&                              mir,
         std::string const argvAccessorName =
             wide ? pa.wideArgvAccessorFn : pa.narrowArgvAccessorFn;
 
-        // Mint the CRT import symbols above the synth function.
-        SymbolId const cfgSym{maxV + 2};
-        SymbolId const argcAccSym{maxV + 3};
-        SymbolId const argvAccSym{maxV + 4};
-        SymbolId const envInitSym{maxV + 5};   // used iff passesEnvironment
-        SymbolId const envAccSym{maxV + 6};    // used iff passesEnvironment
+        // Mint the CRT import symbols after the synth function's — each only when
+        // the verb reads what it fetches.
+        SymbolId const cfgSym     = builder.mintSymbolOrAbort(kMinter);
+        SymbolId const argcAccSym =
+            handsCount ? builder.mintSymbolOrAbort(kMinter) : SymbolId{};
+        SymbolId const argvAccSym = builder.mintSymbolOrAbort(kMinter);
+        SymbolId const envInitSym =
+            passesEnvironment ? builder.mintSymbolOrAbort(kMinter) : SymbolId{};
+        SymbolId const envAccSym =
+            passesEnvironment ? builder.mintSymbolOrAbort(kMinter) : SymbolId{};
+        SymbolId const cmdSym =
+            handsCommand ? builder.mintSymbolOrAbort(kMinter) : SymbolId{};
+        SymbolId const instSym =
+            handsInstance ? builder.mintSymbolOrAbort(kMinter) : SymbolId{};
+        SymbolId const showSym =
+            handsShow ? builder.mintSymbolOrAbort(kMinter) : SymbolId{};
 
         // Register the CRT imports (all FUNCTION imports, not data). Their library
         // is the ROLE-resolved image — see `RuntimeLibraryRole`; nothing here spells
@@ -446,22 +548,39 @@ bool realizeEntryShape(Mir&                              mir,
         // hypothetical: MEASURED 2026-08-06, ucrtbase exports `exit`, `_exit` AND
         // `_Exit` as three DISTINCT functions, so an off-by-one-underscore request
         // binds to a DIFFERENT function rather than failing to resolve.
-        auto addImport = [&](SymbolId sym, std::string const& name) {
+        auto addImport = [&](SymbolId sym, std::string const& name,
+                             std::string const& libraryPath) {
             ExternImport imp;
             imp.symbol      = sym;
             imp.mangledName = dss::ffi::applyCMangling(name, scheme);
-            imp.libraryPath = pa.crtLibraryPath;
+            imp.libraryPath = libraryPath;
             imp.isData      = false;
             externImports.push_back(std::move(imp));
         };
-        addImport(cfgSym,     configureName);
-        addImport(argcAccSym, pa.argcAccessorFn);
-        addImport(argvAccSym, argvAccessorName);
+        addImport(cfgSym, configureName, pa.crtLibraryPath);
+        if (handsCount) addImport(argcAccSym, pa.argcAccessorFn, pa.crtLibraryPath);
+        addImport(argvAccSym, argvAccessorName, pa.crtLibraryPath);
         if (passesEnvironment) {
             addImport(envInitSym, wide ? pa.initializeWideEnvironmentFn
-                                       : pa.initializeNarrowEnvironmentFn);
+                                       : pa.initializeNarrowEnvironmentFn,
+                      pa.crtLibraryPath);
             addImport(envAccSym,  wide ? pa.wideEnvironmentAccessorFn
-                                       : pa.narrowEnvironmentAccessorFn);
+                                       : pa.narrowEnvironmentAccessorFn,
+                      pa.crtLibraryPath);
+        }
+        if (handsCommand) {
+            addImport(cmdSym, wide ? pa.wideWinMainCommandLineFn
+                                   : pa.narrowWinMainCommandLineFn,
+                      pa.crtLibraryPath);
+        }
+        // The backstop above refused a GUI verb on a block with no routines.
+        if (handsInstance) {
+            addImport(instSym, pa.winMainStartupRoutines->moduleInstanceFn,
+                      pa.winMainStartupRoutines->libraryPath);
+        }
+        if (handsShow) {
+            addImport(showSym, pa.winMainStartupRoutines->showWindowFn,
+                      pa.winMainStartupRoutines->libraryPath);
         }
 
         // _dss_pe_start(): the pre-main init. Global-bound so DCE (which runs AFTER
@@ -508,10 +627,10 @@ bool realizeEntryShape(Mir&                              mir,
         // EXACTLY ONE dereference each — the accessors return the ADDRESS of the
         // CRT's state (`ucrt/stdlib.h`'s `__p___argc` / `__p___argv`: `int*` and
         // `char***`), which is why a second load would read the first element
-        // instead of the vector.
+        // instead of the vector. argc only where the verb hands it.
         MirInstId argc{};
         MirInstId argv{};
-        {
+        if (handsCount) {
             MirInstId const accAddr = builder.addGlobalAddr(argcAccSym, pArgcAccSig);
             std::array<MirInstId, 1> call{accAddr};
             MirInstId const slot =
@@ -551,34 +670,74 @@ bool realizeEntryShape(Mir&                              mir,
             static_cast<std::int64_t>(pa.argvUnavailableExitStatus),
             TypeKind::I32, i32Ty));
 
-        // return entry(argc, argv[, envp]);
+        // return entry(<each slot's value, in the verb's order>);
         //
         // envp is `_get_initial_{narrow,wide}_environment()` — the accessor's result
         // IS the vector (no dereference), passed exactly as MSVC's own `invoke_main`
         // passes it (`main(__argc, __argv, _get_initial_narrow_environment())`,
-        // DOCUMENTED in the same file), unchecked there too.
+        // DOCUMENTED in the same file), unchecked there too. The GUI values are
+        // fetched as MSVC's GUI `invoke_main` fetches them (`WinMain(&__ImageBase,
+        // nullptr, _get_narrow_winmain_command_line(), __scrt_get_show_window_mode())`,
+        // DOCUMENTED, exe_common.inl / exe_winmain.cpp), each through the routine the
+        // format names for it.
         builder.beginBlock(callBlk);
         {
             MirInstId const entryAddr =
-                builder.addGlobalAddr(*userEntrySymbol, pEntrySig);
-            MirInstId ret{};
-            if (passesEnvironment) {
-                TypeId const envAccSig = interner.fnSig({}, envpTy, cc);
-                MirInstId const envAddr =
-                    builder.addGlobalAddr(envAccSym, interner.pointer(envAccSig));
-                MirInstId const envp = builder.addInst(
-                    MirOpcode::Call, std::array<MirInstId, 1>{envAddr}, envpTy,
-                    /*payload=*/0);
-                ret = builder.addInst(
-                    MirOpcode::Call,
-                    std::array<MirInstId, 4>{entryAddr, argc, argv, envp},
-                    i32Ty, /*payload=*/0);
-            } else {
-                ret = builder.addInst(
-                    MirOpcode::Call,
-                    std::array<MirInstId, 3>{entryAddr, argc, argv},
-                    i32Ty, /*payload=*/0);
+                builder.addGlobalAddr(calleeSym, pEntrySig);
+            // A zero-argument routine whose result is the slot's value.
+            auto const fetch = [&](SymbolId sym, TypeId resultTy) {
+                TypeId const sig = interner.fnSig({}, resultTy, cc);
+                MirInstId const addr =
+                    builder.addGlobalAddr(sym, interner.pointer(sig));
+                return builder.addInst(MirOpcode::Call,
+                                       std::array<MirInstId, 1>{addr}, resultTy,
+                                       /*payload=*/0);
+            };
+            std::vector<MirInstId> callOps{entryAddr};
+            for (std::size_t i = 0; i < verbSlots.size(); ++i) {
+                TypeId const ty = slotTypes[i];
+                switch (verbSlots[i].value) {
+                case EntryArgumentValue::ArgumentCount:
+                    callOps.push_back(argc);
+                    break;
+                case EntryArgumentValue::NarrowArgumentVector:
+                case EntryArgumentValue::WideArgumentVector:
+                    callOps.push_back(argv);
+                    break;
+                case EntryArgumentValue::NarrowEnvironment:
+                case EntryArgumentValue::WideEnvironment:
+                    callOps.push_back(fetch(envAccSym, ty));
+                    break;
+                case EntryArgumentValue::NarrowCommandLine:
+                case EntryArgumentValue::WideCommandLine:
+                    callOps.push_back(fetch(cmdSym, ty));
+                    break;
+                case EntryArgumentValue::ModuleInstance:
+                    callOps.push_back(fetch(instSym, ty));
+                    break;
+                case EntryArgumentValue::ShowWindow:
+                    callOps.push_back(fetch(showSym, ty));
+                    break;
+                case EntryArgumentValue::PreviousInstance:
+                    callOps.push_back(konst(0, TypeKind::Ptr, ty));
+                    break;
+                case EntryArgumentValue::AppleVector:
+                    // The backstop refused it: no `processArgs` mechanism
+                    // produces it. Reaching here is a backstop that stopped
+                    // asking, so refuse rather than pass the entry a value
+                    // nothing produced.
+                    emitErr(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                            std::format(
+                                "realizeEntryShape: format '{}': the '{}' verb's "
+                                "{} reached the CRT init, which produces none",
+                                formatName, entryMaterializationName(verb),
+                                entryArgumentValueName(verbSlots[i].value)));
+                    return false;
+                }
             }
+            MirInstId const ret = builder.addInst(
+                MirOpcode::Call, std::span<MirInstId const>{callOps}, i32Ty,
+                /*payload=*/0);
             builder.addReturn(ret);
         }
     }
@@ -597,6 +756,50 @@ bool realizeEntryShape(Mir&                              mir,
     // Retarget the program entry to the synth function.
     userEntrySymbol = synthSym;
     return true;
+}
+
+} // namespace
+
+bool realizeEntryShape(Mir&                              mir,
+                       TypeInterner&                     interner,
+                       std::optional<SymbolId>&          userEntrySymbol,
+                       std::vector<ExternImport>&        externImports,
+                       EntryMaterialization              verb,
+                       std::optional<ProcessArgs> const& processArgs,
+                       CSymbolDecorationScheme           scheme,
+                       std::string_view                  formatName,
+                       DiagnosticReporter&               reporter) {
+    return materializeEntryShape(mir, interner, userEntrySymbol, {}, /*callWithTheVerbsSignature=*/false,
+                                 externImports, verb, processArgs, scheme, formatName, reporter);
+}
+
+bool realizeEntryShapeWithTheVerbsSignature(Mir&                              mir,
+                                            TypeInterner&                     interner,
+                                            std::optional<SymbolId>&          userEntrySymbol,
+                                            std::vector<ExternImport>&        externImports,
+                                            EntryMaterialization              verb,
+                                            std::optional<ProcessArgs> const& processArgs,
+                                            CSymbolDecorationScheme           scheme,
+                                            std::string_view                  formatName,
+                                            DiagnosticReporter&               reporter) {
+    return materializeEntryShape(mir, interner, userEntrySymbol, {}, /*callWithTheVerbsSignature=*/true,
+                                 externImports, verb, processArgs, scheme, formatName, reporter);
+}
+
+bool realizeForeignEntryShape(Mir&                              mir,
+                              TypeInterner&                     interner,
+                              std::string_view                  entryLinkName,
+                              std::optional<SymbolId>&          init,
+                              std::vector<ExternImport>&        externImports,
+                              EntryMaterialization              verb,
+                              std::optional<ProcessArgs> const& processArgs,
+                              CSymbolDecorationScheme           scheme,
+                              std::string_view                  formatName,
+                              DiagnosticReporter&               reporter) {
+    init.reset();
+    if (entryLinkName.empty()) return true;   // no entry: nothing to materialize
+    return materializeEntryShape(mir, interner, init, entryLinkName, /*callWithTheVerbsSignature=*/true,
+                                 externImports, verb, processArgs, scheme, formatName, reporter);
 }
 
 } // namespace dss

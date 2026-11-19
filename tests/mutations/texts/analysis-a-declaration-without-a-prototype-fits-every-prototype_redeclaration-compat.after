@@ -1,0 +1,4 @@
+    (void)s;
+    (void)cfg;
+    (void)in;
+    return proto.valid();

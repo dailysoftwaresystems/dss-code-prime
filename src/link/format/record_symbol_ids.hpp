@@ -1,0 +1,120 @@
+#pragma once
+
+#include "core/types/diagnostic_reporter.hpp"   // DiagnosticReporter, report
+#include "core/types/object_format_kind.hpp"    // kFirstWriterReservedSymbolIdValue
+#include "core/types/parse_diagnostic.hpp"      // K_SymbolIdSpaceExhausted
+#include "core/types/strong_ids.hpp"            // SymbolId
+#include "core/types/symbol_id_cursor.hpp"      // IndexSymbolIds, OptionalSymbolIds -- the one home of a fresh id
+
+#include <cstddef>
+#include <cstdint>
+#include <format>
+#include <optional>
+#include <string>
+#include <string_view>
+
+// ═══ THE ID OF A SYMBOL-TABLE RECORD ═══════════════════════════════════════
+//    D-LK-OBJECT-READERS-GAVE-RECORD-ZERO-THE-INVALID-SYMBOL-ID
+//
+// ★★★ THE FAILURE. An object reader names every symbol it reads by the index
+// of its record in the object's symbol table, and index 0 is not an id: it is
+// `SymbolId{}`, the INVALID id — the mark of an unlabelled data item, which
+// every object writer and the image data layout pass over when they give
+// symbols their records and their addresses (`asm.hpp`, "anonymous data"). An
+// ELF table reserves record 0 for the null symbol, so its reader never met the
+// collision. A COFF and a Mach-O table do not: record 0 is an ordinary symbol
+// there, and the datum it names was read under the invalid id, taken for an
+// unlabelled one, and written without its name.
+//
+// ✔MEASURED 2026-10-08.
+//   * DSS's own data-only unit (`int shared = 7;`) writes the datum as record 0
+//     on PE and on both Mach-O ISAs. Read back ALONE into a relocatable
+//     artifact, the artifact held NO symbol at all and the build said nothing.
+//     (ELF, the control, kept it; so did a link of two units, whose merge gives
+//     every definition a new id.)
+//   * Apple clang writes no local labels on x86_64, so record 0 of its objects
+//     is the unit's first external definition — a datum as readily as a
+//     function. The artifact DSS wrote of such an object lost that datum's
+//     names, and Apple's ld refused it for an undefined symbol; the arm64
+//     object opens with `ltmp0`, and its artifact was whole.
+//   * MinGW's `strip --strip-unneeded`, `objcopy --strip-unneeded` and
+//     `ld -r -x` each leave a COFF object whose record 0 is its first external
+//     (gcc 13.2, binutils 2.42; GNU ld links each).
+//
+// ★★ THE RULE. The id of record i is i — and record 0, whose index is not an
+// id, takes the first id past the table (the record count). Ids no record
+// holds (a gap or padding atom, the reference row of a weak name, a directive's
+// row) come after it, from ONE counter. Every reader states its ids through
+// this class; the ELF reader too, whose record 0 names nothing, so that
+// nothing of an ELF object moves. A pass that mints on the unit AFTER the read
+// (the link's, for an entry a directive names or a name handed to a common)
+// continues that counter: the module the reader builds carries this table's
+// end, and the pass opens the module's door (`link/fresh_symbol_ids.hpp`) on
+// it -- a record that became a symbol ROW and nothing else, and a fresh id the
+// reader dropped, included.
+//
+// ★ WHY NOT `index + 1` FOR EVERY RECORD. A site that forgot that rule would
+// mint the NEIGHBOUR record's id: a reference bound to the wrong symbol, which
+// nothing downstream can tell from a right one. Under this rule a site that
+// forgets it mints the right id for every record but 0 and, for record 0, the
+// invalid id — which the link refuses by name (`linker.cpp`, the compound
+// index). And a diagnostic's `symbol #N` stays record N of the object, in all
+// three formats, for every record but the first.
+//
+// ★ NOTHING GOES BACK FROM AN ID TO A RECORD. A reader's own maps — the atom
+// owners, the atoms, the externs, the boundaries — are keyed by the record
+// INDEX and stay so; an id is made where a value enters the module, by `of`.
+namespace dss::link::format {
+
+// ★ P69 (lane `cs`, fold f26d -- review-csf26c2 N9): TWO SPACES, EACH BY THE ONE RULE OF A FRESH ID
+// (core/types/symbol_id_cursor.hpp). A record's id is an INDEX id -- read through the home's INDEX door, record 0's
+// the record count -- so the table ENDS below the first value a format writer reserves: a table whose count reaches
+// it is refused when it is OPENED (`open` -> nullopt, reported by name). The ids no record holds are a COUNTING space
+// past the table, taken through the home's OPTIONAL door, which steps over a reserved value and refuses the last:
+// each take answers nullopt once refused (reported by name), and the reader refuses its read AT the take (P69 f26e,
+// B1), so no module carries an invalid id. The module the reader builds carries the table's end
+// (`end()`, `AssembledModule::symbolIdEnd`): an id `fresh` handed out and the reader later dropped is never handed
+// out again by a pass that mints on the module.
+class RecordSymbolIds {
+public:
+    // The table of `recordCount` records, OPENED: or nullopt -- the refusal REPORTED here, by name -- when the
+    // records reach the first writer-reserved value (an index space ends there).
+    [[nodiscard]] static std::optional<RecordSymbolIds> open(std::size_t recordCount, DiagnosticReporter& reporter,
+                                                             std::string_view reader) {
+        if (recordCount != 0u && !IndexSymbolIds::fits(recordCount + 1u)) {
+            reportExhaustedSymbolIds(SymbolIdRefusalSink{&reporter, DiagnosticCode::K_SymbolIdSpaceExhausted},
+                                     std::format("{}: the object's symbol table", reader),
+                                     SymbolIdSpaceKind::IndexPosition, recordCount);
+            return std::nullopt;
+        }
+        return RecordSymbolIds{recordCount, reporter, reader};
+    }
+
+    // The id of record `index` of the table (`index` < the record count) -- a READ through the INDEX door.
+    [[nodiscard]] SymbolId of(std::uint32_t index) const {
+        return IndexSymbolIds{recordCount_ + 1u}.idAt(index == 0u ? recordCount_ : index, "an object's record table");
+    }
+
+    // An id no record holds and no earlier call returned -- the OPTIONAL door: nullopt once the space past the
+    // table is exhausted, the refusal reported by name; the reader refuses its read at the take.
+    [[nodiscard]] std::optional<SymbolId> fresh() {
+        return OptionalSymbolIds{fresh_, SymbolIdRefusalSink{reporter_, DiagnosticCode::K_SymbolIdSpaceExhausted}}
+            .take(std::format("{}: an id past the object's table", reader_));
+    }
+
+    // One past every id this table gave: the module the reader builds carries it.
+    [[nodiscard]] SymbolIdEnd end() const noexcept { return fresh_; }
+
+private:
+    RecordSymbolIds(std::size_t recordCount, DiagnosticReporter& reporter, std::string_view reader)
+        : recordCount_{recordCount}, reporter_{&reporter}, reader_{reader} {
+        fresh_.keepClearOfHighest(static_cast<std::uint32_t>(recordCount_));
+    }
+
+    std::size_t         recordCount_;
+    DiagnosticReporter* reporter_;
+    std::string_view    reader_;
+    SymbolIdEnd         fresh_;
+};
+
+}  // namespace dss::link::format

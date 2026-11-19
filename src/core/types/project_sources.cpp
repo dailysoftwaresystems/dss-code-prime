@@ -1,11 +1,14 @@
 #include "core/types/project_sources.hpp"
 
+#include "core/substrate/every_unit.hpp"    // runEveryUnit -- every entry, then every source, before the list fails
 #include "core/substrate/path_identity.hpp"
+#include "core/substrate/silent_unit.hpp"   // namingSilentUnits -- a unit that fails having said nothing is named
 
 #include "core/types/glob_match.hpp"
 #include "core/types/include_path_resolve.hpp"  // isRootedPath — the ONE rooted-path predicate
 #include "core/types/parse_diagnostic.hpp"
 
+#include <set>
 #include <system_error>
 #include <unordered_set>
 #include <utility>
@@ -88,9 +91,24 @@ expandAndDedupProjectSources(std::vector<std::string> const& sources,
     //     (`D_FileNotFound` naming the pattern) — a source pattern that names
     //     nothing is a mistake, not an empty no-op. A mid-expansion filesystem
     //     I/O error fails loud (`D_DirectoryScanFailed`).
+    // ★ EVERY ENTRY IS EXPANDED, AND EVERY SOURCE IDENTIFIED, OR SAYS WHY NOT,
+    // BEFORE THE LIST FAILS (`substrate::runEveryUnit`, the several-unit class's
+    // one home, P69 H6c2): an entry that errs or matches nothing never stops
+    // the entries after it, and phase 2 runs over every source phase 1
+    // produced; the list fails after phase 2 when either phase failed. Netted:
+    // each refusal names its pattern or its source. An entry or a source the
+    // list names twice meets the failure its first mention reported, and
+    // answers true -- the first said it, and fails the list.
     std::vector<std::string> expanded;
     expanded.reserve(sources.size());
-    for (auto const& entry : sources) {
+    std::set<std::string> refused;   // the patterns and sources whose failure is said
+    bool const everyEntryExpanded = substrate::runEveryUnit(
+        sources.size(),
+        substrate::namingSilentUnits(
+            rep, "the project sources expansion",
+            [&](std::size_t e) { return "sources entry '" + sources[e] + "'"; },
+            [&](std::size_t e) {
+        std::string const& entry = sources[e];
         if (!hasGlobMetacharacters(entry)) {
             // ★ THE HALF THAT USED TO BE SKIPPED. `expandGlob` re-bases what it
             // walks; a literal never reaches it, so re-basing MUST happen here or
@@ -99,16 +117,19 @@ expandAndDedupProjectSources(std::vector<std::string> const& sources,
             // source, an `includes` entry and a hook program cannot be re-based
             // three different ways.
             expanded.push_back(resolveManifestPathSpelling(baseDir, entry));
-            continue;
+            return true;
         }
-        std::error_code ec;
+        if (refused.contains(entry)) return true;   // said once, by its first mention
+        GlobError ec;
         std::size_t const before = expanded.size();
         if (!expandGlob(entry, expanded, ec, baseDir)) {
             emitDriver(rep, DiagnosticCode::D_DirectoryScanFailed,
                        "project sources: filesystem error expanding glob pattern '"
                        + entry + "' (relative to " + baseLabel(baseDir)
-                       + "): " + ec.message());
-            return std::nullopt;
+                       + "): '" + core::genericSpelling(ec.where) + "' could not be read: "
+                       + core::reasonText(ec.code));
+            refused.insert(entry);
+            return false;
         }
         if (expanded.size() == before) {
             emitDriver(rep, DiagnosticCode::D_FileNotFound,
@@ -116,9 +137,11 @@ expandAndDedupProjectSources(std::vector<std::string> const& sources,
                        + "' matched no files (relative to " + baseLabel(baseDir)
                        + ") — a source pattern that matches nothing is an error; "
                          "check the pattern and that the files exist.");
-            return std::nullopt;
+            refused.insert(entry);
+            return false;
         }
-    }
+        return true;
+    }));
 
     // ── PHASE 2: cross-entry de-duplication ─────────────────────────────────
     //
@@ -151,20 +174,30 @@ expandAndDedupProjectSources(std::vector<std::string> const& sources,
     deduped.reserve(expanded.size());
     std::unordered_set<core::PathIdentity> seen;
     seen.reserve(expanded.size());
-    for (auto& s : expanded) {
+    bool const everySourceIdentified = substrate::runEveryUnit(
+        expanded.size(),
+        substrate::namingSilentUnits(
+            rep, "the project sources de-duplication",
+            [&](std::size_t i) { return "source '" + expanded[i] + "'"; },
+            [&](std::size_t i) {
+        std::string& s = expanded[i];
+        if (refused.contains(s)) return true;   // said once, by its first mention
         std::error_code kec;
-        auto const id = core::PathIdentity::of(fs::path{s}, kec);
+        auto const id = core::PathIdentity::of(fs::path{s}, core::Use::Leaf, kec);   // a source FILE
         if (kec) {
             emitDriver(rep, DiagnosticCode::D_DirectoryScanFailed,
                        "project sources: filesystem error resolving source path '"
                        + s + "' (relative to " + baseLabel(baseDir) + ") while "
-                         "de-duplicating the source list: " + kec.message());
-            return std::nullopt;
+                         "de-duplicating the source list: " + core::reasonText(kec));
+            refused.insert(s);
+            return false;
         }
         if (seen.insert(id).second) {
             deduped.push_back(std::move(s));
         }
-    }
+        return true;
+    }));
+    if (!everyEntryExpanded || !everySourceIdentified) return std::nullopt;
     return deduped;
 }
 

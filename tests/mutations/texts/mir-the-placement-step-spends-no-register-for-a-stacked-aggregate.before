@@ -1,0 +1,4 @@
+            if (spends) {
+                if (gprOver) cursor.gpr = std::max(cursor.gpr, config.argGprCount);
+                if (fprOver) cursor.fpr = std::max(cursor.fpr, config.argFprCount);
+            }

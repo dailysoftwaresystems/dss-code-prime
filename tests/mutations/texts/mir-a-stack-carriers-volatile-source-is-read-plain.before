@@ -1,0 +1,4 @@
+        MirInstFlags const srcVf =
+            volatileFlagFor(argNode) | volatileFlagForType(hir.typeId(argNode));
+        if (!lowerByteWiseCopy(srcAddr, temp, layout->size, srcVf)) return false;
+        if (layout->size > kByValueStackArgSizeMask) {

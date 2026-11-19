@@ -514,66 +514,10 @@ TEST(AsmSubstrate, LirToMirSizeMismatchFailsLoud) {
     EXPECT_EQ(countDiagnostics(rep, DiagnosticCode::A_LirToMirSizeMismatch), 1u);
 }
 
-// Test `EncodingShapeWalkerFiresWhenShapeDeclaredWithoutWalker`
-// removed AS3 cycle 3: both X86Variable and Fixed32 walkers are
-// now registered (cycle 1's no-walker substrate is fully populated).
-// The enum-drift fallback path still exists in asm.cpp + walkers'
-// switch statements; it's unreachable via valid JSON (the loader
-// rejects unknown shape strings) and is exercised only by future
-// enum additions where the static_assert / fall-through diagnostic
-// surfaces the maintenance gap.
-
-#if 0
-TEST(AsmSubstrate, EncodingShapeWalkerFiresWhenShapeDeclaredWithoutWalker) {
-    // Synthesize a target schema whose `trap` opcode declares the
-    // `fixed32` shape — AS2 cycle 2 wires the `x86-variable` walker,
-    // but `fixed32` still has no walker registered (AS3 plugs it in).
-    // `A_NoEncodingShapeWalker` is the expected diagnostic until then.
-    constexpr char const* kJson = R"({
-        "dssTargetVersion": 1,
-        "target": { "name": "synth_arm_like", "version": "0.1" },
-        "opcodes": [
-            { "mnemonic": "invalid", "result": "none" },
-            { "mnemonic": "trap", "result": "none",
-              "terminatorKind": "unreachable",
-              "encoding": {
-                "format": "fixed32",
-                "variants": [
-                  {
-                    "guard":    { "operandKinds": [] },
-                    "template": { "opcode": [222] }
-                  }
-                ]
-              } }
-        ]
-    })";
-    auto schema = TargetSchema::loadFromText(kJson, "synth.target.json");
-    ASSERT_TRUE(schema.has_value());
-
-    // Build a tiny LIR with one function containing the `trap` opcode.
-    auto const trapOp = (*schema)->opcodeByMnemonic("trap");
-    ASSERT_TRUE(trapOp.has_value());
-    LirBuilder b{**schema};
-    (void)b.addFunction(SymbolId{1});
-    auto blk = b.createBlock();
-    b.beginBlock(blk);
-    (void)b.addUnreachable(*trapOp);
-    Lir lir = std::move(b).finish();
-
-    // `lirToMir` size must equal the LIR's instCount() — the
-    // substrate's entry-time bounds check rejects shorter spans
-    // (LirToMirSizeMismatchFailsLoud pins that path). Use a
-    // default-constructed (invalid) MirInstId per slot since this
-    // test exercises the dispatch arm, not the source-map stamping.
-    std::vector<MirInstId> lirToMir(lir.instCount());
-
-    DiagnosticReporter rep;
-    auto result = assemble(lir, **schema, lirToMir, rep);
-    EXPECT_EQ(result.functions.size(), 1u);
-    EXPECT_GT(countDiagnostics(rep, DiagnosticCode::A_NoEncodingShapeWalker), 0u);
-    EXPECT_EQ(countDiagnostics(rep, DiagnosticCode::A_NoEncodingDeclared), 0u);
-}
-#endif
+// No case pins `A_NoEncodingShapeWalker` for a declared shape with no walker: every `TargetEncodingShape`
+// has one (X86Variable and Fixed32, since AS3 cycle 3), the loader refuses an unknown shape string, and the
+// dispatch in asm.cpp is a switch over the enum, so a new value without an arm is named at compile time
+// (-Wswitch); the fallback after the switch still reports the code loudly rather than returning silently.
 
 // ── Schema surface: relocations[] taxonomy ────────────────────────────
 
@@ -585,7 +529,7 @@ TEST(TargetSchemaRelocations, JsonRoundTripsThroughAccessors) {
             { "mnemonic": "invalid", "result": "none" }
         ],
         "relocations": [
-            { "name": "rel32",  "kind": 1, "pcRelative": true,  "addendBias": -4, "widthBytes": 4 },
+            { "name": "rel32",  "kind": 1, "pcRelative": true,  "addendBias": -4, "widthBytes": 4, "fieldRange": "signed" },
             { "name": "abs64",  "kind": 2, "pcRelative": false, "addendBias":  0, "widthBytes": 8 }
         ]
     })";
@@ -1130,18 +1074,25 @@ struct LoweredAgg {
     return f;
 }
 
-// Wrap `fields` into a struct/array aggregate literal tagged `core`.
-[[nodiscard]] MirLiteralValue aggOf(std::vector<MirLiteralValue> fields, TypeKind core) {
+// Wrap `fields` into a struct/array/union aggregate literal tagged `core`. A UNION value
+// names the member its one field initializes (`unionMember`, P69
+// D-C-A-STATIC-UNION-INITIALIZED-THROUGH-A-LATER-MEMBER-IS-NOT-ENCODED) — every producer
+// sets it, so a fixture spells it rather than relying on a default.
+[[nodiscard]] MirLiteralValue aggOf(std::vector<MirLiteralValue> fields, TypeKind core,
+                                    std::optional<std::uint32_t> unionMember = std::nullopt) {
     MirAggregateValue agg;
-    agg.fields = std::move(fields);
+    agg.fields      = std::move(fields);
+    agg.unionMember = unionMember;
     MirLiteralValue v;
     v.value = std::move(agg);
     v.core  = core;
     return v;
 }
 
-// The shipped-target params (natural alignment, 16-byte ISA cap).
-constexpr AggregateLayoutParams kNatural16{ScalarAlignmentRule::Natural, 16};
+// The x86_64 shipped params: natural alignment, the 16-byte ISA cap, and the psABI's 8-byte bit-precise chunk
+// (the wide `_BitInt` images below are x86_64's; a params value with no chunk lays out no wide `_BitInt`).
+constexpr AggregateLayoutParams kNatural16{
+    .scalarAlignment = ScalarAlignmentRule::Natural, .maxAlignment = 16, .bitPreciseChunk = 8};
 
 // Lower ONE scalar (I32) module global through `lowerMirGlobalsToDataItems`
 // with a chosen mutability + init shape, returning the single emitted item +
@@ -1229,8 +1180,8 @@ TEST(AsmDataSection, MutableInitializedGlobalLowersToData) {
 // INVERSION IS DELIBERATE, NOT AN OVERSIGHT. C4b walled the arm fail-loud because
 // the encoder could not carry the image: `appendLE` takes a `std::uint64_t` (so any
 // width past 8 is a >>64 UB) and `scalarByteSize` takes a KIND (so it cannot know N).
-// P42 answered both — a wider SOURCE (the wrapped limbs) and the TypeId-aware
-// `sizeOfScalarOrBitInt` ladder — so the arm is a PRODUCER and the assertions turn
+// P42 answered both — a wider SOURCE (the wrapped limbs) and a TypeId-aware size
+// ladder (`computeLayout` since P69 fold f26d) — so the arm is a PRODUCER and the assertions turn
 // over with it. Leaving the old refusal pin standing would be the P36 mistake
 // [[D-CSUBSET-INT128-DATA-GLOBAL]] recorded: a gate that contradicts the shipped
 // binary.
@@ -1465,7 +1416,8 @@ TEST(AsmDataSection, BitIntAggregateLeafEmitsImage) {
     um.core  = TypeKind::BitInt;
     um.value = BitIntValue{std::vector<std::uint64_t>{19ull, 1ull}, 65,
                            /*isSigned=*/false};
-    auto const ru = lowerOneAggGlobal(ti, uni, aggOf({std::move(um)}, TypeKind::Union),
+    auto const ru = lowerOneAggGlobal(ti, uni,
+                                      aggOf({std::move(um)}, TypeKind::Union, /*unionMember=*/0),
                                       kNatural16, DataModel::Lp64);
     ASSERT_EQ(ru.errors, 0u) << ru.messages;
     ASSERT_EQ(ru.items.size(), 1u);
@@ -1811,7 +1763,7 @@ TEST(AsmAggregateGlobal, LongDoubleLeavesEncodeTheirSixteenBytesAtTheirOffsets) 
                                       ti.primitive(TypeKind::I32)};
         TypeId const u = ti.unionType("UF80", f);
         auto const r = lowerOneAggGlobal(
-            ti, u, aggOf({folded(2.0, TypeKind::F80)}, TypeKind::Union),
+            ti, u, aggOf({folded(2.0, TypeKind::F80)}, TypeKind::Union, /*unionMember=*/0),
             kNatural16, DataModel::Lp64);
         ASSERT_EQ(r.errors, 0u) << r.messages;
         ASSERT_EQ(r.items.size(), 1u);
@@ -1965,6 +1917,40 @@ TEST(AsmAggregateGlobal, IntToPtrLeafBesideSymbolEncodesRawBytesPlusReloc) {
                                           items[0].bytes.begin() + 8);
     std::vector<std::uint8_t> const zero8{0, 0, 0, 0, 0, 0, 0, 0};
     EXPECT_EQ(aHead, zero8) << "the symbol slot stays zero (linker writes the VA)";
+}
+
+// P69 fold 3d (review NIT3): the same mix on a target that declares no absolute
+// address slot of a pointer's width (the caller passes no kind) is refused with
+// the LEAF's own cause — the member's offset and what the target lacks — and not
+// with the caller's generic text, which names several causes this one is not.
+TEST(AsmAggregateGlobal, ASymbolAddressMemberWithNoAddressSlotNamesItsOwnCause) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const ptr = ti.pointer(ti.primitive(TypeKind::Void));
+    std::array<TypeId, 2> const f{ptr, ptr};
+    TypeId const s = ti.structType("MixTwo", f);
+    MirLiteralValue itp;   // offset 0: raw bytes, encodable everywhere
+    itp.value = std::uint64_t{5};
+    itp.core  = TypeKind::Ptr;
+    MirLiteralValue sym;   // offset 8: a link-time symbol address, which needs the slot
+    sym.value = MirSymbolAddrValue{/*symbol=*/2u, /*addend=*/0};
+    sym.core  = TypeKind::Ptr;
+    MirBuilder b;
+    std::uint32_t const lit =
+        b.literalPoolAdd(aggOf({std::move(itp), std::move(sym)}, TypeKind::Struct));
+    b.addGlobal(s, SymbolId{1}, lit, MirFuncId{}, SymbolBinding::Global,
+                SymbolVisibility::Default, /*isConst=*/false, MirThreadStorage::Shared);
+    Mir const m = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto const items = lowerMirGlobalsToDataItems(m, ti, kNatural16, DataModel::Lp64, rep);
+    EXPECT_TRUE(items.empty()) << "no partial item";
+    ASSERT_EQ(rep.errorCount(), 1u);
+    auto const& d = rep.all().front();
+    EXPECT_EQ(d.code, DiagnosticCode::K_NoMatchingObjectFormat);
+    EXPECT_NE(d.actual.find("has a member at byte offset 8 initialized to a symbol address, but the "
+                            "target declares no absolute address slot of a pointer's width"),
+              std::string::npos)
+        << d.actual;
+    EXPECT_EQ(d.actual.find("shape mismatch"), std::string::npos) << "not the generic text: " << d.actual;
 }
 
 // A TENTATIVE (zero-init, no initializer) global lowers to `.bss` with EMPTY
@@ -2128,7 +2114,7 @@ TEST(AsmAggregateGlobal, BitFieldUnionInitPacksFirstMemberByteExact) {
         << "fixture precondition: a bit-field union's members share byte 0";
     auto const r = lowerOneAggGlobal(
         ti, u,
-        aggOf({intField(5, TypeKind::U32)}, TypeKind::Union),   // first member a:3=5
+        aggOf({intField(5, TypeKind::U32)}, TypeKind::Union, /*unionMember=*/0),   // a:3=5
         gnuPacked, DataModel::Lp64);
     ASSERT_EQ(r.errors, 0u);
     ASSERT_EQ(r.items.size(), 1u);
@@ -2662,7 +2648,7 @@ TEST(AsmEnumGlobal, EnumLeavesInsideAggregatesEncodeAtTheirOffsets) {
     std::array<TypeId, 2> const uniFields{e, i32};
     TypeId const uni = ti.unionType("U", uniFields);
     auto const ru = lowerOneAggGlobal(
-        ti, uni, aggOf({intField(5, TypeKind::I32)}, TypeKind::Union),
+        ti, uni, aggOf({intField(5, TypeKind::I32)}, TypeKind::Union, /*unionMember=*/0),
         kNatural16, DataModel::Lp64);
     ASSERT_EQ(ru.errors, 0u) << ru.messages;
     ASSERT_EQ(ru.items.size(), 1u);
@@ -2890,7 +2876,7 @@ TEST(AsmAggregateGlobal, NonZeroUnionGlobalEncodesItsSingleMemberAtOffsetZero) {
            "or this test passes for the wrong reason";
 
     auto const r = lowerOneAggGlobal(
-        ti, u, aggOf({intField(0x11223344, TypeKind::U32)}, TypeKind::Union),
+        ti, u, aggOf({intField(0x11223344, TypeKind::U32)}, TypeKind::Union, /*unionMember=*/0),
         kNatural16, DataModel::Lp64);
     ASSERT_EQ(r.errors, 0u) << r.messages;
     ASSERT_EQ(r.items.size(), 1u);
@@ -2933,4 +2919,131 @@ TEST(AsmAggregateGlobal, MultiMemberUnionGlobalIsRefusedLoud) {
         << "two members supplied for one union is a positional clobber, not an init";
     EXPECT_NE(r.messages.find("more than one member"), std::string::npos)
         << "and the refusal must say WHICH rule it is (C 6.7.9p17): " << r.messages;
+}
+
+// D-C-A-STATIC-UNION-INITIALIZED-THROUGH-A-LATER-MEMBER-IS-NOT-ENCODED (P69, lane `cs`): a union
+// initializer may designate ANY member (C 6.7.9p17), and the static image is that member's bytes.
+// This arm paired field 0 with member 0 for every union, so a later member was encoded against
+// the FIRST member's type: `{ .f = 42.0f }` on `union { int i; float f; }` was refused, and
+// `{ .i = 0x01020304 }` on `union { char c; int i; }` stored ONE byte — the silent wrong image.
+// Each case names a member past the first, and each image is byte-exact; the member-0 case on the
+// SAME union is the control, so the two can only both pass if the member the value names is the
+// one encoded.
+// RED-ON-DISABLE: pair the field with member 0 again — the wider member keeps one byte, the float
+// member is refused, the structure member is refused, and the bit-field member packs into the
+// wrong placement.
+TEST(AsmAggregateGlobal, AUnionValueIsEncodedThroughTheMemberItNames) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const i8  = ti.primitive(TypeKind::I8);
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    TypeId const i64 = ti.primitive(TypeKind::I64);
+    TypeId const f32 = ti.primitive(TypeKind::F32);
+    TypeId const u32 = ti.primitive(TypeKind::U32);
+    auto const leaf = [](auto v, TypeKind k) {
+        MirLiteralValue l;
+        l.value = v;
+        l.core  = k;
+        return l;
+    };
+
+    // (a) the WIDER member: `union { char c; int i; } = { .i = 0x01020304 }` — four bytes, and
+    //     the member-0 control on the same union keeps only its one byte.
+    std::array<TypeId, 2> const ci{i8, i32};
+    TypeId const uci = ti.unionType("UCI", ci);
+    auto const ra = lowerOneAggGlobal(
+        ti, uci, aggOf({intField(0x01020304, TypeKind::I32)}, TypeKind::Union, /*unionMember=*/1),
+        kNatural16, DataModel::Lp64);
+    ASSERT_EQ(ra.errors, 0u) << ra.messages;
+    ASSERT_EQ(ra.items.size(), 1u);
+    EXPECT_EQ(ra.items[0].bytes, (std::vector<std::uint8_t>{0x04, 0x03, 0x02, 0x01}))
+        << "the int member's four bytes, little-endian — not the char member's one";
+    auto const ra0 = lowerOneAggGlobal(
+        ti, uci, aggOf({intField(0x04, TypeKind::I8)}, TypeKind::Union, /*unionMember=*/0),
+        kNatural16, DataModel::Lp64);
+    ASSERT_EQ(ra0.errors, 0u) << ra0.messages;
+    ASSERT_EQ(ra0.items.size(), 1u);
+    EXPECT_EQ(ra0.items[0].bytes, (std::vector<std::uint8_t>{0x04, 0x00, 0x00, 0x00}))
+        << "control: the char member writes one byte and the union's slack stays zero";
+
+    // (b) a FLOAT member past an int: `union { int i; float f; } = { .f = 42.0f }` — 42.0f is
+    //     0x42280000.
+    std::array<TypeId, 2> const if32{i32, f32};
+    TypeId const uif = ti.unionType("UIF", if32);
+    auto const rb = lowerOneAggGlobal(
+        ti, uif, aggOf({leaf(42.0, TypeKind::F32)}, TypeKind::Union, /*unionMember=*/1),
+        kNatural16, DataModel::Lp64);
+    ASSERT_EQ(rb.errors, 0u) << rb.messages;
+    ASSERT_EQ(rb.items.size(), 1u);
+    EXPECT_EQ(rb.items[0].bytes, (std::vector<std::uint8_t>{0x00, 0x00, 0x28, 0x42}));
+
+    // (c) a STRUCTURE member: `union { long l; struct P { int p, q; } s; } = { .s = { 40, 2 } }`.
+    std::array<TypeId, 2> const pq{i32, i32};
+    TypeId const p = ti.structType("P", pq);
+    std::array<TypeId, 2> const ls{i64, p};
+    TypeId const uls = ti.unionType("ULS", ls);
+    auto const rc = lowerOneAggGlobal(
+        ti, uls,
+        aggOf({aggOf({intField(40, TypeKind::I32), intField(2, TypeKind::I32)}, TypeKind::Struct)},
+              TypeKind::Union, /*unionMember=*/1),
+        kNatural16, DataModel::Lp64);
+    ASSERT_EQ(rc.errors, 0u) << rc.messages;
+    ASSERT_EQ(rc.items.size(), 1u);
+    EXPECT_EQ(rc.items[0].bytes,
+              (std::vector<std::uint8_t>{40, 0, 0, 0, 2, 0, 0, 0}));
+
+    // (d) a BIT-FIELD member past the first: `union { unsigned a : 3; unsigned b : 5; } = { .b = 21 }`
+    //     — b's own placement (bits 0..4 of the unit at offset 0, GNU packing), so 21 is kept
+    //     whole; through a's three bits it would be 21 & 7 = 5.
+    std::array<TypeId, 2> const ab{u32, u32};
+    std::array<std::int64_t, 2> const widths{3, 5};
+    TypeId const uab = ti.unionType("UAB", ab, widths);
+    AggregateLayoutParams gnuPacked{ScalarAlignmentRule::Natural, 16};
+    gnuPacked.bitFieldStrategy = BitFieldStrategy::GnuPacked;
+    auto const rd = lowerOneAggGlobal(
+        ti, uab, aggOf({intField(21, TypeKind::U32)}, TypeKind::Union, /*unionMember=*/1),
+        gnuPacked, DataModel::Lp64);
+    ASSERT_EQ(rd.errors, 0u) << rd.messages;
+    ASSERT_EQ(rd.items.size(), 1u);
+    EXPECT_EQ(rd.items[0].bytes, (std::vector<std::uint8_t>{21, 0, 0, 0}))
+        << "the five-bit member keeps all of 21; the three-bit one would keep 5";
+}
+
+// The two refusals the member brings, and why each is a refusal rather than a guess: a union value
+// with a field that names NO member cannot be encoded at all (member 0 would be a guess — the bug
+// this row closed), and a member index the union does not have is not a member. Both are filed
+// under K_StaticDataEncoderInvariantBreach: every producer names a member the union has, so either
+// one reaching the encoder is a DSS defect upstream, never the user's source.
+// RED-ON-DISABLE: default an absent member to 0 again — the first case encodes and passes silently.
+TEST(AsmAggregateGlobal, AUnionValueNamingNoMemberOrAMemberTheUnionLacksIsRefused) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    TypeId const i64 = ti.primitive(TypeKind::I64);
+    std::array<TypeId, 2> const v{i32, i64};
+    TypeId const u = ti.unionType("U2", v);
+
+    auto const none = lowerOneAggGlobal(
+        ti, u, aggOf({intField(7, TypeKind::I32)}, TypeKind::Union), kNatural16, DataModel::Lp64);
+    EXPECT_EQ(none.errors, 1u) << none.messages;
+    EXPECT_TRUE(none.items.empty());
+    ASSERT_EQ(none.codes.size(), 1u) << none.messages;
+    EXPECT_EQ(none.codes[0], DiagnosticCode::K_StaticDataEncoderInvariantBreach);
+    EXPECT_NE(none.messages.find("names no member"), std::string::npos) << none.messages;
+
+    auto const past = lowerOneAggGlobal(
+        ti, u, aggOf({intField(7, TypeKind::I32)}, TypeKind::Union, /*unionMember=*/2),
+        kNatural16, DataModel::Lp64);
+    EXPECT_EQ(past.errors, 1u) << past.messages;
+    EXPECT_TRUE(past.items.empty());
+    ASSERT_EQ(past.codes.size(), 1u) << past.messages;
+    EXPECT_EQ(past.codes[0], DiagnosticCode::K_StaticDataEncoderInvariantBreach);
+    EXPECT_NE(past.messages.find("names member 2 of a union with 2 member(s)"), std::string::npos)
+        << past.messages;
+
+    // Control: an EMPTY union value (no field) names no member and needs none — its image is the
+    // union's zero bytes.
+    auto const empty = lowerOneAggGlobal(
+        ti, u, aggOf({}, TypeKind::Union), kNatural16, DataModel::Lp64);
+    EXPECT_EQ(empty.errors, 0u) << empty.messages;
+    ASSERT_EQ(empty.items.size(), 1u);
+    EXPECT_EQ(empty.items[0].bytes, std::vector<std::uint8_t>(8, 0));
 }

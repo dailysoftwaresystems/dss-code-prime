@@ -211,7 +211,10 @@ public:
                    DiagnosticReporter& reporter, LirBuilder& b)
         : src_(src), schema_(schema), reporter_(reporter), b_(b) {}
 
-    [[nodiscard]] bool expandFunction(LirFuncId fn, std::size_t& expanded);
+    // `entryImage` (sized to the source block arena) receives the entry of each of this function's source
+    // blocks (`LirAsmRegionExpansionResult::blockEntryImage`).
+    [[nodiscard]] bool expandFunction(LirFuncId fn, std::size_t& expanded,
+                                      std::vector<std::uint32_t>& entryImage);
 
 private:
     [[nodiscard]] bool planBundle(LirInstId inst, LirAsmRegion const& region,
@@ -450,7 +453,8 @@ bool RegionExpander::emitBundle(
     return true;
 }
 
-bool RegionExpander::expandFunction(LirFuncId fn, std::size_t& expanded) {
+bool RegionExpander::expandFunction(LirFuncId fn, std::size_t& expanded,
+                                    std::vector<std::uint32_t>& entryImage) {
     (void)b_.addFunction(src_.funcSymbol(fn));
     std::uint32_t const blockCount = src_.funcBlockCount(fn);
     std::unordered_map<std::uint32_t, LirBlockId> srcToDst;
@@ -462,6 +466,10 @@ bool RegionExpander::expandFunction(LirFuncId fn, std::size_t& expanded) {
         LirBlockId const srcBlk = src_.funcBlockAt(fn, bi);
         LirBlockId currentPiece = b_.createBlock();
         srcToDst[srcBlk.v] = currentPiece;
+        // ★ The block's entry; every piece `planBundle` creates for it comes next,
+        // before the next source block's entry —
+        // D-LIR-DESCRIPTOR-BLOCK-IDS-SHIFTED-BY-A-BLOCK-INSERTING-PASS.
+        entryImage[srcBlk.v] = currentPiece.v;
         std::uint32_t const n = src_.blockInstCount(srcBlk);
         for (std::uint32_t i = 0; i < n; ++i) {
             LirInstId const inst = src_.blockInstAt(srcBlk, i);
@@ -546,8 +554,10 @@ expandAsmRegions(Lir const& src, TargetSchema const& schema,
     lir_pass_util::copyModuleSideStructuresConsumingAsmRegions(src, b);
     RegionExpander expander{src, schema, reporter, b};
     std::size_t const funcCount = src.moduleFuncCount();
+    result.blockEntryImage.assign(src.blockCount(), 0u);
     for (std::uint32_t fi = 0; fi < funcCount; ++fi) {
-        if (!expander.expandFunction(src.funcAt(fi), result.regionsExpanded)) {
+        if (!expander.expandFunction(src.funcAt(fi), result.regionsExpanded,
+                                     result.blockEntryImage)) {
             b.poison();
             return result;
         }

@@ -1,0 +1,4 @@
+    {"userEntrySymbol",
+     [](AssembledModule const& m, std::uint32_t& h) {
+         if (m.userEntrySymbol.has_value()) seeHeldSymbolId(h, *m.userEntrySymbol);
+     }},

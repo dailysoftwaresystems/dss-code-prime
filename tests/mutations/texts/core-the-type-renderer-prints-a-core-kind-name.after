@@ -1,0 +1,2 @@
+    if (!vocabularyName.empty()) return std::string{vocabularyName};
+    return std::string{typeKindNameOrEmpty(k)};

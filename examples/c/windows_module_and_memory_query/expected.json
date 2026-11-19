@@ -1,0 +1,12 @@
+{
+  "$comment": "P69 fold f26d (lane cs, P0): the shipped <windows.h>'s module and memory-query calls run on the program's own image -- GetModuleHandleA/W, GetModuleHandleExA by an address inside the image, GetModuleFileNameA/W, and VirtualQuery of a stack page (committed, private) and a code page (an image page whose allocation base is the module's handle). The header lacked every one of them before this example. The declarations' types and MEMORY_BASIC_INFORMATION's layout are asserted at compile time (both pe references' answers, probe p0, 2026-11-17), so a wrong declaration fails the build on every host; the calls, and the release arm, are a Windows host's. Exit 1..11 names the first check to fail, 42 = all right.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

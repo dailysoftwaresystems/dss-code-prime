@@ -1,0 +1,3 @@
+        if (da.severity != db.severity)
+            return static_cast<int>(da.severity) > static_cast<int>(db.severity);
+        return a < b;   // the report order

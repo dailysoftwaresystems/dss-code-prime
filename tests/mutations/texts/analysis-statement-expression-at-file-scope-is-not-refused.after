@@ -1,0 +1,3 @@
+            && false) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::S_StatementExprAtFileScope;

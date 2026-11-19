@@ -9,7 +9,7 @@
 # This repo is PUBLIC, so every destination below is live the moment it is
 # uncommented. Do not enable a key before its target page exists.
 
-custom: ["https://dailysoftwaresystems.com/"]
+custom: ["https://dailysoftwaresystems.com/sponsor"]
 
 # --- staged, each blocked on one external prerequisite ---
 #
@@ -27,4 +27,4 @@ custom: ["https://dailysoftwaresystems.com/"]
 # open_collective: dss-code-prime
 #
 # Once sponsor.html ships on the site, switch `custom` to the deep link:
-# custom: ["https://dailysoftwaresystems.com/sponsor.html"]
+# custom: ["https://dailysoftwaresystems.com/sponsor"]

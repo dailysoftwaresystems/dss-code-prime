@@ -21,6 +21,8 @@
 #include "lir/lir_literal_pool.hpp"
 #include "lir/lir_text.hpp"
 #include "lir/lir_verifier.hpp"
+#include "lir/lir_wide_call_args.hpp"
+#include "mir/mir_opcode.hpp"
 
 #include "fallthrough_form_schema.hpp"
 
@@ -2250,4 +2252,139 @@ TEST(LirTextParser, AnUnknownAddressPartIsRefusedNotReadAsTheWholeAddress) {
     EXPECT_FALSE(parsed->ok);
     EXPECT_TRUE(anyHas(actuals(rep), "'pageoff' is not a part of a symbol's address"))
         << listed(actuals(rep));
+}
+
+// ★ THE BY-VALUE STACKED-AGGREGATE CARRIER'S STAGE RULE (P69, lane `cs`, fold
+// f26c) — THE POSITIVE. The `(Reg, ByValueStackAgg)` carrier is a PRE-pass form:
+// a module written from MIR->LIR's output carries it, and read back it must place
+// each aggregate where the module it was written from does. So every datum
+// `lowerWideCallArgs` places from is spelled and read back — the size, the
+// aggregate's own alignment and the class the carrier exhausts — byte-identically,
+// and the read-back module goes through the pass to exactly the bytes those data
+// place it at. ⚠ The expected offsets are TYPED OUT: an 8-byte aggregate at +0,
+// the 16-aligned 24-byte one at +16 (NOT +8 — its alignment survived the text),
+// and the scalar after the carrier that exhausts the general registers at +40
+// (stacked — the exhaust class survived; dropped, it would ride rsi).
+namespace {
+
+[[nodiscard]] Lir buildPrePassCarrierCall(TargetSchema const& sch) {
+    auto const callOp = sch.opcodeByMnemonic("call");
+    auto const retOp  = sch.opcodeByMnemonic("ret");
+    EXPECT_TRUE(callOp.has_value() && retOp.has_value());
+    LirBuilder b{sch};
+    b.addFunction(SymbolId{1});
+    LirBlockId const entry = b.createBlock();
+    b.beginBlock(entry);
+    LirReg const scalar  = b.newVReg(LirRegClass::GPR);  // rdi
+    LirReg const eight   = b.newVReg(LirRegClass::GPR);  // an 8-byte aggregate's temp
+    LirReg const aligned = b.newVReg(LirRegClass::GPR);  // a 24-byte, 16-aligned one's
+    LirReg const after   = b.newVReg(LirRegClass::GPR);  // a scalar after the exhaust
+    std::array<LirOperand, 7> const callOps{
+        LirOperand::makeSymbolRef(13),
+        LirOperand::makeReg(scalar),
+        LirOperand::makeReg(eight),
+        LirOperand::makeByValueStackAgg(8),
+        LirOperand::makeReg(aligned),
+        LirOperand::makeByValueStackAgg(24, kByValueStackArgExhaustGpr, 16),
+        LirOperand::makeReg(after),
+    };
+    b.addInst(callOp.value_or(0), InvalidLirReg, callOps);
+    b.addReturn(retOp.value_or(0), std::span<LirOperand const>{});
+    return std::move(b).finish();
+}
+
+} // namespace
+
+TEST(LirTextRoundTrip, APrePassCarrierKeepsItsSizeAlignmentAndExhaustAndThePassLowersIt) {
+    auto sch = shippedX86();
+    auto const storeOutOp = sch->opcodeByMnemonic("store_outgoing_arg");
+    ASSERT_TRUE(storeOutOp.has_value());
+    auto const* cc = sch->callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    ASSERT_EQ(cc->name, "sysv_amd64");
+
+    Lir const lir = buildPrePassCarrierCall(*sch);
+    LirTextContext ctx;
+    std::string const text = roundTripOrFail(lir, *sch, ctx, "pre-pass carrier");
+    EXPECT_NE(text.find("byval#24:align=16:exhaust=gpr"), std::string::npos) << text;
+    // An unstated alignment and exhaust class write nothing: the classic form.
+    EXPECT_NE(text.find("byval#8"), std::string::npos) << text;
+    EXPECT_EQ(text.find("byval#8:"), std::string::npos) << text;
+
+    DiagnosticReporter rep;
+    auto const parsed = parseLir(text, *sch, rep);
+    ASSERT_TRUE(parsed->ok) << listed(actuals(rep));
+    std::vector<LirOperand> markers;
+    Lir const& back = parsed->lir;
+    ASSERT_EQ(back.moduleFuncCount(), 1u);
+    LirFuncId const fn = back.funcAt(0);
+    for (std::uint32_t bi = 0; bi < back.funcBlockCount(fn); ++bi) {
+        LirBlockId const bb = back.funcBlockAt(fn, bi);
+        for (std::uint32_t ii = 0; ii < back.blockInstCount(bb); ++ii)
+            for (auto const& o : back.instOperands(back.blockInstAt(bb, ii)))
+                if (o.kind == LirOperandKind::ByValueStackAgg) markers.push_back(o);
+    }
+    ASSERT_EQ(markers.size(), 2u);
+    EXPECT_EQ(markers[0].byValueAggBytes, 8u);
+    EXPECT_EQ(markers[0].byValueAggAlign(), 0u);
+    EXPECT_EQ(markers[0].byValueAggExhaust, kByValueStackArgExhaustNone);
+    EXPECT_EQ(markers[1].byValueAggBytes, 24u);
+    EXPECT_EQ(markers[1].byValueAggAlign(), 16u);
+    EXPECT_EQ(markers[1].byValueAggExhaust, kByValueStackArgExhaustGpr);
+
+    // Through the pass: placed from the data the text carried, and no carrier left.
+    DiagnosticReporter wideRep;
+    auto const wide = lowerWideCallArgs(back, *sch, 0, wideRep);
+    ASSERT_TRUE(wide.ok) << listed(actuals(wideRep));
+    std::vector<std::uint32_t> payloads;
+    bool carrierLeft = false;
+    LirFuncId const wfn = wide.lir.funcAt(0);
+    for (std::uint32_t bi = 0; bi < wide.lir.funcBlockCount(wfn); ++bi) {
+        LirBlockId const bb = wide.lir.funcBlockAt(wfn, bi);
+        for (std::uint32_t ii = 0; ii < wide.lir.blockInstCount(bb); ++ii) {
+            LirInstId const inst = wide.lir.blockInstAt(bb, ii);
+            if (wide.lir.instOpcode(inst) == *storeOutOp)
+                payloads.push_back(wide.lir.instPayload(inst));
+            for (auto const& o : wide.lir.instOperands(inst))
+                if (o.kind == LirOperandKind::ByValueStackAgg) carrierLeft = true;
+        }
+    }
+    EXPECT_FALSE(carrierLeft) << "the pass takes every carrier off its Call";
+    EXPECT_EQ(payloads, (std::vector<std::uint32_t>{40u, 0u, 16u, 24u, 32u}))
+        << "the stacked scalar's store first (+40: the exhaust class survived), then "
+           "the 8-byte aggregate at +0 and the 16-aligned one at +16/+24/+32 (its "
+           "alignment survived — dropped, it would begin at +8)";
+    DiagnosticReporter stageRep;
+    EXPECT_TRUE(verifyLirStackedAggregatesLowered(wide.lir, *sch, stageRep))
+        << listed(actuals(stageRep));
+}
+
+// A `byval#` suffix that would place nothing is REFUSED by name, never read as
+// "not stated" — a dropped datum places the aggregate somewhere else.
+TEST(LirTextParser, ACarrierSuffixThatStatesNothingPlaceableIsRefused) {
+    auto sch = shippedX86();
+    Lir const lir = buildPrePassCarrierCall(*sch);
+    DiagnosticReporter emitRep;
+    LirTextContext ctx;
+    std::string const text = emitLir(lir, *sch, ctx, emitRep);
+    std::string const stated = ":align=16:exhaust=gpr";
+    std::size_t const at = text.find(stated);
+    ASSERT_NE(at, std::string::npos) << text;
+    struct Case {
+        char const* suffix;
+        char const* says;
+    };
+    std::array<Case, 3> const cases{{
+        {":align=12", "which is not a power of two"},
+        {":exhaust=vr", "the classes a carrier exhausts are gpr and fpr"},
+        {":size=16", "carries an unknown suffix 'size'"},
+    }};
+    for (Case const& c : cases) {
+        std::string bad = text;
+        bad.replace(at, stated.size(), c.suffix);
+        DiagnosticReporter rep;
+        auto const parsed = parseLir(bad, *sch, rep);
+        EXPECT_FALSE(parsed->ok) << c.suffix;
+        EXPECT_TRUE(anyHas(actuals(rep), c.says)) << c.suffix << listed(actuals(rep));
+    }
 }

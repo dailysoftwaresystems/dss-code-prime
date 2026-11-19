@@ -45,8 +45,10 @@
 #include "core/types/type_lattice/type_interner.hpp"
 #include "hir/hir.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
+#include "link/object_format_schema.hpp"
 #include "mir/lowering/hir_to_mir.hpp"
 #include "mir/mir.hpp"
+#include "program/model_to_hir.hpp"   // lowerModelToHir — the pipeline's gates
 #include "mir/mir_opcode.hpp"
 #include "mir/mir_verifier.hpp"
 #include "opt/passes/prune_unreachable.hpp"
@@ -114,15 +116,25 @@ struct Lowered {
             }
         throw std::runtime_error{"the fixture did not analyze cleanly: " + why};
     }
+    auto const format = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-exec");
+    if (!format) throw std::runtime_error{"loadShipped(elf64-x86_64-linux-exec) failed"};
     DiagnosticReporter hirReporter;
-    auto hir = lowerToHir(model, hirReporter);
+    ModelLoweredToHir lowered = lowerModelToHir(model, **format, hirReporter);   // the pipeline's gates
     Lowered out{.schema = schema, .target = target, .model = std::move(model),
-                .hir = std::move(hir), .mir = {}, .mirReporter = {}};
+                .hir = std::move(lowered.hir), .mir = {}, .mirReporter = {}};
+    if (!lowered.lowersToMir) {   // the build stops here, and so does the fixture: MIR never entered
+        out.mir.ok = false;
+        return out;
+    }
     // The language's policy through the pipeline's ONE assembly (P68 round 13 fold F7: by hand,
     // this fixture missed `globalsConstantForms` and lowered C with 6.7.9p4's constraint off).
     MirLoweringConfig mirCfg = languageMirLoweringConfig(*schema);
+    mirCfg.dataModel = DataModel::Lp64;   // a config states its unit's data model
+    mirCfg.symbolIdSpace = MirSymbolIdSpace::endingAt(   // the unit's name table, as the driver states it
+        static_cast<std::uint32_t>(out.model.symbols().size()));
     mirCfg.aggregateLayout       = target->aggregateLayout();
     mirCfg.aggregateLayoutLoaded = target->aggregateLayoutLoaded();
+    mirCfg.argumentSlotBytes     = argumentSlotBytes(*target);   // the target's argument-slot quantum, at its home
     out.mir = lowerToMir(out.hir->hir, out.hir->literalPool, out.model.lattice().interner(),
                          out.mirReporter, &out.hir->sourceMap, mirCfg, /*ffiMap=*/nullptr,
                          &out.hir->linkageMap, &out.hir->mutabilityMap, &out.hir->volatileMap,

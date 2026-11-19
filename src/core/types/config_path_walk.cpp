@@ -1,6 +1,6 @@
 #include "core/types/config_path_walk.hpp"
 
-#include "core/substrate/path_identity.hpp"       // absoluteKeepingRoot -- UNC-safe absolute
+#include "core/substrate/path_identity.hpp"       // the home: kinds, streams, the store route's text forms
 #include "core/substrate/phase_timers.hpp"        // the `locate-config` pipeline phase
 #include "core/types/predefined_macro_json.hpp"   // kBuildVersionText — the binary's own version
 
@@ -13,18 +13,6 @@
 #include <string>
 #include <system_error>
 #include <vector>
-
-#if defined(_WIN32)
-    #ifndef WIN32_LEAN_AND_MEAN
-        #define WIN32_LEAN_AND_MEAN
-    #endif
-    #ifndef NOMINMAX
-        #define NOMINMAX
-    #endif
-    #include <windows.h>
-#elif defined(__APPLE__)
-    #include <mach-o/dyld.h>
-#endif
 
 // The INSTALLED layout, as a path RELATIVE to the directory holding the
 // installed executable — computed by `cmake/DssInstall.cmake` from the same
@@ -80,53 +68,25 @@ fs::path repoShapedConfigRoot(fs::path const& treeRoot) {
 // own image on THIS machine" is a property of the host operating system running
 // the compiler, with no bearing on the source language, the target CPU or the
 // object format being compiled FOR. The same `#if defined(_WIN32)` shape already
-// carries `core/substrate/process_spawn.cpp` and `large_stack_call.cpp`.
+// carries `core/substrate/process_spawn.cpp` and `large_stack_call.cpp`; the
+// question itself is the substrate's one home of it (`core::runningExecutable`).
 //
 // ⚠ `argv[0]` is deliberately NOT used. It is whatever the parent chose to pass,
 // it is routinely a bare command name resolved through `PATH`, and a caller can
 // set it to anything at all — so an `argv[0]`-derived layout probe would be an
 // attacker-influenced (and, far more often, merely wrong) input to the question
-// "which config tree is mine". Every host below answers from the KERNEL's record
-// of the loaded image instead.
+// "which config tree is mine". The home answers from the KERNEL's record of the
+// image run instead.
 std::optional<fs::path> runningExecutablePath() {
-#if defined(_WIN32)
-    // `GetModuleFileNameW(nullptr, ...)` yields the loaded image's path. It does
-    // NOT report the required size, so grow until the result fits: success is
-    // "wrote fewer characters than the buffer holds", because a return equal to
-    // the buffer size means TRUNCATED (and on older Windows the buffer is then
-    // not even null-terminated, which is why the length is what is tested rather
-    // than the last character).
-    std::wstring buf(MAX_PATH, L'\0');
-    for (int attempt = 0; attempt < 6; ++attempt) {
-        DWORD const n =
-            ::GetModuleFileNameW(nullptr, buf.data(), static_cast<DWORD>(buf.size()));
-        if (n == 0) return std::nullopt;                    // the call itself failed
-        if (n < buf.size()) {
-            buf.resize(n);
-            return fs::path{buf};
-        }
-        buf.resize(buf.size() * 2);
-    }
-    return std::nullopt;
-#elif defined(__APPLE__)
-    // `_NSGetExecutablePath` REPORTS the required size through the same
-    // out-parameter when it fails, so one retry always suffices; the loop is
-    // kept symmetric with the Windows arm rather than special-cased.
-    std::uint32_t size = 0;
-    ::_NSGetExecutablePath(nullptr, &size);                 // size := required, rc != 0
-    if (size == 0) return std::nullopt;
-    std::string buf(size, '\0');
-    if (::_NSGetExecutablePath(buf.data(), &size) != 0) return std::nullopt;
-    buf.resize(std::char_traits<char>::length(buf.c_str()));
-    return fs::path{buf};
-#else
-    // Linux (and the BSDs that provide it). `/proc/self/exe` is already fully
-    // symlink-resolved by the kernel.
+    // ★ THE HOME'S ANSWER (P69 H6c, plan #17): `core::runningExecutable` asks the kernel's record of the image this
+    // process runs -- QueryFullProcessImageNameW on Windows, never GetModuleFileNameW, which names the spelling the
+    // CREATOR handed (✔MEASURED: started verbatim from a listed `e.` directory, the OS runs the literal image and
+    // GetModuleFileNameW names its twin `e`); `_NSGetExecutablePath` on macOS; `/proc/self/exe`'s reach elsewhere.
+    // Read as the config root's STORE-ROUTE text (path_identity.hpp's last block; H6d makes it a value).
     std::error_code ec;
-    fs::path const  exe = fs::read_symlink("/proc/self/exe", ec);
+    fs::path        exe = core::storeRouteRunningExecutable(ec);
     if (ec || exe.empty()) return std::nullopt;
     return exe;
-#endif
 }
 
 // Read the repo-root `VERSION` file that sits BESIDE `src/` — the same single
@@ -135,12 +95,21 @@ std::optional<fs::path> runningExecutablePath() {
 // repo-shaped config tree's version is simply the version of the tree that
 // contains it.
 //
-// nullopt => the tree declares no version (unreadable/absent `VERSION`). That is
-// NOT a mismatch and is not treated as one: the guard makes a positive claim
-// only when it has BOTH facts.
-std::optional<std::string> declaredTreeVersion(fs::path const& treeRoot) {
-    std::ifstream in(treeRoot / "VERSION", std::ios::binary);
-    if (!in) return std::nullopt;
+// nullopt => the tree declares no version (an ABSENT or empty `VERSION`). That
+// is NOT a mismatch and is not treated as one: the guard makes a positive claim
+// only when it has BOTH facts. An ERROR => a `VERSION` that is there and could
+// not be opened, its OS reason named (H6c2 (d)): the caller refuses, since a
+// version it could not read is not a version it may assume.
+std::expected<std::optional<std::string>, std::string> declaredTreeVersion(fs::path const& treeRoot) {
+    fs::path const file   = treeRoot / "VERSION";
+    auto           opened = core::openInputStream(file, std::ios::binary);   // at any length (the home)
+    if (!opened) {
+        std::error_code kindEc;
+        if (core::reachedKind(file, core::Use::Leaf, kindEc) == core::EntryKind::Absent && !kindEc)
+            return std::nullopt;   // absent: no version declared
+        return std::unexpected(core::reasonText(opened.error()));
+    }
+    std::ifstream& in = *opened;
     std::string text{std::istreambuf_iterator<char>(in),
                      std::istreambuf_iterator<char>()};
     auto const isSpace = [](char c) {
@@ -176,13 +145,18 @@ std::optional<std::string> declaredTreeVersion(fs::path const& treeRoot) {
 // Engaged => the human-readable explanation; nullopt => no disagreement.
 std::optional<std::string> repoTreeVersionSkew(fs::path const& treeRoot) {
     auto const declared = declaredTreeVersion(treeRoot);
-    if (!declared.has_value()) return std::nullopt;
+    if (!declared.has_value())
+        return "shipped-config version unreadable: the config tree at '"
+             + core::genericSpelling(repoShapedConfigRoot(treeRoot)) + "' declares its version in '"
+             + core::genericSpelling(treeRoot / "VERSION") + "', which could not be opened (" + declared.error()
+             + "). Refusing to compile against a config tree whose version cannot be checked.";
+    if (!declared->has_value()) return std::nullopt;
     std::string const mine{detail::kBuildVersionText};
-    if (*declared == mine) return std::nullopt;
+    if (**declared == mine) return std::nullopt;
     return "shipped-config version skew: this compiler is version " + mine
          + " but the config tree at '"
          + core::genericSpelling(repoShapedConfigRoot(treeRoot))
-         + "' belongs to version " + *declared
+         + "' belongs to version " + **declared
          + " (declared by '" + core::genericSpelling(treeRoot / "VERSION")
          + "'). Refusing to compile against a config tree from a different "
            "version — it would not fail, it would silently compile something "
@@ -324,7 +298,7 @@ Resolution resolveByPrecedence(std::string_view                             subd
                 // one — the two wrong spellings are equally absent from disk.
                 // This line must name what `installedConfigRootFrom` actually
                 // probed, or the reader is told the wrong thing was missing.
-                + core::genericSpelling(core::normalizeKeepingRoot(
+                + core::genericSpelling(core::storeRouteNormalized(
                     *exeDir / fs::path{std::string{installedConfigRelDir()}}))
                 + " (no such directory — this is not an installed tree)");
         } else {
@@ -335,7 +309,8 @@ Resolution resolveByPrecedence(std::string_view                             subd
     }
 
     // ── 3. the cwd ancestor walk ─────────────────────────────────────────────
-    fs::path here = startPath.value_or(fs::current_path(ec));
+    // The process's directory is the home's answer (H6c), read as the store route's text (H6d makes it a value).
+    fs::path here = startPath.has_value() ? *startPath : core::storeRouteCurrentDirectory(ec);
     for (int i = 0; i < 8 && !here.empty(); ++i) {
         fs::path const candidate = compose(repoShapedConfigRoot(here));
         out.tried.push_back("cwd walk -> " + core::genericSpelling(candidate));
@@ -352,8 +327,10 @@ Resolution resolveByPrecedence(std::string_view                             subd
             out.arm = ConfigRootArm::CwdWalk;
             return out;
         }
-        fs::path const parent = here.parent_path();
-        if (parent == here) break;   // hit the filesystem root
+        // The walk's step is the substrate's (P69 H6): it stops at the volume root -- never one step past it onto
+        // `\\?\C:`, the volume's device, or onto a share's bare server, as the library's `parent_path()` steps.
+        fs::path const parent = core::parentWithinRoot(here);
+        if (parent.empty()) break;   // hit the volume's root
         here = parent;
     }
 
@@ -361,14 +338,15 @@ Resolution resolveByPrecedence(std::string_view                             subd
 }
 
 bool probeExists(fs::path const& p, std::error_code& ec) {
-    return fs::exists(p, ec);
+    return core::reachedKind(p, core::Use::Leaf, ec) != core::EntryKind::Absent;
 }
 
 // `is_directory` rather than `exists` for the directory form, because that IS
 // the analogue: `exists` would accept a plain FILE named `shippedLibs` and hand
 // a caller a "directory" it cannot iterate.
 bool probeIsDirectory(fs::path const& p, std::error_code& ec) {
-    return fs::is_directory(p, ec);
+    // A CONTAINER (H6c, A2): the directory a config document is named below.
+    return core::reachedKind(p, core::Use::Container, ec) == core::EntryKind::Directory;
 }
 
 // Render "here is every path I tried, in order" for a not-found diagnostic. An
@@ -405,7 +383,7 @@ std::optional<std::filesystem::path> runningExecutableDir() {
         // dir starts from the wrong place. (`/proc/self/exe` is already resolved;
         // this normalises the other two hosts to the same answer.) On failure keep
         // the unresolved path rather than losing the arm entirely.
-        fs::path const real = fs::weakly_canonical(*exe, ec);
+        fs::path const real = core::storeRouteReachedPath(*exe, ec);
         fs::path const use  = ec ? *exe : real;
         fs::path        dir = use.parent_path();
         if (dir.empty()) return std::nullopt;
@@ -437,9 +415,9 @@ installedConfigRootFrom(std::filesystem::path const& executableDir) {
     // once found — silently declines and lets the cwd walk answer instead. That
     // is the worst shape available: not a refusal naming a path, but a
     // DIFFERENT config tree, chosen without a word.
-    fs::path const root = core::normalizeKeepingRoot(
+    fs::path const root = core::storeRouteNormalized(
         executableDir / fs::path{std::string{installedConfigRelDir()}});
-    if (!fs::is_directory(root, ec)) return std::nullopt;
+    if (core::reachedKind(root, core::Use::Container, ec) != core::EntryKind::Directory) return std::nullopt;
     return root;
 }
 
@@ -551,7 +529,7 @@ std::vector<std::filesystem::path> resolveSystemDirs(GrammarSchema const& gramma
         // a schema dir on a UNC share onto the local drive, so a shipped config
         // served from `\\host\share` resolved to nothing. Both sites now go
         // through the one helper.
-        std::filesystem::path const abs = core::absoluteKeepingRoot(*resolved, ec);
+        std::filesystem::path const abs = core::storeRouteAbsolute(*resolved, ec);
         out.push_back(ec ? *resolved : abs);
         ec.clear();
     }
@@ -620,14 +598,16 @@ configRootProvenanceNoteFor(ResolvedConfigRoot const&    resolved,
     // into the path. Tested in this order because the filesystem question is
     // only worth asking for the walk.
     //
-    // `equivalent`, never a string compare: a lane worktree reached through a
-    // junction, a mapped drive and a `..`-bearing spelling are all one
-    // directory, and a spelling-based answer would report a foreign tree where
-    // there is none. `ec` => one side is absent; the resolved root was just
-    // probed, so the absent side is the BUILD tree — a relocated binary, which
-    // genuinely is answering out of someone else's tree.
+    // One file reached (`core::reachedSameFile`, `equivalent`'s question asked
+    // of the substrate), never a string compare: a lane worktree reached
+    // through a junction, a mapped drive and a `..`-bearing spelling are all
+    // one directory, and a spelling-based answer would report a foreign tree
+    // where there is none. Not the same => one side is absent or another
+    // directory; the resolved root was just probed, so an absent side is the
+    // BUILD tree — a relocated binary, which genuinely is answering out of
+    // someone else's tree.
     bool const foreign = resolved.arm == ConfigRootArm::CwdWalk
-                      && !(fs::equivalent(resolved.root, mine, ec) && !ec);
+                      && !(core::reachedSameFile(resolved.root, mine, core::Use::Container, ec) && !ec);
 
     if (!foreign && !resolved.ignoredOverride.has_value()) return std::nullopt;
 
@@ -669,34 +649,52 @@ std::optional<std::string> configRootProvenanceNote() {
 std::expected<std::vector<ShippedConfigDocument>, std::string>
 shippedConfigDocuments(std::filesystem::path const& directory, std::string_view suffix) {
     std::vector<ShippedConfigDocument> out;
-    std::error_code                    ec;
-    fs::directory_iterator             it{directory, ec};
-    if (ec) {
+    // ★ THE SUBSTRATE'S LISTING, NOT THE LIBRARY'S (P69 H6): it lists at any length, and a listing it could not read
+    // WHOLE hands out no entry at all (`walkTree`), so a partial listing can never prove which documents exist. The
+    // library's `directory_iterator` miscounts a directory of 260 characters or more under MinGW's libstdc++, with no
+    // error (path_identity.hpp, "THE SPELLING A FILE CALL TAKES, AT ANY LENGTH"). Every entry is examined below, a link's reach included.
+    std::vector<fs::path>  listed;
+    core::TreeWalkOptions  options;
+    options.handOutUnreadableLinks = true;
+    core::TreeWalk const walk = core::walkTree(
+        directory,
+        [&listed](core::TreeEntry const& entry) {
+            listed.push_back(entry.storeRoutePath);
+            return core::WalkStep::Prune;
+        },
+        options);
+    if (walk.error) {
         return std::unexpected(std::format(
-            "the config directory '{}' could not be listed ({}), so which "
+            "the config directory '{}' could not be listed whole ({}), so which "
             "'*{}' documents it holds cannot be told",
-            directory.generic_string(), ec.message(), suffix));
+            directory.generic_string(), core::reasonText(walk.error), suffix));
     }
-    for (fs::directory_iterator const end; it != end; it.increment(ec)) {
-        if (ec) break;
-        // A dedicated error code: `ec` carries the ITERATION's status, and a probe
-        // failure written into it would masquerade as a listing failure.
-        std::error_code typeEc;
-        if (!it->is_regular_file(typeEc) || typeEc) continue;
-        std::string const leaf = it->path().filename().generic_string();
+    for (fs::path const& entry : listed) {
+        std::string const leaf = entry.filename().generic_string();
         // EXACT: the name ENDS with the suffix and something precedes it. A name that
         // merely CONTAINS it (`c.lang.json.orig`) is not a document of the kind, and
-        // neither is the bare suffix.
+        // neither is the bare suffix. Asked FIRST, so only an entry NAMED as a document
+        // is examined: an unrelated entry is nothing this listing has to answer for.
         if (leaf.size() <= suffix.size() || !std::string_view{leaf}.ends_with(suffix)) continue;
-        out.push_back(ShippedConfigDocument{leaf.substr(0, leaf.size() - suffix.size()),
-                                            it->path()});
-    }
-    if (ec) {
-        return std::unexpected(std::format(
-            "the listing of config directory '{}' was interrupted after {} "
-            "'*{}' document(s) ({}); a partial listing cannot prove which "
-            "documents exist, so it is refused",
-            directory.generic_string(), out.size(), suffix, ec.message()));
+        // A dedicated error code, apart from the listing's. A document
+        // is an entry by what it REACHES (the substrate's answer, never the
+        // library's: libstdc++ on Windows calls a dangling link a regular file).
+        // ★ ONLY ABSENCE IS "NOT A DOCUMENT". A document named like one whose reach
+        // cannot be EXAMINED (a looping link, a refusal) is not known to be absent:
+        // skipping it would drop a language, target or format the tree declares, in
+        // silence -- the same answer as "no such document" for a question nobody could
+        // answer. It is refused, named, as the interrupted listing below is.
+        std::error_code      typeEc;
+        core::EntryKind const reached = core::reachedKind(entry, core::Use::Leaf, typeEc);
+        if (typeEc) {
+            return std::unexpected(std::format(
+                "the config document '{}' cannot be examined ({}): what it reaches is "
+                "unknown, so whether config directory '{}' holds a '*{}' document "
+                "there cannot be told, and the listing is refused",
+                entry.generic_string(), core::reasonText(typeEc), directory.generic_string(), suffix));
+        }
+        if (reached != core::EntryKind::File) continue;
+        out.push_back(ShippedConfigDocument{leaf.substr(0, leaf.size() - suffix.size()), entry});
     }
     std::sort(out.begin(), out.end(),
               [](ShippedConfigDocument const& a, ShippedConfigDocument const& b) {

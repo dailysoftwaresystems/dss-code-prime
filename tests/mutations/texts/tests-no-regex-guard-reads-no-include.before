@@ -1,0 +1,1 @@
+    return text.compare(name, 7, "<regex>") == 0 || text.compare(name, 7, "\"regex\"") == 0;

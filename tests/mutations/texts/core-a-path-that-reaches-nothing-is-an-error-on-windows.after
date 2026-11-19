@@ -1,0 +1,5 @@
+    Handle const firstHandle = reachedHandle(first, FILE_READ_ATTRIBUTES, ec);
+    if (!firstHandle) {
+        if (!ec) ec = winError(ERROR_FILE_NOT_FOUND);
+        return false;
+    }

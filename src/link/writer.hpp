@@ -1,16 +1,19 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/substrate/host_path.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "link/linker.hpp"
 
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <expected>
 #include <filesystem>
 #include <functional>
 #include <span>
 #include <string>
+#include <system_error>
 
 // Linker image file emission — plan 14 LK10 cycle 1 substrate.
 //
@@ -222,9 +225,11 @@ inline constexpr std::uint32_t kMaxClaimAttempts = 1000;
 // three-way path-type differential, and the host split are at the definition
 // site in writer.cpp.
 //
-// Caller owns the returned stream and must `std::fclose` it.
-[[nodiscard]] DSS_EXPORT std::FILE*
-createExclusiveBinary(std::filesystem::path const& p);
+// Caller owns the returned stream and must `std::fclose` it. A refused claim answers the OS's REASON (P69 H6c2: read at
+// the failing call; `core::reasonText` renders it), never a bare null: an occupied name answers ERROR_FILE_EXISTS /
+// EEXIST like every other refusal, and the caller's probe of the entry decides whether to step over it.
+[[nodiscard]] DSS_EXPORT std::expected<std::FILE*, std::error_code>
+createExclusiveBinary(core::HostPath const& p);
 
 // ── THE COMMIT: rename a staged file over its target ───────────────────────
 //
@@ -298,16 +303,16 @@ using CommitPatience = std::function<bool(std::uint32_t holderRefusals)>;
 
 // The production commit: waits up to `kCommitHolderWait` for a holder.
 [[nodiscard]] DSS_EXPORT CommitOutcome
-commitReplacing(std::filesystem::path const& staged,
-                std::filesystem::path const& target);
+commitReplacing(core::HostPath const& staged,
+                core::HostPath const& target);
 
 // The same commit with the caller's patience — the seam a test uses to release
 // its holder at the moment the commit has been refused, by handshake rather
 // than by a timer.
 [[nodiscard]] DSS_EXPORT CommitOutcome
-commitReplacing(std::filesystem::path const& staged,
-                std::filesystem::path const& target,
-                CommitPatience const&        patience);
+commitReplacing(core::HostPath const& staged,
+                core::HostPath const& target,
+                CommitPatience const& patience);
 
 } // namespace detail
 

@@ -1,0 +1,2 @@
+                    if (isStandardAttributeSpecifier(sem, tree(), run)) continue;
+                    roots.push_back(run);

@@ -1,0 +1,2 @@
+    if (reason.category() == std::generic_category() || reason.category() == std::system_category())
+        return "errno=" + std::to_string(reason.value()) + ": ";

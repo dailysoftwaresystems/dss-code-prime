@@ -1,0 +1,3 @@
+            builder_.keepSymbolIdsClearOf(SymbolId{v});
+        }
+        (void)expect(TokKind::RBrace);

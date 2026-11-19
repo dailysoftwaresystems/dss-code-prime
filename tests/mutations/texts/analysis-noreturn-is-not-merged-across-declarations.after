@@ -1,0 +1,1 @@
+                (void)nr;   // each declaration keeps its own answer

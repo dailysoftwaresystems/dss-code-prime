@@ -1,0 +1,62 @@
+{
+  "$comment": "D-LK-MEMBER-DIRECT-LIBRARY-DATUM-BOUND-TO-THE-SLOT, HALF (2) (P69, lane `xa`): DSS's OWN relocatable output reaching a C-library DATUM, linked by DSS. `dsslib.c` reads `stdout` and is built into a DSS static library by each target's `dependsOn`; `main.c` compares the value the library read with its own and prints through the library. WHAT WAS WRONG: the x86_64 ELF relocatable documents declared no `externAddrBinding`, so DSS compiled the library's read as `movq stdout(%rip)` — R_X86_64_PC32 against the datum, the shape gcc emits for a copy relocation — and a DSS link of that archive refused it (`K_ImportReferenceUnbindable`: DSS binds library data through a loader-filled slot and makes no copy relocation) — DOCUMENTED at `refuseUnbindableImportReferences` (`src/link/linker.cpp`, P68 round 11: gcc's `R_X86_64_PC32 stdout` \"and so is DSS's own x86_64 staticlib for the same C\"), and the red-on-disable of this example is that state: remove `externAddrBinding` from `elf64-x86_64-linux-staticlib.format.json` and both x86_64 ELF arms stop linking, by name. WHAT CHANGED: P69 declares `externAddrBinding: got` on the x86_64 ELF relocatable and static-library documents (D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB), so the library reads `stdout` through the GOT (R_X86_64_REX_GOTPCRELX), which any linker — DSS's included — binds to the loader-filled slot. The row's HALF (1) — gcc's own direct `movq stdout(%rip)`, which needs a copy relocation with every alias of the datum defined at the copy — stays OPEN, carried by lane `xa`: the descriptor key it needs, one that states a datum's aliases, is lane `lm`'s per-format `aliases` key of P69 round 3 (`\"aliases\": {\"elf\": [\"__environ\", \"_environ\"]}` on `environ` in `unistd.json`), which reaches main after this lane's fold. Every target here builds its library with DSS. Of the other documents only the aarch64 ELF ones declared `got` before P69 (TF-C52), so the aarch64 arm is the control that the same source already ran; the Mach-O relocatable and static-library documents gained `externAddrBinding: got` in P69 too (with the same row), so their two arms are a second witness of this change, not a control; and the pe64 arm reads UCRT's `stdout` (a function call, `__acrt_iob_func`) — the same C, a different mechanism. P69 review M2 (D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB): the library ALSO takes `&puts` in code and in a static, and main.c compares both with the platform loader's answer — GetProcAddress on the pe64 arm, dlsym on every other — and with its own `&puts` (exit 100 + a bitset otherwise, see main.c). On pe64 this is the split the review found: the relocatable PE documents declared no `externAddrBinding`, so the library's code computed `lea puts(%rip)` — REL32 to `puts`, which every PE linker binds to the import THUNK — while its static `{puts}` became a loader-bound slot (design c2) holding GetProcAddress's answer: one translation unit, two addresses. The PE relocatable and static-library documents now declare `externAddrBinding: got`, and COFF has no GOT relocation, so the library's code LOADS `&puts` from a pointer the object CARRIES (MinGW's `.refptr` shape: one ADDR64 against `puts`, `lowerGotSlotReferences`), filled through the same relocation as its static, so code and static agree under DSS, link.exe, GNU ld and lld-link alike (P69 round 3). D-LK-MEMBER-UNTYPED-EXTERN-TAKEN-AS-DATA (closed in P69 round 3, and this example is its witness): the library names `puts` ONLY by its address — a GOT load in code, an absolute pointer in its static — and calls `fputs`. Until round 3 the ELF and Mach-O object readers took an untyped undefined symbol as DATA unless a call relocation named it, so the member's `puts` became a DATA import and the program's own declaration of `puts` was refused: ✔MEASURED 2026-10-01 on this example without a call to `puts` (run 20261002-000334-c812a53b, windows-x86_64-debug), `K_ExternImportAttributeConflict` for `puts` on the x86_64 ELF exec and PIE, aarch64 ELF exec and arm64 Mach-O exec arms, while the pe64 arm linked and ran. The library carried a never-run caller of `puts` (`lib_announce`) until round 3 so that its object named `puts` by a call. Since round 3 an untyped symbol no call names states no kind, and the library that defines it decides, so that caller is gone. The x86_64 Mach-O arm was added in round 3: P69's `externAddrBinding: got` on the x86_64 Mach-O relocatable documents is what made that arm's `&puts` a GOT_LOAD, so that arm met the conflict only because of P69. It runs under Rosetta on the darwin leg.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "from the library\n",
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "dependsOn": [
+        {"sources": ["dsslib.c"], "spec": "x86_64:elf64-x86_64-linux-staticlib", "artifact": "dsslib.a"}
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-pie",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "dependsOn": [
+        {"sources": ["dsslib.c"], "spec": "x86_64:elf64-x86_64-linux-staticlib", "artifact": "dsslib.a"}
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "dependsOn": [
+        {"sources": ["dsslib.c"], "spec": "arm64:elf64-aarch64-linux-staticlib", "artifact": "dsslib.a"}
+      ]
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "dependsOn": [
+        {"sources": ["dsslib.c"], "spec": "arm64:macho64-arm64-darwin-staticlib", "artifact": "dsslib.a"}
+      ]
+    },
+    {
+      "spec": "x86_64:macho64-x86_64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "dependsOn": [
+        {"sources": ["dsslib.c"], "spec": "x86_64:macho64-x86_64-darwin-staticlib", "artifact": "dsslib.a"}
+      ]
+    },
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"],
+      "expectedStdout": "from the library\r\n",
+      "dependsOn": [
+        {"sources": ["dsslib.c"], "spec": "x86_64:pe64-x86_64-windows-staticlib", "artifact": "dsslib.lib"}
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

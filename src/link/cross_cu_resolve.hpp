@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -20,7 +21,8 @@
 //
 // **Why a separate, pure function** (the Cycle-25 whole-program-MIR-merge
 // prerequisite): the cross-CU symbol policy (strong-shadows-weak / two-strong is
-// ambiguous / all-weak lowest-key wins, order-independent) is the SINGLE source of
+// ambiguous / all-weak: the first in the link's order wins, independent of the order
+// the definitions are handed in) is the SINGLE source of
 // truth both the linker AND a future whole-program MIR merge must agree on. Extracting
 // it as a pure value→value function lets a direct unit test pin the policy (the
 // `test_cross_cu_resolve` tripwire) so the two consumers can never silently diverge.
@@ -39,6 +41,63 @@
 // only.** (The standing source/target/linker agnosticism veto.)
 
 namespace dss::linker {
+
+// ── THE LINK'S ORDER (P69 fold 3d, D-LK-THE-LINK-ORDER-IS-NOT-THE-COMMAND-LINE-ORDER) ──
+//
+// Every tie this kernel breaks is "the first in the link's order", and the link's
+// order is the OPERATOR'S order of the inputs: the place on the command line of the
+// input a definition came from (`AssembledModule::linkPosition`, which states what
+// was measured). The one comparison of two such places, which the section-group
+// keep (`linker.cpp`, `discardLaterSectionGroups`) asks too: a stated position
+// before none, a lower one before a higher. At one position, or with none on both
+// sides, neither precedes the other, and the order the caller holds them in decides.
+[[nodiscard]] inline bool linkPositionPrecedes(std::optional<std::uint32_t> a,
+                                               std::optional<std::uint32_t> b) noexcept {
+    if (!a.has_value()) return false;
+    return !b.has_value() || *a < *b;
+}
+
+// The ranks a caller states for a weak definition today (`CrossCuDef::weakRank`). Only
+// their ORDER means anything to the kernel.
+inline constexpr std::uint8_t kYieldingWeakDefinition = 0;   // every other weak definition of the name replaces it
+inline constexpr std::uint8_t kUnrankedWeakDefinition = 1;   // the default: folds as weak definitions always did
+
+// ── WHAT A WEAK DEFINITION IS BESIDE A STRONG ONE OF ITS NAME ─────────────────
+//
+// P69 fold 3 (lane `xa`). Until it, the kernel knew one answer — the strong
+// definition replaces the weak one — and that answer is a FORMAT's, not a law:
+// a PE select-any definition (a COMDAT) beside a strong definition of its name
+// is a duplicate, refused by every PE linker measured (✔MEASURED 2026-10-12, 16
+// of 16 cells: link.exe 14.44 LNK2005, lld-link 19.1.5 "duplicate symbol", GNU
+// ld 2.42 "multiple definition", both object orders, on cl's, clang's and MinGW
+// gcc's objects), where DSS linked the pair in silence and the program ran on
+// the strong definition's bytes. The CALLER states the answer per definition,
+// read from the link's document (`linker::weakBesideAStrongDefinition`,
+// link/common_yield.hpp); the kernel still knows no kind and no format.
+//   * `Yields`   — the strong definition replaces it. THE DEFAULT, so a caller
+//                  that states nothing folds exactly as before.
+//   * `Collides` — the pair is a duplicate definition: recorded as data
+//                  (`CrossCuResolution::collisions`), the caller's to refuse.
+//   * `Unstated` — the document was asked and does not say: recorded
+//                  (`CrossCuResolution::undecided`), the caller's to refuse by
+//                  the key's name rather than guess between the two.
+enum class WeakBesideStrongAnswer : std::uint8_t { Yields, Collides, Unstated };
+
+// ── WHAT A COMMON IS BESIDE A WEAK DEFINITION OF ITS NAME ─────────────────────
+//
+// A TENTATIVE definition (`CrossCuDef::tentative`) is a COMMON. Beside a weak
+// definition of its name the formats split — ELF's common outranks every weak
+// definition, Mach-O's yields to every one, PE's stands between its two kinds —
+// so, again, the caller states the document's answer for THIS weak definition
+// (`linker::commonBesideAWeakDefinition`, link/common_yield.hpp, the one reader
+// of `commonYieldsTo`) and the kernel compares nothing it does not understand.
+//   * `Yields`   — the weak definition replaces the common;
+//   * `Outranks` — the common is the name's definition and the weak one is
+//                  ignored;
+//   * `Unstated` — THE DEFAULT, deliberately: a caller that hands the kernel a
+//                  tentative definition and never said what a weak one is beside
+//                  it gets the pair back as `undecided`, not a guess.
+enum class CommonBesideWeakAnswer : std::uint8_t { Unstated, Yields, Outranks };
 
 // One externally-visible DEFINITION the resolver ranks. `name` is the cross-CU match
 // key (the raw declared identifier); `binding` is Global (strong) or Weak; `key` is the
@@ -95,6 +154,67 @@ struct CrossCuDef {
     DuplicateMatch                 duplicateMatch = DuplicateMatch::Any;
     std::size_t                    bodySize = 0;
     std::span<std::uint8_t const>  body{};
+    // ── WHERE THIS WEAK DEFINITION STANDS AMONG THE WEAK DEFINITIONS OF ITS NAME ──
+    //    D-LK-WEAK-EXTERNAL-BODY-OUTRANKED-A-SELECT-ANY-DEFINITION-BY-LINK-ORDER
+    //
+    // Read only when `binding == Weak`. A weak definition of a HIGHER rank
+    // replaces one of a lower rank whatever their keys and whatever the order
+    // they arrive in; weak definitions of ONE rank fold as weak definitions
+    // always did (the promise checked, the first in the link's order kept). A definition
+    // outranked by another weak definition of its name is not one of the copies
+    // the fold compares, so nothing is asked of it.
+    //
+    // ★ THE CALLER STATES THE RANK; THIS KERNEL COMPARES NUMBERS. Whether a
+    // format ranks its weak definitions at all, and which kind stands where, is
+    // the link document's fact, read by `linker::weakDefinitionRank`
+    // (`link/common_yield.hpp`). Nothing here knows a kind or a format, which is
+    // what lets the cross-unit MIR merge fold by the same rule. The default is
+    // the rank of a definition nobody ranked, so a caller that states nothing
+    // folds exactly as before.
+    std::uint8_t                   weakRank = kUnrankedWeakDefinition;
+    // Read only when `binding == Weak`: what this definition is beside a STRONG
+    // one of its name, and what a COMMON is beside it — each the caller's
+    // reading of the link's document (see the two enums above).
+    WeakBesideStrongAnswer         besideStrong = WeakBesideStrongAnswer::Yields;
+    CommonBesideWeakAnswer         commonBesideIt = CommonBesideWeakAnswer::Unstated;
+    // ── A TENTATIVE DEFINITION — A COMMON ─────────────────────────────────────
+    //    D-C-TENTATIVE-DEFINITIONS-OF-ONE-NAME-IN-TWO-UNITS-REFUSED
+    //
+    // Read only when `binding == Global`: this definition is one its unit never
+    // completed (C 6.9.2p2 — `int x;` with no initializer anywhere in the
+    // unit). It DEFINES the name, and it is not a strong definition:
+    //   * a STRONG definition of the name replaces it, in silence — the
+    //     initialized definition is the object (✔MEASURED 2026-10-12, 16 of 16
+    //     PE cells and 8 of 8 ELF cells, both orders);
+    //   * TWO of them are ONE object, the larger (`bodySize`, which a caller
+    //     passing a tentative definition states), the first in the link's order on a tie
+    //     (✔MEASURED the same day, 16 of 16 and 8 of 8) — until this field the
+    //     kernel had only "two strong definitions", and DSS refused the program
+    //     cl links;
+    //   * beside a WEAK definition, that definition's `commonBesideIt` decides.
+    // A weak tentative definition (`__attribute__((weak)) int t;`) is a WEAK
+    // definition — its kind decides everything — so the flag is not read there.
+    //
+    // ⓘ A thread-local tentative definition is NOT one of these and its caller
+    // passes false: no reference writes it as a common (✔MEASURED 2026-10-12:
+    // cl and clang put it in `.tls$`, gcc and clang on ELF in `.tbss`, MinGW gcc
+    // in its emulated-TLS control object) and two units holding one are refused
+    // by every linker measured, as two strong definitions are.
+    bool                           tentative = false;
+    // ── WHERE THIS DEFINITION'S INPUT STANDS IN THE LINK'S ORDER (P69 fold 3d) ──
+    //
+    // The place of the input the definition came from (`linkPositionPrecedes`;
+    // the caller reads it with `linkPositionOf`). Every tie below is broken by it
+    // FIRST -- two weak definitions of one rank, two commons of one size, the
+    // strong definition a conflict names first -- and by `key` only among
+    // definitions at one place or at none. A caller that states no position (the
+    // merge of the compiled units, whose keys are their units' places among the
+    // sources) folds exactly as before. ✔MEASURED P69 fold 3d: two weak ELF
+    // definitions of `w`, one in a C unit and one in a named object, under gcc
+    // 13.3 + GNU ld 2.42 and clang 18 + ld.lld 18 -- the definition FIRST ON THE
+    // COMMAND LINE is the program's, in all four orders; DSS kept the unit's in
+    // all four, its key minted before every object's.
+    std::optional<std::uint32_t>   linkPosition;
 };
 
 // One two-strong collision event. `name` is the colliding cross-CU name; `existing` is
@@ -132,10 +252,36 @@ struct CrossCuDuplicateMismatch {
     std::size_t     incomingSize = 0;
 };
 
+// A weak definition beside a strong definition of its name where the link's
+// document says the two COLLIDE (`WeakBesideStrongAnswer::Collides`). `strong`
+// is the name's winning strong definition, `weak` the definition that may not
+// stand beside it — the pair the caller names.
+struct CrossCuCollision {
+    std::string     name;
+    LinkedSymbolKey strong{};
+    LinkedSymbolKey weak{};
+};
+
+// A pair the link's document was asked about and did not decide. `question`
+// says which fact is missing, so the caller can name the key that states it;
+// `definition` is the strong definition or the common, `weak` the weak
+// definition beside it.
+enum class CrossCuQuestion : std::uint8_t {
+    WeakBesideStrong,   // is a strong definition beside this weak one a replacement or a duplicate?
+    CommonBesideWeak,   // does a common yield to this weak definition, or outrank it?
+};
+struct CrossCuUndecided {
+    std::string     name;
+    LinkedSymbolKey definition{};
+    LinkedSymbolKey weak{};
+    CrossCuQuestion question = CrossCuQuestion::WeakBesideStrong;
+};
+
 // The resolution outcome. `winners[name]` is the winning definition's compound key for
-// every externally-visible name (a strong def shadows weak; among all-weak the
-// lexicographically-lowest `(cuId, SymbolId)` wins; among multiple strongs the lowest
-// key is recorded so `winners` stays order-independent even for an ambiguous name).
+// every externally-visible name (a strong def shadows weak; among all-weak the first in
+// the link's order wins -- the earliest `linkPosition`, then the lexicographically-lowest
+// `(cuId, SymbolId)`; among multiple strongs the first the same way is recorded so
+// `winners` stays independent of the order of `defs` even for an ambiguous name).
 // `conflicts` lists one entry PER two-strong collision event — K strong definitions of
 // one name yield K-1 entries (mirrors the former per-pair diagnostic count exactly, so
 // the caller's diagnostic count is unchanged) — each carrying the colliding key pair.
@@ -146,6 +292,17 @@ struct CrossCuResolution {
     // for every link in which no producer declared a duty (the overwhelmingly
     // common case, and the pre-existing behaviour bit for bit).
     std::vector<CrossCuDuplicateMismatch>            duplicateMismatches;
+    // Every weak definition that stands beside a STRONG definition of its name
+    // and stated `Collides` — a duplicate definition, the caller's to refuse.
+    // One entry per such weak definition, in the order the definitions were
+    // handed in; `strong` is the name's winner.
+    std::vector<CrossCuCollision>                    collisions;
+    // Every pair the kernel could not decide because the caller's document did
+    // not say: a weak definition beside a strong one (`besideStrong` Unstated),
+    // or the name's weak winner beside a common (`commonBesideIt` Unstated).
+    // The winner recorded for such a name is the strong definition, or the
+    // common — a module to report against, never a verdict.
+    std::vector<CrossCuUndecided>                    undecided;
 };
 
 // Resolve the winning definition per name. ORDER-INDEPENDENT: permuting `defs` yields

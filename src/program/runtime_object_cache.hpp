@@ -658,6 +658,11 @@ struct DSS_EXPORT DependencyArtifactRequest {
     //   * targetSpecStr      → `targetSpec`; its format half → `buildFormatName`
     //   * compileOpts.config → `configName`
     //   * compileOpts.resolveLibraries, .objectInputs → `linkInputs`
+    //   * compileOpts.objectInputPlaces → each object input's `linkInputs`
+    //     entry (its place in the operator's order rides with its path);
+    //     compileOpts.unitPlaces → NOT a term of its own: a unit stands at the
+    //     gathered index no object takes, so the objects' places and the
+    //     closure's own order already determine it
     //   * artifactName.value_or(sourceStem) → `artifactStem` above, which is a
     //     key term as well as the entry's name
     //   * compileOpts.ltoMode, imageRequest.stackReserveBytes,

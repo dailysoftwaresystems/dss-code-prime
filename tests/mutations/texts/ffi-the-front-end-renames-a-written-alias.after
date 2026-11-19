@@ -1,0 +1,1 @@
+    return stated.has_value() && stated->route == WrittenNameRoute::Refused;

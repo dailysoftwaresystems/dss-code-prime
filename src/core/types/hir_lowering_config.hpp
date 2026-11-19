@@ -3,6 +3,7 @@
 #include "core/export.hpp"
 #include "core/types/enum_name_table.hpp"           // EnumNameTable (kChildLowerTable)
 #include "core/types/object_format_kind.hpp"        // ObjectFormatKind (per-format element core)
+#include "core/types/parse_diagnostic.hpp"          // DiagnosticCode (scalarBraceInitializer)
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/core_type.hpp"   // TypeKind (LiteralPrefixEntry.elementCore)
 
@@ -318,14 +319,14 @@ struct DSS_EXPORT HirLoweringConfig {
     // to their slot type via the shared `coerce` helper (the same path
     // ordinary VarDecl init / coerce uses). Compound literal `(T){...}`
     // lowers via the same `lowerBraceInit` with the type taken from
-    // the parenthesized prefix — declared via a separate operand-alt
-    // rule (`compoundLiteralRule`) so its lookup is positional and the
-    // engine never branches on language.
+    // the parenthesized prefix. WHICH rules are compound literals is
+    // `semantics.compoundLiterals`' alone (P69: C23 adds a second form,
+    // the storage-class one) — this block used to repeat the one rule as
+    // `compoundLiteralRule`, a second owner of the same fact.
     RuleId      braceInitListRule{};   std::string braceInitListRuleName;
     RuleId      initElementRule{};     std::string initElementRuleName;
     RuleId      designatedFieldRule{}; std::string designatedFieldRuleName;
     RuleId      designatedIndexRule{}; std::string designatedIndexRuleName;
-    RuleId      compoundLiteralRule{}; std::string compoundLiteralRuleName;
 
     // FC2: explicit cast `(T)expr` — the operand-alt rule whose subtree
     // lowers to a core `HirKind::Cast` (explicit flags, NOT Synthetic).
@@ -358,6 +359,9 @@ struct DSS_EXPORT HirLoweringConfig {
     RuleId      vaStartRule{};         std::string vaStartRuleName;
     RuleId      vaArgRule{};           std::string vaArgRuleName;
     RuleId      vaEndRule{};           std::string vaEndRuleName;
+    // P69 (lane `cs`, D-C-STDARG-VA-COPY-MISSING): `va_copy(dest, src)` → core
+    // `HirKind::VaCopy` [dest, src]. Invalid ⇒ the language has no copy surface.
+    RuleId      vaCopyRule{};          std::string vaCopyRuleName;
 
     // FC16 C11/C23 6.5.1.1 (D-CSUBSET-GENERIC-SELECTION): the `_Generic` generic
     // selection operand rule (`genericExpr`). A dedicated operand alt (the SizeOf
@@ -385,7 +389,7 @@ struct DSS_EXPORT HirLoweringConfig {
     std::vector<std::string> foldedConstantRuleNames;
 
     // P31: `__builtin_choose_expr` — the compile-time `?:`. Routed to the SAME
-    // lowering body `genericRule` is (`lowerRecordedSelection`), because the two
+    // lowering `genericRule` is (the recorded-selection frame), because the two
     // differ ONLY in how the semantic tier picked the winner and not at all in
     // what the lowering does with it: read the recorded NodeId out of
     // `nodeToSelectedExpr`, lower that sub-expression, discard the rest.
@@ -404,7 +408,7 @@ struct DSS_EXPORT HirLoweringConfig {
     // (`stmtExpr`). A dedicated operand alt (the `sizeof` / `_Generic`
     // precedent) whose children are STATEMENTS, not expressions — so it must
     // never reach the generic operand descent, which would try to lower a
-    // declaration as a value. The lowering (`lowerStatementExpr`) runs the
+    // declaration as a value. The lowering (`stmtExprValuePrologue`) runs the
     // statements through the ordinary statement machinery and yields the last
     // one's expression, building the ALREADY-EXISTING `HirKind::SeqExpr`
     // ([stmts…, result]) — no new HIR kind, and no MIR change, because MIR's
@@ -412,6 +416,25 @@ struct DSS_EXPORT HirLoweringConfig {
     // Invalid ⇒ the language has no statement-expression surface (unset; the
     // operand dispatch skips it).
     RuleId      stmtExprRule{};        std::string stmtExprRuleName;
+
+    // P69 (lane `lm`, the scalar brace closure): what the language makes of a scalar's
+    // brace initializer beyond C 6.7.9p11's "single expression, optionally enclosed in
+    // braces" — each a WARNING the lowering reports where it admits the shape:
+    //   `nestedBraces`   — a brace level beyond the one pair (`int v = {{42}};`; the
+    //                      innermost value initializes, `{{}}` is zero), and the one pair
+    //                      itself around a scalar SUBOBJECT of an aggregate (`struct S s =
+    //                      {{42}};`), which C allows and gcc and clang warn;
+    //   `excessElements` — more than one element (`int v = {42, 7};`; the first
+    //                      initializes, the rest are dropped unevaluated — C 6.7.9p2's
+    //                      constraint, which gcc and clang build with a warning).
+    // `DiagnosticCode::None` (the key absent) ⇒ the language refuses the shape
+    // (S_InvalidScalarInitializer) — and a subobject's one pair stands, unwarned. A
+    // designator in a scalar's braces is refused whatever this says.
+    struct ScalarBraceInitializer {
+        DiagnosticCode nestedBraces   = DiagnosticCode::None;   std::string nestedBracesName;
+        DiagnosticCode excessElements = DiagnosticCode::None;   std::string excessElementsName;
+    };
+    ScalarBraceInitializer scalarBraceInitializer{};
 
     // Per-language MIR-globals const-evaluation policy. The shared
     // const-eval engine (plan 12.5) supports a float-folding gate via

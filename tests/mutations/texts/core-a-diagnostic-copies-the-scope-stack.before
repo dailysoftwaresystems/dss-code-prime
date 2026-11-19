@@ -1,0 +1,1 @@
+    return ScopeTrail::at(scopeChain_, scopes_.back().node,

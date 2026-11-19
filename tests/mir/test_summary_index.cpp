@@ -32,6 +32,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/symbol_attrs.hpp"
 #include "mir/summary/summary_index.hpp"
+#include "link_facts.hpp"   // ordinaryLinkFormat (P69: the summary index and the lazy import read the link's document)
 
 #include <gtest/gtest.h>
 
@@ -121,7 +122,8 @@ TEST(SummaryIndex, IndexResolvesStrongOverWeakAcrossModules) {
     std::vector<ModuleSummary> const mods{m0, m1};
 
     Collector rep;
-    auto const ix = buildSummaryIndex(mods, defaultPolicy(), rep);
+    auto const ix = buildSummaryIndex(mods, defaultPolicy(),
+                                      dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(ix.has_value());
 
     auto const site = ix->definitionOf("f");
@@ -137,7 +139,8 @@ TEST(SummaryIndex, IndexReportsTwoStrongConflict) {
     std::vector<ModuleSummary> const mods{m0, m1};
 
     Collector rep;
-    auto const ix = buildSummaryIndex(mods, defaultPolicy(), rep);
+    auto const ix = buildSummaryIndex(mods, defaultPolicy(),
+                                      dss::test_support::ordinaryLinkFormat(), rep);
     // Reported, not silently resolved — and the build still proceeds with the
     // resolver's winner, which is what `mergeCuMirs` does for the same reason.
     ASSERT_TRUE(ix.has_value());
@@ -153,7 +156,8 @@ TEST(SummaryIndex, IndexUnionsTheAddressEscapeSetAcrossModules) {
     std::vector<ModuleSummary> const mods{m0, m1};
 
     Collector rep;
-    auto const ix = buildSummaryIndex(mods, defaultPolicy(), rep);
+    auto const ix = buildSummaryIndex(mods, defaultPolicy(),
+                                      dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(ix.has_value());
     EXPECT_EQ(ix->escapedSymbols.count("f"), 1u);
     EXPECT_EQ(ix->escapedSymbols.count("g"), 0u);
@@ -180,7 +184,8 @@ TEST(SummaryIndex, IndexRefusesACalleeEscapingInAnotherModule) {
     std::vector<ModuleSummary> const mods{m0, m1, m2};
 
     Collector rep;
-    auto const ix = buildSummaryIndex(mods, defaultPolicy(), rep);
+    auto const ix = buildSummaryIndex(mods, defaultPolicy(),
+                                      dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(ix.has_value());
     ASSERT_EQ(ix->escapedSymbols.count("f"), 1u);
     EXPECT_FALSE(planHas(*ix, 0, "f"))
@@ -192,7 +197,8 @@ TEST(SummaryIndex, IndexRefusesACalleeEscapingInAnotherModule) {
     ModuleSummary m2clean = mod("d2", {fn("takesAddr", 60)});
     std::vector<ModuleSummary> const clean{m0, m1, m2clean};
     Collector rep2;
-    auto const ix2 = buildSummaryIndex(clean, defaultPolicy(), rep2);
+    auto const ix2 = buildSummaryIndex(clean, defaultPolicy(),
+                                       dss::test_support::ordinaryLinkFormat(), rep2);
     ASSERT_TRUE(ix2.has_value());
     EXPECT_TRUE(planHas(*ix2, 0, "f"));
 }
@@ -210,7 +216,8 @@ TEST(SummaryIndex, IndexFindsCrossModuleRecursionSCC) {
     std::vector<ModuleSummary> const mods{mod("d0", {f}), mod("d1", {g, h})};
 
     Collector rep;
-    auto const ix = buildSummaryIndex(mods, defaultPolicy(), rep);
+    auto const ix = buildSummaryIndex(mods, defaultPolicy(),
+                                      dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(ix.has_value());
     ASSERT_EQ(ix->sccOf.count("f"), 1u);
     ASSERT_EQ(ix->sccOf.count("g"), 1u);
@@ -236,7 +243,8 @@ TEST(SummaryIndex, IndexComputesWholeProgramLiveness) {
                                           mod("d1", {used, unused})};
 
     Collector rep;
-    auto const ix = buildSummaryIndex(mods, defaultPolicy(), rep);
+    auto const ix = buildSummaryIndex(mods, defaultPolicy(),
+                                      dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(ix.has_value());
     EXPECT_EQ(ix->liveSymbols.count("main"), 1u);
     EXPECT_EQ(ix->liveSymbols.count("used"), 1u);
@@ -269,7 +277,8 @@ TEST(SummaryIndex, IndexPropagatesLivenessThroughGlobalInitializers) {
     std::vector<ModuleSummary> const mods{mod("d0", {main}), m1};
 
     Collector rep;
-    auto const ix = buildSummaryIndex(mods, defaultPolicy(), rep);
+    auto const ix = buildSummaryIndex(mods, defaultPolicy(),
+                                      dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(ix.has_value());
     EXPECT_EQ(ix->liveSymbols.count("handler"), 1u)
         << "a function reachable only through a data relocation is live";
@@ -283,7 +292,8 @@ TEST(SummaryIndex, IndexPlansCrossModuleImports) {
                                           mod("d1", {fn("f", 50, /*insts=*/3)})};
 
     Collector rep;
-    auto const ix = buildSummaryIndex(mods, defaultPolicy(), rep);
+    auto const ix = buildSummaryIndex(mods, defaultPolicy(),
+                                      dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(ix.has_value());
     ASSERT_EQ(ix->importPlan.size(), 1u);
     EXPECT_EQ(ix->importPlan[0].importerModule, 0u);
@@ -309,7 +319,8 @@ TEST(SummaryIndex, IndexRespectsTheInlineThreshold) {
         mod("d1", {fn("atThreshold", 50, 10), fn("overThreshold", 51, 11)})};
 
     Collector rep;
-    auto const ix = buildSummaryIndex(mods, p, rep);
+    auto const ix = buildSummaryIndex(mods, p,
+                                      dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(ix.has_value());
     EXPECT_TRUE(planHas(*ix, 0, "atThreshold"));
     EXPECT_FALSE(planHas(*ix, 0, "overThreshold"));
@@ -321,7 +332,8 @@ TEST(SummaryIndex, IndexRespectsTheInlineThreshold) {
     std::vector<ModuleSummary> const waived{
         mod("d0", {main}), mod("d1", {fn("atThreshold", 50, 10), big})};
     Collector rep2;
-    auto const ix2 = buildSummaryIndex(waived, p, rep2);
+    auto const ix2 = buildSummaryIndex(waived, p,
+                                       dss::test_support::ordinaryLinkFormat(), rep2);
     ASSERT_TRUE(ix2.has_value());
     EXPECT_TRUE(planHas(*ix2, 0, "overThreshold"));
 }
@@ -349,7 +361,8 @@ TEST(SummaryIndex, IndexRefusesWeakAndDirectiveRefusals) {
                    noReturnF, sehF})};
 
     Collector rep;
-    auto const ix = buildSummaryIndex(mods, defaultPolicy(), rep);
+    auto const ix = buildSummaryIndex(mods, defaultPolicy(),
+                                      dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(ix.has_value());
     // Every one of these is a refusal `inlineLegalityGate` makes today, so the
     // index must not waste an import offering it. None is a QUALITY loss: the
@@ -371,7 +384,8 @@ TEST(SummaryIndex, IndexSkipsSameModuleCallees) {
     std::vector<ModuleSummary> const mods{mod("d0", {main, fn("local", 50)})};
 
     Collector rep;
-    auto const ix = buildSummaryIndex(mods, defaultPolicy(), rep);
+    auto const ix = buildSummaryIndex(mods, defaultPolicy(),
+                                      dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(ix.has_value());
     EXPECT_TRUE(ix->importPlan.empty());
 }
@@ -393,7 +407,8 @@ TEST(SummaryIndex, IndexFollowsTransitiveEdgesToTheDepthBound) {
         mod("d4", {d}), mod("d5", {e})};
 
     Collector rep;
-    auto const ix = buildSummaryIndex(mods, defaultPolicy(), rep);
+    auto const ix = buildSummaryIndex(mods, defaultPolicy(),
+                                      dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(ix.has_value());
     for (char const* n : {"a", "b", "c", "d"}) {
         EXPECT_TRUE(planHas(*ix, 0, n)) << "depth-4 prefetch should reach " << n;
@@ -405,7 +420,8 @@ TEST(SummaryIndex, IndexFollowsTransitiveEdgesToTheDepthBound) {
     SummaryIndexPolicy shallow = defaultPolicy();
     shallow.maxImportDepth = 1;
     Collector rep2;
-    auto const ix2 = buildSummaryIndex(mods, shallow, rep2);
+    auto const ix2 = buildSummaryIndex(mods, shallow,
+                                       dss::test_support::ordinaryLinkFormat(), rep2);
     ASSERT_TRUE(ix2.has_value());
     EXPECT_TRUE(planHas(*ix2, 0, "a"));
     EXPECT_FALSE(planHas(*ix2, 0, "b"));
@@ -426,13 +442,15 @@ TEST(SummaryIndex, IndexBudgetBoundsPrefetchedInstructions) {
     SummaryIndexPolicy p = defaultPolicy();
     p.perModuleImportInstBudget = 40;   // fits one 30-inst callee, not two
     Collector rep;
-    auto const ix = buildSummaryIndex(mods, p, rep);
+    auto const ix = buildSummaryIndex(mods, p,
+                                      dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(ix.has_value());
     EXPECT_EQ(ix->importPlan.size(), 1u);
 
     p.perModuleImportInstBudget = 0;    // no ceiling
     Collector rep2;
-    auto const ix2 = buildSummaryIndex(mods, p, rep2);
+    auto const ix2 = buildSummaryIndex(mods, p,
+                                       dss::test_support::ordinaryLinkFormat(), rep2);
     ASSERT_TRUE(ix2.has_value());
     EXPECT_EQ(ix2->importPlan.size(), 2u);
 }
@@ -451,8 +469,10 @@ TEST(SummaryIndex, IndexTier2KeyChangesWhenACalleeChanges) {
                                            mod("d1-EDITED", {fn("f", 50)})};
 
     Collector r1, r2;
-    auto const a = buildSummaryIndex(before, defaultPolicy(), r1);
-    auto const b = buildSummaryIndex(after, defaultPolicy(), r2);
+    auto const a = buildSummaryIndex(before, defaultPolicy(),
+                                     dss::test_support::ordinaryLinkFormat(), r1);
+    auto const b = buildSummaryIndex(after, defaultPolicy(),
+                                     dss::test_support::ordinaryLinkFormat(), r2);
     ASSERT_TRUE(a.has_value());
     ASSERT_TRUE(b.has_value());
 
@@ -471,7 +491,8 @@ TEST(SummaryIndex, IndexTier2KeyChangesWhenACalleeChanges) {
     SummaryIndexPolicy p = defaultPolicy();
     p.inlineThreshold = 7;
     Collector r3;
-    auto const c = buildSummaryIndex(before, p, r3);
+    auto const c = buildSummaryIndex(before, p,
+                                     dss::test_support::ordinaryLinkFormat(), r3);
     ASSERT_TRUE(c.has_value());
     EXPECT_NE(a->tier2KeyInputs[0].policyIdentity,
               c->tier2KeyInputs[0].policyIdentity);
@@ -491,8 +512,10 @@ TEST(SummaryIndex, IndexIsDeterministic) {
         mod("d1", {a, fn("b", 51), fn("c", 52), fn("d", 53)})};
 
     Collector r1, r2;
-    auto const x = buildSummaryIndex(mods, defaultPolicy(), r1);
-    auto const y = buildSummaryIndex(mods, defaultPolicy(), r2);
+    auto const x = buildSummaryIndex(mods, defaultPolicy(),
+                                     dss::test_support::ordinaryLinkFormat(), r1);
+    auto const y = buildSummaryIndex(mods, defaultPolicy(),
+                                     dss::test_support::ordinaryLinkFormat(), r2);
     ASSERT_TRUE(x.has_value());
     ASSERT_TRUE(y.has_value());
     ASSERT_EQ(x->importPlan.size(), y->importPlan.size());
@@ -524,7 +547,8 @@ TEST(SummaryIndex, IndexRefusesMixedTargets) {
     std::vector<ModuleSummary> const mods{m0, m1};
 
     Collector rep;
-    auto const ix = buildSummaryIndex(mods, defaultPolicy(), rep);
+    auto const ix = buildSummaryIndex(mods, defaultPolicy(),
+                                      dss::test_support::ordinaryLinkFormat(), rep);
     EXPECT_FALSE(ix.has_value());
     EXPECT_EQ(rep.errorCount(), 1u);
     EXPECT_EQ(countCodeIn(rep, DiagnosticCode::K_CrossCuMergeUnsupported), 1u);

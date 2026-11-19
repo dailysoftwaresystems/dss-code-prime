@@ -1,0 +1,1 @@
+    return core::reachedKind(p, core::Use::Container, ec) == core::EntryKind::Directory;

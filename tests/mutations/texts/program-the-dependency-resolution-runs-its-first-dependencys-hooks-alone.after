@@ -1,0 +1,2 @@
+    bool const everyHookRan = substrate::runEveryUnit(
+        std::min<std::size_t>(dependencies, 1),

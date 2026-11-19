@@ -10,8 +10,10 @@
 #include "asm/asm_cfi.hpp"
 #include "asm/asm_text_to_lir.hpp"
 #include "core/substrate/large_stack_call.hpp"  // D-PARSE-DEEP-FRONTEND-STACK: BUILD half on a large stack
+#include "core/substrate/key_order.hpp"  // entriesInKeyOrder -- the recipe partition's order
 #include "core/substrate/mint_monotonic_id.hpp"  // c165: fresh per-member CompilationUnitId (static pull)
 #include "core/types/config_path_walk.hpp"  // findShippedConfigDir -- the ONE shipped-config discovery precedence
+#include "core/types/entry_names.hpp"  // realizedEntryNames -- the ONE vocabulary of a program's entry names
 #include "core/types/object_format_kind.hpp"  // RuntimeLibraryRoleResolver (D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE)
 #include "core/substrate/phase_timers.hpp"      // c97: per-phase --time accumulation
 #include "core/types/parse_diagnostic.hpp"
@@ -26,12 +28,19 @@
 #include "link/format/object_symbol_names.hpp"  // hasExternalLinkage -- the ONE static-resolution predicate (armap + static pull)
 #include "hir/attributes/ffi_metadata.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
+#include "program/model_to_hir.hpp"   // lowerModelToHir — the gates from the analysis to HIR→MIR
 #include "link/format/ar.hpp"  // writeArArchive (D-LK-STATIC-ARCHIVE-WRITER, c163)
 #include "link/format/coff_object_reader.hpp"  // c170: COFF .obj member reader (static-pull dispatch)
 #include "link/format/elf_object_reader.hpp"  // c165: readRelocatableObject (static-pull member parse)
 #include "link/format/macho_object_reader.hpp"  // c168: Mach-O MH_OBJECT member reader (static-pull dispatch)
 #include "core/substrate/thread_pool.hpp"      // D-OPT11-LAZY-IMPORT-EDGE: the thin stage's pool
+#include "link/import_address_references.hpp"  // foldImportAddressReferences (`__imp_X` -> X's address slot)
 #include "link/linker.hpp"
+#include "link/extern_reference_gate.hpp"  // the referenced-only gate the static pull shares with the import table
+#include "link/standing_fallback.hpp"  // standingFallback -- a written name's alias meets a unit's own fallback by the ONE rule (P69 fold 3f)
+#include "link/common_yield.hpp"  // commonYieldsToDefinition -- the ONE answer the static pull shares with the link's allocation (P69 round 4)
+#include "link/standing_fallback.hpp"  // fallbackStatementOf, fallbackStandsOver -- the fallback the pull offers (P69 fold 3f)
+#include "link/unit_linker_decisions.hpp"  // dropPulledMemberEntryRequests (P69 round 4)
 #include "link/writer.hpp"
 #include "mir/summary/lazy_import_optimize.hpp"  // D-OPT11-LAZY-IMPORT-EDGE
 #include "mir/summary/mir_summary.hpp"
@@ -39,6 +48,8 @@
 #include "lir/lir_2addr_legalize.hpp"
 #include "lir/lir_asm_region.hpp"      // expandAsmRegions — the inline-asm bundles
 #include "lir/lir_callconv.hpp"
+#include "lir/lir_descriptor_blocks.hpp"  // translateDescriptorBlockIds — the blocks data names
+#include "lir/lir_guarded_regions.hpp"    // guardedRegionsAt — the runs liveness reads
 #include "lir/lir_liveness.hpp"
 #include "lir/lir_peephole.hpp"
 #include "lir/lir_regalloc.hpp"
@@ -50,9 +61,12 @@
 #include "mir/merge/mir_merge.hpp"  // MergedMirModule (lowerMergedToAssembly consumes it)
 #include "mir/mir_verifier.hpp"           // MirVerifier (UCRT-P4: verify the POST-SYNTHESIS module)
 #include "mir/merge/synth_pe_startup.hpp"  // realizeEntryShape (UCRT-P4: the argv spine)
-#include "mir/merge/synth_stdio_shim.hpp"  // synthesizeStdioShim (D-FFI-PE-CRT-UCRT-MIGRATION Phase 3)
 #include "mir/merge/synth_threads_shim.hpp"  // synthesizeThreadsShim (FC17.9a D-CSUBSET-C11-THREADS-HEADER)
 #include "opt/optimizer.hpp"
+#include "core/types/type_lattice/type_layout.hpp"   // scalarByteSize -- the data model's pointer width
+#include "core/substrate/every_unit.hpp"   // runEveryUnit: every unit's step, before a several-unit build fails
+#include "core/substrate/silent_unit.hpp"  // namingSilentUnits: the net bound to the run's reporter
+#include "core/substrate/input_named_diagnostics.hpp"   // readNamingTheInput: a refusal of one input names it
 // D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-THE-OBJECT-FORMAT:
 // `resolveArchiveSiblingFormat` -- the declared-property lookup that answers
 // "which object format wrote this archive's members", reused rather than respelt.
@@ -60,6 +74,7 @@
 #include "opt/passes/prune_unreachable.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -68,6 +83,7 @@
 #include <functional>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <latch>   // D-OPT11-LAZY-IMPORT-EDGE: the thin stage batch join
 #include <limits>
@@ -82,18 +98,6 @@
 // Plan 14 LK10 cycle 2 — driver pipeline kernel.
 
 namespace dss {
-
-void copyDiagnostics(DiagnosticReporter const& src,
-                     DiagnosticReporter&       dst) {
-    // The retained source buffers move WITH the diagnostics — same rule, same
-    // reason, as `mergeWithTargetContext`: a diagnostic naming a buffer only
-    // `src` holds renders `--> <unknown-buffer:N>` at `dst`. Any tier that
-    // parses text the compilation units do not own (an embedded assembly
-    // template today) registers its fragment buffer on the reporter it was
-    // handed, so every reporter→reporter copy owes the pairing.
-    dst.sourceBuffers().addAll(src.sourceBuffers());
-    for (auto const& d : src.all()) dst.report(d);
-}
 
 namespace {
 
@@ -122,11 +126,63 @@ namespace {
 // cross-CU calls — made intra-module DIRECT by the cycle-25 merge — get inlined
 // (D-OPT7-1). Agnostic: no language/target/format branch — the pipeline is
 // config-driven and `optimize` is target-blind at the MIR tier.
+// The stage topology's test seam (compile_pipeline.hpp, beside `PipelineStage`):
+// empty in every build. Its events come from a CU pool's workers -- each unit's
+// `buildCuMir`, the thin-LTO import stage, each archive member -- so two can
+// arrive at once: the seam hands them to its observer ONE AT A TIME, under its
+// own lock, and an observer needs none. `armed` keeps every build that sets no
+// observer off that lock.
+namespace {
+struct StageSeam {
+    std::mutex                             lock;
+    std::function<void(StageEvent const&)> observer;
+    std::atomic<bool>                      armed{false};
+};
+
+[[nodiscard]] StageSeam& stageSeam() {
+    static StageSeam seam;
+    return seam;
+}
+
+void reportStage(StageEvent const& event) {
+    StageSeam& seam = stageSeam();
+    if (!seam.armed.load(std::memory_order_acquire)) return;
+    std::scoped_lock const hold{seam.lock};
+    if (seam.observer) seam.observer(event);
+}
+}  // namespace
+
+namespace pipeline_testing {
+void setStageObserver(std::function<void(StageEvent const&)> observer) {
+    StageSeam&             seam = stageSeam();
+    std::scoped_lock const hold{seam.lock};
+    seam.armed.store(static_cast<bool>(observer), std::memory_order_release);
+    seam.observer = std::move(observer);
+}
+}  // namespace pipeline_testing
+
+
+namespace {
+// The name a trace gives a stage: one switch over the enum, so a new stage cannot
+// be traced as another.
+[[nodiscard]] constexpr char const* pipelineStageName(PipelineStage stage) noexcept {
+    switch (stage) {
+        case PipelineStage::Unit: return "unit";
+        case PipelineStage::Program: return "program";
+        case PipelineStage::ThinImport: return "thin-import";
+    }
+    return "?";
+}
+}  // namespace
 bool optimizeModule(Mir&                  mir,
                     TargetSchema const&   target,
                     TypeInterner const&   interner,
                     CompileOptions const& opts,
                     PipelineStage         stage,
+                    // D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS:
+                    // see the declaration (compile_pipeline.hpp).
+                    opt::ModuleExtent         extent,
+                    std::span<SymbolId const> entryRoots,
                     DiagnosticReporter&   reporter,
                     // D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED:
                     // the module's extern table, read by `opt::optimize`'s
@@ -224,8 +280,7 @@ bool optimizeModule(Mir&                  mir,
         // Stage attribution under the SAME env gate as the per-pass trace
         // (DSS_OPT_TRACE) — the A/B instrument keys on these lines.
         if (std::getenv("DSS_OPT_TRACE") != nullptr) {
-            std::fprintf(stderr, "opt: stage=%s pipeline=%s\n",
-                         stage == PipelineStage::Unit ? "unit" : "program",
+            std::fprintf(stderr, "opt: stage=%s pipeline=%s\n", pipelineStageName(stage),
                          loadedPipeline.name.c_str());
             std::fflush(stderr);
         }
@@ -237,8 +292,23 @@ bool optimizeModule(Mir&                  mir,
         opts.charIsUnsigned,
         // D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: relayed to the
         // Inlining leaf's gate rule 2 (its load-time half).
-        opts.preemptibleDefinitionBindings);
-    return optResult.ok && tierClean(reporter, optEntry);
+        opts.preemptibleDefinitionBindings,
+        // D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS: relayed
+        // to the Dce leaf's root predicate (the declaration says why).
+        extent, entryRoots,
+        // D-OPT-RELEASE-UNIT-FIXPOINT-CAP-WARNS-THOUGH-THE-PROGRAM-STAGE-RESUMES:
+        // only the PROGRAM stage is ever the last a module receives -- every
+        // route that builds a CU lowers it only after a PROGRAM-stage optimize
+        // (the N>1 merged module, the N==1 sole CU, each archive member), and
+        // the thin-LTO import stage is followed by the merged module's (the
+        // topology `PipelineStage` states) -- so a fixpoint truncated at any
+        // other stage is resumed, whatever schedule ran: the `unitPipeline`
+        // document, the config's own, or an override. The rule is the ONE
+        // predicate beside `PipelineStage`.
+        laterStageResumes(stage));
+    bool const optimized = optResult.ok && tierClean(reporter, optEntry);
+    if (optimized) reportStage({StageEvent::Kind::Optimized, stage, &mir});
+    return optimized;
 }
 
 // ══ VERIFY THE POST-SYNTHESIS MODULE — ONE DEFINITION, BOTH DRIVER SEAMS ═════
@@ -372,6 +442,14 @@ std::optional<CuHirModule> buildCuHir(CompilationUnit const&        cu,
         });
 }
 
+// What a unit's source asks of its link, in its format's form (P69 fold 3f; defined beside `archiveMemberFormat`,
+// whose question -- which document describes this family's objects -- it asks too).
+static void stateSourceLinkerRequests(CuMirModule&                       cuMir,
+                                      std::span<PragmaLinkRequest const> requests,
+                                      ObjectFormatSchema const&          format,
+                                      TargetSchema const&                target,
+                                      DiagnosticReporter&                reporter);
+
 static std::optional<CuMirModule> buildCuMirImpl(
                                       CompilationUnit const&        cu,
                                       GrammarSchema const&          grammar,
@@ -389,7 +467,6 @@ static std::optional<CuMirModule> buildCuMirImpl(
     if (!front) return std::nullopt;
     SemanticModel&                    model           = front->model;
     std::unique_ptr<CstToHirResult>&  hir             = front->hir;
-    std::optional<VaListLayout> const analyzeVaLayout = front->vaListLayout;
     // The two FORMAT-resolved aggregate axes, read back from their ONE owner
     // rather than carried across the seam: `buildCuHirImpl` calls the same two
     // functions for the analysis-side overlay, and both are pure functions of
@@ -433,20 +510,20 @@ static std::optional<CuMirModule> buildCuMirImpl(
     if (!opts.resolveLibraries.empty()) {
         auto const probeEntry = reporter.errorCount();
         for (auto const& lib : opts.resolveLibraries) {
-            std::ifstream probe(lib.path, std::ios::binary);
+            auto probe = core::openInputStream(lib.path, std::ios::binary);
             if (!probe) {
                 ParseDiagnostic d;
                 d.code     = DiagnosticCode::F_FileOpenFailed;
                 d.severity = DiagnosticSeverity::Error;
                 d.actual   = std::format(
-                    "--resolve-library: failed to open '{}' for reading "
+                    "--resolve-library: failed to open '{}' for reading: {} "
                     "(the resolve-library binary must exist + be readable at "
                     "compile time). Check the path.",
-                    core::genericSpelling(lib.path));
+                    core::genericSpelling(lib.path), core::reasonText(probe.error()));
                 reporter.report(std::move(d));
                 continue;  // unopenable: nothing to classify, one message is enough
             }
-            probe.close();
+            probe->close();
             // Reports F_UnsupportedBinaryFormat itself when it objects; the
             // discarded return is the structured twin, which this site (a
             // reporter-driven probe) has no use for.
@@ -718,34 +795,34 @@ static std::optional<CuMirModule> buildCuMirImpl(
             // ["elf"] / ["macho"] / ["pe"], and `sprintf` by an ["elf","macho"]
             // row plus a ["pe"] row -- a per-row test would turn the whole C11
             // threads surface red on every format.
-            auto const shippedFormats = ffi::collectShippedExternSymbolFormats();
             std::vector<ffi::ExternDeclRef> fallThrough = explicitlyBound;
             for (auto const& g : binaryGoverned) {
                 if (ffiMap.tryGet(g.node) != nullptr) continue;  // bound to a binary
-                // `shippedFormats == nullopt` (config discovery failed) => treat
-                // every symbol as possibly-known and fall through -- never a
-                // false-positive fail-loud just because DSS_CONFIG_ROOT was unset.
+                // ★ ASKED ON THE PAIR (P69 fold 3f, ledger 563 (A)): the format AND this
+                // target's arch, by the gates the realization applies
+                // (`shippedExternSymbolAvailabilityOn`). The format-only list vouched for a
+                // row available on ONE arch of the format on every arch of it. `nullopt`
+                // (config discovery failed) => treat the symbol as possibly-known and fall
+                // through -- never a false-positive fail-loud just because DSS_CONFIG_ROOT
+                // was unset.
+                std::optional<ffi::ShippedSymbolAvailability> const shipped =
+                    ffi::shippedExternSymbolAvailabilityOn(
+                        g.canonicalName, format.kind(),
+                        std::optional<std::string_view>{target.name()});
                 std::vector<std::string> const* declaredFormats = nullptr;
                 bool inDescriptors = false;
-                if (shippedFormats.has_value()) {
-                    if (auto it = shippedFormats->find(
-                            std::string{g.canonicalName});
-                        it != shippedFormats->end()) {
+                if (shipped.has_value()) {
+                    if (shipped->declared) {
                         inDescriptors   = true;
-                        declaredFormats = &it->second;
+                        declaredFormats = &shipped->formats;
                     }
                 } else {
                     inDescriptors = true;   // discovery failed -> assume known
                 }
-                // Known ON THIS FORMAT? `declaredFormats == nullptr` is the
-                // discovery-failed arm (assume yes). Otherwise ask the ONE shared
-                // membership predicate the #include / __has_include / semantic-
-                // injection gates all use, so the oracle can never drift from
-                // them (and no `if (format == ...)` appears anywhere here).
+                // Known ON THIS PAIR? `declaredFormats == nullptr` is the
+                // discovery-failed arm (assume yes).
                 bool const availableHere =
-                    declaredFormats == nullptr
-                    || ffi::objectFormatInAvailabilitySet(*declaredFormats,
-                                                          format.kind());
+                    declaredFormats == nullptr || shipped->availableHere;
                 // `declaredFormats != nullptr` (rather than `inDescriptors`)
                 // makes the deref below locally provable: availableHere is
                 // unconditionally true when the pointer is null, so the two
@@ -768,7 +845,7 @@ static std::optional<CuMirModule> buildCuMirImpl(
                     d.severity = DiagnosticSeverity::Error;
                     d.actual   = std::format(
                         "shipped system symbol '{}' is NOT available on object "
-                        "format '{}' -- the shipped descriptors declare it only "
+                        "format '{}' for target '{}' -- the shipped descriptors declare it only "
                         "for: {}. Under --resolve-library it matched no named "
                         "binary's export table, and binding it to this format's "
                         "default library would link clean and then FAIL AT LOAD "
@@ -778,6 +855,7 @@ static std::optional<CuMirModule> buildCuMirImpl(
                         "descriptor if it really exists there.",
                         g.canonicalName,
                         objectFormatKindName(format.kind()),
+                        target.name(),
                         declared,
                         objectFormatKindName(format.kind()));
                     reporter.report(std::move(d));
@@ -858,36 +936,20 @@ static std::optional<CuMirModule> buildCuMirImpl(
     // synthetic literal global whose id aliased a typedef/tag/field/constant
     // record would enter the merge as a NAMED strong definition (bogus
     // cross-CU redefinitions; potential silent mis-merge onto a literal).
-    mirCfg.syntheticSymbolFloor =
-        static_cast<std::uint32_t>(model.symbols().size());
+    // ★ THIS IS THE ONE PLACE the table's end is stated (P69 round 5): the
+    // module carries it from here (`Mir::symbolIdEnd`), and every later minter —
+    // the optimizer's, the three synthesis passes' — asks the module.
+    mirCfg.symbolIdSpace = MirSymbolIdSpace::endingAt(
+        static_cast<std::uint32_t>(model.symbols().size()));
     // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): thread the RESOLVED calling
     // convention's by-value aggregate strategy into HIR→MIR (the §B-locked
     // boundary). A struct arg/return is classified + synthesized at HIR→MIR; the
     // sret mechanism follows the CC's indirect-result register (absent ⇒ hidden
     // first INTEGER arg, SysV/Win64; present ⇒ x8, AAPCS64 — C3).
-    if (auto const* cc = target.callingConvention(callingConventionIndex)) {
-        mirCfg.aggregateClassification  = cc->aggregateClassification;
-        mirCfg.aggregateMaxRegBytes     = cc->aggregateMaxRegBytes;
-        mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
-        mirCfg.argSlotAligned           = cc->slotAligned;
-        // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: the arg-register
-        // pool counts (the agnostic source for the all-or-nothing fit check on
-        // every call) + the stack-exhaust policy (SysV backfill vs AAPCS64 clamp).
-        mirCfg.argGprCount              =
-            static_cast<std::uint32_t>(cc->argGprs.size());
-        mirCfg.argFprCount              =
-            static_cast<std::uint32_t>(cc->argFprs.size());
-        mirCfg.aggregateStackExhaustsRegisters =
-            cc->aggregateStackExhaustsRegisters;
-        // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: the stacked-arg
-        // packing rules — HIR→MIR needs them for `va_start`'s overflow base, which
-        // is the byte span of the named params that overflowed onto the incoming
-        // stack and therefore depends on how those params are packed.
-        mirCfg.stackArgPacking          = cc->stackArgPacking;
-        // FC12a-core (D-FC12A-VARIADIC-CALLEE): thread the active CC's va_list layout
-        // so HIR→MIR can lower va_start/va_arg (or fail loud when the CC omits it).
-        mirCfg.vaListLayout             = cc->vaListLayout;
-    }
+    // The convention's facts are assembled by their ONE home (`takeCallingConvention`, beside
+    // `languageMirLoweringConfig`), which every fixture lowering under a named convention calls too.
+    if (auto const* cc = target.callingConvention(callingConventionIndex))
+        takeCallingConvention(mirCfg, target, *cc);
     phase.emplace(substrate::CompilePhase::LowerMir);
     auto mir = lowerToMir(hir->hir, hir->literalPool,
                           model.lattice().interner(), reporter,
@@ -924,7 +986,11 @@ static std::optional<CuMirModule> buildCuMirImpl(
                           // Without it a `&&label` in a static initializer is refused
                           // (loudly — a per-function label ordinal is unresolvable
                           // without its function), and nothing else changes.
-                          &hir->enclosingFunctionMap);
+                          &hir->enclosingFunctionMap,
+                          // P69 (lane `cs`): the unit's symbol aliases (`alias`) —
+                          // threaded, an alias is a name the module defines; not,
+                          // it is a reference the link refuses as undefined.
+                          hir->symbolAliases);
     phase.reset();
     if (!mir.ok || !tierClean(reporter, mirEntry)) {
         return std::nullopt;
@@ -938,7 +1004,11 @@ static std::optional<CuMirModule> buildCuMirImpl(
                         // P10: the per-CU build is the UNIT stage — the site
                         // whose schedule the document's `unitPipeline` key
                         // selects (D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE).
-                        PipelineStage::Unit, reporter,
+                        PipelineStage::Unit,
+                        // D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS:
+                        // a CU before its link is ONE input of it — its
+                        // siblings may call any external-linkage definition.
+                        opt::ModuleExtent::LinkInput, {}, reporter,
                         // D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED:
                         // this CU's extern table, still owned by `mir` here (the
                         // LOWER half moves it into MIR→LIR later).
@@ -983,10 +1053,8 @@ static std::optional<CuMirModule> buildCuMirImpl(
         // GlobalAddr lowering selects the TLS access sequence; nullopt =
         // thread-local accesses fail loud on this leg).
         format.tlsAccess(),
-        // D-LK4-RODATA-PRODUCER-AGGREGATE-GLOBAL: capture the format's data
-        // model now, for the same reason — the aggregate-global rodata encoder
-        // (in the LOWER half) needs the pointer width to compute byte layout.
-        format.dataModel(),
+        // (No data model: the module states its own, from `mirCfg.dataModel`, the
+        // format's -- P69 fold 3f, `MirModuleFacts::dataModel`.)
         // D-CSUBSET-BITFIELD-ABI-EXACT: capture the FORMAT-resolved bit-field
         // strategy so the LOWER half lays out bit-field globals byte-ABI-exact.
         effectiveBfStrategy,
@@ -1007,20 +1075,19 @@ static std::optional<CuMirModule> buildCuMirImpl(
     cuMir.librarySynthesis = format.librarySynthesis();
     // D-FFI-CMANGLING-RULE-NOT-CONFIG-DRIVEN (C4): the DECLARED rule, not the identity.
     cuMir.cSymbolDecoration = format.cSymbolDecoration().scheme;
-    // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): capture the RESOLVED CC's WHOLE `vaListLayout`
-    // so the LOWER half's `synthesizeStdioShim` knows the target's variadic-forwarding
-    // model — strategy AND `variadicUsesOverflowBase`, which is what picks the va leaf.
-    // Reuses `analyzeVaLayout` (resolved above from the SAME CC that also feeds the
-    // semantic `va_list`-type injection) rather than re-resolving the CC a second time. The
-    // optional is assigned THROUGH — its EMPTINESS is part of the signal, not noise to be
-    // defaulted away: a CC that declares no `vaListLayout` must reach the synth pass as
-    // "nothing declared", which that pass refuses loudly, rather than as a real layout it
-    // could not tell from a genuine declaration. Consulted only if a stdio recipe appears.
-    cuMir.vaListLayout = analyzeVaLayout;
     // P68 round 9 (the aarch64 twins): the format kind, ONLY as the key an
     // inline-asm template's address-part operators are read under — see the
     // field.
     cuMir.assemblyFormatKind = format.kind();
+    // P69 fold 3b: how this unit writes a tentative definition — the document's
+    // facts, for the LOWER half (see the field).
+    cuMir.commons = format.commonsStatement();
+    // P69 fold 3d: the names the image this unit ends in will define, for the
+    // LOWER half (see the field).
+    cuMir.imageDefinedNames = format.imageDefinedNames();
+    // P69 fold 3f: what the unit's source asks of its link, in this format's
+    // form, for the LOWER half (see the field).
+    stateSourceLinkerRequests(cuMir, cu.pragmaLinkRequests(), format, target, reporter);
     return cuMir;
 }
 
@@ -1047,8 +1114,8 @@ static std::optional<CuHirModule> buildCuHirImpl(
     //    error (e.g. S_UndeclaredIdentifier) silently aborts the
     //    pipeline with no diagnostic surfacing. (code-reviewer F1
     //    fold + post-fold-1 architect: routed through the hoisted
-    //    `copyDiagnostics` helper to eliminate the inline-drain
-    //    duplicate.)
+    //    relay -- now `DiagnosticReporter::relayFrom`, the ONE relay,
+    //    which also carries what the model's gates dropped (D9(c)).)
     auto const semEntry = reporter.errorCount();
     // c97: sequential per-phase scoping via optional emplace — emplace
     // destroys the prior Scope (closing its accumulation window) BEFORE
@@ -1073,26 +1140,25 @@ static std::optional<CuHirModule> buildCuHirImpl(
         target.callingConvention(callingConventionIndex));
     phase.reset();
     SemanticModel& model = analysis.model;
-    copyDiagnostics(model.diagnostics(), reporter);
+    reporter.relayFrom(model.diagnostics());
     if (model.hasErrors() || !tierClean(reporter, semEntry)) {
         return std::nullopt;
     }
 
-    // 2. CST → HIR.
-    auto const hirEntry = reporter.errorCount();
-    phase.emplace(substrate::CompilePhase::LowerHir);
-    auto hir = lowerToHir(model, reporter);
-    phase.reset();
-    if (!hir || !hir->ok || !tierClean(reporter, hirEntry)) {
+    // 2. CST → HIR behind the pipeline's two gates, and the HIR settled for the
+    //    format — `lowerModelToHir` (program/model_to_hir.hpp), the one place they
+    //    are decided, which every fixture that lowers source to MIR shares.
+    ModelLoweredToHir lowered = lowerModelToHir(model, format, reporter);
+    if (!lowered.lowersToMir) {
         return std::nullopt;
     }
+    auto hir = std::move(lowered.hir);
 
-    // Both products of the front half, plus the ONE derived fact the lower half
-    // still needs from step 1 (`analysis.vaListLayout` — resolved from the same
-    // CC the MIR lowering config reads, so resolving it twice could disagree).
-    return CuHirModule{.model        = std::move(model),
-                       .hir          = std::move(hir),
-                       .vaListLayout = analysis.vaListLayout};
+    // Both products of the front half. (The resolved CC's `vaListLayout` rode here
+    // for the retired <stdio.h> synth pass alone — P69 — and the MIR lowering
+    // config reads the CC's own block.)
+    return CuHirModule{.model = std::move(model),
+                       .hir   = std::move(hir)};
 }
 
 // LOWER half body (Cycle 25, Stage C): MIR → LIR → liveness → regalloc → rewrite →
@@ -1146,6 +1212,193 @@ bindBlockSymbol(AssembledFunction& outFn, std::uint32_t lirBlockV,
     return true;
 }
 
+// See the header: the jump table's one writer.
+std::optional<AssembledData>
+materializeJumpTable(JumpTableDescriptor const& desc, AssembledFunction& owner, TargetSchema const& target,
+                     DiagnosticReporter& reporter) {
+    auto const refuse = [&](std::string why) -> std::optional<AssembledData> {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::K_NoMatchingObjectFormat;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = std::format("jump-table (SymbolId={{ {} }}) {} (D-OPT-SWITCH-JUMP-TABLE)",
+                                 desc.tableSymbol.v, why);
+        reporter.report(std::move(d));
+        return std::nullopt;
+    };
+    // The slot's address relocation, at the DESCRIPTOR's width -- the width the lowering scaled the index by --
+    // found by its properties, never by name (`addressSlotRelocationKind`).
+    std::optional<RelocationKind> const slotRelocKind =
+        desc.slotBytes == 0 || desc.slotBytes > 0xFF
+            ? std::nullopt
+            : addressSlotRelocationKind(target.relocations(), static_cast<std::uint8_t>(desc.slotBytes));
+    if (!slotRelocKind.has_value()) {
+        return refuse(std::format("requires an address relocation of {} bytes but target '{}' declares none -- "
+                                  "the dense-switch address table cannot be emitted",
+                                  desc.slotBytes, target.name()));
+    }
+    // Byte offsets already bound into blockSymbols (e.g. a target block that
+    // is ALSO a computed-goto `&&label`) — don't double-bind those.
+    std::unordered_set<std::uint32_t> alreadyBound;
+    for (auto const& bs : owner.blockSymbols) alreadyBound.insert(bs.symbol.v);
+
+    AssembledData table;
+    table.symbol    = desc.tableSymbol;
+    table.section   = DataSectionKind::Data;
+    table.alignment = Alignment::ofRuntimePow2(desc.slotBytes);
+    table.bytes.assign(desc.slotCount * desc.slotBytes, std::uint8_t{0});
+    table.relocations.reserve(desc.slotBindings.size());
+    for (auto const& [lirBlockV, slotIdx] : desc.slotBindings) {
+        auto symIt = desc.blockSymbols.find(lirBlockV);
+        // Bind the block symbol from the function's byte-offset map (once per
+        // distinct symbol; a gap/duplicate reuses the same SymbolId).
+        if (symIt == desc.blockSymbols.end() || !bindBlockSymbol(owner, lirBlockV, symIt->second, alreadyBound)) {
+            return refuse("references a target block with no byte offset or symbol — malformed descriptor");
+        }
+        // An address reloc at slot byte offset (slotIdx * slotBytes) → the block symbol.
+        table.relocations.push_back(Relocation{
+            static_cast<std::uint32_t>(slotIdx * desc.slotBytes),
+            symIt->second, *slotRelocKind, /*addend=*/0});
+    }
+    return table;
+}
+
+// ★★★ A TENTATIVE DEFINITION WRITTEN AS A COMMON (P69 fold 3b, lane `xa`;
+// D-C-TENTATIVE-DEFINITIONS-OF-ONE-NAME-IN-TWO-UNITS-REFUSED). Where the unit's
+// document writes tentative definitions as commons
+// (`ObjectFormatSchema::statesCommons`), each global the link may fold
+// (`Mir::globalIsCommon`) leaves the module as the COMMON row the object readers
+// produce for a foreign one (`ExternImport::commonSize`), in place of its zero-fill
+// item and its definition row:
+//   * the SIZE and the ALIGNMENT are the zero-fill item's — the one place they are
+//     computed (`lowerMirGlobalsToDataItems`), an explicit `alignas` included;
+//   * the NAME and the VISIBILITY are the definition row's;
+//   * the unit's own code keeps its relocations against the global's SymbolId,
+//     which the row now carries. The references' objects reach their own common
+//     the same way: ✔MEASURED 2026-10-12, `R_X86_64_PC32` against the common in
+//     gcc's and clang's ELF objects, and on Mach-O Apple's two linkers link and
+//     run an object that reaches its own `.comm` directly (24 of 24) where clang
+//     itself goes through the GOT.
+// An IMAGE link allocates the row before any other pass reads the rows
+// (`linker::allocateCommonDefinitions`): the same `.bss` storage and `Global` row
+// the item and the row gave, at the widest alignment and the stricter visibility
+// of the name's commons, unless a definition of the name elsewhere wins. A
+// RELOCATABLE artifact hands it on, and each writer spells it.
+// Runs AFTER the symbol rows are built, so it reads the row the module would have
+// published, and leaves nothing of the definition behind.
+// ⓘ A global whose zero-fill item reserves NO bytes keeps its definition: a common
+// row of size zero states no common at all (`ExternImport::commonSize`).
+// ★★ AND SO DOES ONE WIDER THAN EVERY LINKER GIVES A COMMON OF ITS SIZE (the
+// re-review of fold 3b, MAJOR 1; `CommonsStatement::admitsCommon`): on COFF a
+// common states its alignment only by `-aligncomm:`, which link.exe ignores, so
+// `_Alignas(64) int v;` written as a common lands at 4 under it — in silence —
+// where a definition lands at 64 under every linker (✔MEASURED 2026-10-15).
+// WHICH definition is the document's (`CommonsStatement::beyondTheRule`, P69
+// fold 3c — the review of the fix fold, A4): `select-any` makes the row a weak
+// definition of that kind, which the PE writer spells as a COMDAT `.bss` section
+// at the item's alignment, so two units' copies fold under link.exe, lld-link and
+// GNU ld as MinGW gcc's commons do, aligned (✔MEASURED 2026-10-20); `definition`
+// keeps the item and the row as built. Only where the unit's OBJECT reaches
+// another linker: under an image document DSS's own link allocates the common at
+// its stated alignment.
+// ⓘ Each table is indexed ONCE and the converted globals leave both in one pass
+// each (the re-review, NIT 8: a find and a count per global, then an erase, was
+// quadratic in a module of many tentative definitions).
+[[nodiscard]] static bool
+stateTentativeDefinitionsAsCommons(Mir const& mir, AssembledModule& assembled,
+                                   CommonsStatement const& commons,
+                                   DiagnosticReporter& reporter) {
+    auto const breach = [&](SymbolId sym, std::string_view what) {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::K_StaticDataEncoderInvariantBreach;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = std::format(
+            "the tentative definition SymbolId={{ {} }} is to be written as a COMMON, "
+            "and {} — the data producer and the symbol table disagree about it, so no "
+            "common can be stated for it",
+            sym.v, what);
+        reporter.report(std::move(d));
+    };
+    // Where each symbol's data item and row are, and how many of each it has.
+    struct Where {
+        std::size_t   at    = 0;
+        std::uint32_t count = 0;
+    };
+    std::unordered_map<std::uint32_t, Where> itemOf;
+    std::unordered_map<std::uint32_t, Where> rowOf;
+    for (std::size_t k = 0; k < assembled.dataItems.size(); ++k) {
+        auto& w = itemOf.try_emplace(assembled.dataItems[k].symbol.v, Where{k, 0u}).first->second;
+        ++w.count;
+    }
+    for (std::size_t k = 0; k < assembled.symbols.size(); ++k) {
+        auto& w = rowOf.try_emplace(assembled.symbols[k].symbol.v, Where{k, 0u}).first->second;
+        ++w.count;
+    }
+    std::unordered_set<std::uint32_t> converted;
+    for (std::uint32_t i = 0; i < mir.moduleGlobalCount(); ++i) {
+        MirGlobalId const gid = mir.globalAt(i);
+        if (!mir.globalIsCommon(gid)) continue;
+        SymbolId const sym    = mir.globalSymbol(gid);
+        auto const     itemIt = itemOf.find(sym.v);
+        AssembledData const* item =
+            itemIt == itemOf.end() ? nullptr : &assembled.dataItems[itemIt->second.at];
+        if (item == nullptr || itemIt->second.count != 1u
+            || item->section != DataSectionKind::Bss || !item->bytes.empty()) {
+            breach(sym, "its data item is missing, is not ONE, or is not a zero-filled one");
+            return false;
+        }
+        if (item->reservedSize == 0u) continue;   // no bytes: no common can say so
+        auto const rowIt = rowOf.find(sym.v);
+        std::uint32_t const rows = rowIt == rowOf.end() ? 0u : rowIt->second.count;
+        ModuleSymbol const* row  = rows == 0u ? nullptr : &assembled.symbols[rowIt->second.at];
+        if (rows != 1u || row->binding != SymbolBinding::Global) {
+            breach(sym, std::format("the module publishes {} row(s) for it where a "
+                                    "common is ONE strong definition's name",
+                                    rows));
+            return false;
+        }
+        // Wider than every linker gives a common of its size: the definition the
+        // document says it is (see the docblock).
+        if (!commons.admitsCommon(item->reservedSize, item->alignment.bytes())) {
+            if (!commons.beyondTheRule.has_value()) {
+                // The PE backend refuses such a document (`validateIdentity`); a
+                // schema built around it is refused here, by the key's name.
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::K_NoMatchingObjectFormat;
+                d.severity = DiagnosticSeverity::Error;
+                d.actual   = std::format(
+                    "the tentative definition '{}' ({} bytes, aligned {}) is wider than a "
+                    "common of its size may be in this format's objects, and the document "
+                    "states no 'tentativeDefinitionBeyondCommonAlignment' to say what it is "
+                    "written as instead",
+                    row->name, item->reservedSize, item->alignment.bytes());
+                reporter.report(std::move(d));
+                return false;
+            }
+            if (*commons.beyondTheRule == TentativeBeyondCommonAlignment::SelectAny) {
+                ModuleSymbol& mutableRow = assembled.symbols[rowIt->second.at];
+                mutableRow.binding  = SymbolBinding::Weak;
+                mutableRow.weakKind = WeakDefinitionKind::SelectAny;
+            }
+            continue;
+        }
+        ExternImport common;
+        common.symbol           = sym;
+        common.mangledName      = row->name;
+        common.isData           = true;
+        common.commonSize       = item->reservedSize;
+        common.commonAlignment  = item->alignment.bytes();
+        common.commonAlignmentStated = item->alignment.bytes();   // the unit's own
+        common.commonVisibility = row->visibility;
+        assembled.externImports.push_back(std::move(common));
+        converted.insert(sym.v);
+    }
+    std::erase_if(assembled.dataItems,
+                  [&](AssembledData const& d) { return converted.contains(d.symbol.v); });
+    std::erase_if(assembled.symbols,
+                  [&](ModuleSymbol const& r) { return converted.contains(r.symbol.v); });
+    return true;
+}
+
 // The grammar's entry-name list is intentionally NOT a parameter — the entry-name SCAN
 // needs to ENUMERATE symbols + names (which `nameOf` cannot do) plus the ambiguity
 // fail-loud, so each caller runs it and hands the resolved id here. Keeping a dead
@@ -1157,7 +1410,6 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                          std::vector<ExternImport>                    externImports,
                          std::optional<SymbolId>                     userEntrySymbol,
                          TargetSchema const&                         target,
-                         DataModel                                   dataModel,
                          BitFieldStrategy                            bitFieldStrategy,
                          UnnamedBitFieldAlignment                    unnamedBitFieldAlignment,
                          std::uint16_t                               callingConventionIndex,
@@ -1215,7 +1467,14 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                          // P68 round 9: the format kind, ONLY as a key into
                          // the assembly dialect's `symbolParts` (see
                          // `CuMirModule::assemblyFormatKind`).
-                         std::optional<ObjectFormatKind>             assemblyFormatKind) {
+                         std::optional<ObjectFormatKind>             assemblyFormatKind,
+                         // P69 fold 3b: how the document writes a tentative
+                         // definition (`stateTentativeDefinitionsAsCommons`).
+                         CommonsStatement const&                     commons,
+                         // P69 fold 3d: the names the image will define
+                         // (`CuMirModule::imageDefinedNames`), threaded into
+                         // MIR→LIR, which lowers a reference to one DIRECT.
+                         std::vector<std::string>                    imageDefinedNames) {
     // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: the on-binary names
     // MIR→LIR needs to MINT a loader-resolved reference for a preemptible
     // definition. Built HERE because this is where names live — `nameOf` is
@@ -1265,7 +1524,7 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     phase.emplace(substrate::CompilePhase::LowerLir);
     auto const lirEntry = reporter.errorCount();
     auto lir = lowerToLir(mir, target,
-                          interner, reporter,
+                          interner, reporter, callingConventionIndex,
                           std::move(externImports),
                           externCallDispatch,
                           dataImportBinding,
@@ -1294,7 +1553,9 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                           std::move(definedSymbolNames),
                           // P68 round 9: the format kind, ONLY as a key into
                           // the assembly dialect's `symbolParts`.
-                          assemblyFormatKind);
+                          assemblyFormatKind,
+                          // P69 fold 3d: the names the image will define.
+                          std::move(imageDefinedNames));
     if (!lir.ok || !tierClean(reporter, lirEntry)) {
         return std::nullopt;
     }
@@ -1357,8 +1618,41 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     }
 
     // 5. Liveness analysis (input to regalloc).
+    //
+    // ★★★ D-LIR-NO-EXCEPTIONAL-EDGE-INTO-A-TRY-HANDLER: THE GUARDED RUNS GO IN
+    // WITH THE MODULE. Each `__try` scope MIR→LIR returned is a run of blocks
+    // from any instruction of which the dispatcher may hand control to the
+    // handler block, keeping only what a call keeps. Liveness makes that block
+    // an exceptional successor of every block of the run, and the allocator
+    // then keeps what the handler reads out of the volatile registers (see
+    // `LirGuardedRegion`).
+    // ★ THE SCOPES' BLOCK IDS ARE MIR→LIR's, AND LIVENESS READS `wideLir.lir`. A
+    // block id is a position in one module, so the ids are FOLLOWED here through
+    // the block image `lowerWideCallArgs` published — the first step of the very
+    // chain the scope table's binding follows to the final module, read by the
+    // same owner (`guardedRegionsAt`, lir/lir_guarded_regions.hpp). The run
+    // liveness guards is the run the table will enclose, cut at this module; a
+    // rebuild that later lands between MIR→LIR and liveness joins this list.
+    // ⚠ Calling the region-less overload here would compile every `__try`
+    // without a diagnostic and deliver its handlers garbage:
+    // `DriverArgumentSupply.GuardedRegionReachesLivenessAndTheScopeTable` in
+    // tests/program reads the emitted image for it.
     phase.emplace(substrate::CompilePhase::Regalloc);
-    auto const liveness = analyzeLiveness(wideLir.lir);
+    auto const livenessEntry = reporter.errorCount();
+    std::vector<LirBlockRebuild> const rebuildsBeforeLiveness{
+        {"wide-call-args", &lir.lir, &wideLir.lir, wideLir.blockEntryImage},
+    };
+    auto const guardedRegions = guardedRegionsAt(
+        rebuildsBeforeLiveness, lir.sehScopeDescriptors, reporter);
+    if (!guardedRegions.has_value() || !tierClean(reporter, livenessEntry)) {
+        return std::nullopt;
+    }
+    auto const livenessOrRefusal =
+        analyzeLiveness(wideLir.lir, *guardedRegions, reporter);
+    if (!livenessOrRefusal.has_value() || !tierClean(reporter, livenessEntry)) {
+        return std::nullopt;
+    }
+    LirLiveness const& liveness = *livenessOrRefusal;
 
     // 6. Register allocation.
     auto const allocEntry = reporter.errorCount();
@@ -1491,7 +1785,7 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     for (auto const& a : lir.funcLocalAlignments) {
         funcLocalAligns.push_back(
             LirFuncLocalAlignment{a.funcSymbol, a.maxLocalAlignBytes,
-                                  a.perAllocaAlignBytes});
+                                  a.perAllocaAlignBytes, a.stackedArgAlignBytes});
     }
     auto cc = materializeCallingConvention(*ccInput, target, alloc, reporter,
                                            sehFuncletParents,
@@ -1635,15 +1929,26 @@ lowerMirModuleToAssembly(Mir&                                        mir,
         globalsLayout->bitFieldStrategy = bitFieldStrategy;
         globalsLayout->unnamedBitFieldAlignment = unnamedBitFieldAlignment;
     }
-    // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): find the target's ABSOLUTE-64 pointer
-    // relocation kind by FORMULA (widthBytes==8 && !pcRelative), never by name —
-    // agnosticism (the same scan the linker uses for cross-CU thunk slots). A
-    // symbol-address global (`char* g="..."`, `int* p=&x`) emits this reloc; if
-    // the target declares none, the assembler fails loud.
-    std::optional<RelocationKind> absPtrRelocKind;
-    for (auto const& r : target.relocations()) {
-        if (r.widthBytes == 8 && !r.pcRelative) { absPtrRelocKind = r.kind; break; }
-    }
+    // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): the target's ADDRESS-SLOT row,
+    // found by its properties, never by name — agnosticism — and never by its
+    // place in the list: `addressSlotRelocationKind`, the one rule the assembler's
+    // `.quad sym` and the linker's pointer slots ask too. A symbol-address global
+    // (`char* g="..."`, `int* p=&x`) carries it (a jump table's slots ask the
+    // same rule at their descriptor's width, `materializeJumpTable`); if the
+    // target declares none, each refuses loud where it needs one.
+    // ★ P69 fold 3c: this scan was `widthBytes == 8 && !pcRelative`, FIRST ROW
+    // WINS, with no formula, thread-local or image-relative exclusion — a
+    // `tls-dtpoff64` declared before `abs64` would have been written into
+    // `char *p = "x"`. ✔MEASURED harmless on the shipped targets (abs64 is the
+    // only 8-byte non-pc-relative row of x86_64 and of arm64), so the defect was
+    // latent: D-ASM-DATA-WORD-RELOCATION-KIND-PICKED-BY-DECLARATION-ORDER.
+    // ★ P69 fold 3e (the review of fold 3d's X9, R2): at the data model's pointer
+    // width, where a literal 8 stood -- the MODULE's model since fold 3f (F3,
+    // RF3.6), the one MIR→LIR's wall read and admitted above; no route hands it in.
+    DataModel const dataModel = mir.moduleFacts().dataModel;
+    std::uint64_t const pointerBytes = scalarByteSize(TypeKind::Ptr, dataModel).value_or(0);
+    std::optional<RelocationKind> const absPtrRelocKind =
+        addressSlotRelocationKind(target.relocations(), static_cast<std::uint8_t>(pointerBytes));
     auto dataItems = lowerMirGlobalsToDataItems(
         mir, interner, globalsLayout, dataModel, reporter, absPtrRelocKind);
     if (!tierClean(reporter, asmEntry)) {
@@ -1653,31 +1958,51 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     }
     assembled.dataItems = std::move(dataItems);
 
+    // ★★★ THE BLOCKS DATA NAMES, FOLLOWED TO THE FINAL LIR BEFORE ANY IS BOUND
+    // (D-LIR-DESCRIPTOR-BLOCK-IDS-SHIFTED-BY-A-BLOCK-INSERTING-PASS). The three
+    // bindings below name blocks by MIR→LIR's ids and read the FINAL module's
+    // `blockByteOffsets`; a block id is an arena position, so every block an
+    // inserting pass adds renumbers each one after it. Every rebuild in between is
+    // listed, in order, WITH THE BLOCK IMAGE IT PUBLISHED: the four that rebuild
+    // block for block state the identity they performed, the two that insert blocks
+    // state where each source block's pieces begin, and nothing is inferred — a
+    // rebuild that publishes no image is refused by name. `assemble()` is held to
+    // its layout, and any descriptor id with no image in the final LIR is refused
+    // by name. See `lir/lir_descriptor_blocks.hpp`.
+    {
+        std::vector<LirBlockRebuild> rebuilds{
+            {"wide-call-args", &lir.lir, &wideLir.lir, wideLir.blockEntryImage},
+            {"rewrite", &wideLir.lir, &rewritten.lir, rewritten.blockEntryImage},
+            {"two-address-legalize", &rewritten.lir, &legal.lir,
+             legal.blockEntryImage},
+            {"lir-peephole", &legal.lir, &peeped.lir, peeped.blockEntryImage},
+        };
+        if (expanded.has_value()) {
+            rebuilds.push_back({"asm-region-expansion", &peeped.lir, &expanded->lir,
+                                expanded->blockEntryImage});
+        }
+        rebuilds.push_back({"callconv", ccInput, &cc.lir, cc.blockEntryImage});
+        if (!translateDescriptorBlockIds(rebuilds, lir.jumpTableDescriptors,
+                                         lir.blockSymbolBindings,
+                                         lir.sehScopeDescriptors, reporter)
+            || !verifyBlockOffsetsFollowLayout(cc.lir, assembled.functions,
+                                               reporter)) {
+            return std::nullopt;
+        }
+    }
+
     // D-OPT-SWITCH-JUMP-TABLE (c70): materialize each dense switch's `.data`
     // address table from the descriptors the LIR lowerer emitted. Runs AFTER
     // assemble() because it reads each owning AssembledFunction's blockByteOffsets
     // (populated by the assembler) to bind the synthetic per-block symbols the
     // table's slots relocate against — those blocks have no live block-address
     // `lea`, so the assembler's BlockSymPatch loop never bound them. Each table
-    // is one `AssembledData{Data, span*8 bytes, abs64 reloc per slot}` — the same
-    // proven shape as a c67 symbol-address global (writable-at-load `.data` so
-    // Mach-O dyld can PIE-rebase it; ELF ET_EXEC / PE `.reloc` handle the abs64
-    // in-place / via base-relocations). `absPtrRelocKind` is the target's abs64
-    // pointer reloc (found by the widthBytes==8 && !pcRelative formula above); if
-    // the target declares none, a jump table cannot be emitted → fail loud.
+    // is one `AssembledData{Data, span*slotBytes bytes, an address reloc per slot}`
+    // (`materializeJumpTable`, the one writer) — the same proven shape as a c67
+    // symbol-address global (writable-at-load `.data` so Mach-O dyld can PIE-rebase
+    // it; ELF ET_EXEC / PE `.reloc` handle the address in-place / via
+    // base-relocations). Its slot width is the DESCRIPTOR's (F3-R1).
     for (auto const& desc : lir.jumpTableDescriptors) {
-        if (!absPtrRelocKind.has_value()) {
-            ParseDiagnostic d;
-            d.code     = DiagnosticCode::K_NoMatchingObjectFormat;
-            d.severity = DiagnosticSeverity::Error;
-            d.actual   = std::format(
-                "jump-table (SymbolId={{ {} }}) requires an absolute-64 pointer "
-                "relocation but target '{}' declares none ("
-                "D-OPT-SWITCH-JUMP-TABLE) — the dense-switch address table cannot be emitted",
-                desc.tableSymbol.v, target.name());
-            reporter.report(std::move(d));
-            return std::nullopt;
-        }
         if (desc.funcIndex >= assembled.functions.size()) {
             ParseDiagnostic d;
             d.code     = DiagnosticCode::K_NoMatchingObjectFormat;
@@ -1689,48 +2014,10 @@ lowerMirModuleToAssembly(Mir&                                        mir,
             reporter.report(std::move(d));
             return std::nullopt;
         }
-        AssembledFunction& outFn = assembled.functions[desc.funcIndex];
-
-        // Byte offsets already bound into blockSymbols (e.g. a target block that
-        // is ALSO a computed-goto `&&label`) — don't double-bind those.
-        std::unordered_set<std::uint32_t> alreadyBound;
-        for (auto const& bs : outFn.blockSymbols) alreadyBound.insert(bs.symbol.v);
-
-        AssembledData table;
-        table.symbol    = desc.tableSymbol;
-        table.section   = DataSectionKind::Data;
-        table.alignment = Alignment::ofRuntimePow2(8);
-        table.bytes.assign(desc.slotCount * 8u, std::uint8_t{0});
-        table.relocations.reserve(desc.slotBindings.size());
-
-        bool tableOk = true;
-        for (auto const& [lirBlockV, slotIdx] : desc.slotBindings) {
-            auto symIt = desc.blockSymbols.find(lirBlockV);
-            if (symIt == desc.blockSymbols.end()) { tableOk = false; break; }
-            SymbolId const blkSym = symIt->second;
-            // Bind the block symbol from the function's byte-offset map (once per
-            // distinct symbol; a gap/duplicate reuses the same SymbolId).
-            if (!bindBlockSymbol(outFn, lirBlockV, blkSym, alreadyBound)) {
-                tableOk = false;
-                break;
-            }
-            // abs64 reloc at slot byte offset (slotIdx * 8) → the block symbol.
-            table.relocations.push_back(Relocation{
-                static_cast<std::uint32_t>(slotIdx * 8u),
-                blkSym, *absPtrRelocKind, /*addend=*/0});
-        }
-        if (!tableOk) {
-            ParseDiagnostic d;
-            d.code     = DiagnosticCode::K_NoMatchingObjectFormat;
-            d.severity = DiagnosticSeverity::Error;
-            d.actual   = std::format(
-                "jump-table (SymbolId={{ {} }}) references a target block with no "
-                "byte offset or symbol — malformed descriptor ("
-                "D-OPT-SWITCH-JUMP-TABLE)", desc.tableSymbol.v);
-            reporter.report(std::move(d));
-            return std::nullopt;
-        }
-        assembled.dataItems.push_back(std::move(table));
+        std::optional<AssembledData> table =
+            materializeJumpTable(desc, assembled.functions[desc.funcIndex], target, reporter);
+        if (!table.has_value()) return std::nullopt;   // reported
+        assembled.dataItems.push_back(std::move(*table));
     }
 
     // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: bind each block whose
@@ -1904,25 +2191,71 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     // externally-visible synthesized globals, so an empty name is no longer a breach.
     // The merge's own `MirVerifier` + `mergedSymbolOf` fail-louds guard merged-module
     // integrity in that arm's place.)
+    //
+    // ★★ P69 (lane `xa`) — THE WEAK DEFINITION'S KIND REACHES THE ROW HERE, AND
+    // THIS IS ITS COMPILED ORIGIN. `ModuleSymbol::weakKind` is what the object
+    // writers spell a weak definition by (PE: a COMDAT for select-any, a weak
+    // external with a default for overridable) and what the link ranks it by
+    // (`linker::weakDefinitionRank`, `commonYieldsToDefinition`). Until this
+    // block read it, only a row an object READER made stated one: every
+    // DSS-COMPILED weak definition reached the writer and the link with no kind
+    // — `__attribute__((weak))` written as a select-any COMDAT on PE, and
+    // ✔MEASURED 2026-10-12 a select-any definition losing to an overridable one
+    // by link order (exit 44 with the overridable unit first, 11 otherwise). The
+    // row is made from the MIR definition's ONE linkage record, so the three
+    // facts cannot arrive in parts.
     {
-        auto appendSym = [&](SymbolId sym, SymbolBinding bind,
-                             SymbolVisibility vis) {
+        auto appendSym = [&](SymbolId sym, MirLinkage const& linkage) {
             std::string name = nameOf(sym);
             if (name.empty()) return;  // module-private (synthesized / no record)
-            assembled.symbols.push_back(
-                ModuleSymbol{sym, std::move(name), bind, vis});
+            ModuleSymbol row{sym, std::move(name), linkage.binding,
+                             linkage.visibility};
+            row.weakKind = linkage.statedWeakKind();
+            assembled.symbols.push_back(std::move(row));
         };
         for (std::uint32_t i = 0; i < mir.moduleFuncCount(); ++i) {
             MirFuncId const fid = mir.funcAt(i);
-            appendSym(mir.funcSymbol(fid), mir.funcBinding(fid),
-                      mir.funcVisibility(fid));
+            appendSym(mir.funcSymbol(fid), mir.funcLinkage(fid));
         }
         for (std::uint32_t i = 0; i < mir.moduleGlobalCount(); ++i) {
             MirGlobalId const gid = mir.globalAt(i);
-            appendSym(mir.globalSymbol(gid), mir.globalBinding(gid),
-                      mir.globalVisibility(gid));
+            appendSym(mir.globalSymbol(gid), mir.globalLinkage(gid));
+        }
+        // P69 (lane `cs`) — A SECOND NAME OF A DEFINITION (`Mir::aliases`, the
+        // compiled `alias("target")`): one more row on the TARGET's id, the shape
+        // every object reader makes of a foreign alias
+        // (`ObjectSymbolNames::definedAliases`), named by the alias and carrying the
+        // alias's OWN binding, visibility and kind. The unit refers to an external
+        // alias by NAME — its declaration lowered to a reference row
+        // (`ExternImport`) — so the row says so (`referencedByName`, read beside a
+        // weak binding): a weak alias another unit's strong definition replaces
+        // takes the unit's own uses with it. A module-private alias has no
+        // reference row (the semantic tier bound its uses to the target) and says
+        // nothing. tests/link/test_compiled_symbol_alias.cpp pins what the link
+        // makes of this shape on every format.
+        for (MirAlias const& a : mir.aliases()) {
+            std::string name = nameOf(a.alias);
+            if (name.empty()) continue;   // module-private and nameless: no row to state
+            ModuleSymbol row{a.target, std::move(name), a.linkage.binding,
+                             a.linkage.visibility};
+            row.weakKind         = a.linkage.statedWeakKind();
+            row.referencedByName = a.linkage.binding != SymbolBinding::Local;
+            assembled.symbols.push_back(std::move(row));
         }
     }
+
+    // P69 fold 3b: a tentative definition the link may fold becomes the COMMON row
+    // where the document writes one (see the function).
+    if (commons.states && !stateTentativeDefinitionsAsCommons(mir, assembled, commons, reporter)) {
+        return std::nullopt;
+    }
+
+    // ★ THE COMPILED MODULE CARRIES ITS ID SPACE'S END (P69 f26e, B1 A7): MIR→LIR's continuation began at the MIR
+    // module's end (past its name table, every symbol it defines and every id minted for it) and ended past every
+    // id the lowering minted beyond it; the assembled module carries that end, so a link-tier door opened on it
+    // (`linker::ModuleSymbolIds`) continues the space and never hands out an id of the table the module does not
+    // hold.
+    assembled.symbolIdEnd.keepClearOf(lir.symbolIdEnd);
 
     // Assembly complete — return the per-CU module; linking + writing is the shared
     // `linkAndWrite` phase below, so N CUs can each assemble before one merged link.
@@ -1959,13 +2292,217 @@ void collectEntryCandidates(SemanticModel const& model,
     }
 }
 
+// See the header: the entry names an object's entry may have, each with the
+// richest of its rows the format realizes.
+std::vector<EntryLinkName> entryLinkNames(GrammarSchema const& grammar, ObjectFormatSchema const& format) {
+    return entryLinkNames(grammar, format, format.entryVerbs());
+}
+
+std::vector<EntryLinkName> entryLinkNames(GrammarSchema const& grammar, ObjectFormatSchema const& format,
+                                          std::span<EntryMaterialization const> verbs) {
+    // ★ ONE VOCABULARY (P69 fold 3e, the review of fold 3d's X1 and its N3): a
+    // language's `entryFunctions` and a dialect's `entryLabels`, intersected with
+    // the format's realized verbs, are `realizedEntryNames`' (core/types/
+    // entry_names.hpp) -- the semantic tier's entry gate asks the same function --
+    // so a `.s` unit's entry, an object's and a source's are spelled, intersected
+    // and elected alike, whatever grammar the build resolved (with no `--language`
+    // that is the target's assembly dialect). Here each is spelled on the binary.
+    CSymbolDecorationScheme const scheme = format.cSymbolDecoration().scheme;
+    std::vector<EntryLinkName>    out;
+    for (RealizedEntryName const& n : realizedEntryNames(grammar, verbs)) {
+        out.push_back(EntryLinkName{dss::ffi::applyCMangling(n.name, scheme), n.name, n.verb});
+    }
+    return out;
+}
+
+namespace {
+
+// The rank of `verb` in an election's `precedence` (`EntryElectionScope::precedence`): the index of the group that
+// lists it -- 0 outranks 1 -- and 0 for every verb where the format states no precedence (one group). The ONE answer
+// the election ranks its candidates by and the entry pull ranks the archives' entry names by (P69 fold 3f, F1), so
+// the member the pull elects is the candidate the election would. A verb no group lists ranks below every group:
+// unreachable, as a stated precedence partitions the verbs (load-enforced) and a scope's restriction keeps it so.
+[[nodiscard]] std::size_t entryPrecedenceRankOf(std::span<std::vector<EntryMaterialization> const> precedence,
+                                                EntryMaterialization                               verb) {
+    if (precedence.empty()) return 0;
+    for (std::size_t g = 0; g < precedence.size(); ++g) {
+        if (std::find(precedence[g].begin(), precedence[g].end(), verb) != precedence[g].end()) return g;
+    }
+    return precedence.size();
+}
+
+// With no entry request standing, the subsystem request that stands among the named units RANKS the entries its
+// C runtime startups call (the vocabulary's `subsystemStartups`) above every other, the format's precedence
+// ranking within each part -- as link.exe starts at the stated subsystem's startups (P69 fold 3f; ✔MEASURED
+// 2026-11-17, cl 19.52 + link.exe 14.52: WINDOWS beside `main` and WinMain runs WinMain, CONSOLE runs `main`). A
+// program defining none of them elects as with none stated: link.exe refuses it, gcc runs it, and acceptance is
+// the union's.
+void rankBySubsystem(GrammarSchema const& grammar, EntryElectionScope& scope,
+                     std::span<AssembledModule const> namedObjects) {
+    auto const standing = linker::standingSubsystemRequest(namedObjects);
+    if (!standing.has_value()) return;
+    UnitImageRequest const&     request   = *standing->request;
+    UnitSubsystemRequest const& subsystem = std::get<UnitSubsystemRequest>(request.value);
+    std::vector<EntryMaterialization> first;
+    for (auto const v : scope.verbs) {
+        if (std::find(subsystem.verbs.begin(), subsystem.verbs.end(), v) != subsystem.verbs.end()) first.push_back(v);
+    }
+    if (first.empty()) return;   // a subsystem whose startups call no entry this format realizes
+    auto const ranksFirst = [&](EntryMaterialization v) {
+        return std::find(first.begin(), first.end(), v) != first.end();
+    };
+    // A format that states no precedence ranks its verbs as one group.
+    std::vector<std::vector<EntryMaterialization>> groups = scope.precedence;
+    if (groups.empty()) groups.push_back(scope.verbs);
+    std::vector<std::vector<EntryMaterialization>> ranked;
+    std::vector<std::vector<EntryMaterialization>> rest;
+    for (auto const& group : groups) {
+        std::vector<EntryMaterialization> mine;
+        std::vector<EntryMaterialization> others;
+        for (auto const v : group) (ranksFirst(v) ? mine : others).push_back(v);
+        if (!mine.empty()) ranked.push_back(std::move(mine));
+        if (!others.empty()) rest.push_back(std::move(others));
+    }
+    ranked.insert(ranked.end(), rest.begin(), rest.end());
+    scope.precedence = std::move(ranked);
+    std::string calls;
+    for (RealizedEntryName const& n : realizedEntryNames(grammar, first)) {
+        calls += (calls.empty() ? "'" : ", '") + n.name + "'";
+    }
+    scope.rankedBy = std::format(
+        "{} states '{}', and the C runtime startups of that subsystem call {}, which outrank every other entry",
+        request.unit.empty() ? std::string{"a linked object"} : "'" + request.unit + "'", request.spelled,
+        calls.empty() ? std::string{"no entry this language declares"} : calls);
+    scope.rankedFirst = std::move(first);
+}
+
+}  // namespace
+
+// See the header: what the program's entry election may elect.
+EntryElectionScope entryElectionScope(GrammarSchema const& grammar, ObjectFormatSchema const& format,
+                                      std::span<AssembledModule const> namedObjects) {
+    EntryElectionScope scope;
+    scope.verbs.assign(format.entryVerbs().begin(), format.entryVerbs().end());
+    scope.precedence.assign(format.entryPrecedence().begin(), format.entryPrecedence().end());
+    if (scope.verbs.empty()) return scope;   // a format that starts no program elects by name
+    auto const standing = linker::standingEntryRequest(namedObjects);
+    if (!standing.has_value()) {
+        // No entry stands: a stated SUBSYSTEM ranks its startups' entries first (P69 fold 3f).
+        rankBySubsystem(grammar, scope, namedObjects);
+        return scope;
+    }
+    UnitImageRequest const& request = *standing->request;
+    auto const&             entry   = std::get<UnitEntryRequest>(request.value);
+    if (!entry.runtimeStartup) {
+        // A function the image starts at, or a startup no DSS image provides: no C
+        // entry is elected, and the link decides the request -- the image's entry,
+        // or a refusal by name with the vocabulary's reason.
+        scope.electsNone = true;
+        return scope;
+    }
+    auto const outside = [&](EntryMaterialization v) {
+        return std::find(entry.verbs.begin(), entry.verbs.end(), v) == entry.verbs.end();
+    };
+    std::erase_if(scope.verbs, outside);
+    for (auto& group : scope.precedence) std::erase_if(group, outside);
+    std::erase_if(scope.precedence, [](std::vector<EntryMaterialization> const& g) { return g.empty(); });
+    std::string calls;
+    for (RealizedEntryName const& n : realizedEntryNames(grammar, scope.verbs)) {
+        calls += (calls.empty() ? "'" : ", '") + n.name + "'";
+    }
+    scope.restrictedBy = std::format(
+        "{} states '{}', the C runtime's startup that calls {}, so the program's entry is one of the functions it "
+        "calls",
+        request.unit.empty() ? std::string{"a linked object"} : "'" + request.unit + "'", request.spelled,
+        calls.empty() ? std::string{"no entry this language declares"} : calls);
+    return scope;
+}
+
+// See the header: an OBJECT's entry candidates.
+std::vector<ForeignEntryCandidate>
+collectObjectEntryCandidates(std::span<AssembledModule const> objects,
+                             GrammarSchema const&             grammar,
+                             ObjectFormatSchema const&        format) {
+    std::vector<ForeignEntryCandidate> out;
+    std::vector<EntryLinkName> const   names = entryLinkNames(grammar, format);
+    if (names.empty()) return out;
+    for (std::size_t k = 0; k < objects.size(); ++k) {
+        AssembledModule const& m = objects[k];
+        for (ModuleSymbol const& ms : m.symbols) {
+            if (ms.binding == SymbolBinding::Local) continue;   // an entry is external
+            auto const it = std::find_if(names.begin(), names.end(),
+                                         [&](EntryLinkName const& e) { return e.linkName == ms.name; });
+            if (it == names.end()) continue;
+            // A row alone is not a definition — a reader mints rows for data and
+            // section symbols too — so the row has to name a FUNCTION of the
+            // object, which is what the init (or the trampoline) will call.
+            bool const isFunction = std::any_of(m.functions.begin(), m.functions.end(),
+                                                [&](auto const& fn) { return fn.symbol.v == ms.symbol.v; });
+            if (!isFunction) continue;
+            out.push_back(ForeignEntryCandidate{EntryCandidate{it->languageName, it->verb}, ms.name, k,
+                                                ms.symbol});
+        }
+    }
+    return out;
+}
+
+// See the header: the startup module of a link that compiles nothing.
+bool buildForeignEntryStartup(ForeignEntryCandidate const&    entry,
+                              EntryMaterialization            verb,
+                              CompilationUnitId               startupId,
+                              GrammarSchema const&            grammar,
+                              TargetSchema const&             target,
+                              ObjectFormatSchema const&       format,
+                              CompileOptions const&           compileOpts,
+                              std::optional<MergedMirModule>& startup,
+                              DiagnosticReporter&             reporter) {
+    startup.reset();
+    MirBuilder emptyModule;
+    emptyModule.stateSymbolIdEnd(1);   // its name table holds no id: the space starts past 0
+    // ★ P69 (lane `xa`, fold 3f): the model this module is lowered for is its FORMAT's -- no unit states one.
+    emptyModule.stateDataModel(format.dataModel());
+    // ★ P69 (lane `cs`, fold f26d — review-csf26c2 N2): the entry shape gives this module functions
+    // that receive arguments, numbered as the convention the format names counts them
+    // (`argCountingOf`) -- a module holding an `Arg` and stating no counting is refused by the MIR
+    // verifier (✔MEASURED, run n2a: every exec link of objects alone was). A format that names no
+    // convention (a register-free machine) has no argument registers to count, and states none.
+    if (!format.cCallingConvention().declaresNoConvention()) {
+        auto const abi = ffi::resolveAbi(target, format, reporter);
+        if (!abi.has_value() || abi->cc == nullptr) return false;   // resolveAbi said why
+        emptyModule.stateArgCounting(argCountingOf(abi->cc->slotAligned));
+    }
+    Mir                       mir = std::move(emptyModule).finish();
+    TypeLattice               host{startupId, std::string{grammar.configName()}};
+    std::optional<SymbolId>   init;
+    std::vector<ExternImport> imports;
+    if (!realizeForeignEntryShape(mir, host.interner(), entry.linkName, init, imports, verb,
+                                  format.processArgs(), format.cSymbolDecoration().scheme,
+                                  format.name(), reporter)) {
+        return false;   // an unusable mechanism — reported
+    }
+    if (!init.has_value()) return true;   // no init needed: the trampoline calls the entry itself
+    startup.emplace(MergedMirModule{std::move(mir), std::move(host), {}, std::move(imports), init, {}});
+    std::span<SymbolId const> const roots{&*startup->userEntrySymbol, 1};
+    for (PipelineStage const stage : {PipelineStage::Unit, PipelineStage::Program}) {
+        if (!optimizeModule(startup->mir, target, startup->host.interner(), compileOpts, stage,
+                            opt::ModuleExtent::LinkInput, roots, reporter, startup->externImports)) {
+            startup.reset();
+            return false;   // reported
+        }
+    }
+    return true;
+}
+
 std::optional<ResolvedEntry>
-resolveProgramEntry(std::span<EntryCandidate const>       candidates,
-                    std::span<EntryMaterialization const> formatVerbs,
-                    std::string_view                      formatName,
-                    DiagnosticReporter&                   reporter,
-                    bool&                                 ok) {
+resolveProgramEntry(std::span<EntryCandidate const> candidates,
+                    EntryElectionScope const&       scope,
+                    std::string_view                formatName,
+                    DiagnosticReporter&             reporter,
+                    bool&                           ok) {
     ok = true;
+    std::span<EntryMaterialization const> const              formatVerbs  = scope.verbs;
+    std::span<std::vector<EntryMaterialization> const> const precedence   = scope.precedence;
+    std::string_view const                                   restrictedBy = scope.restrictedBy;
 
     // ── THE "THIS FORMAT STARTS NO PROGRAM" ARM ────────────────────────────
     //
@@ -1983,7 +2520,11 @@ resolveProgramEntry(std::span<EntryCandidate const>       candidates,
     // arm, `dss --target x86_64:elf64-x86_64-linux` (the RELOCATABLE format)
     // refused `int main(void){return 0;}`, i.e. every object-file build in the
     // tree.
-    if (formatVerbs.empty()) {
+    //
+    // ★ A RESTRICTED set is never that answer (P69 fold 3e): a stated startup whose
+    // verbs this format realizes none of leaves nothing to elect, and is refused
+    // below as a program with no entry.
+    if (formatVerbs.empty() && restrictedBy.empty()) {
         if (candidates.empty()) return std::nullopt;
         return ResolvedEntry{0, EntryMaterialization::None};
     }
@@ -2017,16 +2558,24 @@ resolveProgramEntry(std::span<EntryCandidate const>       candidates,
         for (auto const i : nearMiss) {
             if (!detail.empty()) detail += "; ";
             detail += std::format("'{}' is defined here but needs the '{}' "
-                                  "materialization verb, which this format does "
-                                  "not realize",
+                                  "materialization verb, which {}",
                                   candidates[i].name,
-                                  entryMaterializationName(*candidates[i].verb));
+                                  entryMaterializationName(*candidates[i].verb),
+                                  restrictedBy.empty()
+                                      ? "this format does not realize"
+                                      : "the stated startup does not call an entry with");
         }
         std::string declared;
         for (auto const v : formatVerbs) {
             if (!declared.empty()) declared += ", ";
             declared += entryMaterializationName(v);
         }
+        std::string const admitted =
+            restrictedBy.empty()
+                ? std::format("This format realizes these materialization verbs: {}.", declared)
+                : std::format("{}; the election admits only these materialization verbs of it: {}.",
+                              restrictedBy, declared.empty() ? std::string{"<none this format realizes>"}
+                                                             : declared);
         ParseDiagnostic d;
         d.code     = DiagnosticCode::K_ProgramEntryUndefined;
         d.severity = DiagnosticSeverity::Error;
@@ -2034,13 +2583,12 @@ resolveProgramEntry(std::span<EntryCandidate const>       candidates,
             "no program entry is defined. Object format '{}' STARTS A PROGRAM, so "
             "the build needs exactly one function that is both an entry spelling "
             "the source language declares and realizable by this format; it found "
-            "none. This format realizes these materialization verbs: {}. {} The "
+            "none. {} {} The "
             "accepted entry set is the INTERSECTION of the language's "
             "`entryFunctions` mapping and this format's `entryVerbs`, so a "
             "definition can be a valid entry on one target and an ordinary "
-            "function on another — that is by design, not a bug. "
-            "(D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE.)",
-            formatName, declared,
+            "function on another — that is by design, not a bug.",
+            formatName, admitted,
             detail.empty()
                 ? std::string{"No entry-named function is DEFINED in this build "
                               "at all (a prototype without a body defines "
@@ -2065,18 +2613,75 @@ resolveProgramEntry(std::span<EntryCandidate const>       candidates,
         list += std::format("'{}' [{}]", candidates[i].name,
                             entryMaterializationName(*candidates[i].verb));
     }
+    // ── THE FORMAT RANKS THEM (P69 fold 3e, the review of fold 3d's X2) ────
+    // Not a pick by order: the format STATES which startup outranks which
+    // (`entryPrecedence`), as each reference linker of it does. The candidate of
+    // the highest group holding any is the entry when it is the only one there;
+    // two there are the ambiguity below, whatever lies under them.
+    if (!precedence.empty()) {
+        auto const groupOf = [&](EntryMaterialization v) { return entryPrecedenceRankOf(precedence, v); };
+        std::size_t best = precedence.size();
+        for (auto const i : realizable) best = std::min(best, groupOf(*candidates[i].verb));
+        std::vector<std::size_t> top;
+        for (auto const i : realizable) {
+            if (groupOf(*candidates[i].verb) == best) top.push_back(i);
+        }
+        if (top.size() == 1) {
+            std::string others;
+            for (auto const i : realizable) {
+                if (i == top[0]) continue;
+                if (!others.empty()) others += ", ";
+                others += std::format("'{}' [{}]", candidates[i].name,
+                                      entryMaterializationName(*candidates[i].verb));
+            }
+            // Who ranked it first: a stated subsystem when it is an entry that subsystem's startups call (P69
+            // fold 3f), else the format.
+            bool const bySubsystem = std::find(scope.rankedFirst.begin(), scope.rankedFirst.end(),
+                                               *candidates[top[0]].verb) != scope.rankedFirst.end();
+            std::string const ranker =
+                bySubsystem
+                    ? std::format("{}: '{}' [{}] ranks first among those ('entryPrecedence')", scope.rankedBy,
+                                  candidates[top[0]].name, entryMaterializationName(*candidates[top[0]].verb))
+                    : std::format("the format ranks '{}' [{}] first ('entryPrecedence')", candidates[top[0]].name,
+                                  entryMaterializationName(*candidates[top[0]].verb));
+            ParseDiagnostic w;
+            w.code     = DiagnosticCode::K_ProgramEntryChosenByPrecedence;
+            w.severity = DiagnosticSeverity::Warning;
+            w.actual   = std::format(
+                "this program defines {} entries object format '{}' can start ({}); "
+                "{}, so the program starts there and {} {} an ordinary function.",
+                realizable.size(), formatName, list, ranker, others,
+                realizable.size() == 2 ? "is" : "are each");
+            reporter.report(std::move(w));
+            return ResolvedEntry{top[0], *candidates[top[0]].verb};
+        }
+    }
+    // ★ ONE NAME DEFINED TWICE IS A DUPLICATE DEFINITION, NOT A CHOICE BETWEEN STARTUPS (P69 fold 3f): when every
+    // candidate carries the same name (two units each define `main`), no target resolves it, so the advice to build
+    // for one that realizes fewer verbs would send the reader after a remedy that does not exist. A candidate carries
+    // no input identity, so the message states the name and the count.
+    std::string const& firstName = candidates[realizable[0]].name;
+    bool const oneName = std::all_of(realizable.begin(), realizable.end(),
+                                     [&](std::size_t i) { return candidates[i].name == firstName; });
     ParseDiagnostic d;
     d.code     = DiagnosticCode::K_ProgramEntryAmbiguous;
     d.severity = DiagnosticSeverity::Error;
-    d.actual = std::format(
-        "ambiguous program entry: {} functions are BOTH entry spellings this "
-        "source language declares AND realizable by object format '{}' ({}). A "
-        "program has exactly one entry and this compiler will not choose for you "
-        "— picking one silently is how a build runs the wrong code while "
-        "reporting success. Define one, or build for a target that realizes only "
-        "one of their verbs (the same source resolves cleanly wherever only one "
-        "of these verbs is realized). (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE.)",
-        realizable.size(), formatName, list);
+    d.actual = oneName
+        ? std::format(
+              "ambiguous program entry: '{}' is defined {} times in this program ({}), and object format '{}' "
+              "starts a program at exactly one definition of its entry. Keep one definition of '{}' -- this "
+              "compiler will not choose one for you, because picking one silently is how a build runs the wrong "
+              "code while reporting success.",
+              firstName, realizable.size(), list, formatName, firstName)
+        : std::format(
+              "ambiguous program entry: {} functions are BOTH entry spellings this "
+              "source language declares AND realizable by object format '{}' ({}). A "
+              "program has exactly one entry and this compiler will not choose for you "
+              "— picking one silently is how a build runs the wrong code while "
+              "reporting success. Define one, or build for a target that realizes only "
+              "one of their verbs (the same source resolves cleanly wherever only one "
+              "of these verbs is realized).",
+              realizable.size(), formatName, list);
     reporter.report(std::move(d));
     ok = false;
     return std::nullopt;
@@ -2087,62 +2692,16 @@ resolveProgramEntry(std::span<EntryCandidate const>       candidates,
 // `nameOf` that reads the SemanticModel's symbol records, the CU's extern imports,
 // and the entry symbol resolved by the CU-specific scan above. Produces output
 // byte-identical to the pre-Cycle-25 monolith for any single-CU build.
-std::optional<AssembledModule>
-lowerCuMirToAssembly(CuMirModule&                       cuMir,
-                     std::optional<ProcessArgs> const& processArgs,
-                     std::span<EntryMaterialization const> entryVerbs,
-                     std::optional<SehPersonality> const& sehPersonality,
-                     std::string_view                  formatName,
-                     std::string_view                  wideFloatSoftcallLibrary,
-                     DiagnosticReporter&               reporter,
-                     std::optional<AtomicsRuntime> const& atomicsRuntime) {
-    SemanticModel&       model   = cuMir.model;
-    GrammarSchema const& grammar = *cuMir.grammar;
-
-    // Resolve the program entry FIRST so a multi-entry or entry-less source halts
-    // before lowering — same observable failure point as pre-Cycle-25. Non-const:
-    // `realizeEntryShape` may retarget it.
-    //
-    // Both driver paths call the SAME `resolveProgramEntry`; see its docblock for
-    // why that had to become single-owner.
-    std::vector<EntryCandidate> cands;
-    std::vector<std::uint32_t>  candSym;
-    collectEntryCandidates(model, cands, candSym);
-    bool entryOk = true;
-    auto const resolved = resolveProgramEntry(cands, entryVerbs, formatName,
-                                              reporter, entryOk);
-    if (!entryOk) return std::nullopt;
-
-    std::optional<SymbolId> userEntry;
-    EntryMaterialization    entryVerb = EntryMaterialization::None;
-    if (resolved.has_value()) {
-        // `collectEntryCandidates` records each candidate's index in
-        // `model.symbols()`, which IS its SymbolId on this path (the same identity
-        // the pre-existing scan minted).
-        userEntry = SymbolId{candSym[resolved->index]};
-        entryVerb = resolved->verb;
-    }
-
-    // UCRT-P4 (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE + D-FFI-PE-CRT-UCRT-MIGRATION):
-    // single-CU counterpart of the merge-path call (program.cpp). MATERIALIZE the
-    // resolved entry's arguments per its verb × the format's declared mechanism (on
-    // the CRT-accessor route this appends the pre-main init and retargets
-    // `userEntry` to it). The signature GATE is no longer here or anywhere in the
-    // back half: the semantic tier owns it, with a source span. The CU is already
-    // per-CU-optimized here, so an appended init skips the optimizer but is lowered
-    // like any other function; the interner is the CU model's (the type space this
-    // CU's TypeIds index into).
-    if (!realizeEntryShape(cuMir.mir, model.lattice().interner(),
-                           userEntry, cuMir.externImports,
-                           entryVerb, processArgs, cuMir.cSymbolDecoration,
-                           formatName, reporter)) {
-        return std::nullopt;  // unusable mechanism — fail-loud already reported.
-    }
-
+// ★★ D-MIR-SYNTH-SHIM-SEAM-OPTIMIZE-PLACEMENT-ASYMMETRY — the single-module seam's
+// library-shim synthesis, called by every route that lowers ONE CU's module BEFORE that
+// module's final optimize (the contract is on the declaration).
+bool synthesizeLibraryShims(CuMirModule& cuMir, DiagnosticReporter& reporter) {
     // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): PARTITION `cuMir.libraryShimRecipes` (the
-    // single combined synthesize-recipe map CST→HIR seeded, carrying BOTH families) by
-    // `dss::ffi::shimFamilyOf` BEFORE calling EITHER synth
-    // pass. Each pass fails loud on a recipe id it has no switch arm for (its own anti-
+    // single combined synthesize-recipe map CST→HIR seeded, carrying every family) by
+    // `dss::ffi::shimFamilyOf` BEFORE calling any synth pass. (P69: the <stdio.h> family
+    // left this map — the pe printf/scanf rows are DSS's runtime source now,
+    // runtime/platform/src/stdio.c — so <threads.h> is the one family today.)
+    // Each pass fails loud on a recipe id it has no switch arm for (its own anti-
     // vocab-drift backstop), so handing the WHOLE map to one pass would make it reject the
     // other family's ids and abort a build that never should have failed. A `nullopt`
     // family here is an INTERNAL INVARIANT BREACH, not a user error: the descriptor loader
@@ -2154,8 +2713,11 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
     // `K_NoMatchingObjectFormat`, which would point an operator at the object-format config
     // for what is a recipe-table defect. The merged-module seam (program.cpp) emits the
     // SAME code for the SAME breach.
-    std::unordered_map<std::uint32_t, std::string> threadsRecipes, stdioRecipes;
-    for (auto const& [symV, recipe] : cuMir.libraryShimRecipes) {
+    std::unordered_map<std::uint32_t, std::string> threadsRecipes;
+    // ★ IN ASCENDING SYMBOL ID (P69 fold 3f, lane `xa`): the first recipe with no
+    // family is the one reported, so the walk is the unit's own order.
+    for (auto const* entry : substrate::entriesInKeyOrder(cuMir.libraryShimRecipes)) {
+        auto const& [symV, recipe] = *entry;
         auto const family = dss::ffi::shimFamilyOf(recipe);
         if (!family.has_value()) {
             ParseDiagnostic d;
@@ -2168,11 +2730,10 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
                 "time (isKnownSynthesizeRecipe)",
                 recipe, symV);
             reporter.report(std::move(d));
-            return std::nullopt;
+            return false;
         }
         switch (*family) {
         case dss::ffi::ShimFamily::Threads: threadsRecipes.emplace(symV, recipe); break;
-        case dss::ffi::ShimFamily::Stdio:   stdioRecipes.emplace(symV, recipe);   break;
         }
     }
 
@@ -2180,28 +2741,119 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
     // counterpart of the merge-path shim synth (program.cpp). Supply a definition for every
     // <threads.h> shim symbol the descriptor tagged (mtx_lock etc.) over the format's synth
     // vehicle (pe→kernel32, macho→pthread); a clean no-op when `threadsRecipes` is empty
-    // (every elf + non-threads TU). Same seam as synthesizePeStartup (the CU is per-CU-
-    // optimized; the appended shims are lowered like any other function). The interner is
-    // the CU model's; the vehicle comes from `cuMir.librarySynthesis`.
-    if (!synthesizeThreadsShim(cuMir.mir, model.lattice().interner(),
-                               threadsRecipes, cuMir.librarySynthesis,
-                               cuMir.cSymbolDecoration, cuMir.externImports,
-                               reporter)) {
-        return std::nullopt;  // internal invariant breach (vocab/switch drift) — reported.
+    // (every elf + non-threads TU). The interner is the CU model's; the vehicle comes from
+    // `cuMir.librarySynthesis`. false ⇒ an internal invariant breach (vocab/switch drift),
+    // already reported. The helper imports' ids come from the module, which carries the
+    // end of the name table it was made from (mir/merge/synth_symbol_floor.hpp).
+    return synthesizeThreadsShim(cuMir.mir, cuMir.model.lattice().interner(),
+                                 threadsRecipes, cuMir.librarySynthesis,
+                                 cuMir.cSymbolDecoration, cuMir.externImports,
+                                 reporter);
+}
+
+std::optional<AssembledModule>
+lowerCuMirToAssembly(CuMirModule&                       cuMir,
+                     std::optional<ProcessArgs> const& processArgs,
+                     EntryElectionScope const&         entryScope,
+                     std::span<ForeignEntryCandidate const> entriesOfTheOtherInputs,
+                     std::optional<std::size_t>&       electedOtherInput,
+                     std::optional<SehPersonality> const& sehPersonality,
+                     std::string_view                  formatName,
+                     std::string_view                  wideFloatSoftcallLibrary,
+                     DiagnosticReporter&               reporter,
+                     std::optional<AtomicsRuntime> const& atomicsRuntime) {
+    reportStage({StageEvent::Kind::Lowered, PipelineStage::Program, &cuMir.mir});
+    SemanticModel&       model   = cuMir.model;
+    GrammarSchema const& grammar = *cuMir.grammar;
+
+    // Resolve the program entry FIRST so a multi-entry or entry-less source halts
+    // before lowering — same observable failure point as pre-Cycle-25. Non-const:
+    // `realizeEntryShape` may retarget it.
+    //
+    // Both driver paths call the SAME `resolveProgramEntry`; see its docblock for
+    // why that had to become single-owner. The OTHER inputs' candidates (a named
+    // object's `main`) join this unit's in the same election (P69 fold 3d), after
+    // them, so an index past this unit's own names one of theirs.
+    std::vector<EntryCandidate> cands;
+    std::vector<std::uint32_t>  candSym;
+    collectEntryCandidates(model, cands, candSym);
+    std::size_t const ownCandidates = cands.size();
+    for (ForeignEntryCandidate const& other : entriesOfTheOtherInputs) {
+        cands.push_back(other.candidate);
+    }
+    electedOtherInput.reset();
+    bool entryOk = true;
+    // A named object's stated entry that is no C startup (P69 fold 3e) leaves no C
+    // entry to elect: the link starts the image as the request says, or refuses it.
+    auto const resolved =
+        entryScope.electsNone
+            ? std::optional<ResolvedEntry>{}
+            : resolveProgramEntry(cands, entryScope, formatName, reporter, entryOk);
+    if (!entryOk) return std::nullopt;
+
+    std::optional<SymbolId> userEntry;
+    EntryMaterialization    entryVerb = EntryMaterialization::None;
+    ForeignEntryCandidate const* foreignEntry = nullptr;
+    // P69 fold 3e (class C's N3): a definition whose signature is none of its
+    // name's realized rows is called with the elected verb's signature.
+    bool entryCalledWithTheVerbsSignature = false;
+    if (resolved.has_value() && resolved->index < ownCandidates) {
+        // `collectEntryCandidates` records each candidate's index in
+        // `model.symbols()`, which IS its SymbolId on this path (the same identity
+        // the pre-existing scan minted).
+        userEntry = SymbolId{candSym[resolved->index]};
+        entryVerb = resolved->verb;
+        entryCalledWithTheVerbsSignature =
+            model.symbols()[candSym[resolved->index]].entryCalledWithTheVerbsSignature;
+    } else if (resolved.has_value()) {
+        foreignEntry      = &entriesOfTheOtherInputs[resolved->index - ownCandidates];
+        entryVerb         = resolved->verb;
+        electedOtherInput = resolved->index - ownCandidates;   // the caller states it (X3)
     }
 
-    // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): the <stdio.h> printf-family shim sibling — see
-    // `synth_stdio_shim.hpp` for the full contract. A clean no-op when `stdioRecipes` is
-    // empty (every elf/macho build and every pe TU that includes no <stdio.h> printf
-    // family). `cuMir.vaListLayout` is the RESOLVED CC's WHOLE va_list block (captured at
-    // BUILD time in `buildCuMirImpl`, above) — the shim's variadic-forwarding arm reads
-    // `.strategy` to take the HomogeneousPointer arm (or fail loud on a model it has no arm
-    // for) and `.variadicUsesOverflowBase` to pick the va leaf WITHIN it.
-    if (!synthesizeStdioShim(cuMir.mir, model.lattice().interner(),
-                             stdioRecipes, cuMir.vaListLayout,
-                             cuMir.externImports, reporter)) {
-        return std::nullopt;  // recipe/helper-import/va-strategy mismatch — reported.
+    // UCRT-P4 (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE + D-FFI-PE-CRT-UCRT-MIGRATION):
+    // single-CU counterpart of the merge-path call (program.cpp). MATERIALIZE the
+    // resolved entry's arguments per its verb × the format's declared mechanism (on
+    // the CRT-accessor route this appends the pre-main init and retargets
+    // `userEntry` to it). The signature GATE is no longer here or anywhere in the
+    // back half: the semantic tier owns it, with a source span. The CU is already
+    // per-CU-optimized here, so an appended init skips the optimizer but is lowered
+    // like any other function; the interner is the CU model's (the type space this
+    // CU's TypeIds index into).
+    // Every id this lower half names goes through `nameOf` = the model's records, so
+    // both synthesis passes here mint above the model's id space as well as the module's:
+    // the MODULE carries that end and hands out the ids (mir/merge/synth_symbol_floor.hpp;
+    // ✔MEASURED P69 round 4: an id counted from the module alone published this init as
+    // `T __func__` in an x86_64 Linux image).
+    // An entry another input defines (P69 fold 3d): its init, where its verb needs
+    // one, is synthesized into THIS module and calls it by name; `userEntry` is
+    // then that init, and stays unset where none is needed (the caller states the
+    // entry on the object).
+    bool const shaped =
+        foreignEntry != nullptr
+            ? realizeForeignEntryShape(cuMir.mir, model.lattice().interner(),
+                                       foreignEntry->linkName, userEntry,
+                                       cuMir.externImports, entryVerb, processArgs,
+                                       cuMir.cSymbolDecoration, formatName, reporter)
+        : entryCalledWithTheVerbsSignature
+            ? realizeEntryShapeWithTheVerbsSignature(cuMir.mir, model.lattice().interner(),
+                                                     userEntry, cuMir.externImports, entryVerb,
+                                                     processArgs, cuMir.cSymbolDecoration,
+                                                     formatName, reporter)
+            : realizeEntryShape(cuMir.mir, model.lattice().interner(),
+                                userEntry, cuMir.externImports,
+                                entryVerb, processArgs, cuMir.cSymbolDecoration,
+                                formatName, reporter);
+    if (!shaped) {
+        return std::nullopt;  // unusable mechanism — fail-loud already reported.
     }
+
+    // The LIBRARY SHIMS (<threads.h>'s recipes) are NOT synthesized here any more: the
+    // caller ran `synthesizeLibraryShims` BEFORE this module's final optimize, as the merge
+    // seam always did (D-MIR-SYNTH-SHIM-SEAM-OPTIMIZE-PLACEMENT-ASYMMETRY — the contract is
+    // on its declaration). What this LOWER half still synthesizes — the entry shape above
+    // and the SEH funclets below — is a lowering artifact, placed after the final optimize
+    // at both seams alike.
 
     // c116 (D-WIN64-SEH-FUNCLETS): synthesize the SEH filter funclets + record the
     // scope ranges (post-optimize; the CU is already optimized here). Trigger =
@@ -2308,10 +2960,10 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
             : std::optional<std::string>(
                   std::string(wideFloatSoftcallLibrary));
 
-    return lowerMirModuleToAssembly(
+    auto assembled = lowerMirModuleToAssembly(
         cuMir.mir, model.lattice().interner(), nameOf,
         std::move(cuMir.externImports), userEntry, *cuMir.target,
-        cuMir.dataModel, cuMir.bitFieldStrategy, cuMir.unnamedBitFieldAlignment,
+        cuMir.bitFieldStrategy, cuMir.unnamedBitFieldAlignment,
         cuMir.callingConventionIndex, cuMir.cuId,
         cuMir.externCallDispatch, cuMir.dataImportBinding,
         cuMir.externAddrBinding,
@@ -2319,7 +2971,37 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
         std::move(sehScopes), std::move(wideFloatSoftcallLibraryOpt),
         atomicsRuntime, cuMir.indirectSlotBindings,
         cuMir.preemptibleDefinitionBindings, reporter,
-        cuMir.assemblyFormatKind);
+        cuMir.assemblyFormatKind, cuMir.commons, cuMir.imageDefinedNames);
+    // P69 fold 3f: what the unit's source asks of its link, on the module the
+    // link and the relocatable writers read it from -- its options applied as
+    // the unit's object would be read back.
+    if (!assembled.has_value()) return assembled;
+    appendUnitLinkerRequests(assembled->linkerRequests, cuMir.linkerRequests);
+    if (!stateUnitLinkerOptions(*assembled, cuMir.linkerOptionsDocument, reporter)) return std::nullopt;
+    return assembled;
+}
+
+bool stateUnitLinkerOptions(AssembledModule& module, ObjectFormatSchema const* document,
+                            DiagnosticReporter& reporter) {
+    if (module.linkerRequests.linkerOptions.empty()) return true;
+    auto const refuse = [&](std::string why) {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::K_LinkerDirectiveUnhonourable;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = "the module's units state linker options, and " + std::move(why);
+        reporter.report(std::move(d));
+        return false;
+    };
+    if (document == nullptr || document->backend() == nullptr) {
+        return refuse("no object document was stated to read them through.");
+    }
+    std::optional<bool> const applied =
+        document->backend()->applyUnitLinkerOptions(module, *document, reporter);
+    if (!applied.has_value()) {
+        return refuse(std::format("format '{}' states no option an object of it hands its linker.",
+                                  document->name()));
+    }
+    return *applied;
 }
 
 // LOWER half (merged whole-program): thin wrapper over the shared
@@ -2340,7 +3022,6 @@ std::optional<AssembledModule>
 lowerMergedToAssembly(MergedMirModule&    merged,
                       GrammarSchema const& /*grammar*/,
                       TargetSchema const& target,
-                      DataModel           dataModel,
                       BitFieldStrategy    bitFieldStrategy,
                       UnnamedBitFieldAlignment unnamedBitFieldAlignment,
                       std::uint16_t       callingConventionIndex,
@@ -2368,7 +3049,14 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       // bindings, pre-resolved one level up in program.cpp
                       // (same shape as `indirectSlotBindings` above).
                       std::vector<SymbolBinding> preemptibleDefinitionBindings,
-                      std::optional<ObjectFormatKind> assemblyFormatKind) {
+                      std::optional<ObjectFormatKind> assemblyFormatKind,
+                      // P69 fold 3b: the document's facts, pre-resolved in
+                      // program.cpp (see the declaration).
+                      CommonsStatement const& commons,
+                      // P69 fold 3d: the names the image will define,
+                      // pre-resolved in program.cpp (see the declaration).
+                      std::vector<std::string> imageDefinedNames) {
+    reportStage({StageEvent::Kind::Lowered, PipelineStage::Program, &merged.mir});
     // `nameOf`: merged SymbolId → declared name from the merge's `symbolNames` map.
     // A synthesized / nameless merged symbol is absent from the map → "" → skipped
     // by the LK11a symbol-table populate (module-private), exactly as in the CU path.
@@ -2380,14 +3068,21 @@ lowerMergedToAssembly(MergedMirModule&    merged,
     return lowerMirModuleToAssembly(
         merged.mir, merged.host.interner(), nameOf,
         std::move(merged.externImports), merged.userEntrySymbol, target,
-        dataModel, bitFieldStrategy, unnamedBitFieldAlignment,
+        bitFieldStrategy, unnamedBitFieldAlignment,
         callingConventionIndex, cuId,
         externCallDispatch, dataImportBinding, externAddrBinding, tlsAccess,
         std::move(sehScopes), std::move(wideFloatSoftcallLibrary),
         std::move(atomicsRuntime), std::move(indirectSlotBindings),
         std::move(preemptibleDefinitionBindings), reporter,
-        assemblyFormatKind);
+        assemblyFormatKind, commons, std::move(imageDefinedNames));
 }
+
+namespace {
+// The written names' statement (P69 fold 3f), defined beside the corpus's on-binary door below.
+[[nodiscard]] std::optional<std::vector<AssembledModule>>
+stateWrittenNameRoutes(std::span<AssembledModule const> modules, TargetSchema const& target,
+                       ObjectFormatSchema const& format, DiagnosticReporter& reporter);
+}  // namespace
 
 // Link N assembled CUs into one image + commit to disk. N==1 is the v1 single-CU
 // path; N>1 the linker merges the CUs (LK11a resolution + LK11b byte emission)
@@ -2415,6 +3110,18 @@ bool linkAndWrite(std::span<AssembledModule const> modules,
     // member is a relocatable object with no image identity to bind.
     ImageRequest emissionRequest = request;
     emissionRequest.artifactFileName = outPath.filename().string();
+    // ★ P69 fold 3f (ledger 549 (b)): an IMAGE states its units' written names first
+    // (`stateWrittenNameRoutes`). Every image link of this file passes here, after every binder and
+    // the archive search; a relocatable artifact states nothing, its final link decides.
+    std::vector<AssembledModule> statedModules;
+    if (format.isImageFlavor()) {
+        auto stated = stateWrittenNameRoutes(modules, target, format, reporter);
+        if (!stated.has_value()) return false;   // reported
+        if (!stated->empty()) {
+            statedModules = std::move(*stated);
+            modules       = std::span<AssembledModule const>{statedModules.data(), statedModules.size()};
+        }
+    }
     auto image = linker::link(modules, target, format, reporter,
                               emissionRequest);
     if (!image.ok() || !tierClean(reporter, linkEntry)) {
@@ -2444,86 +3151,65 @@ constexpr std::uint8_t kArGlobalMagic[8] = {'!', '<', 'a', 'r', 'c', 'h', '>', 0
 //
 // `ffi::realizeShippedExternSymbols` is keyed on the CANONICAL C IDENTIFIER,
 // because its first caller was the semantic tier, which is holding a C
-// declaration. TWO producers in this file are not: an assembly unit writes the
-// on-binary symbol itself (`call _puts`), and an ARCHIVE MEMBER is already-
-// compiled object code whose symbol table records whatever the compiler emitted.
-// Both therefore have to reach the same corpus rows through the same query, and
-// this is that query — one owner of "what does the platform say about this
-// on-binary name here", so the two producers cannot drift on the answer.
+// declaration. The producers in this file are not: an assembly unit writes the
+// on-binary symbol itself (`call _puts`), an ARCHIVE MEMBER or an object named to
+// the link is already-compiled object code whose symbol table records whatever
+// its compiler emitted, and the image link states what a reference WRITTEN with a
+// plain name binds to (`stateWrittenNameRoutes`). They therefore reach the same
+// corpus rows through the same query, and this is that query's on-binary door —
+// one owner of "what does the platform say about this on-binary name here", so
+// the producers cannot drift on the answer.
 //
-// ★★★ AND THE INVERSE OF THE DECORATION IS NOT ENOUGH ON ITS OWN — ✔MEASURED,
-// AND IT IS THE HALF THE OBVIOUS FIX MISSES. Un-decorating the written name
-// recovers the C identifier ONLY for a row the platform exports under its own
-// name. A row carrying `linkName` does not: pe's `<time.h>` `time` is exported as
-// `_time64`, `<io.h>`'s whole family as `_open`/`_close`/`_read`/`_write`/…,
-// Darwin x86_64's `opendir`/`readdir` as `opendir$INODE64`/`readdir$INODE64`,
-// `realpath` as `realpath$DARWIN_EXTSN`, and pe `_setjmp` as
-// `__intrinsic_setjmp`. A DSS-compiled TU applies `linkNameFor` BEFORE it emits,
-// so `#include <time.h>` + `time(0)` leaves `_time64` in the object's symbol
-// table — and `_time64` is not a corpus key, so a canonical-name-only lookup
-// misses EVERY one of those rows. ✔MEASURED (shipped CLI, pe64-x86_64, this
-// host): the member's undefined symbol is `_time64` and the exec link rejected
-// it with `K_SymbolUndefined`, i.e. an ordinary `#include <time.h>` in an
-// archived TU did not link. So the lookup runs FORWARD first and falls back to a
-// REVERSE index keyed by each row's REALIZED link name.
+// ★★★ P69 fold 3f (ledger 549 (b)): THE ANSWER IS THE READER'S, ONE ROUTE PER WRITTEN NAME
+// (`ffi::writtenNameRoutesOn`: `Direct`, `Body`, `LinkerAlias`, `Refused`, `Header`). The three
+// arms that stood here — FORWARD by the C spelling, a forward row realizing to ANOTHER name held
+// back, REVERSE by the realized link names (P69 fold 3e) — are the resolver's steps 1, 4 and 2,
+// in that precedence, so `call time` on pe still meets `_time64`'s row (`Header`, the row riding
+// along), `_time64` is answered by `time`'s row, and a foreign `strtol` by
+// `__dss_platform_strtol`'s (glibc, UCRT and libSystem export `strtol` itself, ✔MEASURED by lane
+// `xa`: readelf --dyn-syms of glibc 2.39, llvm-readobj --coff-exports of ucrtbase.dll, dlsym on
+// macOS 26). The reverse index's AMBIGUOUS rule — two rows realizing to one name, which a walk of
+// a hash map would otherwise decide — is the resolver's REFUSAL now, reported on `reporter`
+// (F_ShippedCorpusInvariantBroken, both rows named, sorted), where it used to route the reference
+// unbound with no word; the corpus sweep holds it at zero on every real pair
+// (`WrittenNameResolver`, tests/ffi).
 //
-// ★★ FORWARD FIRST, AND THE ORDER IS POLICY-BEARING RATHER THAN AN OPTIMIZATION.
-// A name found FORWARD is reported under the canonical identifier the caller
-// un-decorated, so a caller that refuses a `linkName` row reached by its C
-// spelling (the `.s` author who wrote `call time` where the platform exports
-// `_time64`) still sees exactly the row it has always seen, and its refusal is
-// unchanged. A name found only in REVERSE is reported under the ROW's own C
-// identifier, so `linkNameFor` on it reproduces the written name by construction
-// and the same refusal correctly stays silent. One lookup, both verdicts, no
-// second policy.
+// ⚠ THE INVERSE OF THE DECORATION IS CHECKED BY RE-APPLYING IT, WHICH IS NOT
+// PEDANTRY — ✔MEASURED, THE CONSERVATIVE INVERSE ALONE TURNED A BUILD ERROR INTO A
+// LOAD ERROR. `unapplyCMangling` passes an undecorated name THROUGH unchanged (its
+// documented, deliberately lenient contract), so a Mach-O source writing
+// `call putchar` — without the `_` that format requires — recovered the canonical
+// `putchar`, matched the corpus, and got BOUND to libSystem under a spelling
+// libSystem does not export. So a name is asked only when re-decorating the
+// recovered identifier reproduces BYTE-FOR-BYTE what the producer wrote; anything
+// else is not this platform's C symbol under this format's own declared rule, and
+// is ABSENT from the answer. No `_` literal and no format name appears here — the
+// rule is applied in both directions.
 //
-// ★★ AMBIGUITY IS REFUSED, NEVER FIRST-MATCHED. The reverse index is built by
-// walking a hash map, so a name two rows both realize to would otherwise be
-// decided by hash order — the "decides the answer by filesystem" hazard this
-// repo has already paid for. Two rows realizing to one on-binary name are
-// recorded as AMBIGUOUS and yield NO answer, which routes the reference unbound
-// to the link tier exactly as an unknown name does.
-struct PlatformExternRealization {
-    // The corpus row's own C identifier — what `linkNameFor` must be applied to
-    // in order to reproduce the on-binary name. NOT necessarily the caller's
-    // un-decorated spelling (see the FORWARD/REVERSE note above).
-    std::string                   canonicalName;
-    ffi::ShippedSymbolRealization row;
-};
-
-// Realize `onBinaryNames` against the shipped-descriptor corpus for the ACTIVE
-// (target, format). Returns one entry per name the corpus answers for; a name
-// with no row, no availability here, or an AMBIGUOUS reverse match is simply
-// ABSENT (the caller routes it unbound and the LINK tier judges the reference —
-// C23 5.1.1.2 phase 8). Returns nullopt IFF the corpus directory could not be
-// located, which is a statement about the ENVIRONMENT and never about the user's
-// program: the caller must then behave exactly as it did before this oracle
-// existed. `latticeOwner` / `latticeLabel` name the throwaway lattice the
-// descriptor decode needs; nothing reads the resulting TypeIds here.
+// Returns one answer per name asked (keyed by the ON-BINARY name), every route
+// included — each caller keeps its own accept/refuse policy, worded in its own
+// vocabulary. Returns nullopt IFF the corpus directory could not be located, which
+// is a statement about the ENVIRONMENT and never about the user's program: the
+// caller must then behave exactly as it did before this oracle existed.
+// `latticeOwner` / `latticeLabel` name the throwaway lattice the descriptor decode
+// needs; nothing reads the resulting TypeIds here.
 //
 // ── `reporter` — D-FFI-DUPLICATE-SYMBOL-ACROSS-DESCRIPTORS-SILENTLY-ORDER-RESOLVED
 //
-// ★★ IT IS THE REAL REPORTER, NOT A THROWAWAY, AND THE DISTINCTION IS THE FIX.
-// Every OTHER descriptor fault this path meets belongs to a descriptor the user
-// never asked for, so it is deliberately swallowed (see the skip rationale in the
-// oracle's header). A cross-descriptor realization DISAGREEMENT is the opposite
-// kind of fault: it is not "some unrelated file is malformed", it is "the corpus
-// gives TWO answers for a name THIS BUILD IS BINDING and the tie-break is a path
-// sort". Swallowing it is exactly the silence being deleted, so it travels on the
-// build's own reporter.
-//
-// ⓘ THE CALLER MUST REFUSE — the conflict is NOT in the return value. `nullopt`
-// keeps its single meaning ("the corpus directory could not be located", benign,
-// route unbound); a conflict is signalled by `reporter.errorCount()` having
-// moved, which is the `tierClean` idiom used throughout this file.
-[[nodiscard]] std::optional<std::unordered_map<std::string, PlatformExternRealization>>
-realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
-                                     TargetSchema const&          target,
-                                     ObjectFormatSchema const&    format,
-                                     CompilationUnitId            latticeOwner,
-                                     std::string_view             latticeLabel,
-                                     DiagnosticReporter&          reporter) {
-    std::unordered_map<std::string, PlatformExternRealization> out;
+// ★★ IT IS THE REAL REPORTER, NOT A THROWAWAY. A cross-descriptor realization
+// disagreement, and a written name the corpus gives two routes, are "the corpus
+// gives TWO answers for a name THIS BUILD IS BINDING", so they travel on the
+// build's own reporter. ⓘ THE CALLER MUST REFUSE — neither is in the return value:
+// `nullopt` keeps its single meaning, and a refusal is signalled by
+// `reporter.errorCount()` having moved (the `tierClean` idiom of this file).
+[[nodiscard]] std::optional<std::unordered_map<std::string, ffi::WrittenNameRouteAnswer>>
+writtenNameRoutesByOnBinaryName(std::span<std::string const> onBinaryNames,
+                                TargetSchema const&          target,
+                                ObjectFormatSchema const&    format,
+                                CompilationUnitId            latticeOwner,
+                                std::string_view             latticeLabel,
+                                DiagnosticReporter&          reporter) {
+    std::unordered_map<std::string, ffi::WrittenNameRouteAnswer> out;
     if (onBinaryNames.empty()) return out;
 
     auto const scheme = format.cSymbolDecoration().scheme;
@@ -2535,14 +3221,13 @@ realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
     // P68 round 12 (S2a-2a of D-C-STDLIB-H-LACKS-THIRTY-FIVE-ISO-NAMES): and it reads
     // each descriptor with the PAIR's facts, as the `#include` path does — the ABI
     // typedefs a row's signature may name (`wchar_t`) and the long-double format an
-    // arm may key on — built by the one owner of a pair's type facts. No consuming
-    // language: this oracle realizes symbol rows, never a lattice-derived constant.
+    // arm may key on — built by the one owner of a pair's type facts.
     PredefinedTypeFacts const typeFacts = predefinedTypeFactsFor(target, format);
     ffi::ShippedPairFacts const pairFacts{nullptr, typeFacts.dataModel, typeFacts.charIsUnsigned,
                                           typeFacts.abiTypedefs, typeFacts.longDoubleFormat};
 
     // The oracle interns each row's declared signature, so it needs a lattice.
-    // Neither of this file's on-binary-name producers has a `SemanticModel` (the
+    // None of this file's on-binary-name producers has a `SemanticModel` (the
     // `encode` tier's absence of one IS the tier; an archive member never had
     // one in this process at all), so one is built here, scoped to this call: a
     // throwaway interner keeps the descriptor read byte-for-byte the one the
@@ -2553,26 +3238,16 @@ realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
     // ★★★ `va_list` IS A REQUIRED PART OF THE CORPUS'S TYPE VOCABULARY, AND
     // OMITTING IT SILENTLY LOSES A WHOLE DESCRIPTOR. ✔MEASURED: without this
     // binding, `stdio.json` fails to decode (`vfprintf` and friends spell
-    // `va_list`, which no descriptor can declare — it is compiler-provided),
-    // `realizeShippedExternSymbols` SKIPS the unreadable descriptor by design,
-    // and every stdio name comes back absent ⇒ `Unknown` ⇒ unbound. So a `.s`
-    // calling `abort` (stdlib.json, no va_list anywhere) linked while one
-    // calling `putchar` did NOT — a per-descriptor split with no diagnostic
-    // between them. The corpus-wide decode test binds it for exactly this
-    // reason (`sysvVaListBinding`, tests/ffi).
-    //
-    // ★★ AND IT IS DERIVED FROM THE ACTIVE ABI, NEVER PICKED. The three shapes
-    // are the three `VaListStrategy` arms the semantic tier injects from the
-    // SAME `cc->vaListLayout->strategy`, so the descriptor read here sees the
-    // identical type the `#include` path would give it on this (target, format)
-    // — Win64's `char*` is 8 bytes and SysV's `__va_list_tag[1]` is 24, and a
-    // corpus row that ever gained a `signature` variant keyed on the
-    // difference would otherwise decode one way here and another way there.
-    // Hard-coding one arm would be a platform GUESS in shared substrate; asking
-    // the ABI is a fact lookup, with no `if (arch)` and no `if (format)`.
-    // ⓘ The resulting TypeId is not read by either caller. It is threaded so the
-    // READ succeeds and so that, when a future consumer does read it, it is
-    // already the right one rather than a placeholder someone must remember.
+    // `va_list`, which no descriptor can declare — it is compiler-provided), the
+    // oracle SKIPS the unreadable descriptor by design, and every stdio name comes
+    // back unanswered. So a `.s` calling `abort` (stdlib.json, no va_list
+    // anywhere) linked while one calling `putchar` did NOT — a per-descriptor
+    // split with no diagnostic between them. ★★ AND IT IS DERIVED FROM THE ACTIVE
+    // ABI, NEVER PICKED: the shape the semantic tier injects from the same
+    // `cc->vaListLayout->strategy`, through the ONE builder it reads too
+    // (`vaListTypes`), so the descriptor read here sees the type the `#include`
+    // path would give it on this (target, format). ⓘ The TypeId is not read by
+    // any caller; it is threaded so the READ succeeds.
     std::array<NamedTypeBinding, 1> namedTypeStorage{};
     std::span<NamedTypeBinding const> namedTypes{};
     {
@@ -2583,142 +3258,171 @@ realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
             && abi->cc->vaListLayout.has_value()) {
             strat = abi->cc->vaListLayout->strategy;
         }
-        auto& in = lattice.interner();
-        TypeId vaListTy;
-        if (strat == VaListStrategy::HomogeneousPointer) {
-            vaListTy = in.pointer(in.primitive(TypeKind::I8));   // Win64: char*
-        } else if (strat == VaListStrategy::Aapcs64DualCursor) {
-            TypeId const voidPtr = in.pointer(in.primitive(TypeKind::Void));
-            std::array<TypeId, 5> f{voidPtr, voidPtr, voidPtr,
-                                    in.primitive(TypeKind::I32),
-                                    in.primitive(TypeKind::I32)};
-            vaListTy = in.structType("__va_list", f);
-        } else {
-            // SysVRegisterSave, and the nullopt default: a cc with no
-            // `vaListLayout` has no variadic-callee surface at all, so the
-            // SysV-family shape is inert there — the identical fallback the
-            // semantic injector takes.
-            TypeId const voidPtr = in.pointer(in.primitive(TypeKind::Void));
-            std::array<TypeId, 4> f{in.primitive(TypeKind::U32),
-                                    in.primitive(TypeKind::U32), voidPtr,
-                                    voidPtr};
-            vaListTy = in.array(in.structType("__va_list_tag", f), 1);
-        }
-        namedTypeStorage[0] = NamedTypeBinding{"va_list", vaListTy};
+        TypeId const vaListTy =
+            vaListTypes(strat.value_or(VaListStrategy::SysVRegisterSave),
+                        lattice.interner()).list;
+        namedTypeStorage[0] =
+            NamedTypeBinding{ffi::kVaListDescriptorTypeName, vaListTy};
         namedTypes = std::span<NamedTypeBinding const>{namedTypeStorage.data(),
                                                        1};
     }
 
-    // ── FORWARD: the caller's spelling, un-decorated ─────────────────────────
-    //
-    // ⚠ THE INVERSE IS CHECKED BY RE-APPLYING IT, WHICH IS NOT PEDANTRY —
-    // ✔MEASURED, THE CONSERVATIVE INVERSE ALONE TURNED A BUILD ERROR INTO A LOAD
-    // ERROR. `unapplyCMangling` passes an undecorated name THROUGH unchanged (its
-    // documented, deliberately lenient contract), so a Mach-O source writing
-    // `call putchar` — without the `_` that format requires — recovered the
-    // canonical `putchar`, matched the corpus, and got BOUND to libSystem under a
-    // spelling libSystem does not export. A "fix" that replaces a build error
-    // with a dyld failure at process start is a regression, not a feature. So a
-    // name is carried FORWARD only when re-decorating the recovered identifier
-    // reproduces BYTE-FOR-BYTE what the producer wrote; anything else is not this
-    // platform's C symbol under this format's own declared rule. No `_` literal
-    // and no format name appears here — the rule is applied in both directions.
-    std::vector<std::string> canonicalOf(onBinaryNames.size());
-    std::vector<std::string> forwardRequest;
-    forwardRequest.reserve(onBinaryNames.size());
+    // The written names: each on-binary name un-decorated by the format's own
+    // rule, kept only where the rule re-applied reproduces it (the ⚠ note).
+    std::vector<std::string> writtenOf(onBinaryNames.size());
+    std::vector<std::string> asked;
+    asked.reserve(onBinaryNames.size());
     for (std::size_t i = 0; i < onBinaryNames.size(); ++i) {
         if (onBinaryNames[i].empty()) continue;
-        std::string canonical = ffi::unapplyCMangling(onBinaryNames[i], scheme);
-        if (ffi::applyCMangling(canonical, scheme) != onBinaryNames[i]) continue;
-        canonicalOf[i] = std::move(canonical);
-        forwardRequest.push_back(canonicalOf[i]);
+        std::string written = ffi::unapplyCMangling(onBinaryNames[i], scheme);
+        if (ffi::applyCMangling(written, scheme) != onBinaryNames[i]) continue;
+        writtenOf[i] = std::move(written);
+        asked.push_back(writtenOf[i]);
     }
-
-    if (!forwardRequest.empty()) {
-        auto const realized = ffi::realizeShippedExternSymbols(
-            forwardRequest, lattice.interner(), lattice.registry(), reporter,
-            format.dataModel(), std::optional<std::string_view>{target.name()},
-            format.kind(), namedTypes, &roleResolver, &pairFacts);
-        if (!realized.has_value()) return std::nullopt;   // corpus not located
-        for (std::size_t i = 0; i < onBinaryNames.size(); ++i) {
-            if (canonicalOf[i].empty()) continue;
-            auto const row = realized->find(canonicalOf[i]);
-            if (row == realized->end()) continue;
-            // Only a fully realized row is an ANSWER. `Unknown`,
-            // `UnavailableForFormat` and `NoLibraryForFormat` all mean "the
-            // platform states no image for this name here" ⇒ absent, so the
-            // caller routes it unbound. Enumerated by the status check, never
-            // fallen through.
-            if (row->second.status != ffi::ShippedRealizationStatus::Realized) {
-                continue;
-            }
-            out.emplace(onBinaryNames[i],
-                        PlatformExternRealization{canonicalOf[i], row->second});
-        }
-    }
-
-    // ── REVERSE: the corpus's own realized link names ────────────────────────
-    //
-    // Built ONLY for the names FORWARD could not answer, and only when there are
-    // any: realizing the whole corpus decodes every descriptor's signatures, and
-    // the ordinary case (every unbound name is a plain library export, or a
-    // sibling symbol the caller already filtered out) never reaches this.
-    std::vector<std::string> missing;
-    for (auto const& name : onBinaryNames) {
-        if (!name.empty() && out.find(name) == out.end()) missing.push_back(name);
-    }
-    if (missing.empty()) return out;
-
-    auto const allNames = ffi::collectShippedExternSymbolFormats();
-    if (!allNames.has_value()) return std::nullopt;   // corpus not located
-    std::vector<std::string> everyName;
-    everyName.reserve(allNames->size());
-    for (auto const& [name, formats] : *allNames) {
-        (void)formats;   // availability is re-decided by the realization below
-        everyName.push_back(name);
-    }
-    if (everyName.empty()) return out;
-    // ★ THE AGREEMENT CHECK THIS CALL RUNS IS CORPUS-WIDE, BECAUSE THE QUESTION
-    // IS. Every other caller asks about a handful of names and is held to those;
-    // this arm genuinely asks "realize EVERY name", because the reverse index it
-    // is building is keyed on realized link names and cannot be narrowed before
-    // the realization exists. So a disagreement anywhere in the corpus is a
-    // disagreement about an answer this call is computing, and it is reported.
-    // ⓘ It is reached only when the FORWARD pass left a name unbound, so the
-    // ordinary build never pays for it.
-    auto const wholeCorpus = ffi::realizeShippedExternSymbols(
-        everyName, lattice.interner(), lattice.registry(), reporter,
-        format.dataModel(), std::optional<std::string_view>{target.name()},
-        format.kind(), namedTypes, &roleResolver, &pairFacts);
-    if (!wholeCorpus.has_value()) return std::nullopt;   // corpus not located
-
-    // on-binary name -> the row realizing to it. A SECOND row claiming one name
-    // marks the key AMBIGUOUS (see the ★★ note): it is erased and blacklisted,
-    // so no answer is returned for it and the reference routes unbound.
-    std::unordered_map<std::string, PlatformExternRealization> byLinkName;
-    std::unordered_set<std::string>                            ambiguous;
-    for (auto const& [cName, row] : *wholeCorpus) {
-        if (row.status != ffi::ShippedRealizationStatus::Realized) continue;
-        std::string onBinary =
-            ffi::linkNameFor(cName, /*asmLabel=*/{}, scheme, row.linkName);
-        if (onBinary.empty()) continue;
-        if (ambiguous.count(onBinary) != 0) continue;
-        auto const it = byLinkName.find(onBinary);
-        if (it != byLinkName.end()) {
-            if (it->second.canonicalName == cName) continue;   // the same row
-            ambiguous.insert(onBinary);
-            byLinkName.erase(it);
-            continue;
-        }
-        byLinkName.emplace(std::move(onBinary),
-                           PlatformExternRealization{cName, row});
-    }
-    for (auto const& name : missing) {
-        auto const it = byLinkName.find(name);
-        if (it == byLinkName.end()) continue;
-        out.emplace(name, it->second);
+    if (asked.empty()) return out;
+    auto const routes = ffi::writtenNameRoutesOn(
+        asked, lattice.interner(), lattice.registry(), reporter, format.dataModel(),
+        std::optional<std::string_view>{target.name()}, format.kind(), namedTypes,
+        &roleResolver, &pairFacts);
+    if (!routes.has_value()) return std::nullopt;   // corpus not located
+    for (std::size_t i = 0; i < onBinaryNames.size(); ++i) {
+        if (writtenOf[i].empty()) continue;
+        auto const route = routes->find(writtenOf[i]);
+        if (route != routes->end()) out.try_emplace(onBinaryNames[i], route->second);
     }
     return out;
+}
+
+// ★ P69 fold 3f (ledger 549 (b); main's ruling (a)): a written name the corpus REFUSES on this
+// format (`ffi::WrittenNameRouteKind::Refused`) is refused BY NAME with the reason its data states
+// — `__iob_func`, the msvcrt runtime's stream accessor, which no UCRT image exports (MinGW's own
+// UCRT link leaves it undefined, ✔MEASURED 2026-11-17 by lane `xa`, d257) — never left to the
+// link's generic undefined symbol, which names neither the platform nor why.
+void reportRefusedWrittenName(std::string_view onBinaryName, ffi::WrittenNameRouteAnswer const& route,
+                              ObjectFormatSchema const& format, DiagnosticReporter& reporter) {
+    ParseDiagnostic d;
+    d.code     = DiagnosticCode::F_ShippedSymbolUnavailableForTarget;
+    d.severity = DiagnosticSeverity::Error;
+    d.actual   = std::format(
+        "'{}' is written by a unit of this link, and on object format '{}' the platform's link refuses that "
+        "name: {}",
+        onBinaryName, objectFormatKindName(format.kind()), route.reason);
+    reporter.report(std::move(d));
+}
+
+// ── THE WRITTEN NAMES' STATEMENT (P69 fold 3f, ledger 549 (b); home audit v3 §2, §3.C) ──────
+//
+// ★★★ ONE PRODUCER, ONCE PER IMAGE. A reference WRITTEN with a plain name W whose route on
+// this pair is `LinkerAlias` (the 17 POSIX names the UCRT exports only as `_<W>`: `close`,
+// `write`, ...) binds the way the platform's own link binds it: link.exe maps W to the link
+// name through oldnames.lib's WEAK EXTERNAL `W` -> `_W` (a definition of W in the link beats
+// it), and MinGW's import libraries define W over the same `_W` export (✔MEASURED 2026-11-17
+// by lane `xa`, d256 on windows-x86_64-release, d257 on windows-x86_64-debug). So the row is
+// stated as exactly that weak external: binding Weak, its fallback the link name decorated by
+// the format, and the fallback's IMAGE beside it (`ExternImport::fallbackLibraryPath`), which
+// `linker::bindFallbackReferences` applies only when it TAKES the fallback — an image whose
+// program defines W imports nothing (F9). Every unit of the link is a writer: a foreign object
+// (named or pulled), a `.s`, and DSS's own C units, whose front end keeps the written name
+// under `LinkerAlias` and binds nothing (`ffi::frontEndKeepsTheWrittenName`).
+//
+// ★★ WHY HERE, AFTER EVERY BINDER AND THE ARCHIVE SEARCH, AND NOT AS EACH UNIT JOINS THE
+// LINK (v3 §2 placed it at the join, so the search would read it): BY MEASUREMENT, the
+// platform's LIBRARY answers the alias's fallback, never a user archive. A user archive whose
+// member defines `_access` beside an object writing `access` (cell (b)-L, A8): link.exe loads
+// libucrt.lib's member and never u.lib's (d256), and GNU ld binds MinGW's own and never
+// libu.a's (d257). Stated at the join, the search would offer `_access` to the archives and
+// pull the member neither reference pulls. The search still answers W itself: a member that
+// defines W is pulled for the reference to W, as both references pull it.
+//
+// ★ WHAT IS STATED: an UNBOUND reference (no image yet), not a common, not a name the link
+// defines, that the unit USES (the reference gate's question: an injected declaration no code
+// names states nothing and is dropped), whose route is `LinkerAlias`. A reference that already
+// states a fallback of its own — an object's `/alternatename:W=X`, a weak external's default —
+// meets the alias through the ONE rule of which fallback stands (`linker::standingFallback`):
+// the alias is a weak external's own default, so it stands over a directive (link.exe:
+// `/alternatename:access=my_access` LOSES to OLDNAMES' `access`, d256) and after a weak
+// external of the link's own inputs (oldnames.lib is searched after them; its place is none).
+//
+// Returns nullopt when it reported (the corpus disagreeing with itself about a name asked); an
+// EMPTY vector when nothing is stated, so `modules` stand as given; else the stated copy.
+[[nodiscard]] std::optional<std::vector<AssembledModule>>
+stateWrittenNameRoutes(std::span<AssembledModule const> modules, TargetSchema const& target,
+                       ObjectFormatSchema const& format, DiagnosticReporter& reporter) {
+    std::vector<AssembledModule> unstated;
+    // What the link defines: a reference to it binds to that definition (the merge), never
+    // to a fallback, so it is never stated.
+    std::unordered_set<std::string> definedNames;
+    for (auto const& m : modules) {
+        for (auto const& ms : m.symbols) {
+            if (link::format::ObjectSymbolNames::hasExternalLinkage(ms)) definedNames.insert(ms.name);
+        }
+        for (auto const& ext : m.externImports) {
+            if (ext.commonSize != 0u && !ext.mangledName.empty()) definedNames.insert(ext.mangledName);
+        }
+    }
+    std::vector<std::unordered_set<std::uint32_t>> usedBy;
+    usedBy.reserve(modules.size());
+    auto const askable = [&](ExternImport const& ext, std::size_t mi) {
+        return !ext.mangledName.empty() && ext.libraryPath.empty() && ext.commonSize == 0u
+            && !definedNames.contains(ext.mangledName)
+            && linker::externSurvivesReferenceGate(ext, usedBy[mi]);
+    };
+    std::vector<std::string> names;
+    for (std::size_t mi = 0; mi < modules.size(); ++mi) {
+        usedBy.push_back(linker::relocationTargetIds(modules[mi]));
+        for (auto const& ext : modules[mi].externImports) {
+            if (askable(ext, mi)) names.push_back(ext.mangledName);
+        }
+    }
+    if (names.empty()) return unstated;
+    auto const corpusEntry = reporter.errorCount();
+    auto const routes = writtenNameRoutesByOnBinaryName(
+        names, target, format, substrate::mintMonotonicId<CompilationUnitId>(), format.name(), reporter);
+    if (!tierClean(reporter, corpusEntry)) return std::nullopt;
+    if (!routes.has_value()) return unstated;   // no corpus located: the environment, nothing stated
+    std::string const formatKey{objectFormatKindName(format.kind())};
+    auto const scheme = format.cSymbolDecoration().scheme;
+    std::optional<std::vector<AssembledModule>> stated;
+    for (std::size_t mi = 0; mi < modules.size(); ++mi) {
+        for (std::size_t k = 0; k < modules[mi].externImports.size(); ++k) {
+            ExternImport const& ext = modules[mi].externImports[k];
+            if (!askable(ext, mi)) continue;
+            auto const found = routes->find(ext.mangledName);
+            if (found == routes->end() || found->second.kind != ffi::WrittenNameRouteKind::LinkerAlias) continue;
+            ffi::ShippedSymbolRealization const& row = found->second.row;
+            // The reader refuses a `linkerAlias` with no image here at load (a weak default must
+            // reach an export), so the row names one.
+            auto const lib = row.library.find(formatKey);
+            if (lib == row.library.end() || lib->second.empty()) continue;
+            linker::FallbackStatement alias{
+                ffi::linkNameFor(found->second.canonicalName, /*asmLabel=*/{}, scheme, row.linkName),
+                linker::FallbackSource::WeakDefault, std::nullopt,
+                "the platform's link (shipped-corpus `linkerAlias` of '" + found->second.canonicalName + "')"};
+            bool const ownStatement = !ext.fallbackName.empty() || ext.binding == SymbolBinding::Weak;
+            if (ownStatement) {
+                linker::FallbackStatement own{
+                    ext.fallbackName,
+                    ext.binding == SymbolBinding::Weak ? linker::FallbackSource::WeakDefault
+                                                       : linker::FallbackSource::Directive,
+                    linkPositionOf(modules[mi], ext.symbol), "linked unit #" + std::to_string(mi)};
+                std::string const aliasFallback = alias.fallback;
+                linker::standingFallback(ext.mangledName, own, std::move(alias), reporter);
+                if (own.source != linker::FallbackSource::WeakDefault || own.fallback != aliasFallback
+                    || own.place.has_value()) {
+                    continue;   // the unit's own statement stands
+                }
+            }
+            if (!stated.has_value()) stated.emplace(modules.begin(), modules.end());
+            ExternImport& s = (*stated)[mi].externImports[k];
+            s.binding             = SymbolBinding::Weak;
+            s.fallbackName        = ffi::linkNameFor(found->second.canonicalName, /*asmLabel=*/{}, scheme,
+                                                     row.linkName);
+            s.fallbackLibraryPath = lib->second;
+            s.fallbackVersion     = row.version;
+            s.fallbackIsData      = !row.isFunction;
+        }
+    }
+    return stated.has_value() ? std::move(*stated) : unstated;
 }
 
 // ── D-LK-ARCHIVE-MEMBER-EXTERN-CANNOT-BIND-A-RESOLVE-LIBRARY ─────────────────
@@ -2726,7 +3430,7 @@ realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
 // ★★★ THE `--resolve-library` BINDING QUERY: what the binaries THE OPERATOR
 // NAMED say about a symbol, asked ONCE for every producer that needs it.
 //
-// The sibling of `realizePlatformExternsByOnBinaryName` above, and it exists for
+// The sibling of `writtenNameRoutesByOnBinaryName` above, and it exists for
 // the identical reason. That helper owns "what does the PLATFORM say about this
 // on-binary name here"; this one owns "what do the binaries the BUILD WAS
 // POINTED AT say about it". Both questions have the same two askers — an
@@ -2783,7 +3487,15 @@ resolveOperatorNamedLibraryImports(std::span<ResolveLibrarySpec const> libraries
     std::unordered_map<std::string, OperatorNamedImport> bySymbol;
     if (libraries.empty()) return bySymbol;
 
-    for (auto const& lib : libraries) {
+    // ★ EVERY LIBRARY IS READ, AND REPORTS ITS OWN REFUSAL, BEFORE THE BINDING
+    // FAILS (`substrate::runEveryUnit`, the several-unit class's one home; site
+    // (f) of the orchestrator's ledger 568, P69 fold 3e): a library whose
+    // surface cannot be read never stops the libraries after it. The first row
+    // a name meets still wins (`try_emplace`, in library order).
+    bool const everyLibraryRead = substrate::runEveryUnit(libraries.size(), substrate::namingSilentUnits(
+        reporter, "the operator-named library binding", [&](std::size_t l) { return "library '" + core::genericSpelling(libraries[l].path) + "'"; },
+        [&](std::size_t l) {
+        ResolveLibrarySpec const& lib = libraries[l];
         // ★ THE TARGET-AWARE READ, NOT THE BARE READER. This binder and
         // `ingest()`'s `readSource` are the paths a `--resolve-library` binary
         // reaches FF1 by, and a wrong-FORMAT library must be refused on all of
@@ -2791,7 +3503,7 @@ resolveOperatorNamedLibraryImports(std::span<ResolveLibrarySpec const> libraries
         // formats are undecorated and the export names match verbatim
         // (D-FFI-RESOLVE-LIBRARY-WRONG-FORMAT-GUARD-IS-INCIDENTAL).
         auto surface = ffi::readImportsForTargetFormat(lib.path, format, reporter);
-        if (!surface.has_value()) return std::nullopt;   // reported loud there
+        if (!surface.has_value()) return false;   // reported loud there
         std::string const basename = lib.path.filename().string();
         for (auto const& row : *surface) {
             if (row.mangledName.empty()) continue;
@@ -2811,15 +3523,18 @@ resolveOperatorNamedLibraryImports(std::span<ResolveLibrarySpec const> libraries
                 OperatorNamedImport{std::move(identity), std::move(version),
                                     row.kind});
         }
-    }
+        return true;
+    }));
+    if (!everyLibraryRead) return std::nullopt;
     return bySymbol;
 }
 
 }  // namespace
 
 bool isArArchiveFile(std::filesystem::path const& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) return false;   // unreadable -> stays dynamic (eager probe fails loud)
+    auto opened = core::openInputStream(path, std::ios::binary);
+    if (!opened) return false;   // unreadable -> stays dynamic (the eager probe names it, with the OS's reason)
+    std::ifstream& in = *opened;
     std::uint8_t buf[8] = {};
     in.read(reinterpret_cast<char*>(buf), static_cast<std::streamsize>(sizeof(buf)));
     if (in.gcount() != static_cast<std::streamsize>(sizeof(buf))) return false;
@@ -2831,8 +3546,9 @@ bool isArArchiveFile(std::filesystem::path const& path) {
 
 bool isRelocatableObjectFile(std::filesystem::path const& path,
                              ObjectFormatSchema const&    format) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) return false;   // unreadable -> stays dynamic (eager probe fails loud)
+    auto opened = core::openInputStream(path, std::ios::binary);
+    if (!opened) return false;   // unreadable -> stays dynamic (the eager probe names it, with the OS's reason)
+    std::ifstream& in = *opened;
 
     // A HEADER PREFIX, never the file. Every field the backends inspect lives in
     // the first few dozen bytes (the ELF `e_type` at 16, the Mach-O `filetype`
@@ -2952,11 +3668,21 @@ partitionResolveLibraries(std::span<ResolveLibrarySpec const> libraries,
 // through the `container: "archive"` schema, so that schema is the one that
 // wrote the bytes being read back.
 //
-// ⓘ WHY A NON-IMAGE LINK FORMAT SHORT-CIRCUITS rather than resolving. On the
-// fat-archive path the link format is itself a relocatable one (`-staticlib`,
-// or the bare `.o` format), so its own `relocations()` IS an object-relocation
-// table -- the identity case, not a fallback to something merely close. That
-// path was already correct and stays free of the scan.
+// ⓘ WHY AN ARCHIVE LINK FORMAT SHORT-CIRCUITS rather than resolving. On the
+// fat-archive path the link format IS the `container: "archive"` document, the
+// one that wrote the members -- the identity case, not a fallback to something
+// merely close. That path was already correct and stays free of the scan.
+//
+// ★ A BARE RELOCATABLE LINK FORMAT RESOLVES ITS SIBLING, AS AN IMAGE DOES (P69
+// round 5, D-LK-ARCHIVE-SEARCH-FETCHES-A-MEMBER-FOR-A-WEAK-REFERENCE). It took
+// the identity case until then, on the true ground that its relocation table is
+// an object's; but the member document also states what an ARCHIVE SEARCH does
+// (`archiveWeakReferenceSearch`, `archiveCommonResolution`), and those answers
+// live on the archive document ALONE, so a relocatable link that met either
+// question was refused where every reference linker's `-r` links it
+// (✔MEASURED 2026-10-08: GNU ld 2.42 and ld.lld 18 leave the weak reference
+// unresolved and fetch nothing, ld64 fetches the member -- the image link's own
+// answers). One document per family states them; every link reads that one.
 struct ArchiveMemberFormat {
     // The resolved answer, or null until first use. Points either at the link's
     // own schema (the identity case) or into `owned`.
@@ -2998,9 +3724,10 @@ archiveMemberFormat(ArchiveMemberFormat&          cache,
         d.severity = DiagnosticSeverity::Error;
         d.actual   = std::format(
             "static-link: cannot determine the object format of archive member "
-            "'{}' in '{}'. The link is producing '{}', whose relocation "
-            "vocabulary describes an IMAGE and was never promised to describe a "
-            "relocatable member; the member's own object format {}. {} "
+            "'{}' in '{}'. The link is producing '{}', which is not an archive "
+            "document: an archive's members are described by the format's "
+            "archive-writing sibling, never by the document of the artifact being "
+            "linked; the member's own object format {}. {} "
             "Anchored: "
             "D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-THE-OBJECT-FORMAT.",
             memberName, core::genericSpelling(archivePath), linkFormat.name(),
@@ -3013,9 +3740,10 @@ archiveMemberFormat(ArchiveMemberFormat&          cache,
         return nullptr;
     };
 
-    // The identity case: a relocatable link format already speaks the object
-    // vocabulary (see the note above).
-    if (!linkFormat.isImageFlavor()) {
+    // The identity case: an ARCHIVE document is its members' own (see the note
+    // above). Every other link format -- an image, a bare relocatable --
+    // resolves the archive-writing sibling.
+    if (linkFormat.isStaticArchive()) {
         cache.schema = &linkFormat;
         return cache.schema;
     }
@@ -3044,6 +3772,129 @@ archiveMemberFormat(ArchiveMemberFormat&          cache,
     cache.schema = cache.owned.get();
     return cache.schema;
 }
+
+// ★ THE DOCUMENT THAT DESCRIBES A UNIT'S OBJECT (P69 fold 3f, `#pragma comment`).
+//
+// A unit's request is read as its OBJECT would state it: by `format` itself unless `format` makes an IMAGE, whose
+// document states no object vocabulary -- the family's objects are described by the archive-writing sibling, the
+// document every object and member of the family is read through (`archiveMemberFormat`, the same question), so a
+// unit compiled straight into an image means what it means compiled to an object and linked. `owner` keeps a
+// loaded sibling alive. nullptr: it cannot be had, refused here by name.
+constexpr ::dss::runtime::ArchiveSiblingRequester kUnitObjectDocumentRequester{
+    "a unit's `#pragma comment`", kArchiveMemberRequester.anchor};
+
+[[nodiscard]] static ObjectFormatSchema const*
+objectDocumentOf(ObjectFormatSchema const&                  format,
+                 TargetSchema const&                        target,
+                 std::shared_ptr<ObjectFormatSchema const>& owner,
+                 DiagnosticReporter&                        reporter) {
+    if (!format.isImageFlavor()) return &format;
+    auto const refuse = [&](std::string detail) -> ObjectFormatSchema const* {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::D_SchemaLoadFailed;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = std::format(
+            "a unit's `#pragma comment`: the document that describes the objects of format '{}' cannot be had, so "
+            "what the unit asks of its link cannot be read: {}",
+            format.name(), detail);
+        reporter.report(std::move(d));
+        return nullptr;
+    };
+    auto const formatsDir = findShippedConfigDir("object-formats");
+    if (!formatsDir) {
+        return refuse("the shipped `object-formats` directory could not be located (set DSS_CONFIG_ROOT, or run "
+                      "from inside the config tree).");
+    }
+    auto const sibling = ::dss::runtime::resolveArchiveSiblingFormat(format, target, *formatsDir,
+                                                                     kUnitObjectDocumentRequester);
+    if (!sibling) return refuse(sibling.error());
+    auto loaded = ObjectFormatSchema::loadShipped(*sibling);
+    if (!loaded) {
+        std::string detail;
+        for (auto const& diag : loaded.error()) detail += (detail.empty() ? "" : "; ") + diag.message;
+        return refuse("'" + *sibling + "' does not load: " + detail);
+    }
+    owner = std::move(loaded).value();
+    return owner.get();
+}
+
+// ★ WHAT A UNIT'S SOURCE ASKS OF ITS LINK, IN ITS FORMAT'S FORM (P69 fold 3f, lane `xa`).
+//
+// Each reached `#pragma comment` that asks something (`CompilationUnit::pragmaLinkRequests`), as the unit's OBJECT
+// would state it (`objectDocumentOf`):
+//   * a LIBRARY to search. An IMAGE link searches no library a unit names: a DSS link binds a library function
+//     through its descriptors and the `--resolve-library` inputs, and a name nothing resolves still fails loud (ELF's
+//     `elf.dependentLibraries` block, COFF's `dependentLibrary` row and Mach-O's `macho.linkerOptions` state the same
+//     reason) -- so an image takes none, in silence, as it takes a read object's. An object that names libraries
+//     (`statesDependentLibraries`) names each (✔MEASURED P69 fold 3f: clang writes `.deplibs` and ld.lld honours it;
+//     cl writes `/DEFAULTLIB:` and link.exe honours it; clang -fms-extensions writes LC_LINKER_OPTION `-l` and ld64
+//     honours it); one that names none drops it with a WARNING, as gcc does;
+//   * an OPTION for its linker. An object that states options (`readsLinkerDirectives`) takes the text as the unit's
+//     own (`UnitLinkerRequests::linkerOptions`), which its format's backend applies once the module is assembled
+//     (`stateUnitLinkerOptions`); one that states none drops it with a WARNING, as clang does on ELF ("'#pragma
+//     comment linker' ignored").
+static void stateSourceLinkerRequests(CuMirModule&                       cuMir,
+                                      std::span<PragmaLinkRequest const> requests,
+                                      ObjectFormatSchema const&          format,
+                                      TargetSchema const&                target,
+                                      DiagnosticReporter&                reporter) {
+    UnitLinkerRequests& out = cuMir.linkerRequests;
+    bool                asked = false;   // the object document is had once, and only for an option
+    auto const objectDocument = [&]() -> ObjectFormatSchema const* {
+        if (!asked) {
+            cuMir.linkerOptionsDocument = objectDocumentOf(format, target, cuMir.linkerOptionsDocumentOwner, reporter);
+            asked = true;
+        }
+        return cuMir.linkerOptionsDocument;
+    };
+    auto const dropped = [&](std::string_view kind, std::string_view text, std::string_view document,
+                             std::string_view why) {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::K_LinkerDirectiveIgnored;
+        d.severity = DiagnosticSeverity::Warning;
+        d.actual   = std::format("`#pragma comment` asks the link to {} '{}', and format '{}' {} -- the request "
+                                 "is dropped, as clang and gcc drop it",
+                                 kind, text, document, why);
+        reporter.report(std::move(d));
+    };
+    for (PragmaLinkRequest const& r : requests) {
+        switch (r.request) {
+            case PragmaCommentRequest::DependentLibrary: {
+                if (format.isImageFlavor()) break;   // an image link searches no library a unit names
+                if (!format.statesDependentLibraries()) {
+                    dropped("search the library", r.text, format.name(), "writes objects that name no library");
+                    break;
+                }
+                // Each named once, at its first statement, where the requests fold onto the module
+                // (`appendUnitLinkerRequests`, the one home of "once").
+                out.dependentLibraries.push_back(r.text);
+                break;
+            }
+            case PragmaCommentRequest::LinkerDirective: {
+                ObjectFormatSchema const* const document = objectDocument();
+                if (document == nullptr) break;   // refused by name
+                if (!document->readsLinkerDirectives()) {
+                    dropped("read the option", r.text, document->name(), "states no option an object hands its linker");
+                    break;
+                }
+                out.linkerOptions.push_back({r.text});
+                break;
+            }
+            case PragmaCommentRequest::Nothing:
+                break;   // the preprocessor records none
+        }
+    }
+    if (out.linkerOptions.empty()) {
+        cuMir.linkerOptionsDocument = nullptr;   // no option: no document is read
+        cuMir.linkerOptionsDocumentOwner.reset();
+    }
+}
+
+// ★ A REFUSAL OF ONE INPUT NAMES THE INPUT: every read of a named object or
+// archive input below goes through `substrate::readNamingTheInput`
+// (core/substrate/input_named_diagnostics.hpp, the class's one home), as the FF1
+// surface read of a named library does inside `ffi::readImportsForTargetFormat`.
+using substrate::readNamingTheInput;
 
 // Parse ONE `ar` member's raw bytes back into a mergeable `AssembledModule`,
 // dispatching to the per-FORMAT relocatable-object reader by the object-format
@@ -3112,166 +3963,51 @@ readArchiveMemberModule(std::span<std::uint8_t const> memberBytes,
         reporter.report(std::move(d));
         return std::nullopt;
     }
-    return backend->readRelocatableObject(memberBytes, target, format,
-                                          reporter, memberCu);
+    // The member, named as its archive's open refusal names the archive (a
+    // named object is a member of a one-member container, named by its path).
+    std::string const input =
+        memberName == archivePath.filename().string()
+            ? core::genericSpelling(archivePath)
+            : std::format("{}({})", core::genericSpelling(archivePath), memberName);
+    auto unit = readNamingTheInput(input, reporter, [&](DiagnosticReporter& inputReporter) {
+        return backend->readRelocatableObject(memberBytes, target, format, inputReporter, memberCu);
+    });
+    // P69 send-back 5 (review-xa4 NIT 11): every request the unit states names
+    // the unit -- the object's file, or `archive(member)` -- from here on, so
+    // each diagnostic a link makes of one says whose directive it is.
+    if (unit.has_value() && !unit->linkerRequests.empty()) {
+        std::string const file = archivePath.filename().string();
+        nameStatingUnit(unit->linkerRequests,
+                        memberName == file ? file : std::format("{}({})", file, memberName));
+    }
+    return unit;
 }
 
-std::optional<std::vector<AssembledModule>>
-pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
-                         std::span<std::filesystem::path const> archivePaths,
-                         std::span<ResolveLibrarySpec const>    dynamicLibraries,
-                         TargetSchema const&                    target,
-                         ObjectFormatSchema const&              format,
-                         DiagnosticReporter&                    reporter) {
-    std::vector<AssembledModule> pulled;
-    if (archivePaths.empty()) return pulled;  // nothing to pull
+namespace {
+// Defined with the `.s` binder below; the archive-member binder asks the same question of the same
+// definition (a `Pending` row's kind comes from what the library says it is).
+void decideKindFromTheDefinition(ExternImport& e, ffi::SymbolKind definition);
 
-    // Read every archive up front: its raw bytes (kept alive so member subspans
-    // stay valid) + its parsed member list + armap (c161 reader).
-    struct ParsedArchive {
-        std::vector<std::uint8_t> bytes;
-        ffi::ArArchive            archive;
-    };
-    std::vector<ParsedArchive> archives;
-    archives.reserve(archivePaths.size());
-    for (auto const& archivePath : archivePaths) {
-        std::ifstream in(archivePath, std::ios::binary);
-        if (!in) {
-            ParseDiagnostic d;
-            d.code     = DiagnosticCode::F_FileOpenFailed;
-            d.severity = DiagnosticSeverity::Error;
-            d.actual   = std::format(
-                "static-link: failed to open archive '{}' for reading "
-                "(D-LK-STATIC-LINK).",
-                core::genericSpelling(archivePath));
-            reporter.report(std::move(d));
-            return std::nullopt;
-        }
-        std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(in),
-                                        std::istreambuf_iterator<char>()};
-        auto arch = ffi::readArArchive(
-            std::span<std::uint8_t const>{bytes.data(), bytes.size()},
-            archivePath.filename().string(), reporter);
-        if (!arch) return std::nullopt;   // corrupt archive -> reader fail-loud
-        archives.push_back(ParsedArchive{std::move(bytes), std::move(*arch)});
-    }
-
-    // Global armap: symbol name -> (archiveIdx, memberIndex). First-wins across
-    // archives (standard left-to-right link order) + first-wins within one
-    // archive (an armap lists a symbol against its single defining member).
-    std::unordered_map<std::string, std::pair<std::size_t, std::size_t>> armap;
-    for (std::size_t ai = 0; ai < archives.size(); ++ai) {
-        for (auto const& sym : archives[ai].archive.symbols) {
-            armap.emplace(sym.name, std::pair{ai, sym.memberIndex});
-        }
-    }
-
-    // Names already satisfied by a DEFINITION (every client module, then each
-    // pulled member). A worklist name that is already defined is never pulled
-    // again. Only EXTERNAL-LINKAGE definitions can satisfy a cross-module
-    // reference (`hasExternalLinkage`, the same filter the c163 armap writer
-    // applies), so Local defs are excluded.
-    //
-    // ⚠ THIS PREDICATE AND THE ARMAP WRITER'S MUST MOVE TOGETHER, and the
-    // reason is not symmetry for its own sake —
-    // D-LK-OBJECT-GLOBAL-HIDDEN-VISIBILITY-EMITTED-LOCAL. Both were
-    // `isExternallyVisible`, which folds VISIBILITY into a question about
-    // LINKAGE and so calls a `visibility("hidden")` non-static definition
-    // false. Fixing only the WRITER would have created a defect that did not
-    // exist before: a DSS-written archive would then index `vis_hidden`, so a
-    // client module that ALREADY defines `vis_hidden` would no longer suppress
-    // the pull (its own definition never entering `definedNames`) and the link
-    // would merge two definitions of one symbol. ✔MEASURED against gcc 13.3.0
-    // + binutils 2.42 and clang 18.1.3: a hidden definition inside an archive
-    // member DOES satisfy a cross-module reference (`gcc use.o libhid.a` links
-    // rc 0 and runs), which is the whole reason the writer indexes it — so the
-    // resolver must agree that it is satisfied.
-    // ⚠ EVERY module in `clientModules`, not merely the compiled one -- see the
-    // header's plural note
-    // (D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION). A
-    // pre-assembled
-    // object input that DEFINES a name must suppress the pull of an archive
-    // member defining it too, or the link merges two definitions of one symbol.
-    std::unordered_set<std::string> definedNames;
-    for (auto const& clientModule : clientModules) {
-        for (auto const& ms : clientModule.symbols) {
-            if (link::format::ObjectSymbolNames::hasExternalLinkage(ms)) {
-                definedNames.insert(ms.name);
-            }
-        }
-    }
-
-    // Worklist: every client module's unresolved extern names (the references to
-    // satisfy). An object input's externs belong here for the same reason the
-    // compiled client's do -- they are references the archives may resolve.
-    std::vector<std::string> worklist;
-    for (auto const& clientModule : clientModules) {
-        for (auto const& ext : clientModule.externImports) {
-            if (!ext.mangledName.empty()) worklist.push_back(ext.mangledName);
-        }
-    }
-
-    // The member format, resolved at most ONCE for the whole pull (see
-    // `ArchiveMemberFormat`): it is a function of the LINK's format and target,
-    // which no member varies, so per-member resolution would re-scan the
-    // object-format tree for every symbol an archive satisfies.
-    ArchiveMemberFormat memberFormat;
-
-    // (archiveIdx << 32) | memberIndex of every member already pulled -- the LAZY
-    // dedup so a member defining several referenced symbols is pulled once.
-    std::unordered_set<std::uint64_t> pulledMembers;
-    auto memberKey = [](std::size_t ai, std::size_t mi) -> std::uint64_t {
-        return (static_cast<std::uint64_t>(ai) << 32)
-             |  static_cast<std::uint64_t>(static_cast<std::uint32_t>(mi));
-    };
-
-    for (std::size_t cursor = 0; cursor < worklist.size(); ++cursor) {
-        std::string const& name = worklist[cursor];
-        if (definedNames.count(name) != 0) continue;   // already satisfied
-        auto const it = armap.find(name);
-        if (it == armap.end()) continue;   // no archive defines it -> a real FFI
-                                           // import / an undefined the linker's
-                                           // own gate handles (never pulled here)
-        auto const [ai, mi] = it->second;
-        if (!pulledMembers.insert(memberKey(ai, mi)).second) continue;  // lazy dedup
-
-        ffi::ArMember const& member = archives[ai].archive.members[mi];
-        std::span<std::uint8_t const> const memberBytes{
-            archives[ai].bytes.data() + static_cast<std::size_t>(member.dataOffset),
-            static_cast<std::size_t>(member.size)};
-
-        // Parse the member back into a mergeable module via the shared
-        // per-format reader chokepoint (fresh cuId minted inside; a format
-        // with no reader arm fails loud there).
-        auto member_mod =
-            readArchiveMemberModule(memberBytes, target, format, memberFormat,
-                                    archivePaths[ai], member.name, reporter);
-        if (!member_mod) return std::nullopt;   // member-read fail-loud
-
-        // A pulled member's EXTERNAL-LINKAGE definitions satisfy later worklist
-        // names; its OWN unresolved externs feed the next pass -- the
-        // transitive lazy-pull (a member referencing another member). Same
-        // predicate as the client scan above and as the armap writer, for the
-        // reason stated there
-        // (D-LK-OBJECT-GLOBAL-HIDDEN-VISIBILITY-EMITTED-LOCAL): a member that
-        // defines a hidden non-static function HAS satisfied that name, and a
-        // resolver that disagreed with the index it just searched would pull a
-        // second member defining the same symbol.
-        for (auto const& ms : member_mod->symbols) {
-            if (link::format::ObjectSymbolNames::hasExternalLinkage(ms)) {
-                definedNames.insert(ms.name);
-            }
-        }
-        for (auto const& ext : member_mod->externImports) {
-            if (!ext.mangledName.empty()) worklist.push_back(ext.mangledName);
-        }
-        pulled.push_back(std::move(*member_mod));
-    }
-
+// ★★★ THE BINDING OF A FOREIGN MODULE'S IMPORTS (P69 fold 3c,
+// D-LK-FOREIGN-OBJECT-NAMED-TO-THE-LINK-BINDS-NO-LIBRARY-IMPORT). A module this build did not compile —
+// an archive member the search pulled, or an object named to the link — names the libraries it calls by
+// NAME alone, and both kinds are bound here, by the same three arms, in the same order. Until the fold only
+// the pulled members were: an object named on the command line kept every library reference unbound, so
+// ✔MEASURED 2026-10-20 a cl /MD, clang-cl, cl /MT or mingw-w64 gcc object calling `puts` (directly or
+// through `__imp_puts`) was refused "undefined symbol" though the same object in an archive linked and ran.
+// `definedNames` is every external-linkage definition and common of the link: a name some linked module
+// defines is bound by the merge to that definition, never to a library. Returns false when it reported.
+[[nodiscard]] bool bindForeignImports(std::span<AssembledModule>             foreign,
+                                      std::unordered_set<std::string> const& definedNames,
+                                      std::span<ResolveLibrarySpec const>    dynamicLibraries,
+                                      TargetSchema const&                    target,
+                                      ObjectFormatSchema const&              format,
+                                      DiagnosticReporter&                    reporter) {
     // ── D-LK-ARCHIVE-MEMBER-EXTERN-LOSES-ITS-LIBRARY ─────────────────────────
     //
-    // ★★★ REBIND EVERY PULLED MEMBER'S LIBRARY IMPORTS, BECAUSE THE OBJECT FILE
-    // COULD NOT CARRY THEM AND THAT IS NOT A DSS GAP.
+    // ★★★ REBIND EVERY FOREIGN MODULE'S LIBRARY IMPORTS (a pulled member's, a
+    // named object's), BECAUSE THE OBJECT FILE COULD NOT CARRY THEM AND THAT IS
+    // NOT A DSS GAP.
     //
     // ✔MEASURED (shipped CLI, this host, baseline config) with a discriminating
     // pair over ONE pair of sources — a TU calling `puts` plus a `main` calling
@@ -3315,7 +4051,7 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
     //
     // ★ WHAT IS DELIBERATELY LEFT UNBOUND, so a genuinely undefined symbol still
     // fails LOUD with `K_SymbolUndefined` and its present message:
-    //   * a name the client or another pulled member DEFINES — the merge binds
+    //   * a name the client or another foreign member DEFINES — the merge binds
     //     that reference to the definition, and it is not a library import at
     //     all. Filtering it here also keeps the corpus query off the names that
     //     dominate an ordinary static link.
@@ -3336,6 +4072,16 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
     // ⓘ `isEagerImport` is NOT set: an unreferenced row must still be DROPPED by
     // the reference gate, so binding a library here can never resurrect a dead
     // declaration as a real import.
+
+    // ── (0) D-LK-PE-DLLIMPORT-OBJECT-REFERENCE-UNRESOLVED: a member compiled against a
+    // `dllimport` declaration names an import only through its ADDRESS SLOT (`__imp_X` on COFF — every
+    // MSVC /MD object). Make each such row an import of X whose address slot is that symbol, before
+    // either arm binds X — or, when a linked unit DEFINES X, a pointer of the image's own holding
+    // X's address (link.exe's LNK4217). The spelling is the format's (`importAddressSymbolPrefix`).
+    // See `link/import_address_references.hpp`.
+    if (!linker::foldImportAddressReferences(foreign, format, target, definedNames, reporter).has_value()) {
+        return false;   // reported: a pointer of the image's own the target cannot fill
+    }
 
     // ── (1) D-LK-ARCHIVE-MEMBER-EXTERN-CANNOT-BIND-A-RESOLVE-LIBRARY ─────────
     //
@@ -3369,23 +4115,26 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
     // reader, which correctly refuses it and would fail an otherwise good build.
     //
     // The skip set is this producer's own, identical to the corpus arm's: a name
-    // the client or another pulled member DEFINES is bound by the merge to that
+    // the client or another foreign member DEFINES is bound by the merge to that
     // definition and is not a library import at all.
-    if (!pulled.empty() && !dynamicLibraries.empty()) {
+    if (!foreign.empty() && !dynamicLibraries.empty()) {
         auto const bySymbol = resolveOperatorNamedLibraryImports(
             dynamicLibraries, format, reporter);
         // nullopt ⇒ a named binary could not be read; the chokepoint already
         // reported the structural cause loud. Refuse WITHOUT a second
         // diagnostic rather than continue with the flag quietly ineffective.
-        if (!bySymbol.has_value()) return std::nullopt;
-        for (auto& mod : pulled) {
+        if (!bySymbol.has_value()) return false;
+        for (auto& mod : foreign) {
             for (auto& ext : mod.externImports) {
                 if (ext.mangledName.empty()) continue;
                 if (!ext.libraryPath.empty()) continue;
+                // A COMMON row is the member's own DEFINITION
+                // (`ExternImport::commonSize`), never a library's import.
+                if (ext.commonSize != 0u) continue;
                 if (definedNames.count(ext.mangledName) != 0) continue;
                 auto const it = bySymbol->find(ext.mangledName);
                 if (it == bySymbol->end()) continue;
-                // D-FFI-LIBRARY-TLS-EXPORT-BINDS-AS-PLAIN-DATA: the pulled
+                // D-FFI-LIBRARY-TLS-EXPORT-BINDS-AS-PLAIN-DATA: the foreign
                 // member's reference must agree with the library's storage
                 // duration for the same name, exactly as a C source reference
                 // must. ONE rule, one implementation (ffi/ingest.hpp) — the
@@ -3398,17 +4147,24 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
                 }
                 ext.libraryPath = it->second.library;
                 ext.version     = it->second.version;
+                decideKindFromTheDefinition(ext, it->second.kind);
             }
         }
     }
 
-    // ── (2) THE PLATFORM REALIZATION ORACLE ─────────────────────────────────
-    if (!pulled.empty()) {
+    // ── (2) THE PLATFORM'S ROUTE OF EACH WRITTEN NAME (P69 fold 3f, ledger 549 (b)) ──────
+    // The reader's ONE answer (`writtenNameRoutesByOnBinaryName`): `Direct` binds the row's image
+    // here, as this arm always has; `Refused` is refused BY NAME with the row's reason; the rest
+    // stay unbound here — `LinkerAlias` for the image link's statement (`stateWrittenNameRoutes`),
+    // `Body` for the runtime archive's member the search pulls for the name itself, and `Header`
+    // (a written name the platform's header renames away, or one no row knows) for the link tier.
+    if (!foreign.empty()) {
         std::vector<std::string> names;
-        for (auto const& mod : pulled) {
+        for (auto const& mod : foreign) {
             for (auto const& ext : mod.externImports) {
                 if (ext.mangledName.empty()) continue;
                 if (!ext.libraryPath.empty()) continue;
+                if (ext.commonSize != 0u) continue;   // a definition (see arm (1))
                 if (definedNames.count(ext.mangledName) != 0) continue;
                 names.push_back(ext.mangledName);
             }
@@ -3419,59 +4175,892 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
             // process. `format.name()` is the one fact that is actually true of
             // every member being bound here.
             // D-FFI-DUPLICATE-SYMBOL-ACROSS-DESCRIPTORS-SILENTLY-ORDER-RESOLVED:
-            // the oracle reports a cross-descriptor realization disagreement on
-            // THIS reporter and still answers the name (omitting it would route
-            // it unbound and file the config's fault against the user's program).
-            // The refusal is therefore the caller's, off the errorCount snapshot
-            // — and it must be spelled here rather than left to a later tier,
-            // because the enclosing `entry` snapshot was taken before this
-            // function ran and nothing between here and the link would compare.
+            // the oracle reports a corpus disagreement on THIS reporter and still
+            // answers the name, so the refusal is this caller's, off the
+            // errorCount snapshot — spelled here, because the enclosing `entry`
+            // snapshot was taken before this function ran and nothing between
+            // here and the link would compare.
             auto const corpusEntry = reporter.errorCount();
-            auto const realized = realizePlatformExternsByOnBinaryName(
+            auto const routes = writtenNameRoutesByOnBinaryName(
                 names, target, format,
                 substrate::mintMonotonicId<CompilationUnitId>(), format.name(),
                 reporter);
-            if (!tierClean(reporter, corpusEntry)) return std::nullopt;
+            if (!tierClean(reporter, corpusEntry)) return false;
             // nullopt ⇒ the shippedLibs directory could not be located: a
             // statement about the ENVIRONMENT, never about the user's program.
             // Every name stays unbound and the link tier judges the reference,
             // exactly as it did before this binder existed.
-            if (realized.has_value()) {
+            if (routes.has_value()) {
                 std::string const formatKey{objectFormatKindName(format.kind())};
-                for (auto& mod : pulled) {
+                std::unordered_set<std::string> refusedNames;   // each reported once
+                for (auto& mod : foreign) {
                     for (auto& ext : mod.externImports) {
                         if (ext.mangledName.empty()) continue;
                         if (!ext.libraryPath.empty()) continue;
+                        if (ext.commonSize != 0u) continue;   // a definition (see arm (1))
                         if (definedNames.count(ext.mangledName) != 0) continue;
-                        auto const found = realized->find(ext.mangledName);
-                        if (found == realized->end()) continue;
-                        auto const& row = found->second.row;
-                        if (!row.recipeId.empty()) continue;   // see ★ above
-                        if (!row.linkName.empty()
-                            && ffi::linkNameFor(found->second.canonicalName,
-                                                /*asmLabel=*/{},
-                                                format.cSymbolDecoration().scheme,
-                                                row.linkName)
-                                   != ext.mangledName) {
-                            continue;   // see ★ above
+                        auto const found = routes->find(ext.mangledName);
+                        if (found == routes->end()) continue;
+                        ffi::WrittenNameRouteAnswer const& route = found->second;
+                        if (route.kind == ffi::WrittenNameRouteKind::Refused) {
+                            if (refusedNames.insert(ext.mangledName).second)
+                                reportRefusedWrittenName(ext.mangledName, route, format, reporter);
+                            continue;
                         }
+                        if (route.kind != ffi::WrittenNameRouteKind::Direct) continue;
+                        // A `Direct` row's link name here IS the written name (the
+                        // resolver's steps 1 and 2), so nothing is re-spelled.
+                        auto const& row = route.row;
+                        if (!row.recipeId.empty()) continue;   // see ★ above
                         // Fold the row's per-object-format `library` map on the
-                        // active format — the identical fold `buildCuMir`
-                        // performs for the C path and the asm binder performs
-                        // for a `.s`, keyed on the same `objectFormatKindName`.
-                        // A key ABSENT means the platform states no image for
-                        // this name on this format: leave it unbound.
+                        // active format — the identical fold `buildCuMir` performs
+                        // for the C path and the asm binder performs for a `.s`,
+                        // keyed on the same `objectFormatKindName`. A key ABSENT
+                        // means the platform states no image for this name on this
+                        // format: leave it unbound.
                         auto const lib = row.library.find(formatKey);
                         if (lib == row.library.end() || lib->second.empty()) {
                             continue;
                         }
                         ext.libraryPath = lib->second;
                         ext.version     = row.version;
+                        decideKindFromTheDefinition(
+                            ext, row.isFunction ? ffi::SymbolKind::Function
+                                                : ffi::SymbolKind::Object);
                     }
                 }
+                if (!refusedNames.empty()) return false;   // each reported by name
             }
         }
     }
+    return true;
+}
+}  // namespace
+
+std::optional<std::vector<AssembledModule>>
+pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
+                         std::span<std::filesystem::path const> archivePaths,
+                         std::span<ResolveLibrarySpec const>    dynamicLibraries,
+                         TargetSchema const&                    target,
+                         ObjectFormatSchema const&              format,
+                         DiagnosticReporter&                    reporter) {
+    std::vector<AssembledModule> pulled;
+    if (archivePaths.empty()) return pulled;  // nothing to pull
+
+    // Read every archive up front: its raw bytes (kept alive so member subspans
+    // stay valid) + its parsed member list + armap (c161 reader).
+    struct ParsedArchive {
+        std::vector<std::uint8_t> bytes;
+        ffi::ArArchive            archive;
+    };
+    std::vector<ParsedArchive> archives;
+    archives.reserve(archivePaths.size());
+    // ★ EVERY ARCHIVE IS OPENED AND PARSED, AND REPORTS ITS OWN REFUSAL, BEFORE
+    // THE PULL FAILS (`substrate::runEveryUnit`; site (g) of the orchestrator's
+    // ledger 568, P69 fold 3e): an unreadable archive never stops the archives
+    // after it. Nothing is pulled from any archive when one failed.
+    bool const everyArchiveParsed = substrate::runEveryUnit(archivePaths.size(), substrate::namingSilentUnits(
+        reporter, "the archive pull's parse", [&](std::size_t a) { return "archive '" + core::genericSpelling(archivePaths[a]) + "'"; },
+        [&](std::size_t a) {
+        std::filesystem::path const& archivePath = archivePaths[a];
+        auto opened = core::openInputStream(archivePath, std::ios::binary);
+        if (!opened) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::F_FileOpenFailed;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "static-link: failed to open archive '{}' for reading: {} "
+                "(D-LK-STATIC-LINK).",
+                core::genericSpelling(archivePath), core::reasonText(opened.error()));
+            reporter.report(std::move(d));
+            return false;
+        }
+        std::ifstream& in = *opened;
+        std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(in),
+                                        std::istreambuf_iterator<char>()};
+        auto arch = readNamingTheInput(
+            core::genericSpelling(archivePath), reporter, [&](DiagnosticReporter& archiveReporter) {
+                return ffi::readArArchive(std::span<std::uint8_t const>{bytes.data(), bytes.size()},
+                                          archivePath.filename().string(), archiveReporter);
+            });
+        if (!arch) return false;   // corrupt archive -> reader fail-loud, named
+        archives.push_back(ParsedArchive{std::move(bytes), std::move(*arch)});
+        return true;
+    }));
+    if (!everyArchiveParsed) return std::nullopt;
+
+    // Global armap: symbol name -> (archiveIdx, memberIndex). First-wins across
+    // archives (standard left-to-right link order) + first-wins within one
+    // archive (an armap lists a symbol against its single defining member).
+    std::unordered_map<std::string, std::pair<std::size_t, std::size_t>> armap;
+    for (std::size_t ai = 0; ai < archives.size(); ++ai) {
+        for (auto const& sym : archives[ai].archive.symbols) {
+            armap.emplace(sym.name, std::pair{ai, sym.memberIndex});
+        }
+    }
+
+    // Names already satisfied by a DEFINITION (every client module, then each
+    // pulled member). A worklist name that is already defined is never pulled
+    // again. Only EXTERNAL-LINKAGE definitions can satisfy a cross-module
+    // reference (`hasExternalLinkage`, the same filter the c163 armap writer
+    // applies), so Local defs are excluded.
+    //
+    // ⚠ THIS PREDICATE AND THE ARMAP WRITER'S MUST MOVE TOGETHER, and the
+    // reason is not symmetry for its own sake —
+    // D-LK-OBJECT-GLOBAL-HIDDEN-VISIBILITY-EMITTED-LOCAL. Both were
+    // `isExternallyVisible`, which folds VISIBILITY into a question about
+    // LINKAGE and so calls a `visibility("hidden")` non-static definition
+    // false. Fixing only the WRITER would have created a defect that did not
+    // exist before: a DSS-written archive would then index `vis_hidden`, so a
+    // client module that ALREADY defines `vis_hidden` would no longer suppress
+    // the pull (its own definition never entering `definedNames`) and the link
+    // would merge two definitions of one symbol. ✔MEASURED against gcc 13.3.0
+    // + binutils 2.42 and clang 18.1.3: a hidden definition inside an archive
+    // member DOES satisfy a cross-module reference (`gcc use.o libhid.a` links
+    // rc 0 and runs), which is the whole reason the writer indexes it — so the
+    // resolver must agree that it is satisfied.
+    // ⚠ EVERY module in `clientModules`, not merely the compiled one -- see the
+    // header's plural note
+    // (D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION). A
+    // pre-assembled
+    // object input that DEFINES a name must suppress the pull of an archive
+    // member defining it too, or the link merges two definitions of one symbol.
+    std::unordered_set<std::string> definedNames;
+    // ── WHAT A COMMON MEETS IN THE LINK (P69 send-back 5, review-xa4 MINOR 1) ──
+    // `definedNames` answers a REFERENCE: any external-linkage definition
+    // satisfies one, and so does a common (`noteCommonsOf`, below). A COMMON asks
+    // another question of the same definitions: it stays a common, and its own
+    // search stays open (the commons round of the loop below), until a definition
+    // it YIELDS to is in the link — `linker::commonYieldsToDefinition`, the ONE
+    // answer the link's allocation gives too. `yieldedToNames` holds the names
+    // some linked definition answered "yes" for; `openYieldNames` those a WEAK
+    // definition leaves to a link document that does not say. Until send-back 5
+    // the search asked `definedNames` for both, so a weak definition the common
+    // OUTRANKS ended the common's search: on ELF a program holding `c` as a
+    // common, weak in a second object and strong in an archive read 0 where GNU
+    // ld reads the archive's 7 (✔MEASURED 2026-10-08, GNU ld 2.42, x86_64 and
+    // aarch64).
+    std::unordered_set<std::string> yieldedToNames;
+    std::unordered_set<std::string> openYieldNames;
+    auto const noteDefinition = [&](ModuleSymbol const& ms) {
+        definedNames.insert(ms.name);
+        auto const yields = linker::commonYieldsToDefinition(format, ms);
+        if (!yields.has_value()) {
+            openYieldNames.insert(ms.name);
+        } else if (*yields) {
+            yieldedToNames.insert(ms.name);
+        }
+    };
+    for (auto const& clientModule : clientModules) {
+        for (auto const& ms : clientModule.symbols) {
+            if (link::format::ObjectSymbolNames::hasExternalLinkage(ms)) {
+                noteDefinition(ms);
+            }
+        }
+    }
+
+    // Worklist: the extern names each client module USES -- the references to
+    // satisfy. An object input's externs belong here for the same reason the
+    // compiled client's do -- they are references the archives may resolve.
+    // ★ USES, NOT DECLARES
+    // (D-LK-ARCHIVE-PULL-TAKES-UNREFERENCED-EXTERNS-AS-REFERENCES):
+    // a module carries an extern row for every declaration it saw,
+    // so following them all pulled a member for a declaration nothing calls --
+    // `#include <stdio.h>` alone linked DSS's stdio runtime into the image
+    // (✔MEASURED P69, pe64: `.text` 0x23 -> 0x7c3, imports 1 -> 6). The pull
+    // takes exactly the rows the image's import table keeps, by the ONE
+    // reference gate both read (`link/extern_reference_gate.hpp`).
+    std::vector<std::string> worklist;
+    // ★★ A WEAK REFERENCE JOINS THE SEARCH BY ITS MEMBERS' RULE (P69 round 4,
+    // D-LK-ARCHIVE-SEARCH-FETCHES-A-MEMBER-FOR-A-WEAK-REFERENCE): a row
+    // `linker::weakReferenceAwaitsTheArchiveRule` answers for waits in
+    // `weakReferences` until the search has answered every strong name, and then
+    // follows `archiveWeakReferenceSearch` (the loop's weak round, below).
+    std::vector<std::string> weakReferences;
+    auto const noteUse = [&](ExternImport const& ext) {
+        (linker::weakReferenceAwaitsTheArchiveRule(ext) ? weakReferences : worklist)
+            .push_back(ext.mangledName);
+    };
+    for (auto const& clientModule : clientModules) {
+        auto const targets = linker::relocationTargetIds(clientModule);
+        for (auto const& ext : clientModule.externImports) {
+            if (!ext.mangledName.empty()
+                && linker::externSurvivesReferenceGate(ext, targets)) {
+                noteUse(ext);
+            }
+        }
+    }
+
+    // The member format, resolved at most ONCE for the whole pull (see
+    // `ArchiveMemberFormat`): it is a function of the LINK's format and target,
+    // which no member varies, so per-member resolution would re-scan the
+    // object-format tree for every symbol an archive satisfies.
+    ArchiveMemberFormat memberFormat;
+
+    // ── A COMMON'S NAME IN THE ARCHIVE SEARCH (P69 round 3,
+    //    D-LK-ARCHIVE-SEARCH-FETCHED-A-DEFINITION-FOR-A-COMMON) ──────────────
+    // A COMMON row (`ExternImport::commonSize`) DEFINES its name, and the
+    // reference linkers split on whether an archive member that defines the name
+    // too is fetched to replace it: GNU ld's ELF linker fetches it (its
+    // definition then wins, `linker::allocateCommonDefinitions`), while link.exe,
+    // lld-link, GNU ld's PE linker and ld.lld by default keep the common and
+    // fetch nothing (✔MEASURED 2026-10-07). The members' document states which
+    // (`archiveCommonResolution`, asked in the COMMONS ROUND of the loop below): a
+    // kept common satisfies its name here exactly
+    // as a definition does, so no member is fetched for it; one this pull cannot
+    // place, because the document states nothing, is refused by name the moment
+    // an archive defines it — no shipped member document since P69 round 4, when
+    // Apple's ld was measured (D-LK-MACHO-ARCHIVE-COMMON-RESOLUTION-UNMEASURED).
+    // Until round 3 a common was a ROW the worklist followed, so every format
+    // fetched — the PE linkers' answer inverted.
+    std::optional<ArchiveCommonResolution> commonResolution;
+    bool                                   commonResolutionRead = false;
+    // ── WHICH MEMBER `fetchDefinition` FETCHES FOR A COMMON'S NAME (P69 round 4)
+    // Not the first the armap lists: the reference linkers visit EVERY armap
+    // entry of the name, in order, and fetch the first member whose own symbol
+    // table DEFINES it as a DATUM the common YIELDS to — the definition the link
+    // then lets win (`linker::commonYieldsToDefinition`, `link/common_yield.hpp`:
+    // the ONE answer the link's allocation applies, from the link's own
+    // document) — passing over a function, another common, and a definition the
+    // common outranks. A common no member answers stays the definition, and
+    // nothing is fetched for it.
+    //   * GNU ld's ELF linker, where a common outranks a WEAK definition: the first
+    //     GLOBAL datum (bfd elflink.c, `elf_link_is_defined_archive_symbol` ->
+    //     `is_global_data_symbol_definition`). ✔MEASURED 2026-10-07 (gcc 13.3.0,
+    //     GNU ld 2.42; the aarch64 cross gcc and ld, the same answers): a member
+    //     whose `c` is
+    //     STB_GLOBAL data — `.data`, `.bss`, `.rodata`, hidden, thread-local — is
+    //     fetched; one whose `c` is weak, a common or a function is not; and the
+    //     search goes on past one that is not (common-, weak- and function-then-
+    //     strong archives all fetch the strong member).
+    //   * Apple's ld, where a weak definition replaces a common: the first datum,
+    //     weak or not. ✔MEASURED 2026-10-07 (Apple clang 21's ld-1267, arm64 and
+    //     x86_64): a member whose `_c` is `__data`, zerofill,
+    //     `__const`, private-extern, weak or thread-local data is fetched, a
+    //     function or a common is not, and the search goes on past a function
+    //     (function-then-strong fetches the strong member, weak-then-strong the
+    //     weak one). The deprecated ld64-957.1 (`-ld_classic`, which says it "is
+    //     deprecated and will be removed") stops at a function member instead; DSS
+    //     follows the linker Apple clang runs.
+    std::unordered_map<std::string, std::vector<std::pair<std::size_t, std::size_t>>> armapEntries;
+    for (std::size_t ai = 0; ai < archives.size(); ++ai) {
+        for (auto const& sym : archives[ai].archive.symbols) {
+            armapEntries[sym.name].emplace_back(ai, sym.memberIndex);
+        }
+    }
+    // Does member (ai, mi) define `name` as a datum the common yields to? nullopt
+    // after reporting why the member could not be read to answer, or why the
+    // link's document leaves the answer open.
+    auto const memberDefinesADatumTheCommonYieldsTo = [&](std::size_t ai, std::size_t mi,
+                                                          std::string const& name) -> std::optional<bool> {
+        ffi::ArMember const& member = archives[ai].archive.members[mi];
+        std::span<std::uint8_t const> const memberBytes{
+            archives[ai].bytes.data() + static_cast<std::size_t>(member.dataOffset),
+            static_cast<std::size_t>(member.size)};
+        DiagnosticReporter probeReporter;
+        auto const probed = readArchiveMemberModule(memberBytes, target, format, memberFormat,
+                                                    archivePaths[ai], member.name, probeReporter);
+        if (!probed) {
+            reporter.relayFrom(probeReporter);
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::K_NoMatchingObjectFormat;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "static-link: '{}' is a COMMON (tentative) definition of a linked object, and "
+                "member '{}' of archive '{}' lists it; the member had to be read to tell whether "
+                "it defines '{}' as a datum the common yields to (which the archive search would "
+                "fetch), and it could not be read (above).",
+                name, member.name, core::genericSpelling(archivePaths[ai]), name);
+            reporter.report(std::move(d));
+            return std::nullopt;
+        }
+        std::unordered_set<std::uint32_t> functionIds;
+        for (auto const& f : probed->functions) functionIds.insert(f.symbol.v);
+        for (auto const& ms : probed->symbols) {
+            // A common is the member's import row, never a ModuleSymbol, so every
+            // row here is a definition; a function does not count.
+            if (ms.name != name || functionIds.contains(ms.symbol.v)) continue;
+            // The ONE answer the link's allocation applies too: a strong datum
+            // qualifies, a weak one where the LINK's document says a common
+            // yields to it, and never one whose own spelling yields to a common.
+            auto const yields = linker::commonYieldsToDefinition(format, ms);
+            if (!yields.has_value()) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::K_NoMatchingObjectFormat;
+                d.severity = DiagnosticSeverity::Error;
+                d.actual   = std::format(
+                    "static-link: '{}' is a COMMON (tentative) definition of a linked object, and "
+                    "member '{}' of archive '{}' defines it WEAK. Whether the common yields to that "
+                    "definition (Apple's ld fetches the member, and the definition wins) or "
+                    "outranks it (GNU ld fetches nothing for it) is format '{}''s "
+                    "'commonYieldsTo', which it does not state -- refusing rather than guess one.",
+                    name, member.name, core::genericSpelling(archivePaths[ai]), format.name());
+                reporter.report(std::move(d));
+                return std::nullopt;
+            }
+            if (*yields) return true;
+        }
+        return false;
+    };
+    // The commons of the link, each name once, in the order they entered it —
+    // the client modules', then each pulled member's. A common DEFINES its name,
+    // so it answers every reference to it from here on; whether the search
+    // replaces it is the commons round's question.
+    std::vector<std::string>        commonNames;
+    std::unordered_set<std::string> commonNameSet;
+    auto const noteCommonsOf = [&](AssembledModule const& m) {
+        for (auto const& ext : m.externImports) {
+            if (ext.commonSize == 0u || ext.mangledName.empty()) continue;
+            definedNames.insert(ext.mangledName);
+            if (commonNameSet.insert(ext.mangledName).second) {
+                commonNames.push_back(ext.mangledName);
+            }
+        }
+    };
+    for (auto const& clientModule : clientModules) noteCommonsOf(clientModule);
+
+    // (archiveIdx << 32) | memberIndex of every member already pulled -- the LAZY
+    // dedup so a member defining several referenced symbols is pulled once.
+    std::unordered_set<std::uint64_t> pulledMembers;
+    // Whether every member the search pulled could be read (site (h) of the
+    // orchestrator's ledger 568): a member that cannot be read is reported and
+    // the search goes on; the pull fails at its fixed point.
+    bool everyPulledMemberRead = true;
+    auto memberKey = [](std::size_t ai, std::size_t mi) -> std::uint64_t {
+        return (static_cast<std::uint64_t>(ai) << 32)
+             |  static_cast<std::uint64_t>(static_cast<std::uint32_t>(mi));
+    };
+
+    // Pulls member (ai, mi) into the link — for a reference the worklist holds,
+    // or for a common (the commons round): reads it, and notes its commons, its
+    // definitions and its uses. The uses join the search as the client's do
+    // (`noteUse`: the worklist, or the weak references that await their round);
+    // they are answered when the loop next runs, never here. False after
+    // reporting why the member could not be read.
+    auto const pullMember = [&](std::size_t ai, std::size_t mi) -> bool {
+        ffi::ArMember const& member = archives[ai].archive.members[mi];
+        std::span<std::uint8_t const> const memberBytes{
+            archives[ai].bytes.data() + static_cast<std::size_t>(member.dataOffset),
+            static_cast<std::size_t>(member.size)};
+
+        // Parse the member back into a mergeable module via the shared
+        // per-format reader chokepoint (fresh cuId minted inside; a format
+        // with no reader arm fails loud there).
+        auto member_mod =
+            readArchiveMemberModule(memberBytes, target, format, memberFormat,
+                                    archivePaths[ai], member.name, reporter);
+        if (!member_mod) return false;   // member-read fail-loud
+        // A pulled member's own commons, by the same rule as the client's.
+        noteCommonsOf(*member_mod);
+
+        // A pulled member's EXTERNAL-LINKAGE definitions satisfy later worklist
+        // names; its OWN unresolved externs feed the next pass -- the
+        // transitive lazy-pull (a member referencing another member). Same
+        // predicate as the client scan above and as the armap writer, for the
+        // reason stated there
+        // (D-LK-OBJECT-GLOBAL-HIDDEN-VISIBILITY-EMITTED-LOCAL): a member that
+        // defines a hidden non-static function HAS satisfied that name, and a
+        // resolver that disagreed with the index it just searched would pull a
+        // second member defining the same symbol.
+        for (auto const& ms : member_mod->symbols) {
+            if (link::format::ObjectSymbolNames::hasExternalLinkage(ms)) {
+                noteDefinition(ms);
+            }
+        }
+        // The member's own uses, by the same gate as the client's.
+        auto const memberTargets = linker::relocationTargetIds(*member_mod);
+        for (auto const& ext : member_mod->externImports) {
+            if (!ext.mangledName.empty()
+                && linker::externSurvivesReferenceGate(ext, memberTargets)) {
+                noteUse(ext);
+            }
+        }
+        pulled.push_back(std::move(*member_mod));
+        return true;
+    };
+
+    // ── THE COMMONS ROUND (P69 send-back 5, review-xa4 MINOR 1) ─────────────
+    // Run each time the search has answered every reference it holds (the
+    // worklist's, then the weak round's — the loop below says why in that order): every
+    // name STILL a common — no definition it yields to is in the link
+    // (`yieldedToNames`) — whose members' document says `fetchDefinition` fetches
+    // the first member, in the archive's own order, that defines it as a datum
+    // the common yields to (`memberDefinesADatumTheCommonYieldsTo`). EVERY common
+    // the round began with is walked before the search answers the references
+    // the fetched members brought, and those members' own commons wait for the
+    // next round. nullopt after reporting; otherwise whether a member was fetched.
+    //   * WHY AFTER THE REFERENCES, AND WHY ALL OF THEM FIRST: it is what Apple's
+    //     ld does, and the one order under which both families' measured programs
+    //     come out. ✔MEASURED 2026-10-08, Apple clang 21's ld-1267 (arm64, x86_64)
+    //     and ld64-957.1: a program holding `c` as a common and calling `f` against
+    //     an archive of W (`f` + a WEAK `c`) and S (a strong `c`) reads W's `c` and
+    //     never fetches S, in both member orders — the reference is answered
+    //     first, W's weak definition replaces the common (Mach-O: `commonYieldsTo`
+    //     `anyDefinition`), and nothing is still a common. And a program holding
+    //     two commons T1 and T2 against X (a strong T1 + a call of `u`), U (`u` + a
+    //     weak T2) and T (a strong T2) fetches T whenever T precedes U in the
+    //     archive and never otherwise, whatever X's place and the names' order:
+    //     T2 was walked before X's `u` was answered.
+    //   * GNU ld's ELF linker walks the archive's index instead, entry by entry,
+    //     fetching for an undefined name and — for a common — a global datum, and
+    //     it reaches the same programs in every cell measured (✔MEASURED
+    //     2026-10-08, GNU ld 2.42, x86_64 and aarch64: the two shapes above read
+    //     the STRONG definition in every order, a weak definition never ending a
+    //     common's search there). The two orders part in ONE shape, and it is
+    //     ✔MEASURED too (2026-10-08, the same linkers and ld.lld 18.1.3; a program
+    //     holding `c` as a common and a strong reference to `w`): against an
+    //     archive of m0 (`c`) then m15 (`w` and `c`) GNU ld fetches m0 for the
+    //     common, then m15 for the reference, and REFUSES ("multiple definition
+    //     of `c'"); this search answers the reference first, m15's `c` ends the
+    //     common's search, and the program links with m15 alone — the value
+    //     ld.lld, which links the cell, gives. A link that works where one
+    //     reference refuses, never a different answer where one works: in the
+    //     other member order, and against m1 (`w`) and m2 (`c` and `w`) in both
+    //     orders, the two give one answer — the REFUSAL of m1 then m2 included,
+    //     where the reference's member and the common's both define `w` (ld.lld
+    //     links that one, because it fetches nothing for a common; under this
+    //     format's `fetchDefinition` the program defines `w` twice, and it is
+    //     refused by name). Pinned by `ArchiveSearchRoundOrder` (every leg) and
+    //     `ArchiveSearchRoundOrderNative` (GNU ld on the Linux legs, Apple's ld
+    //     on the Mac), `tests/link/test_common_symbols.cpp`.
+    // ★ EVERY COMMON OF THE ROUND IS ASKED (`substrate::runEveryUnit`; site (h)
+    // of the orchestrator's ledger 568, P69 fold 3e): a name whose member cannot
+    // be read, or whose answer the documents leave open, is reported and the
+    // round goes on to the next name; the search fails at its fixed point
+    // (`everyPulledMemberRead`). A name stops at its own undecidable member --
+    // a later member of the same name is never fetched in its place -- in this
+    // round or a later one: a name the round reported is never asked again
+    // (`commonsRefused`), where a round after a fetch would read its unreadable
+    // member a second time, and say so twice (✔MEASURED, the every-unit pin on
+    // the Mac leg: a readable member fetched, then the unreadable member's name
+    // refused once per round).
+    bool commonRuleUnknown = false;   // the members' rule could not be read: reported once, no name decided after it
+    std::unordered_set<std::string> commonsRefused;   // reported by a round: failed, never asked again
+    auto const fetchDefinitionsForCommons = [&]() -> bool {
+        bool              fetched  = false;
+        std::size_t const roundEnd = commonNames.size();
+        auto const answerCommon = [&](std::string const& name) -> bool {
+            if (yieldedToNames.contains(name)) return true;   // a definition replaced it
+            auto const listed = armapEntries.find(name);
+            if (listed == armapEntries.end()) return true;   // no archive defines it: nothing to decide
+            auto const [fai, fmi] = listed->second.front();
+            std::string_view const memberName = archives[fai].archive.members[fmi].name;
+            if (!commonResolutionRead) {
+                commonResolutionRead = true;
+                ObjectFormatSchema const* const memberSchema = archiveMemberFormat(
+                    memberFormat, format, target, archivePaths[fai], memberName, reporter);
+                if (memberSchema == nullptr) {
+                    commonRuleUnknown = true;
+                    return false;   // reported
+                }
+                commonResolution = memberSchema->archiveCommonResolution();
+            }
+            if (!commonResolution.has_value()) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::K_NoMatchingObjectFormat;
+                d.severity = DiagnosticSeverity::Error;
+                d.actual   = std::format(
+                    "static-link: '{}' is a COMMON (tentative) definition of a linked "
+                    "object, and member '{}' of archive '{}' defines it as well. "
+                    "Whether the archive search fetches that member, whose definition "
+                    "then wins (GNU ld's ELF linker), or keeps the common and fetches "
+                    "nothing (link.exe, lld-link, GNU ld's PE linker), is the members' "
+                    "format's 'archiveCommonResolution', which '{}' does not state -- "
+                    "refusing rather than guess one.",
+                    name, memberName, core::genericSpelling(archivePaths[fai]),
+                    memberFormat.schema != nullptr ? memberFormat.schema->name()
+                                                   : format.name());
+                reporter.report(std::move(d));
+                commonRuleUnknown = true;   // the document's gap, said once
+                return false;
+            }
+            if (*commonResolution == ArchiveCommonResolution::KeepCommon) return true;
+            // FetchDefinition. A WEAK definition already in the link, under a link
+            // document that does not say whether the common yields to it, leaves
+            // open whether this name is still a common at all.
+            if (openYieldNames.contains(name)) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::K_NoMatchingObjectFormat;
+                d.severity = DiagnosticSeverity::Error;
+                d.actual   = std::format(
+                    "static-link: '{}' is a COMMON (tentative) definition of a linked "
+                    "object, another linked unit defines it WEAK, and member '{}' of "
+                    "archive '{}' defines it as well. Whether the common yields to the "
+                    "weak definition, which ends the search for it (Apple's ld), or "
+                    "outranks it, so the search goes on (GNU ld), is format '{}''s "
+                    "'commonYieldsTo', which it does not state -- refusing rather than "
+                    "guess one.",
+                    name, memberName, core::genericSpelling(archivePaths[fai]), format.name());
+                reporter.report(std::move(d));
+                return false;
+            }
+            for (auto const& [cai, cmi] : listed->second) {
+                // A member already in the link has had its say: its definition of
+                // the name, if any, is one the common outranks.
+                if (pulledMembers.contains(memberKey(cai, cmi))) continue;
+                auto const qualifies = memberDefinesADatumTheCommonYieldsTo(cai, cmi, name);
+                if (!qualifies.has_value()) return false;   // reported: the name's answer is unknown
+                if (!*qualifies) continue;
+                pulledMembers.insert(memberKey(cai, cmi));
+                if (!pullMember(cai, cmi)) return false;   // reported
+                fetched = true;
+                break;
+            }
+            return true;
+        };
+        // ★ NETTED (P69 fold 3f, ledger 638 item 2): a common's answer fails only for a failure it REPORTED itself,
+        // so a common that fails having said nothing is named (`namingSilentUnits`). A name an earlier round refused,
+        // or one met once the members' rule proved unknown, meets a failure an EARLIER unit reported: it answers
+        // TRUE -- that unit's false already fails the search (`everyPulledMemberRead`) -- where it answered false and
+        // the net would have named it silent.
+        bool const everyCommonAnswered = substrate::runEveryUnit(roundEnd, substrate::namingSilentUnits(
+            reporter, "the archive search's commons round",
+            [&](std::size_t k) { return "the common '" + commonNames[k] + "'"; }, [&](std::size_t k) {
+            std::string const name = commonNames[k];   // a copy: a pull grows the vector
+            if (commonsRefused.contains(name) || commonRuleUnknown) return true;   // an earlier unit's, reported
+            if (answerCommon(name)) return true;
+            commonsRefused.insert(name);
+            return false;
+        }));
+        everyPulledMemberRead = everyCommonAnswered && everyPulledMemberRead;
+        return fetched;
+    };
+
+    // ★ A FALLBACK B (`/alternatename:A=B`, or a weak external deferring to B —
+    // P69 round 3, D-LK-COFF-READER-SKIPPED-EVERY-LINKER-DIRECTIVE) is a use only
+    // once A stays unresolved: the reference linkers bind A's references to B
+    // only when nothing in the link defines A (link.exe 14.51 and lld-link 18,
+    // ✔MEASURED 2026-10-06 by lane `xa`), and the reader keeps a row for a B its
+    // object does not define, which no relocation names. So B joins the worklist
+    // only after the search has answered A, and the search resumes (a chain
+    // A -> B -> C is followed the same way, a round per link); an A a member or a
+    // library answers leaves B unsearched, as `bindFallbackReferences` leaves it
+    // unbound.
+    std::unordered_set<std::string> fallbacksSearched;
+    std::size_t cursor = 0;
+    // The member the search reads for a worklist name, for the net's report of a member read that failed in silence.
+    auto const searchedMemberOf = [&](std::string const& name) {
+        auto const it = armap.find(name);
+        if (it == armap.end()) return "'" + name + "'";
+        auto const [ai, mi] = it->second;
+        return std::format("member '{}' of archive '{}' (for '{}')", archives[ai].archive.members[mi].name,
+                           core::genericSpelling(archivePaths[ai]), name);
+    };
+    // The weak round's state: the members' rule, read once, when a weak
+    // reference first meets a member that defines its name.
+    std::size_t                               weakCursor = 0;
+    std::optional<ArchiveWeakReferenceSearch> weakRule;
+    bool                                      weakRuleRead = false;
+    // ── A WEAK REFERENCE TO A NAME THE RUNTIME REALIZES (P69 round 5) ────────
+    // To a program, DSS's runtime IS the platform's library: a name whose body
+    // the platform states DSS ships as source on this format (a descriptor's
+    // `realization.<format>`, the row that puts the body in a runtime archive)
+    // answers a weak reference as a name the platform's own image exports does —
+    // the reference BINDS, on every format, whatever the members' document says
+    // an archive search does for a weak reference. ✔MEASURED 2026-10-08: glibc
+    // 2.39 (gcc 13.3.0 and clang 18.1.3, x86_64; gcc, aarch64) and libSystem
+    // (Apple clang 21, both arches) bind a weak reference to `strtol` and to
+    // `puts` on their default, dynamic link. Until round 5 the search treated a
+    // runtime archive as an operator's, so on the `doNotFetch` formats `strtol`
+    // read as NULL on pe (DSS ships its body) beside a `puts` that bound (the
+    // UCRT's image exports it). Asked of the corpus by NAME, through the one
+    // on-binary-name query both binders use — never of the archive, whose name
+    // and path say nothing — and once per search for every weak name still open.
+    // nullopt after a report: the corpus disagreed with itself about a name asked.
+    std::unordered_set<std::string> runtimeNamesAsked;
+    std::unordered_set<std::string> runtimeRealized;
+    auto const runtimeRealizes = [&](std::string const& name) -> std::optional<bool> {
+        if (runtimeNamesAsked.insert(name).second) {
+            std::vector<std::string> ask{name};
+            for (std::size_t k = weakCursor + 1; k < weakReferences.size(); ++k) {
+                std::string const& later = weakReferences[k];
+                if (definedNames.count(later) != 0 || armap.find(later) == armap.end()) continue;
+                if (runtimeNamesAsked.insert(later).second) ask.push_back(later);
+            }
+            auto const corpusEntry = reporter.errorCount();
+            // P69 fold 3f: the written name's ROUTE, the one answer every binder reads — `Body`
+            // is a name whose body the platform states DSS's runtime ships as source here.
+            auto const routes = writtenNameRoutesByOnBinaryName(
+                ask, target, format, substrate::mintMonotonicId<CompilationUnitId>(), format.name(),
+                reporter);
+            if (!tierClean(reporter, corpusEntry)) return std::nullopt;
+            // No corpus located: a statement about the environment — no name is the runtime's.
+            if (routes.has_value()) {
+                for (auto const& [onBinaryName, route] : *routes) {
+                    if (route.kind == ffi::WrittenNameRouteKind::Body) runtimeRealized.insert(onBinaryName);
+                }
+            }
+        }
+        return runtimeRealized.count(name) != 0;
+    };
+    // ★ EVERY MEMBER THE SEARCH REACHES IS READ, AND REPORTS ITS OWN REFUSAL,
+    // BEFORE THE PULL FAILS (site (h) of the orchestrator's ledger 568, P69 fold
+    // 3e): a member that cannot be read never stops the search for the names the
+    // other members answer. Its key stays in `pulledMembers`, so it is read once;
+    // its own uses never join the search; the pull fails after the fixed point.
+    // The worklist grows while it is asked -- a member's uses are the next names
+    // -- so it takes the home's GROWING form (`runEveryUnitOfAGrowingSet`), NETTED
+    // (P69 fold 3f, F4): the reporter's count is read before EACH name, appended
+    // and resumed ones too, and a member read that fails having said nothing is
+    // named (`namingSilentUnits`). A name whose member is already keyed answers
+    // true -- read once, its failure said by the name that read it.
+    // (`everyPulledMemberRead` is declared with `pulledMembers`, above: the
+    // commons round's pulls answer it too.)
+    for (;;) {
+        everyPulledMemberRead = substrate::runEveryUnitOfAGrowingSet(
+                                    cursor, [&] { return worklist.size(); },
+                                    substrate::namingSilentUnits(
+                                        reporter, "the archive search's member read",
+                                        [&](std::size_t k) { return searchedMemberOf(worklist[k]); },
+                                    [&](std::size_t k) {
+                                        std::string const& name = worklist[k];
+                                        if (definedNames.count(name) != 0) return true;   // already satisfied
+                                        auto const it = armap.find(name);
+                                        // No archive defines it -> a real FFI import / an undefined the
+                                        // linker's own gate handles (never pulled here).
+                                        if (it == armap.end()) return true;
+                                        auto const [ai, mi] = it->second;
+                                        if (!pulledMembers.insert(memberKey(ai, mi)).second) return true;   // lazy dedup
+                                        return pullMember(ai, mi);   // false: reported
+                                    }))
+                             && everyPulledMemberRead;
+        // THE WEAK ROUND: each weak reference the search left unresolved, by the
+        // members' document — fetched as a strong reference where it says
+        // `fetchMember` (ld64), left unresolved where it says `doNotFetch` (the
+        // ELF gABI; the COFF linkers for a weak external that asks no library
+        // search), refused by name where it says nothing. A member fetched for a
+        // strong name has already defined every weak name it satisfies.
+        bool weakFetched = false;
+        for (; weakCursor < weakReferences.size(); ++weakCursor) {
+            std::string const& name = weakReferences[weakCursor];
+            if (definedNames.count(name) != 0) continue;   // already satisfied
+            auto const definer = armap.find(name);
+            if (definer == armap.end()) continue;   // no member defines it
+            auto const [ai, mi] = definer->second;
+            std::string_view const memberName = archives[ai].archive.members[mi].name;
+            if (!weakRuleRead) {
+                weakRuleRead = true;
+                ObjectFormatSchema const* const memberSchema = archiveMemberFormat(
+                    memberFormat, format, target, archivePaths[ai], memberName, reporter);
+                if (memberSchema == nullptr) return std::nullopt;   // reported
+                weakRule = memberSchema->archiveWeakReferenceSearch();
+            }
+            if (!weakRule.has_value()) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::K_NoMatchingObjectFormat;
+                d.severity = DiagnosticSeverity::Error;
+                d.actual   = std::format(
+                    "static-link: '{}' is a WEAK reference nothing in the link defines, and "
+                    "member '{}' of archive '{}' defines it. Whether the archive search "
+                    "fetches that member (ld64) or leaves the reference unresolved (the ELF "
+                    "gABI: GNU ld, ld.lld; link.exe and lld-link for a weak external that "
+                    "asks no library search) is the members' format's "
+                    "'archiveWeakReferenceSearch', which '{}' does not state -- refusing "
+                    "rather than guess one.",
+                    name, memberName, core::genericSpelling(archivePaths[ai]),
+                    memberFormat.schema != nullptr ? memberFormat.schema->name()
+                                                   : format.name());
+                reporter.report(std::move(d));
+                return std::nullopt;
+            }
+            // `doNotFetch` leaves the name to the runtime's question (above the loop).
+            std::optional<bool> const fetches =
+                *weakRule == ArchiveWeakReferenceSearch::FetchMember ? std::optional<bool>{true}
+                                                                     : runtimeRealizes(name);
+            if (!fetches.has_value()) return std::nullopt;   // reported
+            if (*fetches) {
+                worklist.push_back(name);
+                weakFetched = true;
+            }
+        }
+        if (weakFetched) continue;   // the search resumes with the fetched names
+        // THE COMMONS ROUND (`fetchDefinitionsForCommons`, above): the names still
+        // common, now that every reference is answered — the strong ones by the
+        // worklist, the weak ones by the weak round.
+        // ★ AFTER THE WEAK ROUND, BY MEASUREMENT. ✔MEASURED 2026-10-08 on Apple's ld
+        // (Apple clang 21's ld-1267 for arm64 and x86_64, and ld64-957.1; probe
+        // runs 20261008-084313-c1f1b501 and 20261008-084342-4a820962, which agree
+        // cell for cell): a program holding a WEAK reference `w` and a common `c`
+        // against an archive of m1 (`w`) and m2 (`c` and `w`) is REFUSED for a
+        // duplicate `w` — m1 was fetched for the reference, then m2 for the common,
+        // where this round first would have loaded m2 alone — and against m0 (`c`)
+        // and m1 (`w` and `c`) it loads m1 ALONE, whose `c` ends the common's
+        // search (this round first would have loaded m0, then m1: a duplicate
+        // `c`). A STRONG reference to `w` gives the same cells. The order shows
+        // only where both rounds can fetch, which is Mach-O's member documents
+        // alone: an ELF member document fetches nothing for a weak reference, and
+        // a PE one neither that nor a definition for a common.
+        {
+            // (A common the round could not answer is reported there and fails
+            // the pull at the fixed point, `everyPulledMemberRead`.)
+            if (fetchDefinitionsForCommons()) continue;   // the search resumes with those members' uses
+        }
+        // The search has answered every name it holds: offer the fallback of each A
+        // it left unresolved -- the ONE that stands.
+        // ★ ONLY THE STANDING FALLBACK IS SEARCHED FOR (P69 fold 3f, review F8 of
+        // H6c2). Of the statements the link's units make of A's fallback, read as
+        // the link reads them (`linker::fallbackStatementOf`, in the order the link
+        // holds the units: these, then the members), the one
+        // `linker::fallbackStandsOver` keeps -- a weak external's own default over
+        // every directive's, else the first in the link's order -- is the one
+        // `bindFallbackReferences` binds A's references to, so it is the only one
+        // whose member the search may pull: link.exe loads no member for a dropped
+        // one (✔MEASURED P69 fold 3f, GFB). Decided here in silence: the link that
+        // binds them warns about the dropped one, once. Until fold 3f every
+        // unresolved row offered its own fallback, and the member defining a
+        // dropped one was pulled.
+        std::unordered_set<std::string> libraryBound;
+        std::unordered_map<std::string, linker::FallbackStatement> standingOf;
+        auto const noteRows = [&](AssembledModule const& mod) {
+            for (auto const& ext : mod.externImports) {
+                if (!ext.libraryPath.empty()) libraryBound.insert(ext.mangledName);
+                auto statement = linker::fallbackStatementOf(ext, linkPositionOf(mod, ext.symbol), {});
+                if (!statement.has_value()) continue;
+                auto const [standing, fresh] = standingOf.try_emplace(ext.mangledName, *statement);
+                if (!fresh && linker::fallbackStandsOver(*statement, standing->second)) {
+                    standing->second = std::move(*statement);
+                }
+            }
+        };
+        for (auto const& clientModule : clientModules) noteRows(clientModule);
+        for (auto const& member : pulled) noteRows(member);
+        bool searchMore = false;
+        auto const offerFallbacks = [&](AssembledModule const& mod) {
+            for (auto const& ext : mod.externImports) {
+                if (definedNames.contains(ext.mangledName) || libraryBound.contains(ext.mangledName)) continue;
+                // A name no row gives a fallback, or whose standing statement is the
+                // absolute 0, offers nothing.
+                auto const standing = standingOf.find(ext.mangledName);
+                if (standing == standingOf.end() || standing->second.fallback.empty()) continue;
+                if (!fallbacksSearched.insert(standing->second.fallback).second) continue;
+                worklist.push_back(standing->second.fallback);
+                searchMore = true;
+            }
+        };
+        for (auto const& clientModule : clientModules) offerFallbacks(clientModule);
+        for (std::size_t k = 0; k < pulled.size(); ++k) offerFallbacks(pulled[k]);
+        if (!searchMore) break;
+    }
+    // The search's fixed point is reached: a member that could not be read fails
+    // the pull now, after every member the search reached was asked (site (h)).
+    if (!everyPulledMemberRead) return std::nullopt;   // each reported
+
+    // ── A PULLED MEMBER NAMES NO ENTRY (P69 round 4) ─────────────────────────
+    // link.exe fixes the image's entry before it searches an archive and GNU ld
+    // reads no MS `/ENTRY:`, so a member this search pulled cannot move it; an
+    // object input, linked eagerly above, keeps its `/ENTRY:`, as link.exe keeps
+    // one named on its command line (`linker::dropPulledMemberEntryRequests`).
+    for (auto& member : pulled) linker::dropPulledMemberEntryRequests(member.linkerRequests);
+
+    // ── THE BINDING, `bindForeignImports`: the `__imp_X` fold, the operator-named binaries, the platform
+    // realization oracle. The objects NAMED to the link ask the same function, after this search
+    // (`linkAndWriteWithStaticArchives`).
+    if (!bindForeignImports(pulled, definedNames, dynamicLibraries, target, format, reporter)) {
+        return std::nullopt;   // reported
+    }
+    return pulled;
+}
+
+// See the header: the ONE archive member a program's startup pulls for its entry.
+std::optional<std::vector<AssembledModule>>
+pullEntryArchiveMembers(std::span<EntryLinkName const>                     names,
+                        std::span<std::vector<EntryMaterialization> const> precedence,
+                        std::span<std::filesystem::path const>             archivePaths,
+                        TargetSchema const&                                target,
+                        ObjectFormatSchema const&                          format,
+                        DiagnosticReporter&                                reporter) {
+    std::vector<AssembledModule> pulled;
+    if (names.empty() || archivePaths.empty()) return pulled;
+    // Each entry name's rank (`entryPrecedenceRankOf`, the election's one answer), and the best rank any of them
+    // holds: an archive that lists a name of that rank closes the walk, as no later archive can outrank it.
+    std::unordered_map<std::string, std::size_t> rankOf;
+    std::size_t                                  top = std::numeric_limits<std::size_t>::max();
+    for (EntryLinkName const& n : names) {
+        std::size_t const rank = entryPrecedenceRankOf(precedence, n.verb);
+        rankOf.emplace(n.linkName, rank);
+        top = std::min(top, rank);
+    }
+    // Per archive, in the link's order: its bytes and its index, read by its own unit -- each archive once.
+    struct ParsedArchive {
+        std::vector<std::uint8_t> bytes;
+        ffi::ArArchive            archive;
+    };
+    std::vector<std::optional<ParsedArchive>> archives(archivePaths.size());
+    // The member the walk elects: its archive, its index in the archive, and the rank of the name its entry lists.
+    struct Elected {
+        std::size_t archive = 0;
+        std::size_t member  = 0;
+        std::size_t rank    = 0;
+    };
+    std::optional<Elected> elected;
+    // ★ ONE MEMBER, BY THE FORMAT'S PRECEDENCE, ARCHIVES IN THE LINK'S ORDER (P69 fold 3f, F1). The startup object
+    // every reference links first references ONE entry, so one member is pulled for it -- never one per name: with a
+    // member defining `main` and another `wmain` (pe64, either order), link.exe, lld-link and MinGW-w64 GNU ld each
+    // link ONE member, `main`'s (✔MEASURED P69 fold 3f, lane `xa`); fold 3e's pull seeded every name, linked both and
+    // warned of the precedence between them. The member is the one the election would elect: the first rank
+    // (`entryPrecedence`) any archive's index lists a name of, the first archive in the link's order listing a name
+    // of that rank, and that archive's index's FIRST entry of that rank -- the member every reference loads, on both
+    // archivers' indexes and in both member orders (✔MEASURED P69 fold 3f, lane `xa`, batch9: MinGW-w64 GNU ld, GNU
+    // ld, lld-link and link.exe; a lib.exe index lists one member of a name defined twice, an `ar` index both, in
+    // member order).
+    // ★ THE UNITS ARE THE ARCHIVES, EACH READ ONCE (the several-unit class's one home, `runEveryUnitOfAGrowingSet`:
+    // a set that CLOSES). A unit reads its archive and its index -- never a member's bytes -- reports what it cannot
+    // read, and the walk goes on: every archive the walk reaches is read, and says what is wrong with it, before the
+    // pull fails, and a failed walk pulls nothing. The set closes at the first archive that lists a name of the top
+    // rank, so an archive after it is never opened; where none does, every archive is read. No unit meets an archive
+    // twice, so a unit fails only for a failure it reported itself, and the net (`namingSilentUnits`) names one that
+    // did not.
+    std::size_t end    = archivePaths.size();
+    std::size_t cursor = 0;
+    bool const everyArchiveRead = substrate::runEveryUnitOfAGrowingSet(
+        cursor, [&] { return end; },
+        substrate::namingSilentUnits(
+            reporter, "the entry pull's archive read",
+            [&](std::size_t ai) { return "archive '" + core::genericSpelling(archivePaths[ai]) + "'"; },
+            [&](std::size_t ai) {
+        auto opened = core::openInputStream(archivePaths[ai], std::ios::binary);
+        if (!opened) {
+            report(reporter, DiagnosticCode::F_FileOpenFailed, DiagnosticSeverity::Error,
+                   std::format("static-link: failed to open archive '{}' for reading: {}.",
+                               core::genericSpelling(archivePaths[ai]), core::reasonText(opened.error())));
+            return false;
+        }
+        std::ifstream& in = *opened;
+        std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(in),
+                                        std::istreambuf_iterator<char>()};
+        auto arch = readNamingTheInput(
+            core::genericSpelling(archivePaths[ai]), reporter, [&](DiagnosticReporter& archiveReporter) {
+                return ffi::readArArchive(std::span<std::uint8_t const>{bytes.data(), bytes.size()},
+                                          archivePaths[ai].filename().string(), archiveReporter);
+            });
+        if (!arch) return false;   // corrupt archive -> reader fail-loud, named
+        ParsedArchive const& pa = archives[ai].emplace(ParsedArchive{std::move(bytes), std::move(*arch)});
+        // The best rank this archive's index lists, at the index's first entry of it; an earlier archive's member of
+        // the same rank stands.
+        for (auto const& sym : pa.archive.symbols) {
+            auto const rank = rankOf.find(sym.name);
+            if (rank == rankOf.end()) continue;
+            if (!elected.has_value() || rank->second < elected->rank) {
+                elected = Elected{ai, sym.memberIndex, rank->second};
+            }
+        }
+        if (elected.has_value() && elected->rank == top) end = ai + 1;   // no later archive outranks it
+        return true;
+    }));
+    if (!everyArchiveRead) return std::nullopt;   // each reported
+    if (!elected.has_value()) return pulled;      // no archive lists an entry: the election says so
+    // The elected member's bytes, read after the walk: a failure to read them is the pull's own, said once.
+    ParsedArchive const& pa     = *archives[elected->archive];
+    ffi::ArMember const& member = pa.archive.members[elected->member];
+    std::span<std::uint8_t const> const memberBytes{pa.bytes.data() + static_cast<std::size_t>(member.dataOffset),
+                                                    static_cast<std::size_t>(member.size)};
+    ArchiveMemberFormat memberFormat;
+    auto mod = readArchiveMemberModule(memberBytes, target, format, memberFormat, archivePaths[elected->archive],
+                                       member.name, reporter);
+    if (!mod) return std::nullopt;   // member-read fail-loud
+    // A member the search pulled names no entry of its own (`dropPulledMemberEntryRequests`, the lazy pull's rule).
+    linker::dropPulledMemberEntryRequests(mod->linkerRequests);
+    pulled.push_back(std::move(*mod));
     return pulled;
 }
 
@@ -3485,25 +5074,36 @@ extractStaticArchiveMembers(std::span<std::filesystem::path const> archivePaths,
     // lazy pull's. On this path `format` is a `container: "archive"` schema, so
     // the resolution is the identity case and costs nothing.
     ArchiveMemberFormat memberFormat;
-    for (auto const& archivePath : archivePaths) {
-        std::ifstream in(archivePath, std::ios::binary);
-        if (!in) {
+    // EVERY input archive, and every member of each, is read and reports its
+    // own errors before the extraction fails (`runEveryUnit`, the several-unit
+    // class's one home: P69 H6b, the review of H6's N1; site (c) of the
+    // orchestrator's ledger 550, fold 3e): an archive that does not open or
+    // parse, or a member that does not read, never stops the ones after it.
+    bool const everyArchiveRead = substrate::runEveryUnit(archivePaths.size(), substrate::namingSilentUnits(
+        reporter, "the input archive extraction", [&](std::size_t a) { return "archive '" + core::genericSpelling(archivePaths[a]) + "'"; },
+        [&](std::size_t a) {
+        std::filesystem::path const& archivePath = archivePaths[a];
+        auto opened = core::openInputStream(archivePath, std::ios::binary);
+        if (!opened) {
             ParseDiagnostic d;
             d.code     = DiagnosticCode::F_FileOpenFailed;
             d.severity = DiagnosticSeverity::Error;
             d.actual   = std::format(
                 "fat-archive: failed to open input static archive '{}' for "
-                "reading (D-FF1-STATICLIB-FAT-ARCHIVE).",
-                core::genericSpelling(archivePath));
+                "reading: {} (D-FF1-STATICLIB-FAT-ARCHIVE).",
+                core::genericSpelling(archivePath), core::reasonText(opened.error()));
             reporter.report(std::move(d));
-            return std::nullopt;
+            return false;
         }
+        std::ifstream& in = *opened;
         std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(in),
                                         std::istreambuf_iterator<char>()};
-        auto arch = ffi::readArArchive(
-            std::span<std::uint8_t const>{bytes.data(), bytes.size()},
-            archivePath.filename().string(), reporter);
-        if (!arch) return std::nullopt;   // corrupt archive -> reader fail-loud
+        auto arch = readNamingTheInput(
+            core::genericSpelling(archivePath), reporter, [&](DiagnosticReporter& archiveReporter) {
+                return ffi::readArArchive(std::span<std::uint8_t const>{bytes.data(), bytes.size()},
+                                          archivePath.filename().string(), archiveReporter);
+            });
+        if (!arch) return false;   // corrupt archive -> reader fail-loud, named
 
         // EVERY member, in archive order -- a static LIBRARY packages all of its
         // objects (unlike the LAZY referenced-subset the exe/final-link path
@@ -3513,7 +5113,10 @@ extractStaticArchiveMembers(std::span<std::filesystem::path const> archivePaths,
         // is carried verbatim -- cosmetic (the armap selects members by index),
         // and `ar` permits duplicate member names; a rare empty name (never from
         // a well-formed archive) is synthesized so the writer's name belt holds.
-        for (auto const& member : arch->members) {
+        return substrate::runEveryUnit(arch->members.size(), substrate::namingSilentUnits(
+            reporter, "the input archive extraction", [&](std::size_t m) { return core::genericSpelling(archivePath) + "(" + arch->members[m].name + "), member " + std::to_string(m); },
+            [&](std::size_t m) {
+            ffi::ArMember const& member = arch->members[m];
             std::span<std::uint8_t const> const memberBytes{
                 bytes.data() + static_cast<std::size_t>(member.dataOffset),
                 static_cast<std::size_t>(member.size)};
@@ -3521,14 +5124,16 @@ extractStaticArchiveMembers(std::span<std::filesystem::path const> archivePaths,
                 readArchiveMemberModule(memberBytes, target, format,
                                         memberFormat, archivePath, member.name,
                                         reporter);
-            if (!member_mod) return std::nullopt;   // member-read fail-loud
+            if (!member_mod) return false;   // member-read fail-loud
             out.modules.push_back(std::move(*member_mod));
             out.names.push_back(
                 member.name.empty()
                     ? ("member_" + std::to_string(out.names.size()) + ".o")
                     : member.name);
-        }
-    }
+            return true;
+        }));
+    }));
+    if (!everyArchiveRead) return std::nullopt;
     return out;
 }
 
@@ -3549,21 +5154,29 @@ readObjectInputModules(std::span<std::filesystem::path const> objectPaths,
     // target, which no input varies, so per-file resolution would re-scan the
     // object-format tree for every object named.
     ArchiveMemberFormat memberFormat;
-    for (auto const& objectPath : objectPaths) {
-        std::ifstream in(objectPath, std::ios::binary);
-        if (!in) {
+    // EVERY named object is read and reports its own errors before the read
+    // fails (`runEveryUnit`, the several-unit class's one home: P69 H6b; site
+    // (c) of the orchestrator's ledger 550, fold 3e): an object that does not
+    // open or read never stops the objects after it.
+    bool const everyObjectRead = substrate::runEveryUnit(objectPaths.size(), substrate::namingSilentUnits(
+        reporter, "the object input read", [&](std::size_t o) { return "object '" + core::genericSpelling(objectPaths[o]) + "'"; },
+        [&](std::size_t o) {
+        std::filesystem::path const& objectPath = objectPaths[o];
+        auto opened = core::openInputStream(objectPath, std::ios::binary);
+        if (!opened) {
             ParseDiagnostic d;
             d.code     = DiagnosticCode::F_FileOpenFailed;
             d.severity = DiagnosticSeverity::Error;
             d.actual   = std::format(
-                "object input: failed to open '{}' for reading. It was named as "
+                "object input: failed to open '{}' for reading: {}. It was named as "
                 "a link input, so it cannot be skipped -- an omitted object "
                 "would link into a smaller image that may still run "
                 "(D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION).",
-                core::genericSpelling(objectPath));
+                core::genericSpelling(objectPath), core::reasonText(opened.error()));
             reporter.report(std::move(d));
-            return std::nullopt;
+            return false;
         }
+        std::ifstream& in = *opened;
         std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(in),
                                         std::istreambuf_iterator<char>()};
 
@@ -3576,14 +5189,27 @@ readObjectInputModules(std::span<std::filesystem::path const> objectPaths,
             std::span<std::uint8_t const>{bytes.data(), bytes.size()}, target,
             linkFormat, memberFormat, objectPath,
             objectPath.filename().string(), reporter);
-        if (!object_mod) return std::nullopt;   // read fail-loud already reported
+        if (!object_mod) return false;   // read fail-loud already reported
         objects.push_back(std::move(*object_mod));
+        return true;
+    }));
+    if (!everyObjectRead) return std::nullopt;
+    // P69 send-back 5 (review-xa4 MINOR 3): an object NAMED to the link keeps
+    // its `/ENTRY:`, and the entry's name is a reference the archive search
+    // answers (`linker::requireEntryReference`). An image link decides it; a
+    // relocatable artifact hands the directive on and decides nothing. Asked
+    // of the named objects TOGETHER, once all are read (P69 fold 2): only the
+    // entry that stands among them is a reference — a later object's dropped
+    // `/ENTRY:` requires nothing, as under link.exe.
+    if (linkFormat.isImageFlavor()
+        && !linker::requireEntryReference(std::span<AssembledModule>{objects}, reporter)) {
+        return std::nullopt;   // the unit's id space is exhausted, refused by name
     }
     return objects;
 }
 
-bool linkAndWriteWithStaticArchives(AssembledModule                        clientModule,
-                                    std::span<std::filesystem::path const> objectInputs,
+bool linkAndWriteWithStaticArchives(std::vector<AssembledModule>           compiledModules,
+                                    std::vector<AssembledModule>           objects,
                                     std::span<std::filesystem::path const> staticArchives,
                                     std::span<ResolveLibrarySpec const>    dynamicLibraries,
                                     TargetSchema const&                    target,
@@ -3591,34 +5217,75 @@ bool linkAndWriteWithStaticArchives(AssembledModule                        clien
                                     std::filesystem::path const&           outPath,
                                     DiagnosticReporter&                    reporter,
                                     ImageRequest const&                    request) {
-    if (objectInputs.empty() && staticArchives.empty()) {
-        return linkAndWrite(std::span<AssembledModule const>{&clientModule, 1},
+    if (compiledModules.empty() && objects.empty()) {
+        // The contract's one refusal: a caller reached the link with nothing to
+        // link. Every route that produces an image hands a compiled module or at
+        // least one object (the all-object route refuses an empty input before).
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::D_EmptyInput;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = std::format(
+            "linkAndWriteWithStaticArchives: nothing to link into '{}' -- no compiled "
+            "module and no object input reached the link (an internal breach of the "
+            "link's contract: the driver refuses an empty build before this point).",
+            core::genericSpelling(outPath));
+        reporter.report(std::move(d));
+        return false;
+    }
+    if (objects.empty() && staticArchives.empty()) {
+        return linkAndWrite(std::span<AssembledModule const>{compiledModules.data(), compiledModules.size()},
                             target, format, outPath, reporter, request);
     }
 
-    // EAGER FIRST -- see the header's ordering note. The objects join the seed
-    // the lazy archive pull resolves against, so an archive member an object
-    // input needs is pulled rather than silently left behind.
-    auto objects = readObjectInputModules(objectInputs, target, format, reporter);
-    if (!objects) return false;   // read fail-loud already reported
-
-    std::vector<AssembledModule> combined;
-    combined.reserve(1 + objects->size());
-    combined.push_back(std::move(clientModule));
-    for (auto& object_mod : *objects) combined.push_back(std::move(object_mod));
+    // The objects join the seed the lazy archive pull resolves against (the
+    // header's ordering note), so an archive member an object input needs is
+    // pulled rather than silently left behind.
+    std::size_t const compiledCount = compiledModules.size();
+    std::size_t const objectCount   = objects.size();
+    std::vector<AssembledModule> combined = std::move(compiledModules);
+    combined.reserve(compiledCount + objectCount);
+    for (auto& object_mod : objects) combined.push_back(std::move(object_mod));
 
     auto pulled = pullStaticArchiveMembers(
         std::span<AssembledModule const>{combined.data(), combined.size()},
         staticArchives, dynamicLibraries, target, format, reporter);
     if (!pulled) return false;   // pull fail-loud already reported
 
-    // Link the COMBINED span [client, objects..., pulled...]. >1 element triggers
+    // Link the COMBINED span [compiled, objects..., pulled...]. >1 element triggers
     // the c154 cross-CU merge in `linker::link`, whose `mergeModules` binds each
     // cross-module reference to its definition (stripping the extern import)
-    // exactly as it resolves a sibling-CU reference. With no objects and nothing
-    // pulled the span is the client alone -- the single-CU path, unchanged.
+    // exactly as it resolves a sibling-CU reference.
     combined.reserve(combined.size() + pulled->size());
     for (auto& member_mod : *pulled) combined.push_back(std::move(member_mod));
+
+    // ── THE NAMED OBJECTS' LIBRARY IMPORTS (P69 fold 3c,
+    // D-LK-FOREIGN-OBJECT-NAMED-TO-THE-LINK-BINDS-NO-LIBRARY-IMPORT). An object named to the link is as foreign as
+    // a pulled member — it names the libraries it calls by NAME alone — and it is bound by the members' own function
+    // (`bindForeignImports`). AFTER the search: an archive member that defines a name an object calls answers it
+    // before any library does, as under link.exe and GNU ld. Until the fold nothing bound them, so ✔MEASURED
+    // 2026-10-20 every object of cl /MD, clang-cl, cl /MT and mingw-w64 gcc that calls `puts` — directly or through
+    // `__imp_puts` — was refused "undefined symbol" here, though the same object in an archive linked and ran.
+    // EVERY named object (P69 fold 3d): the one that defines the program's entry is foreign too. ✔MEASURED before
+    // (lane `xa`, `client_bind_dss.py`): an all-object link made that object a "client" ahead of the span bound here,
+    // and its `puts` was refused undefined.
+    if (objectCount != 0u) {
+        // Every name the link defines — external-linkage definitions and commons, of every module — is bound by
+        // the merge to its definition, never to a library (the search's own `definedNames`, asked of the whole
+        // link now that the search is done).
+        std::unordered_set<std::string> definedNames;
+        for (auto const& m : combined) {
+            for (auto const& ms : m.symbols) {
+                if (link::format::ObjectSymbolNames::hasExternalLinkage(ms)) definedNames.insert(ms.name);
+            }
+            for (auto const& ext : m.externImports) {
+                if (ext.commonSize != 0u && !ext.mangledName.empty()) definedNames.insert(ext.mangledName);
+            }
+        }
+        if (!bindForeignImports(std::span<AssembledModule>{combined.data() + compiledCount, objectCount}, definedNames,
+                                dynamicLibraries, target, format, reporter)) {
+            return false;   // reported
+        }
+    }
     return linkAndWrite(std::span<AssembledModule const>{combined.data(), combined.size()},
                         target, format, outPath, reporter, request);
 }
@@ -3709,15 +5376,28 @@ bool linkAndWriteStaticArchive(std::span<AssembledModule const> modules,
                                    reporter);
     ImageRequest memberRequest = request;
     memberRequest.runpaths.clear();
-    for (std::size_t i = 0; i < modules.size(); ++i) {
-        // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: `request` rides each member link
-        // so the capability gate fires on the archive path too. No archive
-        // format declares a stack-reserve capability (an `ar` member carries no
-        // image headers), so a request here is REFUSED on the first member —
-        // never silently swallowed by a build that reports success.
-        auto image = linker::link(std::span<AssembledModule const>{&modules[i], 1},
-                                  target, format, reporter, memberRequest);
-        if (!image.ok() || !tierClean(reporter, entry)) {
+    // ★ THE REQUEST IS THE ARCHIVE'S, ASKED ONCE (P69 H6b; the orchestrator's ledger 550). Its capability gate
+    // (D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: no archive format declares a stack-reserve capability, an `ar` member
+    // carries no image headers) is asked HERE, of the whole archive, by the gate every link asks -- so a refusal is
+    // said ONCE, never once per member now that every member is linked whatever an earlier one answered, and never
+    // silently swallowed by a build that reports success. A request the gate passes still rides every member link,
+    // where the same gate passes it again.
+    if (!enforceImageRequest(memberRequest, format, "linkAndWriteStaticArchive", reporter)) return false;
+    // EVERY member is linked and reports its own errors before the archive fails (`runEveryUnit`, the several-unit
+    // class's one home): a member that fails never stops the members after it, and each member's cleanliness is
+    // counted from its own start, not from the archive's.
+    bool const everyMemberLinked = substrate::runEveryUnit(modules.size(), substrate::namingSilentUnits(
+        reporter, "the static archive's member link", [&](std::size_t i) { return "member '" + memberNames[i] + "'"; },
+        [&](std::size_t i) {
+        auto const memberEntry = reporter.errorCount();
+        // The member's link reports NAME THE MEMBER (`readNamingTheInput`, H6c2): the linker's words name symbols, and
+        // two members failing on one symbol would say the same words -- the reporter keeps one, and the net would
+        // then name the other silent.
+        auto image = substrate::readNamingTheInput(memberNames[i], reporter, [&](DiagnosticReporter& memberReporter) {
+            return linker::link(std::span<AssembledModule const>{&modules[i], 1}, target, format, memberReporter,
+                                memberRequest);
+        });
+        if (!image.ok() || !tierClean(reporter, memberEntry)) {
             return false;
         }
         std::vector<std::string> exported;
@@ -3726,9 +5406,17 @@ bool linkAndWriteStaticArchive(std::span<AssembledModule const> modules,
                 exported.push_back(ms.name);
             }
         }
+        // A COMMON the member hands on (`ExternImport::commonSize`) is a
+        // definition it makes, so a link that searches the archive for the
+        // name must find this member.
+        for (ExternImport const& e : modules[i].externImports) {
+            if (e.commonSize != 0u) exported.push_back(e.mangledName);
+        }
         members.push_back(link::format::ArMemberInput{
             memberNames[i], std::move(image.bytes), std::move(exported)});
-    }
+        return true;
+    }));
+    if (!everyMemberLinked) return false;
 
     // c169/c171 (D-FF1-AR-COFF-WRITER + D-FF1-AR-STATICLIB-DRIVER-WIRING):
     // the archive FLAVOR is the format ecosystem's `ar` variant — Microsoft
@@ -3792,8 +5480,22 @@ assembleUnit(CompilationUnit const&        cu,
     auto cuMir = buildCuMir(cu, grammar, target, format,
                             callingConventionIndex, reporter, opts);
     if (!cuMir) return std::nullopt;
+    // D-MIR-SYNTH-SHIM-SEAM-OPTIMIZE-PLACEMENT-ASYMMETRY: the same final-module shape
+    // as the driver's sole-CU route — the library shims are synthesized, then the
+    // PROGRAM-stage optimize sees them, then the module is lowered. The module may be
+    // linked with archives or objects by its caller (`test_static_link` does), so it
+    // is a `LinkInput` (D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS).
+    if (!synthesizeLibraryShims(*cuMir, reporter)) return std::nullopt;
+    if (!optimizeModule(cuMir->mir, target, cuMir->model.lattice().interner(), opts,
+                        PipelineStage::Program, opt::ModuleExtent::LinkInput, {},
+                        reporter, cuMir->externImports)) {
+        return std::nullopt;   // optimize-stage failure already reported
+    }
+    std::optional<std::size_t> noOtherInput;   // one unit alone: none can win
     return lowerCuMirToAssembly(
-        *cuMir, format.processArgs(), format.entryVerbs(),
+        *cuMir, format.processArgs(), entryElectionScope(grammar, format, {}),
+        // One unit assembled alone: no other input of a link stands beside it.
+        std::span<ForeignEntryCandidate const>{}, noOtherInput,
         format.sehPersonality(), format.name(),
         target.wideFloatSoftcallLibrary(format.kind()), reporter,
         // D-CSUBSET-PACKED-ATOMIC-MEMBER: the format's atomics runtime, read
@@ -3833,6 +5535,9 @@ namespace {
 // (D-ASM-ADDRESS-OPERAND-CANNOT-NAME-AN-UNDEFINED-SYMBOL). A `.s` address operand
 // or data slot naming a symbol the file does not define mints its import
 // `Pending`: it states no code-vs-data, and gas's relocation states none either.
+// So, since P69, does an object reader for an untyped undefined symbol that no
+// call relocation names (D-LK-MEMBER-UNTYPED-EXTERN-TAKEN-AS-DATA), and the
+// archive-member binder asks this function the same question for it.
 // The library this binder just matched it to is the DEFINITION, and it states
 // its own kind, so that kind is written into `isData`, as ld reads it from the
 // symbol it resolves to. A library that states none (a stripped `.so`'s
@@ -3913,36 +5618,35 @@ void decideKindFromTheDefinition(ExternImport& e, ffi::SymbolKind definition) {
         }
     }
 
-    // ── (2) THE PLATFORM REALIZATION ORACLE ─────────────────────────────────
+    // ── (2) THE PLATFORM'S ROUTE OF EACH WRITTEN NAME ───────────────────────
     //
-    // The same `ffi::realizeShippedExternSymbols` the semantic tier asks about a
-    // hand-written C prototype. A `.s` that writes `call putchar` and a `.c`
-    // that writes `extern int putchar(int);` are making the SAME claim about the
-    // platform, so they must reach the same descriptor row and produce a
-    // byte-identical import — the corpus is the single owner of "which image
-    // owns this name here" (UCRT-P4 Decision 1).
+    // The same corpus the semantic tier asks about a hand-written C prototype. A
+    // `.s` that writes `call putchar` and a `.c` that writes `extern int
+    // putchar(int);` are making the SAME claim about the platform, so they must
+    // reach the same descriptor row and produce a byte-identical import — the
+    // corpus is the single owner of "which image owns this name here" (UCRT-P4
+    // Decision 1).
     // ★★ THE CORPUS IS KEYED ON THE CANONICAL C IDENTIFIER; A `.s` WROTE THE
     // DECORATED ONE. ✔MEASURED: a Mach-O source spells `call _putchar` (gas
     // requires it, and `asm_text_to_lir` takes the name VERBATIM by design), so
     // looking the written name up in the descriptor index missed on every
     // decorating format while elf and pe — where the decoration is empty — bound
-    // fine. That is the worst shape of gap: a feature that works on two of three
-    // formats with no diagnostic on the third.
-    // ⚠ AND IT IS UN-DECORATED BY ASKING THE FORMAT, never by stripping a `_`:
-    // `cSymbolDecoration().scheme` is the format's DECLARED rule and
-    // `unapplyCMangling` is the one shared inverse (the same call `ingest()`
-    // makes on binary-reader rows), so there is no `if (format == macho)` here
-    // and a format that declares no decoration is a byte-identical no-op.
+    // fine. ⚠ AND IT IS UN-DECORATED BY ASKING THE FORMAT, never by stripping a
+    // `_`: the query un-decorates by the format's DECLARED rule with the
+    // round-trip check (`writtenNameRoutesByOnBinaryName`, the one door every
+    // on-binary-name producer of this file asks through).
     //
-    // ★★★ THE QUERY ITSELF NOW LIVES IN `realizePlatformExternsByOnBinaryName`,
-    // WHICH THIS FILE'S OTHER ON-BINARY-NAME PRODUCER — THE ARCHIVE MEMBER — ALSO
-    // ASKS (D-LK-ARCHIVE-MEMBER-EXTERN-LOSES-ITS-LIBRARY). Read its docblock for
-    // the un-decoration round trip that used to be spelled here, and for the
-    // REVERSE (realized-link-name) arm that was missing from it: a `.s` writing
-    // `call _time64` names a symbol ucrtbase genuinely exports, yet the
-    // canonical-name-only lookup could not find its row, because the corpus keys
-    // that row under `time`. The POLICY below — which rows may bind, and the two
-    // refusals — stays HERE, with the producer whose vocabulary it is worded in.
+    // ★★★ P69 fold 3f (ledger 549 (b), main's ruling (ii)): THE ROUTE DECIDES, NOT
+    // THE INPUT KIND. A `.s` is a WRITTEN name like a foreign object's: `Direct`
+    // binds the row's image (a `call _time64` binds `time`'s row, which realizes to
+    // it); `Refused` is refused by name with the row's reason; `LinkerAlias` stays
+    // unbound for the image link's statement (`stateWrittenNameRoutes`), as a
+    // `call close` on pe binds `_close` through link.exe's oldnames and MinGW's
+    // import library (✔MEASURED 2026-11-17, d256/d257); `Body` stays unbound for
+    // the runtime archive's member that defines it; and `Header` with a row behind
+    // it — the platform's header renames the name away — is REFUSED below, as it
+    // always was. The POLICY — which rows may bind, and the refusals — stays HERE,
+    // with the producer whose vocabulary it is worded in.
     auto const scheme  = format.cSymbolDecoration().scheme;
     std::vector<std::string> writtenNames;
     writtenNames.reserve(externs.size());
@@ -3950,33 +5654,65 @@ void decideKindFromTheDefinition(ExternImport& e, ffi::SymbolKind definition) {
         writtenNames.push_back(e.libraryPath.empty() ? e.mangledName
                                                      : std::string{});
     }
-    // D-FFI-DUPLICATE-SYMBOL-ACROSS-DESCRIPTORS-SILENTLY-ORDER-RESOLVED: see the
-    // archive member's twin of this snapshot. The oracle reports a
-    // cross-descriptor realization disagreement on `reporter` and still answers
-    // the name; refusing is this caller's job, and it has to happen HERE —
-    // `compileAsmUnit` takes its `asmEntry` snapshot AFTER this function returns,
-    // so an error raised inside it would be carried past the tier gate.
+    // D-FFI-DUPLICATE-SYMBOL-ACROSS-DESCRIPTORS-SILENTLY-ORDER-RESOLVED: the oracle
+    // reports a corpus disagreement on `reporter` and still answers the name;
+    // refusing is this caller's job, and it has to happen HERE — `compileAsmUnit`
+    // takes its `asmEntry` snapshot AFTER this function returns, so an error
+    // raised inside it would be carried past the tier gate.
     auto const corpusEntry = reporter.errorCount();
-    auto const realized = realizePlatformExternsByOnBinaryName(
+    auto const routes = writtenNameRoutesByOnBinaryName(
         writtenNames, target, format, cu.id(), grammar.name(), reporter);
     if (!tierClean(reporter, corpusEntry)) return false;
     // nullopt ⇒ the shippedLibs directory could not be located. A statement
     // about the ENVIRONMENT, never about the user's program: every name stays
     // unbound and the link tier judges the reference, exactly as before this
     // binder existed.
-    if (!realized.has_value()) return true;
+    if (!routes.has_value()) return true;
 
     std::string const formatKey{objectFormatKindName(format.kind())};
     for (std::size_t i = 0; i < externs.size(); ++i) {
         ExternImport& e = externs[i];
         if (!e.libraryPath.empty()) continue;
-        auto const found = realized->find(e.mangledName);
-        if (found == realized->end()) continue;
+        auto const found = routes->find(e.mangledName);
+        if (found == routes->end()) continue;
+        ffi::WrittenNameRouteAnswer const& route = found->second;
+        if (route.kind == ffi::WrittenNameRouteKind::Refused) {
+            reportRefusedWrittenName(e.mangledName, route, format, reporter);
+            return false;
+        }
         // The corpus row's OWN C identifier — not necessarily the un-decorated
-        // spelling this file wrote (see the helper's FORWARD/REVERSE note), and
-        // it is what the two refusals below must reason about.
-        std::string const& canonical = found->second.canonicalName;
-        auto const row = &found->second;
+        // spelling this file wrote (`call _time64` is answered by `time`'s row),
+        // and it is what the refusal below must reason about.
+        std::string const& canonical = route.canonicalName;
+        auto const& row = route.row;
+        if (route.kind == ffi::WrittenNameRouteKind::Header) {
+            if (canonical.empty()) continue;   // no row knows it: the link tier judges it
+            // ⚠ A ROW THAT RENAMES THE NAME AWAY IS REFUSED rather than silently
+            // re-spelled. `ShippedSymbolRealization::linkName` replaces the C
+            // identifier a C declaration would have been decorated from (Darwin's
+            // `fstat` → `fstat$INODE64`); a `.s` did not write a C identifier, it
+            // wrote the on-binary symbol, and its own relocations already name that
+            // symbol. Rewriting the import's name here would leave the file's
+            // `call fstat` pointing at an import row named `_fstat$INODE64` — a
+            // mismatch resolved at LOAD, not at build. The link name is decorated
+            // by the FORMAT's rule (`linkNameFor`) before it is shown, so the
+            // message names exactly what the source should write.
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::A_AsmTextUnsupported;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "assembly unit references '{}', but on this target the platform "
+                "exports that facility under the link name '{}' (shipped-"
+                "descriptor per-target linkName). A '.s' names the ON-BINARY "
+                "symbol directly, so DSS will not silently re-spell the "
+                "reference: write '{}' in the source if that is the symbol you "
+                "mean.",
+                e.mangledName, row.linkName,
+                ffi::linkNameFor(canonical, /*asmLabel=*/{}, scheme, row.linkName));
+            reporter.report(std::move(d));
+            return false;
+        }
+        if (route.kind != ffi::WrittenNameRouteKind::Direct) continue;
         // ★★★ A `synthesize` ROW IS REFUSED HERE, LOUDLY, AND THAT REFUSAL IS
         // THE POINT RATHER THAN A GAP. A recipe row is realized as a
         // COMPILER-EMITTED BODY (pe `printf` is a shim over
@@ -3987,7 +5723,7 @@ void decideKindFromTheDefinition(ExternImport& e, ffi::SymbolKind definition) {
         // artifact would LINK CLEAN and die at LOAD with 0xC0000139 and no
         // diagnostic anywhere. That is the exact failure mode the eager-import
         // law exists to prevent, and it is worth a compile error.
-        if (!row->row.recipeId.empty()) {
+        if (!row.recipeId.empty()) {
             ParseDiagnostic d;
             d.code     = DiagnosticCode::A_AsmTextUnsupported;
             d.severity = DiagnosticSeverity::Error;
@@ -4001,11 +5737,10 @@ void decideKindFromTheDefinition(ExternImport& e, ffi::SymbolKind definition) {
                 "to LOAD, because '{}' exports no such symbol. Call the "
                 "descriptor's underlying core symbol from this file, or route "
                 "this reference through a compiled translation unit.",
-                e.mangledName, row->row.recipeId, formatKey,
+                e.mangledName, row.recipeId, formatKey,
                 [&] {
-                    auto const lib = row->row.library.find(formatKey);
-                    return lib != row->row.library.end() ? lib->second
-                                                            : formatKey;
+                    auto const lib = row.library.find(formatKey);
+                    return lib != row.library.end() ? lib->second : formatKey;
                 }());
             reporter.report(std::move(d));
             return false;
@@ -4015,45 +5750,15 @@ void decideKindFromTheDefinition(ExternImport& e, ffi::SymbolKind definition) {
         // same `objectFormatKindName`. A key ABSENT means the platform states no
         // image for this name on this format: leave it unbound (there is no
         // format-level default left to fall back to since UCRT-P4).
-        auto const lib = row->row.library.find(formatKey);
-        if (lib == row->row.library.end() || lib->second.empty()) continue;
+        auto const lib = row.library.find(formatKey);
+        if (lib == row.library.end() || lib->second.empty()) continue;
         e.libraryPath = lib->second;
-        e.version     = row->row.version;
+        e.version     = row.version;
         // The corpus row IS the platform's definition, and it states its kind
-        // (an ExternFunction or an ExternGlobal).
-        decideKindFromTheDefinition(e, row->row.isFunction ? ffi::SymbolKind::Function
-                                                           : ffi::SymbolKind::Object);
-        // ⚠ `mangledName` IS NOT REWRITTEN, and a `linkName` row is REFUSED
-        // rather than silently re-spelled. `ShippedSymbolRealization::linkName`
-        // replaces the C identifier a C declaration would have been decorated
-        // from (Darwin's `fstat` → `fstat$INODE64`); a `.s` did not write a C
-        // identifier, it wrote the on-binary symbol, and its own relocations
-        // already name that symbol. Rewriting the import's name here would leave
-        // the file's `call fstat` pointing at an import row named
-        // `_fstat$INODE64` — a mismatch resolved at LOAD, not at build.
-        // The comparison goes through `linkNameFor`, so the row's UNDECORATED
-        // link base is decorated by the FORMAT's rule before it is measured
-        // against what the file wrote — a source that already spelled
-        // `_fstat$INODE64` is correct and must not be refused.
-        if (!row->row.linkName.empty()
-            && ffi::linkNameFor(canonical, /*asmLabel=*/{}, scheme,
-                                row->row.linkName) != e.mangledName) {
-            ParseDiagnostic d;
-            d.code     = DiagnosticCode::A_AsmTextUnsupported;
-            d.severity = DiagnosticSeverity::Error;
-            d.actual   = std::format(
-                "assembly unit references '{}', but on this target the platform "
-                "exports that facility under the link name '{}' (shipped-"
-                "descriptor per-target linkName). A '.s' names the ON-BINARY "
-                "symbol directly, so DSS will not silently re-spell the "
-                "reference: write '{}' in the source if that is the symbol you "
-                "mean.",
-                e.mangledName, row->row.linkName,
-                ffi::linkNameFor(canonical, /*asmLabel=*/{}, scheme,
-                                 row->row.linkName));
-            reporter.report(std::move(d));
-            return false;
-        }
+        // (an ExternFunction or an ExternGlobal). ⓘ `mangledName` is not
+        // rewritten: a `Direct` row's link name here IS what the file wrote.
+        decideKindFromTheDefinition(e, row.isFunction ? ffi::SymbolKind::Function
+                                                      : ffi::SymbolKind::Object);
     }
     return true;
 }
@@ -4067,7 +5772,6 @@ assembleAsmUnit(CompilationUnit const&     cu,
                 ObjectFormatSchema const&  format,
                 DiagnosticReporter&        reporter,
                 CompileOptions const&      opts) {
-    std::span<EntryMaterialization const> const formatVerbs = format.entryVerbs();
     // ★★★ THE `encode` TIER'S WHOLE BODY. Compare it with `assembleUnit` above:
     // no semantic analysis, no CST→HIR, no HIR→MIR, no optimizer, no MIR→LIR,
     // no liveness, no register allocation, no two-address legalization, no
@@ -4084,59 +5788,38 @@ assembleAsmUnit(CompilationUnit const&     cu,
         empty.cuId = cu.id();
         return empty;
     }
-    // ★★★ THE ENTRY NAMES ARE **NOT** INTERSECTED WITH THE FORMAT'S VERBS, AND
-    // THIS COMMENT USED TO CLAIM THEY WERE. The claim sat above a `(void)
-    // formatVerbs;` for the whole life of the function — fifteen lines
-    // describing an intersection that no line performed. Corrected rather than
-    // implemented, because the intersection is not merely unwritten: it has no
-    // subject here.
-    //
-    // ✔MEASURED in `resolveProgramEntry` (this file): the intersection is
-    // `EntryCandidate::verb ∈ formatVerbs`, and `verb` comes from
-    // `SemanticModel`'s `SymbolRecord::entryVerb` — the SEMANTIC tier's record
-    // of which declared entry SHAPE a definition's signature matched. The
-    // `encode` tier runs no semantic analysis by construction (there is no MIR
-    // module, which is the whole point of the tier), and a `.s` label carries
-    // no signature to match a shape against anyway. So an assembly label has no
-    // materialization verb, and "intersect the labels' verbs with the format's"
-    // is not a thing that can be computed — not a TODO.
-    //
-    // ⚠ WHAT `formatVerbs` CAN HONESTLY ANSWER HERE, AND NOW DOES: whether this
-    // format STARTS A PROGRAM at all. A non-empty declared verb set means it
-    // does (`ObjectFormatData::validate()` pins non-empty ⟺ exec-flavored, in
-    // both directions), and a dialect that declares no `entryLabels` can then
-    // never resolve one — every function would come back unelected and the
-    // trampoline would call whatever landed at functions[0]. That is the
-    // silently-wrong-entry outcome the previous comment named as the thing that
-    // must not happen, while the code it introduced did nothing to prevent it.
-    std::span<std::string const> const entryNames{
-        grammar.assembly().entryLabels};
-    if (!formatVerbs.empty() && entryNames.empty()) {
-        ParseDiagnostic d;
-        d.code     = DiagnosticCode::K_ProgramEntryUndefined;
-        d.severity = DiagnosticSeverity::Error;
-        d.actual = std::format(
-            "assembly dialect '{}' declares no 'assembly.entryLabels', so no "
-            "label in a '{}' file can be this program's entry — but the object "
-            "format STARTS A PROGRAM (it declares {} entry-materialization "
-            "verb(s)), so it needs one. Without an elected entry the emitted "
-            "trampoline would call whichever function happened to land first. "
-            "Add the entry spelling(s) to the dialect's 'assembly.entryLabels', "
-            "or build this unit for a relocatable format.",
-            grammar.name(), grammar.name(), formatVerbs.size());
-        reporter.report(std::move(d));
-        return std::nullopt;
-    }
+    // ★★★ THIS UNIT ELECTS NO ENTRY (P69 fold 3e, the review of fold 3d's X1).
+    // It used to: its lowering matched the dialect's own label list, a second
+    // election over a second vocabulary, which never saw an object input's
+    // `main`. The unit's module is now one candidate source among the link's
+    // inputs, read as an object's is (`collectObjectEntryCandidates`, through the
+    // one vocabulary `entryLinkNames`: the dialect's `entryLabels` rows, with the
+    // richest verb of each name the format realizes, spelled on the binary in the
+    // format's C decoration), and the driver's route elects among them all
+    // (`resolveProgramEntry`). What stays here is the label-level refusal only a
+    // lowering can make: an entry-named label that is not exported is no
+    // candidate, and is refused by name.
+    std::vector<std::string> entryNames;
+    for (EntryLinkName const& n : entryLinkNames(grammar, format)) entryNames.push_back(n.linkName);
 
     AssembledModule merged;
     merged.cuId = cu.id();
-    for (auto const& tree : cu.trees()) {
+    // EVERY tree is lowered and assembled, and reports its own errors, before
+    // the unit fails (`runEveryUnit`, the several-unit class's one home: P69
+    // H6b, the review of H6's N1; site (e) of the orchestrator's ledger 550,
+    // fold 3e): a tree that fails never stops the trees after it.
+    std::vector<AssembledModule> assembledTrees;
+    std::span<Tree const> const trees = cu.trees();
+    bool const everyTreeAssembled = substrate::runEveryUnit(trees.size(), substrate::namingSilentUnits(
+        reporter, "the assembly unit's source assembly", [](std::size_t ti) { return "assembly source " + std::to_string(ti); },
+        [&](std::size_t ti) {
+        Tree const& tree = trees[ti];
         // P68 round 9: the format kind, ONLY as a key into the dialect's
         // `symbolParts` / `impliedSymbolPart` (`:lo12:` on ELF, `@PAGEOFF` on
         // Mach-O — each reference reads only its own format's spelling).
         auto lowered = lowerAsmTextToLir(tree, grammar, target, entryNames,
                                          reporter, format.kind());
-        if (!lowered) return std::nullopt;
+        if (!lowered) return false;
 
         // D-ASM-EXTERN-CALL-CANNOT-BIND-A-LIBRARY +
         // D-ASM-RESOLVE-LIBRARY-SILENTLY-IGNORED-ON-ENCODE-TIER: the rows
@@ -4149,7 +5832,7 @@ assembleAsmUnit(CompilationUnit const&     cu,
         // bound after that call would be bound too late.
         if (!bindAsmExternImports(lowered->externImports, cu, grammar, target,
                                   format, opts, reporter)) {
-            return std::nullopt;
+            return false;
         }
 
         auto const asmEntry = reporter.errorCount();
@@ -4164,11 +5847,10 @@ assembleAsmUnit(CompilationUnit const&     cu,
         auto assembled = assemble(lowered->lir, target, lirToMir, reporter,
                                   lowered->externImports);
         if (!assembled.ok() || !tierClean(reporter, asmEntry)) {
-            return std::nullopt;
+            return false;
         }
         assembled.cuId            = cu.id();
         assembled.symbols         = std::move(lowered->symbols);
-        assembled.userEntrySymbol = lowered->userEntrySymbol;
         // D-ASM-DATA-ITEMS-NOT-WIRED-INTO-THE-DRIVER: without this line the
         // data-defining directives' bytes were COMPUTED AND DROPPED. `assemble()`
         // builds its module from the LIR, and LIR carries no data — so the only
@@ -4195,7 +5877,7 @@ assembleAsmUnit(CompilationUnit const&     cu,
         if (lowered->cfiInitial.has_value()
             && !attachAssemblyCfi(assembled, lowered->perFuncCfi,
                                   *lowered->cfiInitial, reporter)) {
-            return std::nullopt;
+            return false;
         }
         // D-ASM-INTERIOR-LABELS-NOT-ADDRESSABLE-AT-AN-OFFSET: bind the block
         // symbols that only a DATA slot names (a hand-written jump table). This
@@ -4219,7 +5901,7 @@ assembleAsmUnit(CompilationUnit const&     cu,
                            "assembler disagree about this file's function list "
                            "(D-ASM-INTERIOR-LABELS-NOT-ADDRESSABLE-AT-AN-OFFSET)",
                            b.funcIndex, assembled.functions.size()));
-                return std::nullopt;
+                return false;
             }
             AssembledFunction& outFn = assembled.functions[b.funcIndex];
             std::unordered_set<std::uint32_t> alreadyBound;
@@ -4236,24 +5918,30 @@ assembleAsmUnit(CompilationUnit const&     cu,
                            "with no address ("
                            "D-ASM-INTERIOR-LABELS-NOT-ADDRESSABLE-AT-AN-OFFSET)",
                            b.lirBlockV));
-                return std::nullopt;
+                return false;
             }
         }
-        // ⚠ ONE TREE PER UNIT TODAY. A multi-file `.s` build would need each
-        // file's SymbolIds namespaced before the merge; refusing is the honest
-        // answer while that is unbuilt, because silently keeping the LAST tree
-        // would drop every function in the others.
-        if (merged.expectedFuncCount != 0 || !merged.functions.empty()) {
-            report(reporter, DiagnosticCode::A_AsmTextUnsupported,
-                   DiagnosticSeverity::Error,
-                   "a compilation unit with more than one assembly source is "
-                   "not yet lowered — each file's symbol space would have to be "
-                   "namespaced before the modules merge, and keeping only one "
-                   "of them would silently drop the others' functions");
-            return std::nullopt;
-        }
-        merged = std::move(assembled);
+        assembledTrees.push_back(std::move(assembled));
+        return true;
+    }));
+    if (!everyTreeAssembled) return std::nullopt;
+    // ⚠ ONE TREE PER UNIT TODAY. A multi-file `.s` build would need each
+    // file's SymbolIds namespaced before the merge; refusing is the honest
+    // answer while that is unbuilt, because silently keeping the LAST tree
+    // would drop everything in the others. Asked of the trees' COUNT, after
+    // every tree was asked (fold 3e): it used to ask whether the module kept
+    // so far held a function, so a first tree of DATA alone was replaced by
+    // the second, its data dropped with no word.
+    if (assembledTrees.size() > 1) {
+        report(reporter, DiagnosticCode::A_AsmTextUnsupported,
+               DiagnosticSeverity::Error,
+               "a compilation unit with more than one assembly source is "
+               "not yet lowered — each file's symbol space would have to be "
+               "namespaced before the modules merge, and keeping only one "
+               "of them would silently drop the others' functions and data");
+        return std::nullopt;
     }
+    if (!assembledTrees.empty()) merged = std::move(assembledTrees.front());
     return merged;
 }
 
@@ -4272,6 +5960,23 @@ bool compileSingleUnit(CompilationUnit const&        cu,
                         target, format, outPath, reporter);
 }
 
+// The import fixpoint's bound, the invariant its declaration states: the compiler defect by name, and the answer the
+// stage stops on.
+bool importBoundReached(std::size_t unit, std::uint32_t demandLeft, DiagnosticReporter& reporter) {
+    if (demandLeft == 0) return false;
+    ParseDiagnostic d;
+    d.code     = DiagnosticCode::X_OptImportBoundReached;
+    d.severity = DiagnosticSeverity::Error;
+    d.actual   = std::format(
+        "runThinLtoImportStage: module #{} still had {} importable callee(s) when the import fixpoint reached its "
+        "bound of {} round(s). The import closure takes every direct callee before the first optimize, so no later "
+        "round has a body to take: this is a defect of the compiler's import closure, not a property of the program.",
+        unit, demandLeft, ::dss::mirsum::kMaxImportRounds);
+    // Anchored: D-OPT-RELEASE-UNIT-FIXPOINT-CAP-WARNS-THOUGH-THE-PROGRAM-STAGE-RESUMES.
+    reporter.report(std::move(d));
+    return true;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // THE THIN-LTO PER-TU IMPORT STAGE (D-OPT11-LAZY-IMPORT-EDGE, plan 22 §0.2)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -4285,13 +5990,14 @@ bool compileSingleUnit(CompilationUnit const&        cu,
 // Reached only from `--lto=thin`. Every build that does not ask for it takes the
 // identical path it took before this function existed — including the
 // `PhaseTimers::read(Optimize).runs` count three driver-supply tests pin.
-bool runThinLtoImportStage(std::span<CuMirModule>  cuMirs,
-                           TargetSchema const&     target,
-                           CSymbolDecorationScheme cSymDecor,
-                           std::string_view        targetIdentity,
-                           CompileOptions const&   opts,
-                           substrate::IExecutor*   executor,
-                           DiagnosticReporter&     reporter) {
+bool runThinLtoImportStage(std::span<CuMirModule>     cuMirs,
+                           TargetSchema const&        target,
+                           ObjectFormatSchema const&  linkFormat,
+                           CSymbolDecorationScheme    cSymDecor,
+                           std::string_view           targetIdentity,
+                           CompileOptions const&      opts,
+                           substrate::IExecutor*      executor,
+                           DiagnosticReporter&        reporter) {
     if (cuMirs.size() < 2) return true;   // nothing crosses a boundary
 
     // ── (1) THE POLICY, 100% FROM THE PIPELINE DOCUMENT ─────────────────────
@@ -4401,7 +6107,8 @@ bool runThinLtoImportStage(std::span<CuMirModule>  cuMirs,
             &cuMirs[i].libraryShimRecipes});
     }
 
-    auto index = ::dss::mirsum::buildSummaryIndex(summaries, policy, reporter);
+    auto index = ::dss::mirsum::buildSummaryIndex(summaries, policy, linkFormat,
+                                                  reporter);
     if (!index.has_value()) return false;
     if (!::dss::mirsum::summariesDescribeModules(views, summaries, reporter))
         return false;
@@ -4427,11 +6134,17 @@ bool runThinLtoImportStage(std::span<CuMirModule>  cuMirs,
     auto runOne = [&](std::size_t i) {
         outcomes[i] = ::dss::mirsum::lazyImportOptimize(
             static_cast<std::uint32_t>(i), views, summaries, *index, policy,
-            srcLanguage,
+            srcLanguage, linkFormat,
             [&](Mir& m, TypeInterner const& in,
                 std::span<ExternImport const> ex) {
+                // D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS:
+                // a thin unit is optimized ALONE and linked with its siblings.
+                // Its stage is the IMPORT stage: the merged module's Program
+                // stage runs after it, so a truncation here is resumed there.
                 return optimizeModule(m, target, in, opts,
-                                      PipelineStage::Program, scratch[i], ex);
+                                      PipelineStage::ThinImport,
+                                      opt::ModuleExtent::LinkInput, {},
+                                      scratch[i], ex);
             },
             scratch[i]);
     };
@@ -4456,19 +6169,28 @@ bool runThinLtoImportStage(std::span<CuMirModule>  cuMirs,
     // module is also a potential import SOURCE for every other importer, which
     // is exactly why `lazyImportOptimize` returns its module instead of writing
     // one through a reference.
-    bool ok = true;
-    for (std::size_t i = 0; i < cuMirs.size(); ++i) {
-        copyDiagnostics(scratch[i], reporter);
-        if (!outcomes[i].ok) { ok = false; continue; }
-        if (!outcomes[i].mir.has_value()) continue;   // imported nothing
-        cuMirs[i].mir                 = std::move(*outcomes[i].mir);
-        cuMirs[i].importedHost        = std::move(outcomes[i].host);
-        cuMirs[i].importedSymbolNames = std::move(outcomes[i].symbolNames);
-        cuMirs[i].externImports       = std::move(outcomes[i].externImports);
-        cuMirs[i].libraryShimRecipes  = std::move(outcomes[i].synthRecipes);
-        cuMirs[i].usesImportedLattice = true;
-    }
-    return ok;
+    // ★ EVERY CU IS INSTALLED, OR SAYS WHY NOT, BEFORE THE STAGE FAILS (`runEveryUnit`, the several-unit class's one
+    // home, P69 H6c2): a CU whose import failed never stops the CUs after it. Netted: a CU's reports carry its own
+    // buffer, and the bound's names its module, so a CU that failed having said nothing is named.
+    return substrate::runEveryUnit(
+        cuMirs.size(),
+        substrate::namingSilentUnits(
+            reporter, "the thin-LTO import install", [](std::size_t i) { return "module #" + std::to_string(i); },
+            [&](std::size_t i) {
+                reporter.relayFrom(scratch[i]);
+                // The import fixpoint's bound is an INVARIANT, never a truncation (`importBoundReached`, beside the
+                // stage rule): a unit that reached it fails the stage, whatever its report became.
+                if (importBoundReached(i, outcomes[i].demandLeftAtBound, reporter)) return false;
+                if (!outcomes[i].ok) return false;
+                if (!outcomes[i].mir.has_value()) return true;   // imported nothing
+                cuMirs[i].mir                 = std::move(*outcomes[i].mir);
+                cuMirs[i].importedHost        = std::move(outcomes[i].host);
+                cuMirs[i].importedSymbolNames = std::move(outcomes[i].symbolNames);
+                cuMirs[i].externImports       = std::move(outcomes[i].externImports);
+                cuMirs[i].libraryShimRecipes  = std::move(outcomes[i].synthRecipes);
+                cuMirs[i].usesImportedLattice = true;
+                return true;
+            }));
 }
 
 } // namespace dss

@@ -10,6 +10,7 @@
 // cycle to route around the way `sectionName` has to.
 #include "core/types/asm_template_text_forms.hpp"   // AsmTemplateTextForms
 #include "core/types/cfi.hpp"
+#include "core/types/entry_shape.hpp"   // EntryMaterialization -- an entry label's verbs
 #include "core/types/rule_id.hpp"
 #include "core/types/strong_ids.hpp"   // LexerModeId — the template surface's mode
 #include "core/types/object_format_kind.hpp"   // ObjectFormatKind — the key of a symbol-part spelling
@@ -1283,17 +1284,35 @@ struct DSS_EXPORT AssemblyConfig {
     // spelling is an ordinary name.
     std::string locationCounter;
 
-    // Label names that START A PROGRAM. ★ IT IS THE SAME FACT `c.lang.json`
-    // states as `semantics.declarations[].entryFunctions`, stated at a tier that
-    // has no declarations: the `encode` path runs no semantic analysis, so there
-    // is no declaration row for an entry SHAPE to hang off, and a `.s` label
-    // carries no signature to match one against anyway. ⚠ IT IS NOT A SECOND
-    // POLICY — it supplies only the NAMES; whether a named entry is realizable
-    // stays the format's `entryVerbs()` question, answered by the same
-    // intersection every other language goes through.
+    // The labels that START A PROGRAM, each with the materialization verbs a
+    // program entered there may take. ★ IT IS THE SAME FACT `c.lang.json` states
+    // as `semantics.declarations[].entryFunctions`, in the same shape less the
+    // signature: the `encode` path runs no semantic analysis and a `.s` label
+    // carries no signature, so a row states its NAME and its VERBS, the way a
+    // language's rows do. ★ ONE VOCABULARY (P69 fold 3e, the review of fold 3d's
+    // X1): `entryLinkNames` (program/compile_pipeline.hpp) reads these rows and a
+    // language's alike, intersects them with the format's `entryVerbs`, and
+    // spells each name on the binary in the format's C decoration -- so a Mach-O
+    // `.s` enters at `_main`, as ld64 enters a clang `.s` (✔MEASURED, lane `xa`:
+    // ld64 links a `_main` `.s` and refuses a `main` one, "_main undefined"). A
+    // label of the dialect is elected exactly as an object's definition of the
+    // name is: with the richest verb of its name the format realizes, by the one
+    // election every route holds (`resolveProgramEntry`).
     // Empty is legal and means "this dialect starts no program by itself" — a
     // pure object/relocatable build, where the entry is somebody else's.
-    std::vector<std::string> entryLabels;
+    struct EntryLabel {
+        std::string                       name;
+        std::vector<EntryMaterialization> verbs;   // in the dialect's order
+    };
+    std::vector<EntryLabel> entryLabels;
+
+    // The labels' names alone, in declaration order.
+    [[nodiscard]] std::vector<std::string> entryLabelNames() const {
+        std::vector<std::string> out;
+        out.reserve(entryLabels.size());
+        for (EntryLabel const& e : entryLabels) out.push_back(e.name);
+        return out;
+    }
 
     // ★★★ THE ONE SPELLING COMPARISON. Every match against declared vocabulary
     // — mnemonic, directive, operand selector, register name — goes through

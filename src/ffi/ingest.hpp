@@ -566,8 +566,8 @@ private:
 // (CallConv lives on the FnSig TypeId, per the post-FF3 design).
 //
 // Behavior:
-//   * Missing source: caller-API-level — fails loud via reporter
-//     on the FIRST source that fails to read.
+//   * A source that fails to read: fails loud via reporter, and EVERY
+//     source is read and reports before the ingest fails (P69 H6c2).
 //   * Duplicate mangledName across sources: silent for the first
 //     occurrence; subsequent duplicates skipped with a Warning-level
 //     diagnostic (`F_FfiIngestDuplicateSymbol`) so the audit log
@@ -613,12 +613,14 @@ ingest(std::span<IngestionSource const> sources,
 // stable across platforms (FF-latent substrate; no live production
 // caller as of 2026-06-03).
 //
-// Failure modes (post-fold #5 H1): per-file failures are collected.
-// The directory read returns a partial surface with rows from every
-// file that DID parse, and only returns std::unexpected when EVERY
-// file failed. Per-file failure diagnostics already reach the
-// reporter via `readCHeader`; the propagated HeaderReadError carries
-// the FIRST failure's detail for triage convenience.
+// Failure modes (P69 H6c2): EVERY header is read, and each failure
+// reaches the reporter via `readCHeader`, before the read fails; the
+// read FAILS when ANY header failed, and the propagated HeaderReadError
+// carries the FIRST failure's detail. A partial surface is never
+// answered: one short of a broken header's declarations let `ingest`
+// refuse an extern that header declared, two steps from its cause. The
+// read's own refusals (not a directory, an empty `importLibrary`, a
+// listing that cannot be read whole) are reported here too.
 //
 // `pair` is the `<target>:<format>` pair (with its resolved calling convention)
 // every header is read under — see `HeaderReadPair`.

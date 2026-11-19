@@ -1,0 +1,1 @@
+        row.isCommon       = mir.globalIsCommon(g);   // the ONE statement of it

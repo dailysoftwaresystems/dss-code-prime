@@ -1,0 +1,1 @@
+        void noteCommittedFailure(RuleId candidate) noexcept { if (!committedFailure.valid()) committedFailure = candidate; }

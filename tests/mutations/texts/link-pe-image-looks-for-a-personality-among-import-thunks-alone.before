@@ -1,0 +1,1 @@
+                if (module.functions[fi].symbol != patch.symbol) continue;

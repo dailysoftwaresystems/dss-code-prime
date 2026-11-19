@@ -1,0 +1,1 @@
+    --s.depth;   // the arm: the scope's snapshot outlives its operation

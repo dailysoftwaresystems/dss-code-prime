@@ -127,6 +127,8 @@ namespace {
     auto const sig = interner.fnSig(params, boolT, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(sig, SymbolId{1});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const thenB = mb.createBlock(StructCfMarker::IfThen);
@@ -196,7 +198,7 @@ struct LoweredShape {
 void runToBytes(Mir& mir, TypeInterner const& interner,
                 TargetSchema const& target, std::uint16_t ccIndex,
                 LoweredShape& out) {
-    auto lowered = lowerToLir(mir, target, interner, out.rep);
+    auto lowered = lowerToLir(mir, target, interner, out.rep, ccIndex);
     ASSERT_TRUE(lowered.ok) << "MIR->LIR failed";
     ASSERT_EQ(out.rep.errorCount(), 0u) << "the lowering must be clean";
 

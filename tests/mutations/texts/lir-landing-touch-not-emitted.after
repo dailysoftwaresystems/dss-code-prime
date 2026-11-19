@@ -1,0 +1,3 @@
+            if (false && footing.landingTouch) {   /*S6a*/
+                outProbeTouches.insert(
+                    emitProbeTouch(b, h.orMem, sp, 0, probeTouch).v);

@@ -17,6 +17,7 @@
 #include "program/cli_args.hpp"
 #include "program/input_resolver.hpp"
 #include "program/program.hpp"          // formatWallTime (the --time formatter)
+#include "driver_diagnostics_listener.hpp"   // AskedDriverCodes
 
 #include <gtest/gtest.h>
 
@@ -1121,6 +1122,7 @@ TEST(CliArgs, ReporterConfigProjectionStillCarriesWarningsAsErrorsAndSuppress) {
 // The CONTROL arm is the load-bearing half — without it the pin would pass over
 // an implementation that always caps, which is the mirror defect.
 TEST(CliArgs, MaxDiagnosticsCapAppearsOnRealStderrThroughProgramRun) {
+    dss::test_support::AskedDriverCodes const asked{dss::DiagnosticCode::D_FileNotFound, dss::DiagnosticCode::P_TooManyDiagnostics};   // missing files are how the cap is reached
     auto const runCapturingStderr = [](Argv& a) {
         std::ostringstream captured;
         auto* const previous = std::cerr.rdbuf(captured.rdbuf());
@@ -1714,4 +1716,67 @@ TEST(CliArgs, HelpTextGlossesForceGitCacheImperatively) {
               std::string::npos)
         << "the imperative gloss is missing — without it the flag's name is the "
            "only documentation, and it reads as the opposite of what it does";
+}
+
+// ── THE WALK NAMES EVERY UNIT IT REFUSES (P69 H6c2) ──────────
+// One run names every malformed argument: the first refused unit is the error's own kind and detail, every later one
+// is in `also`, in argv order; a refused unit's span is read whole; the checks of the whole line read only a walk
+// that refused nothing.
+
+TEST(CliArgs, EveryMalformedUnitIsNamedInArgvOrder) {
+    Argv a{"dsscp", "--max-diagnostics", "many", "--bogus", "--compile", "a.c",
+           "--language", "c", "--target", "x86_64:elf64-x86_64-linux"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::InvalidMaxDiagnostics);
+    ASSERT_EQ(r.error().also.size(), 1u) << "the walk stopped at its first refusal";
+    EXPECT_EQ(r.error().also[0].kind, CliArgsError::UnknownFlag);
+    EXPECT_NE(r.error().also[0].detail.find("--bogus"), std::string::npos) << r.error().also[0].detail;
+}
+
+TEST(CliArgs, ARepeatedModeFlagStillSpansItsFileList) {
+    Argv a{"dsscp", "--compile", "a.c", "--compile", "b.c", "c.c",
+           "--language", "c", "--target", "x86_64:elf64-x86_64-linux"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::DuplicateModeFlag);
+    EXPECT_TRUE(r.error().also.empty()) << "b.c and c.c are the repeated flag's list, never stray positionals: "
+                                        << r.error().also.size() << " more refusal(s)";
+}
+
+TEST(CliArgs, AnEmptyPositionalIsRefusedInsideItsList) {
+    Argv a{"dsscp", "--compile", "a.c", "", "b.c",
+           "--language", "c", "--target", "x86_64:elf64-x86_64-linux"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::EmptyFilename);
+    EXPECT_TRUE(r.error().also.empty()) << "the empty positional is its list's, and b.c too: "
+                                        << r.error().also.size() << " more refusal(s)";
+}
+
+TEST(CliArgs, ARefusedWalkRunsNoCheckOfTheWholeLine) {
+    Argv a{"dsscp", "--bogus"};   // no mode, no --language, no --target: the whole-line checks would refuse it too
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::UnknownFlag);
+    EXPECT_TRUE(r.error().also.empty()) << "a check of the whole line ran on a refused walk";
+}
+
+// The shipped entry point prints every refused unit, one `error:` line each, in argv order.
+TEST(CliArgs, ProgramRunPrintsEveryRefusedUnit) {
+    Argv a{"dsscp", "--bogus-first", "--max-diagnostics", "many", "--bogus-last"};
+    std::ostringstream captured;
+    auto* const        previous = std::cerr.rdbuf(captured.rdbuf());
+    Program            program;
+    int const          code = program.run(a.argc(), a.argv());
+    std::cerr.rdbuf(previous);
+    std::string const err = captured.str();
+    EXPECT_EQ(code, 2);
+    std::size_t const first  = err.find("error: unknown flag '--bogus-first'");
+    std::size_t const middle = err.find("error: ", first + 1);
+    std::size_t const last   = err.find("error: unknown flag '--bogus-last'");
+    EXPECT_NE(first, std::string::npos) << err;
+    EXPECT_NE(last, std::string::npos) << err;
+    EXPECT_LT(first, middle);
+    EXPECT_LT(middle, last) << "the --max-diagnostics refusal is printed between the two unknown flags:\n" << err;
 }

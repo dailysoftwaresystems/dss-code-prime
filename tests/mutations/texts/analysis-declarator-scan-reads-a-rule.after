@@ -1,0 +1,2 @@
+        RuleId const cr = tree.rule(c);
+        // VLA C4c (D-CSUBSET-VLA-PARAM-STAR): the bare-`[*]` suffix is a THIRD

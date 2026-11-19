@@ -1,0 +1,1 @@
+    for (std::uint32_t i = sc.first; i != kNoBinding; i = bindings_[i].nextInScope) unlink_(i);

@@ -1,0 +1,1 @@
+    for (std::uint32_t i = ((void)bindings_.begin(), scopes_[from.scope].first); i != kNoBinding;) {

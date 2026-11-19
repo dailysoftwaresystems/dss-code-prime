@@ -1,13 +1,53 @@
 # PURPOSE: census `#pragma` usage across the corpus and hold the profile to its expected shape.
 name: pragma-profile-census
 description: >-
-  The action censuses the reached #pragma vocabulary over the staged corpus against its expected shape; it refuses by name without a staged corpus and a dsscp.
+  The action censuses the reached #pragma vocabulary of ONE corpus -- the sqlite corpus a run on this leg staged --
+  under that corpus's own predefine class, against the checked-in expected set; it refuses by name without a
+  staged corpus and a dsscp, and fails, judging nothing, unless both sentinels around each TU spoke and the log
+  holds no error but an unclaimed pragma and no pragma diagnostic the reporter elided.
   The program documents itself in its own header; this file declares only how a
   runner starts it and what witnesses that it ran.
 steps:
+  # The CHECK, on the leg whose corpus it is (pe on Windows, elf on Linux, macho on the Mac): the leg's own
+  # build (`{product}`, which DssHarness builds before the step) over the manifest that leg's sqlite run wrote.
+  # HEAVY wherever it runs: it compiles the whole corpus.
   - name: census
+    heavy: true
+    workingDirectoryRoot: action
+    inputs:
+      manifest:
+        description: 'the corpus manifest a sqlite run on this leg wrote, relative to the tree (its recompile manifest)'
+        required: true
+    run: |
+      python3 ./pragma-profile-census.py --dss-bin="{product}" --manifest="{manifest}"
+    successPattern: 'census of class \S+ MATCHES the checked-in expected set'
+    requireInputsUnmoved: true
+
+  # REGENERATE the expected set with this leg's class measured anew -- into the step's KEPT OUTPUT, never the
+  # tracked file (2026-10-01, the P69 review's MAJOR 2: a run on a remote leg would rewrite only that host's copy).
+  # The run's --json names the kept file (`keptOutputs`); `dssharness sync --legs <leg> --pull <it>` brings a
+  # remote leg's back; the reviewer replaces the tracked file with it in the change that reviews it.
+  - name: update
+    manual: true
+    heavy: true
+    workingDirectoryRoot: action
+    inputs:
+      manifest:
+        description: 'the corpus manifest a sqlite run on this leg wrote, relative to the tree (its recompile manifest)'
+        required: true
+    run: |
+      python3 ./pragma-profile-census.py --update --out="{stepBuild}" --dss-bin="{product}" --manifest="{manifest}"
+    outputs: [pragma-profile-census.expected]
+    persist: true
+    successPattern: 'expected set REGENERATED for class \S+ -> '
+    requireInputsUnmoved: true
+
+  # The program's own arms, host-independent and with no compiler -- the ones ctest runs as
+  # `harness/pragma_profile_census_selftest` -- on a leg with no build (its own light runner).
+  - name: self-test
+    manual: true
     workingDirectoryRoot: action
     run: |
-      python3 ./pragma-profile-census.py
-    successPattern: 'census MATCHES the checked-in expected set'
+      python3 ./pragma-profile-census.py --self-test
+    successPattern: '^pragma-census self-test: \d+ arm\(s\), 0 failed$'
     requireInputsUnmoved: true

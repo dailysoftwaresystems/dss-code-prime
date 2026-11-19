@@ -12,14 +12,15 @@ work sits in the registry looking like a decision rather than like an oversight.
 
 Neither anchor gate can catch it, and for good reasons of their own:
 
-  * `check-anchor-balance` compares row NAMES across two commits. A row that was
-    open before and is open now is, to it, a non-event -- which is correct for
-    what that gate measures.
+  * `dssharness check-anchor-balance` compares the OPEN rows at a base commit with
+    those now. A row that was open before and is open now is, to it, a non-event --
+    which is correct for what that gate measures.
   * `check-anchor-registry` RESOLVES a citation, i.e. asks whether the cited row
-    EXISTS. It deliberately globs all three registries so a `D-*` cited in `src/`
-    still resolves after its row moves to the archive on close. Asking whether
-    the cited row is still OPEN is a different question, and answering it inside
-    that guard would break the resolution it is there to provide.
+    EXISTS. It deliberately globs every registry (`_deferred-anchor-registry*.md`)
+    so a `D-*` cited in `src/` still resolves after its row moves to the done
+    registry on close. Asking whether the cited row is still OPEN is a different
+    question, and answering it inside that guard would break the resolution it is
+    there to provide.
 
 ✔MEASURED 2026-09-08 (cycle P65), the run that produced this script: **71**
 citations across the two working registries, **32 of them in production rows and
@@ -47,10 +48,11 @@ and counting those turned a readable list into noise when it was tried.
 ────────────────────────────────────────────────────────────────────────────────
 USAGE
 
-    python .harness-config/runner/actions/check-stale-blockers/check-stale-blockers.py
-    python .harness-config/runner/actions/check-stale-blockers/check-stale-blockers.py --production
-    python .harness-config/runner/actions/check-stale-blockers/check-stale-blockers.py --band P1
-    python .harness-config/runner/actions/check-stale-blockers/check-stale-blockers.py --selftest
+    dssharness run check-stale-blockers                           the self-test, then the report
+    dssharness run check-stale-blockers --input band=P1           the report for one band
+
+    (`--production` and `--harness` retired on 2026-09-30: the harness registry was retired on 2026-09-16,
+    so every open row is a production row -- `--production` chose every one and `--harness` none.)
 
 Exit status is 0 whether or not hits are found -- it reports, it does not judge.
 A non-zero status means the SCAN itself could not run.
@@ -79,10 +81,32 @@ import anchors  # noqa: E402
 # sibling's own file, which sits in the same tree as this one.
 ROOT = anchors.ROOT
 
+_PATH_TYPES_OWNER = []
+
+
+def _path_types():
+    """owning-tree, loaded ONCE by path from the actions directory (a hyphen is no module name): its argparse kinds --
+    `read_path_arg`, `written_path_arg`, `path_part_arg`, `text_arg`, `option_text_arg` and `command_words_arg` --
+    are the `type=` every argument of this program that takes a value declares. What each refuses is said there once;
+    check-scripts-index's clause 14 asks one of them of every such argument. It FAILS LOUD when owning-tree is
+    absent."""
+    if not _PATH_TYPES_OWNER:
+        import importlib.util
+        path = os.path.join(os.path.dirname(HERE), "owning-tree", "owning-tree.py")
+        if not os.path.isfile(path):
+            raise SystemExit("check-stale-blockers: cannot find %s -- what each kind of its arguments refuses is "
+                             "said there and nowhere else" % path)
+        spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _PATH_TYPES_OWNER.append(mod)
+    return _PATH_TYPES_OWNER[0]
+
+
 WIKILINK = re.compile(r"\[\[([A-Za-z0-9_-]+)\]\]")
 
 
-def scan(root, buckets=None, band=None):
+def scan(root, band=None):
     """-> [(row, cited_name)] for every open row citing a CLOSED blocker.
 
     The index is built over EVERY bucket including the archive, because the
@@ -95,8 +119,6 @@ def scan(root, buckets=None, band=None):
     hits = []
     for row in rows:
         if row.closed:
-            continue
-        if buckets and row.bucket not in buckets:
             continue
         if band and row.priority != band:
             continue
@@ -162,22 +184,17 @@ def self_test():
 
 def main(argv):
     ap = argparse.ArgumentParser(add_help=True)
-    ap.add_argument("--production", action="store_true")
-    ap.add_argument("--harness", action="store_true")
-    ap.add_argument("--band", default=None, help="P0..P5")
+    ap.add_argument("--band", default="", help="one band, P0..P5; empty reports every band",
+                    type=_path_types().text_arg("--band"))
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args(argv)
 
     if a.selftest:
         return self_test()
 
-    buckets = []
-    if a.production:
-        buckets.append("production")
-    if a.harness:
-        buckets.append("harness")
-
-    hits = scan(ROOT, buckets or None, a.band)
+    if a.band and a.band not in anchors.queue.BANDS:
+        ap.error("--band=%s: the bands are %s" % (a.band, " ".join(anchors.queue.BANDS)))
+    hits = scan(ROOT, a.band or None)
     for row, cited in sorted(hits, key=lambda h: (h[0].priority, h[0].name)):
         print("%-4s %-11s %-62s waits on CLOSED %s"
               % (row.priority, row.bucket, row.name.strip("`")[:62], cited))

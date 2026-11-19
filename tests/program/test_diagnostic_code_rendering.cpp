@@ -52,8 +52,8 @@
 
 #include <filesystem>
 #include <fstream>
+#include <cstddef>
 #include <iostream>
-#include <regex>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -129,6 +129,17 @@ void compileCapturing(ProbeRun& run, ScratchDir& scratch, std::string_view sourc
          + std::string{diagnosticCodeName(d.code)} + "]: ";
 }
 
+// The first bracketed hex-band code token in `text` -- `[`, a capital letter, four hexadecimal digits (`0-9A-F`),
+// `]` -- or "" when there is none. A loop, not `std::regex`: the text is a whole compiler's stderr.
+[[nodiscard]] std::string bracketedHexCode(std::string const& text) {
+    auto const hex = [](char c) { return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F'); };
+    for (std::size_t p = text.find('['); p != std::string::npos; p = text.find('[', p + 1)) {
+        if (p + 6 >= text.size() || text[p + 1] < 'A' || text[p + 1] > 'Z' || text[p + 6] != ']') continue;
+        if (hex(text[p + 2]) && hex(text[p + 3]) && hex(text[p + 4]) && hex(text[p + 5])) return text.substr(p, 7);
+    }
+    return {};
+}
+
 } // namespace
 
 TEST(DiagnosticCodeRendering, EveryTierSpellsItsCodeTheSameWay) {
@@ -198,8 +209,6 @@ TEST(DiagnosticCodeRendering, NoBracketHoldsAHexBandTokenAnyMore) {
     // text: the elision marker deliberately prints `P0009 (P_UnexpectedToken)`
     // in its PROSE to keep the name-to-hex correspondence reachable from a log,
     // and that is contract, not a relapse (diagnostic_reporter.hpp says so).
-    static std::regex const hexBracket{R"(\[[A-Z][0-9A-F]{4}\])"};
-
     for (std::string_view source : {kPositionedSource, kBufferlessSource}) {
         ProbeRun run;
         {
@@ -210,11 +219,11 @@ TEST(DiagnosticCodeRendering, NoBracketHoldsAHexBandTokenAnyMore) {
             << "probe produced no diagnostics at all, so this assertion would "
                "pass vacuously. stderr was:\n"
             << run.stderrText;
-        std::smatch m;
-        std::string const text = run.stderrText;
-        EXPECT_FALSE(std::regex_search(text, m, hexBracket))
+        std::string const text  = run.stderrText;
+        std::string const found = bracketedHexCode(text);
+        EXPECT_TRUE(found.empty())
             << "a bracketed hex-band code token is back in the output ("
-            << m.str()
+            << found
             << "). Every diagnostic header spells its code with "
                "`diagnosticCodeName`; `diagnosticCodePrefix` belongs to "
                "`hir_text.cpp`'s `@diag` surface, not to a diagnostic header.\n"

@@ -14,22 +14,21 @@
 // WHY IT IS ITS OWN HEADER, SPLIT OUT OF `process_spawn.hpp`. The quoter is a
 // PURE FUNCTION over `std::vector<std::string>` — no OS call, no library state,
 // nothing to link. Its second consumer is `tests/test_support/run_binary.hpp`,
-// which is included by THREE targets with three different include-path sets,
-// and one of them (`integrated_tests`, via `integrated_tests/runner.cpp`) links
-// NO DSS library at all and does not carry `src/` on its include path, because
-// it drives the compiler as a black-box subprocess. A call from there into
-// `dsscp-lib` would break both its compile and its link, and widening
-// that target's link graph to borrow a string helper is the wrong trade — the
-// black-box boundary is the point of the target.
+// which is included by several targets, `integrated_tests` among them -- which
+// drives the compiler as a black-box subprocess and links NO DSS library: it
+// compiles exactly one substrate unit, `path_identity.cpp`, into itself and carries
+// `src/` on its include path (since 2026-10-20, ✔MEASURED by the review of P69's H6
+// in integrated_tests/CMakeLists.txt; this sentence said "does not carry `src/`"
+// until P69 H6b, the C1 correction). A call from there into `dsscp-lib` would still
+// break its link, and widening that target's link graph to borrow a string helper
+// is the wrong trade -- the black-box boundary is the point of the target.
 //
 // So this header is HEADER-ONLY and DEPENDENCY-FREE, exactly like
-// `src/program/platform_token.hpp` and for exactly the same reason. In
-// particular it deliberately does NOT include `core/export.hpp`: everything
+// `src/program/platform_token.hpp`: a pure function needs no unit to compile.
+// In particular it deliberately does NOT include `core/export.hpp`: everything
 // below is `inline`, so `DSS_EXPORT` would be meaningless at best (an inline
 // function needs no export) and an outright compile error at worst
-// (`__declspec(dllimport)` on a function that is also defined here). KEEP IT
-// THAT WAY — one added project include here breaks a consumer that never links
-// the lib, and the duplicate quoter comes back.
+// (`__declspec(dllimport)` on a function that is also defined here).
 //
 // `run_binary.hpp` includes this by RELATIVE PATH
 // (`#include "../../src/core/substrate/windows_command_line.hpp"`) for the same

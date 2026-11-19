@@ -1,0 +1,2 @@
+    if (form.back() != L'\\') form += L'\\';
+    return form;

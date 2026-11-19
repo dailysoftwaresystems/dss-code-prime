@@ -26,6 +26,32 @@ dss_add_test(NAME analysis/syntactic/test_corpus                SOURCES test_cor
 # ceiling, and the identity pin renders every tree so the two renditions can be
 # diffed byte-for-byte. See the file header.
 dss_add_test(NAME analysis/syntactic/test_parser_speculation_refusal_cost SOURCES test_parser_speculation_refusal_cost.cpp)
+# P69 L2b2 (lane `lm`): the binder sketch's structure — its chains hold live bindings only, a
+# declarator-end binding is taken back by its token's node, snapshots restore last in first out.
+# Its own runner: a broken close makes every parse abort, and its claims run in child processes.
+dss_add_test(NAME analysis/syntactic/test_binder_sketch_structure SOURCES test_binder_sketch_structure.cpp)
+# P69 L2b2 (lane `lm`): the type-name triage's base ask, HOISTED before a probe opens. The pins: the
+# reach read off the shipped data, a value base costing no probe at each run length, a type or unknown
+# base left to its probe, every condition biting on a synthetic grammar beside its control, and the
+# grammar-token view looking through a body mode's leaves (tsql-subset). See the file header.
+dss_add_test(NAME analysis/syntactic/test_parser_triage_hoist SOURCES test_parser_triage_hoist.cpp)
+# P69 L2b2: the hoist's IDENTITY WITNESS — every shipped corpus and example unit parses to the same
+# trees and diagnostics with the hoist on and off, and the switch reaches the parser (the unit's probe
+# count). See the file header.
+dss_add_test(NAME analysis/syntactic/test_parser_triage_hoist_identity SOURCES test_parser_triage_hoist_identity.cpp)
+# P69 L2b2: the hoist's off switch has ONE caller, the identity witness. Its verdict reads the
+# repository's sources, so it carries `repo-guard`.
+dss_add_test(NAME analysis/syntactic/test_triage_hoist_switch_has_one_caller
+             SOURCES test_triage_hoist_switch_has_one_caller.cpp)
+dss_label_repo_guard(analysis/syntactic/test_triage_hoist_switch_has_one_caller)
+# P69 L2b2: a parse's scope chain does not grow with its input — a clean program twice as long ends
+# with the same chain. See the file header.
+dss_add_test(NAME analysis/syntactic/test_parser_scope_chain_bound SOURCES test_parser_scope_chain_bound.cpp)
+# P69 L2b2 (lane `lm`): the empty typedef-named declaration split in two reads every row as before —
+# the split table and the diagnostics corpus's scope kinds against the golden beside the test, captured
+# before the split and the memory fix, its only deltas the rule names the split moves. See the header.
+dss_add_test(NAME analysis/syntactic/test_parser_empty_declaration_split_table
+             SOURCES test_parser_empty_declaration_split_table.cpp)
 # P65 [[D-CSUBSET-DECL-QUALIFIER-BEFORE-STORAGE-CLASS]] + residue (2) of
 # [[D-CSUBSET-DECL-GRAMMAR-LOW-RESIDUES]]: the PARSER-tier half -- every C 6.7p2
 # specifier ordering the references accept, the C 6.7.1p2 refusals, and the

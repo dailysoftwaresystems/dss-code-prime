@@ -44,12 +44,15 @@
 #include "analysis/semantic/semantic_test_fixture.hpp"
 #include "core/types/data_model.hpp"
 #include "core/types/diagnostic_budget.hpp"
+#include "core/types/type_lattice/type_interner.hpp"
 #include "core/types/type_lattice/type_layout.hpp"
 
 #include <gtest/gtest.h>
 
 #include <cstddef>
+#include <initializer_list>
 #include <string>
+#include <string_view>
 
 using namespace dss;
 using namespace dss::sem_test;
@@ -212,4 +215,40 @@ TEST(ParamPositionAttribute, EveryDecoratedPositionStillBindsItsParameter) {
         << "the attribute run must be STRIPPED from the positional child count — "
            "an unstripped prefix makes the head become the declarator and the "
            "arity go wrong";
+}
+
+// ★ P69 (lane `cs`, fold f26c) — A RUN AFTER A PARAMETER WITH NO NAME IS NOT ITS
+// DECLARATOR. The `param` row reads `declarator: 1` by position; with the
+// declarator absent, position 1 is the trailing attribute run, and the signature
+// lost the parameter's type. ✔MEASURED before the fix (lane `cs`'s probe np, the
+// shipped CLI): the prototype alone failed H_TypeUnresolved, and beside its
+// definition S_IncompatibleRedeclaration — where gcc 13.3.0, clang 18.1.3,
+// mingw-w64 gcc 13.2.0 and Apple clang 21.0.0 run every shape below. The pointer
+// parameter is the control: its run sits inside a declarator, which was always
+// read.
+TEST(ParamPositionAttribute, ARunAfterAParameterWithNoNameIsNotItsDeclarator) {
+    std::string const src =
+        "int one(int __attribute__((unused)));\n"
+        "int one(int x){ return x; }\n"
+        "int two(int __attribute__((__unused__)) __attribute__((unused)), int);\n"
+        "int two(int a, int b){ return a + b; }\n"
+        "int ptr(int * __attribute__((unused)));\n"
+        "int ptr(int *p){ return *p; }\n"
+        "int main(void){ int one_ = 1; return one(39) + two(1, 0) + ptr(&one_); }\n";
+    ASSERT_EQ(parseErrorsFor(src), 0u);
+    auto model = analyzeC(src);
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatibleRedeclaration), 0u)
+        << "a prototype whose parameter lost its type conflicts with its definition";
+    TypeInterner const& in = model.lattice().interner();
+    for (std::string_view const fn : {"one", "two", "ptr"}) {
+        TypeId sig = InvalidType;
+        for (std::size_t i = 1; i < model.symbols().size(); ++i)
+            if (model.symbols()[i].name == fn) sig = model.symbols()[i].type;
+        ASSERT_TRUE(sig.valid()) << fn;
+        ASSERT_EQ(in.kind(sig), TypeKind::FnSig) << fn;
+        for (TypeId const p : in.fnParams(sig))
+            EXPECT_TRUE(p.valid()) << fn << ": a parameter has no type";
+    }
 }

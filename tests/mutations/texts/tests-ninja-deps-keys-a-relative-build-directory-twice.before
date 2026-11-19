@@ -1,0 +1,1 @@
+    build_dir = os.path.abspath(str(build_dir))

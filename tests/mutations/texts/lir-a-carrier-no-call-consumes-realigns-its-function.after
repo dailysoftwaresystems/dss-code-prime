@@ -1,0 +1,2 @@
+                std::span<MirInstId const> const operands(&call, 1);
+                for (std::size_t k = 0; k < operands.size(); ++k) {

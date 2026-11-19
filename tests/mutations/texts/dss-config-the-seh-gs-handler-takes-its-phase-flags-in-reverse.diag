@@ -1,0 +1,1 @@
+42 = the scope's handler ran, 43 = it did not, 0xC0000409 = the cookie check

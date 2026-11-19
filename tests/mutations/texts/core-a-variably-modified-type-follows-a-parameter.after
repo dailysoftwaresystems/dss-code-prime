@@ -1,0 +1,1 @@
+        id = ops.back();   // the pointee, the element, or a signature's result

@@ -1,0 +1,1 @@
+        if (!carrier.has_value() || *carrier >= vis.size()) {

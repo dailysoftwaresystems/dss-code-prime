@@ -1,0 +1,1 @@
+    return in.fnSig(promoted, in.fnResult(rec.type), CallConv::CcSysV, /*isVariadic=*/false);

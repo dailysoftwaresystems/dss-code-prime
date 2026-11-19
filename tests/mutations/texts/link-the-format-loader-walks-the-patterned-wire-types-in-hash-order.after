@@ -1,0 +1,1 @@
+        std::unordered_map<std::uint32_t, std::vector<std::size_t>> patterned;

@@ -1,0 +1,1 @@
+return (int)sizeof (int[]){ 1, 2 };

@@ -1,0 +1,1 @@
+    refusals_.push_back(std::move(r));

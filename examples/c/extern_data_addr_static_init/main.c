@@ -35,7 +35,13 @@
      to keep straight, not merely a smaller diff.
 
    Either way the identity holds -> exit 42. (PE has NO symbol-based image
-   reloc, so its arm is the fail-loud sibling extern_data_addr_reject_pe.)
+   reloc. Since P69 its loader binds an address-only slot as an import of its
+   own (design c2), and an address PLUS an offset — which the loader cannot
+   write — is written at load by the image's import-slot residue runner, a
+   synthesized first TLS callback. The PE run witnesses are
+   extern_data_addr_plus_offset_pe, named extern_data_addr_reject_pe until it
+   stopped being a refusal, and
+   library_function_address_equals_getprocaddress.)
 
    `*pp != stdout` additionally proves the slot DEREFERENCES to the live
    stream -- the whole pointer chain is real, not just address-equal. The

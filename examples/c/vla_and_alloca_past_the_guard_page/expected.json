@@ -1,0 +1,45 @@
+{
+  "$comment": "P69 (lane `cs`, D-CSUBSET-VLA-WIN64-STACK-PROBE): runtime descents of the stack pointer far past one page, through a VLA and through `__builtin_alloca`, each block's FAR end (its lowest address) written first -- the bytes a bare `sub rsp, size` leaves below Windows' one guard page, where the first access faults with 0xC0000005. Six groups, shallowest first so each deep one reaches stack no earlier group touched: the walk's boundary sizes (3 bytes, one page, a page and 16 bytes, two pages; every byte written and summed, by VLA and by alloca), a three-page VLA freed and re-descended in a loop, an eight-deep recursion holding most of a page of fixed frame and a live three-page block per level, a 49-page VLA and a 74-page alloca in leaves, and one function descending twice (150000 then 250000 bytes) with both blocks live across its calls. The exit code is a bitmask of the groups that misbehaved (see main.c). DSS walks every runtime descent under a calling convention that declares `stackProbePageBytes` (ms_x64): `___chkstk_ms`'s loop, inline. MEASURED 2026-10-07 through `dssharness run probe-reference-cc`, this file, every build exits 42: gcc 13.3.0 and clang 18.1.3 at -std=c17 -pedantic-errors and -std=c2x (run 20261007-095811-215d8e18, host run -095807-69e8c0db) and at -std=c2x -O2 (run 20261007-095837-fd3d50f4, host run -095827-a696ff47); mingw-w64 gcc 13.2.0 at -std=c17 -pedantic-errors and -std=c2x (run 20261007-095855-85eebdf6) and at -std=c2x -O2 (run 20261007-095857-ce63da6a); MSVC 19.51 at /std:clatest and /std:c17 (run 20261007-095900-42c4e650) and at /std:clatest /Od and /O2 (run 20261007-095913-325537fd) -- it has no VLA, so each is an `_alloca`; AppleClang at -std=c17 -pedantic-errors and -std=c2x (macos-arm64-release, run 20261007-095928-4847d8c2, host run -095921-aa11c5fa). How the two Windows references descend, MEASURED 2026-10-07 on two-function probes: mingw-w64 calls `___chkstk_ms` with the aligned size in rax and then subtracts it from rsp, for a VLA and `__builtin_alloca` alike, at -O0 and -O2 (run 20261007-092301-c2e15666); MSVC calls `__chkstk` the same way for `_alloca` at /Od and /O2 (run 20261007-092304-b712362b). Every size derives from argc. The release arm runs the same checks through the optimized pipeline.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": [
+        "darwin"
+      ],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release",
+      "mustDifferFromBaseline": false
+    }
+  ]
+}

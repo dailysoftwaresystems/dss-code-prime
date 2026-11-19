@@ -21,32 +21,30 @@ namespace dss {
 
 // Outcome of `Parser::parse() &&`. Owns the assembled tree; the
 // tree's diagnostic stream is reachable via `tree.diagnostics()`.
-//
-// The two FC2 sidecars travel WITH the tree (not on it — Tree stays a
-// pure frozen CST):
-//   * `typeNameCandidates` — ambiguous lone-identifier type-name sites
-//     the parser rolled back to the value reading (triage rule 4).
-//     The compilation unit's oracle (UnitBuilder::finish) resolves them
-//     against cross-file type names and reparses once on a hit.
-//   * `globalTypeNames` — the GLOBAL-scope TYPE names this parse bound
-//     (typedefs / struct tags / …, per `semantics.declarations`), the
-//     export surface the oracle harvests. Empty for binder-less
-//     languages.
-//   * `globalTypeBindings` — the same GLOBAL-scope TYPE names paired with
-//     the source span of their declaring name-token. The oracle's SELF-
-//     DEFINITION channel: a candidate whose span equals its own binding
-//     span is a typedef's own defining occurrence (C 6.2.1p7) and must
-//     NOT be seeded (D-CSUBSET-FN-TYPE-TYPEDEF-PAREN-NAME).
 struct DSS_EXPORT ParseResult {
     Tree                                    tree;
-    std::vector<AmbiguousTypeNameCandidate> typeNameCandidates;
-    std::vector<std::string>                globalTypeNames;
-    std::vector<std::pair<std::string, SourceSpan>> globalTypeBindings;
     // c108 (D-PARSE-FLAT-CHAIN-WORK-LINEAR): total token-stream accesses (peek +
     // advance, incl. speculative re-scans) the parse performed — the DETERMINISTIC
     // total-work proxy that replaced a flaky wall-clock O(N²) guard. O(N) for a
     // correct parse; a backtracking blowup makes it super-linear.
     std::uint64_t                           tokenAccessCount = 0;
+    // The binder sketch's own work (`BinderSketch::workCount`), which `tokenAccessCount`
+    // does not see: its snapshots and lookups, the journal records its restores replay, and
+    // every entry read from its containers.
+    std::uint64_t                           sketchWorkCount = 0;
+    // The tree builder's own scope work (`TreeBuilder::scopeWork`): one unit per token
+    // resolution and one per scope-presence question it asks.
+    std::uint64_t                           scopeWorkCount = 0;
+    // P69 L2b2 (lane `lm`): the speculative probes the parse OPENED — each a snapshot of the
+    // five machines a probe touches and, when refuted, their rollback. Deterministic. The
+    // type-name triage asked before a probe opens (`ParserConfig::hoistTriageBaseAsk`) is
+    // what lowers it on a refuted candidate.
+    std::uint64_t                           speculationProbeCount = 0;
+    // P69 L2b2 (lane `lm`): the nodes the tree builder's scope chain held when the parse
+    // ended, before `finish` re-homed the kept diagnostics' trails: bounded by the live
+    // depth, the trails handed out and the nodes committed checkpoints kept — never by
+    // the scopes the parse pushed and popped, or by its rolled-back probes.
+    std::uint64_t                           scopeChainNodesAtFinish = 0;
 };
 
 // How the dispatch loop's recovery sites behave when they see an
@@ -199,13 +197,32 @@ struct DSS_EXPORT ParserConfig {
     // bespoke logic. Move-only ownership.
     std::unique_ptr<PrattWalker> prattWalker;
 
-    // FC2: names seeded into the binder sketch's GLOBAL scope as TYPE
-    // bindings before parsing — the compilation-unit oracle's cross-file
-    // typedef channel. A reparse triggered by an ambiguous type-name
-    // candidate passes the resolved candidate names here so the
-    // type-name commit triage sees them as types (case 2) instead of
-    // unknowns (case 4). Empty (the default) for every first parse.
+    // Names seeded into the binder sketch's GLOBAL scope as TYPE bindings
+    // before parsing, so the type-name commit triage sees them as types
+    // (case 2) instead of unknowns (case 4): the typedef names of the shipped
+    // descriptors the preprocessor resolved, whose typedefs are injected
+    // SEMANTICALLY and so are declared by no token the parse reads
+    // (D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION, UnitBuilder::parseAndAdd_).
+    // Empty (the default) when the unit resolves no such descriptor.
     std::vector<std::string> seedGlobalTypeNames;
+
+    // The same descriptors' VALUE names (functions, objects, constants), seeded as
+    // VALUE bindings: with them the sketch knows every name the semantic tier binds
+    // that the parse reads no declaration of, so a lone name it does not know is one
+    // nothing declares (the unknown-name refusal's reader, P69 L2b2).
+    std::vector<std::string> seedGlobalValueNames;
+
+    // ★ P69 L2b2 (lane `lm`): THE TRIAGE HOIST'S IDENTITY WITNESS, AND NOTHING ELSE. True — the
+    // default, and the only value production code ever runs — refutes a speculative candidate
+    // whose probe the type-name triage's early base ask would refute, without opening the probe
+    // (`Parser::Impl::hoistRefutesTheCandidate_`). False takes every candidate through its probe:
+    // the path every candidate the hoist lets through takes in every run, so the two settings
+    // must parse every input identically, and the identity witness
+    // (tests/analysis/syntactic/test_parser_triage_hoist_identity.cpp) asserts that over every
+    // shipped corpus unit. No `.lang.json` key and no CLI flag reads it; the witness sets it
+    // through the unit builder's one identity-witness setter (compilation_unit.hpp, its single
+    // caller pinned by a repo-guard scan), and the hoist's own tests through this field.
+    bool hoistTriageBaseAsk = true;
 };
 
 // Schema-driven recursive-descent parser.

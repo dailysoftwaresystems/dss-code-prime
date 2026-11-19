@@ -1,0 +1,1 @@
+                if (std::find(definers.begin(), definers.end(), cj + 1) != definers.end()) continue;

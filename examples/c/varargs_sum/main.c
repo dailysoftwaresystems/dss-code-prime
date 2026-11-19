@@ -20,6 +20,8 @@
 // separately by `varargs_overflow` (>5 varargs); the SSE path by `varargs_double`.
 // Runs natively on the x86_64-Linux CI leg.
 
+#include <stdarg.h>
+
 int sum(int n, ...) {
     va_list ap;
     va_start(ap, n);

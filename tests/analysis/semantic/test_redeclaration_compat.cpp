@@ -68,15 +68,6 @@ compat(TypeInterner const& in, TypeId a, TypeId b,
 
 // ── e2e tier: the real `c` schema + the REAL shipped-lib descriptor corpus ───
 
-[[nodiscard]] fs::path shippedLibsDir() {
-    fs::path const dir = dss::test::configRoot() / "shippedLibs";
-    std::error_code ec;
-    if (!fs::is_directory(dir, ec))
-        throw std::runtime_error("shipped-lib descriptor directory missing: "
-                                 + dir.string());
-    return dir;
-}
-
 // Analyze `src` the way the production driver does for one (format, dataModel):
 // the real descriptor corpus on the system include path and the format active, so
 // the goal-2 suppression + the platform-realization pass both run for real. The
@@ -87,7 +78,6 @@ compat(TypeInterner const& in, TypeId a, TypeId b,
                                                DataModel dataModel) {
     auto schema = loadShippedSchema("c");
     UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
-    builder.addSystemDir(shippedLibsDir());
     builder.setActiveFormat(format);
     builder.addInMemory(std::move(src), "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
@@ -438,11 +428,11 @@ TEST(RedeclarationCompat, RestrictIsJudgedOnPointeesAndDroppedAtAParameterTopLev
 }
 
 // The structural axes keep working through the same oracle — these were already
-// refused before P44 and must not have been relaxed by the qualifier work.
-TEST(RedeclarationCompat, StructuralIncompatibilityStaysRefused) {
+// refused before P44 and must not have been relaxed by the qualifier work. Every pair
+// here is two PROTOTYPES; a declaration WITHOUT one beside a prototype is the next
+// test's.
+TEST(RedeclarationCompat, StructuralIncompatibilityBetweenPrototypesStaysRefused) {
     for (char const* src : {
-             "extern int p();\nextern int p(int, int);\nint main(void){return 0;}\n",
-             "extern int q(const char *, ...);\nextern int q();\nint main(void){return 0;}\n",
              "extern int v(volatile char *);\nextern int v(char *);\nint main(void){return 0;}\n",
              "extern int ta(_Atomic int);\nextern int ta(int);\nint main(void){return 0;}\n",
              "extern int n(int);\nextern long n(int);\nint main(void){return 0;}\n",
@@ -452,6 +442,44 @@ TEST(RedeclarationCompat, StructuralIncompatibilityStaysRefused) {
                             DiagnosticCode::S_IncompatibleRedeclaration))
             << src;
     }
+}
+
+// ★★ P69 (lane `cs`, fold f26d — main's ledgers 598/599): A DECLARATION WITHOUT A
+// PROTOTYPE BESIDE A PROTOTYPE IS JUDGED BY C 6.7.6.3p15, NOT BY THE PROTOTYPE ORACLE
+// (`prototypeFitsADeclarationWithoutOne`, the one judgement). `int p();` is no prototype
+// (main's ledger 554), so `p()` and `p(int, int)` are COMPATIBLE — `int` is its own
+// promotion — and `q()` beside `q(const char *, ...)` is not, but is taken as cl takes
+// it and warned. ✔MEASURED (lane `cs` probe rcp, each program built and RUN): gcc
+// 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and Apple clang 21 build the `p` pair at
+// their default standard and refuse the `q` pair; cl 19.52 builds and runs both, at its
+// default standard and /std:clatest; under -std=c2x every gcc/clang refuses both (C23
+// reads `()` as `(void)`). These two pairs were in the test above until f26c2, when DSS
+// read `()` as C23's `(void)`.
+TEST(RedeclarationCompat, ADeclarationWithoutAPrototypeBesideAPrototypeIsJudgedByParagraph15) {
+    struct Cell { char const* src; std::size_t warned; };
+    for (Cell const c : {
+             Cell{"extern int p();\nextern int p(int, int);\nint main(void){return 0;}\n", 0},
+             Cell{"extern int p(int, int);\nextern int p();\nint main(void){return 0;}\n", 0},
+             Cell{"extern int q(const char *, ...);\nextern int q();\nint main(void){return 0;}\n", 1},
+             Cell{"extern int q();\nextern int q(const char *, ...);\nint main(void){return 0;}\n", 1},
+             Cell{"extern int q(const char *, ...);\nextern int q();\n"
+                  "int main(void){return q(\"x\", 1, 2) - 3;}\n"
+                  "int q(const char *s, ...){return s[0] == 'x' ? 3 : 4;}\n", 1},
+         }) {
+        auto model = analyzeC(c.src);
+        EXPECT_FALSE(model.hasErrors()) << c.src << "  first error: " << firstMessage(model);
+        EXPECT_FALSE(hasCode(model.diagnostics(), DiagnosticCode::S_IncompatibleRedeclaration)) << c.src;
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_PrototypeIncompatibleWithADeclarationWithoutOne),
+                  c.warned)
+            << c.src;
+    }
+    // …and a call the prototype in force rejects is the arity error every reference
+    // gives ("too few arguments to function 'p'"; cl C2198) — rcp cell 10.
+    auto const shortCall = analyzeC(
+        "extern int p();\nextern int p(int, int);\nint main(void){return p(1);}\n");
+    EXPECT_TRUE(hasCode(shortCall.diagnostics(), DiagnosticCode::S_ArgCountMismatch))
+        << "the composite, `p(int, int)`, is the type the call is checked against";
 }
 
 // ══ 3. THE SHIPPED-DESCRIPTOR TIER ═══════════════════════════════════════════
@@ -506,38 +534,61 @@ TEST(RedeclarationCompat, MatchingUserDeclarationOfAShippedNameStaysAccepted) {
     }
 }
 
-// ★★ THE TIER, WHICH IS THE WHOLE OF THE THIRD ROW. `extern int printf();`
-// applies C23's `()` ≡ `(void)` correctly — that half is right and is untouched —
-// but the only complaint used to be an ARITY error at the CALL, so the SAME
-// program with NO CALL compiled clean. The no-call program is the sharpest
-// available witness that the diagnostic moved tiers rather than changing wording.
-TEST(RedeclarationCompat, IncompatibleRedeclarationIsDiagnosedAtTheDeclaration) {
+// ★★ THE TIER, WHICH IS THE WHOLE OF THE THIRD ROW: the pair is judged AT THE
+// DECLARATION, the program with NO call included. ★ P69 (lane `cs`, fold f26d — main's
+// ledgers 598/599): `extern int printf();` is a declaration WITHOUT a prototype (ledger
+// 554), so beside <stdio.h>'s `printf(const char *, ...)` it is the pair the
+// redeclaration sweep judges, asking the SAME judgement
+// (`prototypeFitsADeclarationWithoutOne`): an ellipsis is never compatible with no
+// prototype (C 6.7.6.3p15), and the pair is WARNED, not refused, because cl builds and
+// runs it; the header's prototype is then the function's type at every call. So a call it
+// accepts (`printf("hi\n")`) is clean, and a call it rejects (`printf()`) is the arity
+// error every reference gives — the call-site check JOINS the declaration's, it is not
+// suppressed. ✔MEASURED (lane `cs` probe rcp, each program built and RUN): cl 19.52
+// builds and runs the pair with and without the call, printing `hi`, at its default
+// standard and /std:clatest; gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and Apple
+// clang 21 refuse it ("conflicting types for 'printf'"); `printf()` is refused by every
+// one (cl C2198 "too few arguments for call"). Until f26c2 DSS read `()` as C23's
+// `(void)`: an error at the declaration and an arity error at `printf("hi")`; after it,
+// until f26d, the check against the shipped row still refused the pair while every call
+// saw no prototype at all, so `printf()` compiled.
+TEST(RedeclarationCompat, ALibraryFunctionDeclaredWithoutAPrototypeTakesItsHeadersPrototype) {
     constexpr char const* kNoCall =
         "#include <stdio.h>\nextern int printf();\nint main(void){return 0;}\n";
     constexpr char const* kWithCall =
-        "#include <stdio.h>\nextern int printf();\nint main(void){printf(\"hi\");return 0;}\n";
+        "#include <stdio.h>\nextern int printf();\nint main(void){printf(\"hi\\n\");return 0;}\n";
+    constexpr char const* kRejectedCall =
+        "#include <stdio.h>\nextern int printf();\nint main(void){return printf();}\n";
 
     for (auto* analyzeLeg : {&analyzeElf, &analyzePe}) {
         auto noCall = (*analyzeLeg)(kNoCall);
-        EXPECT_TRUE(hasCode(noCall.diagnostics(),
-                            DiagnosticCode::S_IncompatibleRedeclaration))
-            << "a program with the bad declaration and NO CALL compiled clean — "
-               "the defect hides in exactly the case nothing else catches";
-        EXPECT_FALSE(hasCode(noCall.diagnostics(),
-                             DiagnosticCode::S_ArgCountMismatch))
+        EXPECT_FALSE(noCall.hasErrors()) << firstMessage(noCall);
+        EXPECT_EQ(countCode(noCall.diagnostics(),
+                            DiagnosticCode::S_PrototypeIncompatibleWithADeclarationWithoutOne),
+                  1u)
+            << "the pair is judged at the declaration, with no call to blame";
+        EXPECT_FALSE(hasCode(noCall.diagnostics(), DiagnosticCode::S_IncompatibleRedeclaration));
+        EXPECT_FALSE(hasCode(noCall.diagnostics(), DiagnosticCode::S_ArgCountMismatch))
             << "there is no call to blame";
 
-        // ⚠ THE FAILURE ARM: the call-site arity check must NOT have been
-        // suppressed to make room for the declaration-site one. With a call
-        // present BOTH fire — the declaration error is the new one, and the arity
-        // error is the old behaviour, unchanged.
         auto withCall = (*analyzeLeg)(kWithCall);
-        EXPECT_TRUE(hasCode(withCall.diagnostics(),
-                            DiagnosticCode::S_IncompatibleRedeclaration));
-        EXPECT_TRUE(hasCode(withCall.diagnostics(),
-                            DiagnosticCode::S_ArgCountMismatch))
+        EXPECT_FALSE(withCall.hasErrors()) << firstMessage(withCall);
+        EXPECT_EQ(countCode(withCall.diagnostics(),
+                            DiagnosticCode::S_PrototypeIncompatibleWithADeclarationWithoutOne),
+                  1u);
+        EXPECT_FALSE(hasCode(withCall.diagnostics(), DiagnosticCode::S_ArgCountMismatch))
+            << "`printf(\"hi\n\")` is a call the header's prototype accepts";
+
+        // ⚠ THE FAILURE ARM: the call-site check must NOT have been suppressed to make
+        // room for the declaration-site one — a call the prototype in force rejects is
+        // the arity error, beside the declaration's warning.
+        auto rejected = (*analyzeLeg)(kRejectedCall);
+        EXPECT_TRUE(hasCode(rejected.diagnostics(), DiagnosticCode::S_ArgCountMismatch))
             << "the call-site arity check was suppressed rather than joined — a "
                "message change wearing a tier change's clothes";
+        EXPECT_EQ(countCode(rejected.diagnostics(),
+                            DiagnosticCode::S_PrototypeIncompatibleWithADeclarationWithoutOne),
+                  1u);
     }
 }
 
@@ -903,4 +954,39 @@ TEST(RedeclarationCompat, TheSixtyThreeLevelBitsetBoundIsAMissedDiagnosticNotARe
            "it must never become a refusal: " << firstMessage(above);
     EXPECT_FALSE(hasCode(above.diagnostics(),
                          DiagnosticCode::S_IncompatibleRedeclaration));
+}
+
+// ★ OF TWO UNITS THAT DECLARE ONE INCLUDED NAME, THE FIRST UNIT'S DECLARATION IS JUDGED (P69 fold 3f, lane `xa`).
+// The pass gathers every user declaration of the ordinary namespace over every tree's root scope, and a name two
+// trees declare keeps the FIRST tree's (`try_emplace`). It walked the trees in the order of an unordered map keyed
+// by tree id, so WHICH unit's declaration the C23 check judged against the included platform declaration was the
+// host library's. It walks them in ascending tree id: the units' own order. Both orders are asked: the verdict
+// follows the unit that comes first, the compatible declaration once and the incompatible one once.
+namespace {
+
+[[nodiscard]] SemanticModel analyzeElfUnits(std::vector<std::string> sources) {
+    auto schema = loadShippedSchema("c");
+    UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
+    builder.setActiveFormat(ObjectFormatKind::Elf);
+    for (std::size_t i = 0; i < sources.size(); ++i) {
+        builder.addInMemory(std::move(sources[i]), "unit" + std::to_string(i) + ".c");
+    }
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    assertNoBuilderErrors(*cu);
+    return analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, std::nullopt, std::nullopt,
+                   SelectableObjectFormatKind::of(ObjectFormatKind::Elf), "x86_64");
+}
+
+}  // namespace
+
+TEST(RedeclarationCompat, OfTwoUnitsDeclaringOneIncludedNameTheFirstUnitsIsJudged) {
+    std::string const compatible =
+        "#include <stdio.h>\nint puts(const char *s);\nint main(void){return 0;}\n";
+    std::string const incompatible = "int puts(double x);\n";
+    auto const compatibleFirst = analyzeElfUnits({compatible, incompatible});
+    EXPECT_FALSE(hasCode(compatibleFirst.diagnostics(), DiagnosticCode::S_IncompatibleRedeclaration))
+        << "the first unit's declaration is judged, and it is the platform's: " << firstMessage(compatibleFirst);
+    auto const incompatibleFirst = analyzeElfUnits({incompatible, compatible});
+    EXPECT_TRUE(hasCode(incompatibleFirst.diagnostics(), DiagnosticCode::S_IncompatibleRedeclaration))
+        << "the first unit's declaration is judged, and it contradicts the platform's";
 }

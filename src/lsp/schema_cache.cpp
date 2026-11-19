@@ -200,9 +200,11 @@ SchemaResult SchemaCache::resolveByName(std::string_view languageName) {
     if (preferred.empty()) {
         detail += " No preferred language was supplied to break the tie.";
     } else {
-        detail += " The preferred languages (" + join(preferred) + ") matched "
-                + std::to_string(matched.size()) + " of them"
-                + (matched.empty() ? "" : " (" + join(matched) + ")")
+        std::string const preferredList = join(preferred);
+        std::string const matchedList =
+            matched.empty() ? std::string{} : " (" + join(matched) + ")";
+        detail += " The preferred languages (" + preferredList + ") matched "
+                + std::to_string(matched.size()) + " of them" + matchedList
                 + "; exactly one match is required to break the tie.";
     }
     return SchemaResolveError{

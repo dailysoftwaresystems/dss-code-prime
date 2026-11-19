@@ -1,0 +1,1 @@
+            stated.push_back(StatedCopy{i, s.symbol, 0, s.name});

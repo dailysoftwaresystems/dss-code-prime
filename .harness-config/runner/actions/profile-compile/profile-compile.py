@@ -18,13 +18,12 @@ this program under Git Bash -- and every path it hands a native tool is an
 absolute path in the host's own form.
 
 ── HOW TO RUN THE FULL FOUR-LEG PROFILE FROM A COLD START ───────────────────
- 0. Once, on a host that has a STAGED subject (the Windows box, after a
-    real-examples/c/sqlite run has staged sqlite and emitted a manifest):
-      python .harness-config/runner/actions/profile-compile/profile-compile-support.py kit \
-          --manifest build/real-examples/c/sqlite/windows/sqlite3.elf64-x86_64.dss-project.json \
-          --root stage=build/real-examples/c/sqlite/windows/stage \
-          --root libs="$USERPROFILE/.cache/dsscp/harness-libs" \
-          --out build/perf/kit
+ 0. Once, on a host that has a STAGED subject (the Windows box, after a sqlite run
+    has staged sqlite and emitted a manifest), the action's `kit` step -- its kit is
+    the step's kept output, `<the step's build directory>/kit`:
+      dssharness run profile-compile --manual-step kit \
+          --input manifest=build/real-examples/c/sqlite/windows/sqlite3.elf64-x86_64.dss-project.json \
+          --input "roots=stage=build/real-examples/c/sqlite/windows/stage;libs=<the harness libraries>"
     The kit is COPIED, never re-staged: the sqlite harness pulls upstream on
     every run, so a host that stages for itself is not compiling the same
     program as its peers.
@@ -34,37 +33,51 @@ absolute path in the host's own form.
       dssharness run profile-compile --legs linux-x86_64-release
     Only a RELEASE leg that the `profile-compile` runner in `.harness-config/config.json`
     declares: the program refuses any dsscp that is not a Release build (below).
-    ⚠ A leg that needs `sync` (WSL, ssh) waits on DssHarness round four, whose sync
-    ships actions.
-    By hand on one host, the same program:
-      python3 .harness-config/runner/actions/profile-compile/profile-compile.py --kit build/perf/kit \
-          --label win-x86_64 --target x86_64:elf64-x86_64-linux-exec
- 2. The yardstick, on any host with gcc (the same TUs, the same manifest):
-      python3 .harness-config/runner/actions/profile-compile/profile-compile-support.py gcc-reference \
-          --manifest build/perf/wsl-x86_64/subject.dss-project.json \
-          --out build/perf/wsl-x86_64 --jobs 32
+ 2. The yardstick, on any leg with gcc (the same TUs, the same manifest): the same step with
+    `--input gccReference=true`, the reference compiler, its optimization and its link
+    libraries being the step's `referenceCc`, `referenceOpt` and `referenceLinkLibs` inputs
+    (gcc, -O2, -lz -lm -lpthread -ldl unless a run says otherwise).
     ✔MEASURED 2026-08-18 on WSL, 103 TUs, gcc 13 -O2: -j1 21.5 s, -j32 4.8 s,
     against DSS's 1m40.8 s on that same host.
 
 Usage:
   profile-compile.py --kit <dir> --target <spec> --label <name>
-                     [--repo <dir>] [--build-dir <dir>] [--no-build]
-                     [--out <dir>] [--jobs N] [--gcc-reference]
+                     [--build-dir <dir>] [--no-build]
+                     [--out <dir>] [--jobs N] [--gcc-reference true|false]
+                     [--reference-cc <cc> --reference-opt <flag> --reference-link-libs <libs>]
 
   --kit <dir>        a materialized kit (`profile-compile-support.py kit`). REQUIRED.
   --target <spec>    the ONE <target>:<format> every leg compiles. REQUIRED.
   --label <name>     names this leg in the report and in the witness line. REQUIRED.
-  --repo <dir>       the dsscp checkout (default: the tree this file lives in).
   --build-dir <dir>  the compiler's build tree (default: <repo>/build/rel).
   --no-build         time the dsscp already in the build tree; configure nothing.
   --out <dir>        logs, the subject manifest and the image (default:
                      <repo>/build/perf/<label>).
   --jobs N           build and gcc-reference parallelism (default: DSS_JOBS, then 6).
-  --gcc-reference    also time gcc over the same TUs from the same manifest.
+  --gcc-reference B  true also times gcc over the same TUs from the same manifest.
+  --reference-cc C, --reference-opt F, --reference-link-libs L
+                     the yardstick's compiler, optimization flag and link libraries --
+                     the step's inputs, REQUIRED with --gcc-reference true (a value that
+                     begins with `-` is still the option's value).
   -h, --help         show this help and exit.
-  A relative --kit, --out or --build-dir is taken from the repository root; a
-  relative --repo from the directory the program is run in. Every value flag
-  needs a non-empty value; anything else on the command line is refused.
+  --self-test        prove the command line's refusals (no kit, no build), one verdict line per arm; the
+                     action's `self-test` step and the ctest entry `harness/profile_compile_selftest` run it.
+  A relative --kit, --out or --build-dir is taken from the repository root -- the
+  tree this file lives in. Every value flag needs a non-empty value; anything else
+  on the command line is refused.
+
+THE HOST-EQUALITY GATE (P69, 2026-11-16):
+  profile-compile.py --host-equality <label>,<label>[,...]
+  Every leg profiles the SAME kit for the SAME target, so the image must be the same bytes on every leg: an image
+  is a function of its inputs and its target, never of the host whose toolchain built the compiler. (MEASURED
+  2026-11-16: the kit image differed in 4,879,353 of 6,019,864 bytes between the MSVC-built and the GCC-built
+  compiler. An optimizer pass walked an unordered container while minting phis.)
+  This mode reads `build/perf/<label>/image/` for each label named: this leg's own, and every other leg's, each
+  brought back first with `dssharness sync --legs <leg> --pull build/perf/<leg>/image/`. It compares every
+  file's name, size and md5, writes what it read to `build/perf/host-equality.txt`, and prints `HOST-EQUALITY-OK
+  <md5 of each file>` when every leg holds the same files with the same bytes. Otherwise it prints
+  `HOST-EQUALITY-FAILED` with each leg's files and exits 1. It REFUSES (exit 1) before reading any image: fewer
+  than two labels, an empty or repeated label, and a label whose image directory holds no file.
 
 Output: the last line is `PROFILE-LEG-OK <label>   (out: <dir>)` on success, and
 `PROFILE-LEG-FAILED <label> rc=<rc>  (log: <file>)` when the compile failed -- the
@@ -100,12 +113,18 @@ TOOL = "profile-compile"
 OK_TOKEN = "PROFILE-LEG-OK"
 FAILED_TOKEN = "PROFILE-LEG-FAILED"
 
-VALUE_FLAGS = ("--kit", "--target", "--label", "--repo", "--build-dir", "--out", "--jobs")
-SWITCHES = ("--no-build", "--gcc-reference")
+# ★ `--gcc-reference` TAKES `true` OR `false` (2026-09-30): the `profile` step hands every input over, its
+# default included, and a switch cannot be passed conditionally. `--repo` is RETIRED the same day: the tree
+# profiled is the one this file lives in, which is the tree the harness step runs in.
+# ★ THE YARDSTICK'S KNOBS ARE THE STEP'S INPUTS (2026-10-01, the P69 review's NIT 7): `--reference-cc`,
+# `--reference-opt` and `--reference-link-libs`, handed to the support's `gcc-reference` -- as compile-bench made
+# its own knobs inputs, so no value a measurement depends on is fixed inside a program.
+VALUE_FLAGS = ("--kit", "--target", "--label", "--build-dir", "--out", "--jobs", "--gcc-reference",
+               "--reference-cc", "--reference-opt", "--reference-link-libs")
+SWITCHES = ("--no-build",)
 DEFAULT_JOBS = 6
 
-# The support program, taken from the REPOSITORY being profiled (as it always was),
-# not from beside this file: `--repo` names the tree whose tools run.
+# The support program, taken from the REPOSITORY being profiled -- the tree this file lives in.
 SUPPORT_REL = (".harness-config", "runner", "actions", "profile-compile",
                "profile-compile-support.py")
 
@@ -118,7 +137,18 @@ SUPPORT_REL = (".harness-config", "runner", "actions", "profile-compile",
 # so /usr/local/bin ends up first -- what the retired shell program did.
 PATH_PROBES = ("/opt/homebrew/bin", "/usr/local/bin")
 
-_PHASE_LINE = re.compile(r"compile time|^dsscp:   phase")
+# The `--time` report dsscp writes (program.cpp `emitPhaseTimeReport`): its first line `dsscp: compile time ...`, then
+# a table whose header and every row -- each phase, `[other]`, a violation's `!` line, the pre-scan memo, a batch --
+# begin `dsscp:   `, and, on a run whose accounting is broken, the violation BANNER `dsscp: *** ...` before the `!`
+# lines. The report is that BLOCK: the first line and every line after it that begins with either prefix. ⚠ The pattern this replaced
+# matched `^dsscp:   phase`, the HEADER alone, so the report printed a table's head with no row under it (P69 H6).
+_REPORT_FIRST = re.compile(r"^dsscp: compile time ")
+_REPORT_ROW   = "dsscp:   "
+# The writer's OTHER prefix inside the block (program.cpp `emitPhaseTimeReport`): the invariant-violation banner,
+# `dsscp: *** --time INVARIANT VIOLATION ... ***`, one space after the colon -- its `!` lines, the pre-scan memo row
+# and the per-batch rows follow it under `_REPORT_ROW` (P69 H6b, the review of H6's F6: a block ended at the banner
+# showed a broken run's report as a clean table missing its `[other]` row).
+_REPORT_BANNER = "dsscp: *** "
 
 
 def _flush():
@@ -157,8 +187,9 @@ def parse_cli(argv):
     misspelling) is a REFUSAL, never a shrug: silently ignoring one is how a run ends
     up not measuring what its command line said it measured. A value flag with a
     missing or EMPTY value is refused by name."""
-    o = {"kit": "", "target": "", "label": "", "repo": "", "build_dir": "", "out": "",
-         "jobs": "", "no_build": False, "gcc_reference": False, "help": False}
+    o = {"kit": "", "target": "", "label": "", "build_dir": "", "out": "",
+         "jobs": "", "no_build": False, "gcc_reference": "false", "reference_cc": "", "reference_opt": "",
+         "reference_link_libs": "", "help": False}
     i, n = 0, len(argv)
     while i < n:
         a = argv[i]
@@ -176,6 +207,17 @@ def parse_cli(argv):
             i += 1
             continue
         die("unknown argument '%s'. See --help." % a)
+    # ★ A PATH TO WRITE NEVER BEGINS WITH `-` -- owning-tree's `written_path` says so for every program: `--out --help`
+    # took `--help` for the report directory, an option read as a value. A value that is no path may begin with one
+    # (`--reference-opt -O2`), so only these two are asked.
+    for flag in ("--out", "--build-dir"):
+        key = flag[2:].replace("-", "_")
+        if o[key]:
+            owner = _owning_tree_module()
+            try:
+                o[key] = owner.written_path(o[key], flag)
+            except owner.Refusal as exc:
+                die("%s. See --help." % exc)
     if not o["kit"]:
         die("--kit is required")
     if not o["target"]:
@@ -184,6 +226,13 @@ def parse_cli(argv):
         die("--label is required (it names this leg in the report)")
     if o["jobs"]:
         _positive_jobs(o["jobs"], "--jobs")
+    if o["gcc_reference"] not in ("true", "false"):
+        die("--gcc-reference is true or false, got '%s'" % o["gcc_reference"])
+    o["gcc_reference"] = o["gcc_reference"] == "true"
+    if o["gcc_reference"]:
+        for flag in ("--reference-cc", "--reference-opt", "--reference-link-libs"):
+            if not o[flag[2:].replace("-", "_")]:
+                die("%s is required with --gcc-reference true (the yardstick's knobs are the step's inputs)" % flag)
     return o
 
 
@@ -229,37 +278,49 @@ def augment_path(environ=None, isdir=os.path.isdir):
     environ["PATH"] = os.pathsep.join(entries)
 
 
+_OWNER = []
+
+
+def _owning_tree_module():
+    """`owning-tree.py`, loaded once as a SIBLING: it names the tree this file lives in, and says what a path a
+    command line names for writing may be. A missing owner is a refusal by name."""
+    if not _OWNER:
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                            "owning-tree", "owning-tree.py")
+        if not os.path.isfile(path):
+            die("cannot find %s -- the tree this program lives in is named there and "
+                "nowhere else" % path)
+        saved = sys.dont_write_bytecode
+        sys.dont_write_bytecode = True          # no __pycache__ in a directory not ours
+        try:
+            spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        finally:
+            sys.dont_write_bytecode = saved
+        _OWNER.append(mod)
+    return _OWNER[0]
+
+
 def _owning_tree_root():
-    """The tree this file lives in, by `owning-tree.py`'s walk, loaded as a SIBLING.
+    """The tree this file lives in, by `owning-tree.py`'s walk.
 
     ⓘ Never by counting `..` from this file: that count named `.harness-config/runner`
     the day this program moved out of `scripts/` (2026-09-18). A missing owner or a
     walk that finds nothing is a refusal by name, never a fallback to the caller's cwd.
     """
-    path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
-                        "owning-tree", "owning-tree.py")
-    if not os.path.isfile(path):
-        die("cannot find %s -- the tree this program lives in is named there and "
-            "nowhere else (or pass --repo)" % path)
-    saved = sys.dont_write_bytecode
-    sys.dont_write_bytecode = True          # no __pycache__ in a directory not ours
-    try:
-        spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-    finally:
-        sys.dont_write_bytecode = saved
+    mod = _owning_tree_module()
     try:
         return mod.owning_tree(__file__)
     except mod.Refusal as exc:
         die("cannot name the tree this program lives in: %s" % exc)
 
 
-def resolve_repo(opt_repo):
-    """The dsscp checkout to profile: `--repo` (from the caller's directory), else the
-    tree this file lives in -- a profiler that has to be told where it is can be
-    pointed at a different checkout than the compiler it just built."""
-    repo = os.path.abspath(opt_repo) if opt_repo else _owning_tree_root()
+def resolve_repo():
+    """The dsscp checkout to profile: the tree this file lives in -- a profiler that has to be told
+    where it is can be pointed at a different checkout than the compiler it just built (`--repo` did
+    exactly that until its retirement on 2026-09-30)."""
+    repo = _owning_tree_root()
     if not os.path.isdir(os.path.join(repo, "src", "dss-config")):
         die("%s is missing — that is not a dsscp checkout"
             % os.path.join(repo, "src", "dss-config"))
@@ -420,16 +481,29 @@ def support(repo, support_path, argv, extra_env=None, capture=False):
     return _status(p.returncode), text
 
 
+def report_lines(text):
+    """The `--time` report's lines in `text`: its `compile time` line and the table under it, header and rows."""
+    out, inside = [], False
+    for line in text.splitlines():
+        if _REPORT_FIRST.match(line):
+            out.append(line)
+            inside = True
+        elif inside and (line.startswith(_REPORT_ROW) or line.startswith(_REPORT_BANNER)):
+            out.append(line)
+        else:
+            inside = False
+    return out
+
+
 def phase_report(log):
-    """The compile log's `compile time` line and its `dsscp:   phase` lines."""
+    """The compile log's `--time` report, whole: its `compile time` line and every row of the table under it."""
     try:
         with open(log, "rb") as fh:
             text = fh.read().decode("utf-8", "replace")
     except OSError:
         return
-    for line in text.splitlines():
-        if _PHASE_LINE.search(line):
-            sys.stdout.write(line + "\n")
+    for line in report_lines(text):
+        sys.stdout.write(line + "\n")
 
 
 def list_artifacts(image_dir, limit):
@@ -447,16 +521,239 @@ def list_artifacts(image_dir, limit):
                 return
 
 
+# ── THE HOST-EQUALITY GATE (see the header) ─────────────────────────────────────────
+HOST_OK_TOKEN = "HOST-EQUALITY-OK"
+HOST_FAILED_TOKEN = "HOST-EQUALITY-FAILED"
+HOST_RECORD = "host-equality.txt"
+
+
+class HostEqualityRefusal(Exception):
+    """A request the gate refuses before it reads any image."""
+
+
+def image_files(image_dir):
+    """[(name relative to `image_dir`, size, md5)] for every regular file under it, sorted by name."""
+    import hashlib
+    found = []
+    for dirpath, dirnames, filenames in os.walk(image_dir):
+        dirnames.sort()
+        for f in sorted(filenames):
+            p = os.path.join(dirpath, f)
+            if not os.path.isfile(p):
+                continue
+            h = hashlib.md5()
+            with open(p, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
+            found.append((os.path.relpath(p, image_dir).replace(os.sep, "/"), os.path.getsize(p), h.hexdigest()))
+    return found
+
+
+def host_equality(perf_dir, labels_value):
+    """(equal, report lines) for the images `build/perf/<label>/image/` of every label in `labels_value`; raises
+    HostEqualityRefusal before reading any image when the request cannot be judged."""
+    labels = labels_value.split(",") if labels_value else []
+    if len(labels) < 2:
+        raise HostEqualityRefusal("--host-equality compares two legs or more: name at least two labels, "
+                                  "comma-separated (got %r)" % labels_value)
+    if "" in labels:
+        raise HostEqualityRefusal("--host-equality names an empty label in %r" % labels_value)
+    if len(set(labels)) != len(labels):
+        raise HostEqualityRefusal("--host-equality names a label twice: %r" % labels_value)
+    dirs = [(label, os.path.join(perf_dir, label, "image")) for label in labels]
+    for label, d in dirs:
+        if not os.path.isdir(d) or not any(files for _, _, files in os.walk(d)):
+            raise HostEqualityRefusal(
+                "leg %s has no image to compare: %s holds no file. Profile it, and bring a remote leg's image back "
+                "with `dssharness sync --legs %s --pull build/perf/%s/image/`" % (label, d, label, label))
+    listings = [(label, image_files(d)) for label, d in dirs]
+    lines = []
+    for label, files in listings:
+        lines.append("host-equality: %s: %d file(s): %s" % (
+            label, len(files), ", ".join("%s %d byte(s) md5 %s" % f for f in files)))
+    equal = all(files == listings[0][1] for _, files in listings[1:])
+    if equal:
+        lines.append("%s %s  (%s)" % (HOST_OK_TOKEN, " ".join("%s=%s" % (n, d) for n, _, d in listings[0][1]),
+                                      ", ".join(labels)))
+    else:
+        lines.append("%s the legs' images differ (%s): an image must be a function of its inputs and its target, "
+                     "never of the host that built the compiler" % (HOST_FAILED_TOKEN, ", ".join(labels)))
+    return equal, lines
+
+
+def run_host_equality(labels_value):
+    """The gate's run -> its exit code: the lines printed and written to build/perf/host-equality.txt."""
+    perf_dir = os.path.join(resolve_repo(), "build", "perf")
+    try:
+        equal, lines = host_equality(perf_dir, labels_value)
+    except HostEqualityRefusal as exc:
+        die(str(exc))
+    with open(os.path.join(perf_dir, HOST_RECORD), "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("\n".join(lines) + "\n")
+    for line in lines:
+        sys.stdout.write(line + "\n")
+    return 0 if equal else 1
+
+
 # ── the run ─────────────────────────────────────────────────────────────────────
+# ── THE COMMAND LINE'S OWN SELF-TEST: no kit, no build ───────────────────────────
+SELFTEST_MARKER = "profile-compile self-test: "
+# ⚠ Raising this is the claim that the arms you added actually RUN.
+EXPECTED_ARMS = 15
+# A compile log's `--time` report as dsscp writes it (program.cpp `emitPhaseTimeReport`'s own lines), with a trace line
+# before it and an optimizer trace line after it, which are no part of it.
+_REPORT_SAMPLE = (
+    "opt: pass inline 3 changed\n"
+    "dsscp: compile time 1.25s  (process wall)\n"
+    "dsscp:   phase                         cpu        wall   peak    runs\n"
+    "dsscp:   parse                       0.10s       0.10s      1       1\n"
+    "dsscp:   optimize                    0.80s       0.81s      1       1\n"
+    "dsscp:   [other]                                 0.34s\n"
+    "opt: fixpoint release converged after 2 iteration(s)\n")
+# The same report from a run whose accounting is broken (program.cpp's own lines): the banner, its `!` lines, then the
+# pre-scan memo and a batch row -- the rows a block ended at the banner dropped.
+_REPORT_VIOLATION_SAMPLE = (
+    "dsscp: compile time 1.25s  (process wall)\n"
+    "dsscp:   phase                         cpu        wall   peak    runs\n"
+    "dsscp:   parse                       0.10s       0.10s      1       1\n"
+    "dsscp: *** --time INVARIANT VIOLATION — the phase accounting is inconsistent with itself, so the unattributed "
+    "remainder is NOT reported ***\n"
+    "dsscp:   ! 1 phase scope(s) are still LIVE at the report\n"
+    "dsscp:   pre-scan memo             3 built      9 hit   (12 include request(s), 75.0% served)\n"
+    "dsscp:   compile-units        width 4    jobs 2     batch      0.50s  Σjobs      0.90s\n"
+    "opt: fixpoint release converged after 2 iteration(s)\n")
+_REQUIRED =["--kit", "kit", "--target", "x86_64:elf64-x86_64-linux-exec", "--label", "leg"]
+
+
+def self_test():
+    """Each arm parses one command line and reads what it did; a refusal is read from the program's own words."""
+    import contextlib
+    import io
+    ran = []
+
+    def arm(label, ok, detail=""):
+        ran.append(bool(ok))
+        if ok:
+            print("%sok      %s" % (SELFTEST_MARKER, label))
+        else:
+            print("%sFAILED  %s -- %s" % (SELFTEST_MARKER, label, (detail or "no detail").replace("\n", " ")[:600]))
+
+    def parsed(argv):
+        said = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(said):
+                return parse_cli(_REQUIRED + argv), None, ""
+        except SystemExit as exc:
+            return None, exc.code, said.getvalue().strip()
+
+    def refused(argv, flag):
+        got, code, text = parsed(argv)
+        if got is not None:
+            return False, "parsed, no refusal: %s=%r" % (flag, got[flag[2:].replace("-", "_")])
+        return (code == 1 and ("%s takes '" % flag) in text and "begins with `-`" in text,
+                "exit %r: %s" % (code, text[:300]))
+
+    arm("--out --help is an option taken for the directory to write: refused, naming --out",
+        *refused(["--out", "--help"], "--out"))
+    arm("--build-dir -x is an option taken for the build tree to write: refused, naming --build-dir",
+        *refused(["--build-dir", "-x"], "--build-dir"))
+    got, code, text = parsed(["--out=--help"])
+    arm("--out=--help is no spelling of a value here: refused as an unknown argument",
+        got is None and code == 1 and "unknown argument '--out=--help'" in text, "exit %r: %s" % (code, text[:300]))
+    got, code, text = parsed(["--out", "build/perf/x-y", "--build-dir", "build/rel-2"])
+    arm("a path holding a dash is kept (the control)",
+        got is not None and (got["out"], got["build_dir"]) == ("build/perf/x-y", "build/rel-2"),
+        "exit %r: %s" % (code, text[:300]) if got is None else "got %r" % ((got["out"], got["build_dir"]),))
+    got, code, text = parsed(["--gcc-reference", "true", "--reference-cc", "gcc", "--reference-opt", "-O2",
+                              "--reference-link-libs", "-lm"])
+    arm("a value that is no path may begin with `-` (the control)",
+        got is not None and (got["reference_opt"], got["reference_link_libs"]) == ("-O2", "-lm"),
+        "exit %r: %s" % (code, text[:300]) if got is None else "got %r" % ((got["reference_opt"],),))
+    shown = report_lines(_REPORT_SAMPLE)
+    rows = [l for l in shown if l.startswith(_REPORT_ROW)]
+    arm("the phase report shows the table's header AND every row under it",
+        len(rows) == 4 and rows[0].startswith(_REPORT_ROW + "phase") and any("optimize" in r for r in rows)
+        and any("[other]" in r for r in rows), "reported %r" % (shown,))
+    arm("the phase report shows the `compile time` line and nothing of the traces around it (the control)",
+        shown[:1] == ["dsscp: compile time 1.25s  (process wall)"] and not any(l.startswith("opt:") for l in shown),
+        "reported %r" % (shown,))
+    broken = report_lines(_REPORT_VIOLATION_SAMPLE)
+    arm("a broken run's report shows the violation banner, each `!` line, and the memo and batch rows after them",
+        any(l.startswith(_REPORT_BANNER) and "INVARIANT VIOLATION" in l for l in broken)
+        and any(l.startswith(_REPORT_ROW + "! ") for l in broken)
+        and any("pre-scan memo" in l for l in broken) and any("compile-units" in l for l in broken),
+        "reported %r" % (broken,))
+    arm("a broken run's report still ends at the first line of neither prefix (the control)",
+        len(broken) == 7 and not any(l.startswith("opt:") for l in broken), "reported %r" % (broken,))
+
+    # The host-equality gate, over images this self-test writes itself.
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="dss-profile-compile-") as perf:
+        def image(label, files):
+            for name, data in files.items():
+                p = os.path.join(perf, label, "image", "fmt", name)
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                with open(p, "wb") as fh:
+                    fh.write(data)
+
+        def judged(labels):
+            try:
+                return host_equality(perf, labels)
+            except HostEqualityRefusal as exc:
+                return "REFUSED: %s" % exc
+
+        image("a", {"app": b"same bytes"})
+        image("b", {"app": b"same bytes"})
+        image("c", {"app": b"other bytes"})
+        image("d", {"app": b"same bytes", "app.map": b"x"})
+        os.makedirs(os.path.join(perf, "empty", "image"))
+        got = judged("a,b")
+        arm("host-equality: two legs whose image is the same bytes pass, naming the file's md5",
+            isinstance(got, tuple) and got[0] and got[1][-1].startswith(HOST_OK_TOKEN + " fmt/app=")
+            and got[1][-1].endswith("(a, b)"), "got %r" % (got,))
+        got = judged("a,c")
+        import hashlib
+        md5s = (hashlib.md5(b"same bytes").hexdigest(), hashlib.md5(b"other bytes").hexdigest())
+        arm("host-equality: two legs whose image differs FAIL, each leg's md5 said",
+            isinstance(got, tuple) and not got[0] and got[1][-1].startswith(HOST_FAILED_TOKEN)
+            and got[1][0].startswith("host-equality: a: ") and md5s[0] in got[1][0]
+            and got[1][1].startswith("host-equality: c: ") and md5s[1] in got[1][1], "got %r" % (got,))
+        got = judged("a,d")
+        arm("host-equality: a leg that left another file beside the same image FAILS",
+            isinstance(got, tuple) and not got[0], "got %r" % (got,))
+        got = judged("a")
+        arm("host-equality: one label is REFUSED before any image is read",
+            isinstance(got, str) and "at least two labels" in got, "got %r" % (got,))
+        got = judged("a,a")
+        arm("host-equality: a label named twice is REFUSED",
+            isinstance(got, str) and "names a label twice" in got, "got %r" % (got,))
+        got = judged("a,empty")
+        arm("host-equality: a leg whose image directory holds no file is REFUSED by name, with the pull to run",
+            isinstance(got, str) and "leg empty has no image" in got and "--pull build/perf/empty/image/" in got,
+            "got %r" % (got,))
+    failed = ran.count(False)
+    if len(ran) != EXPECTED_ARMS:
+        print("%s%d arm(s) ran, %d expected -- FAIL" % (SELFTEST_MARKER, len(ran), EXPECTED_ARMS))
+        return 1
+    print("%s%d arm(s), %d failed%s" % (SELFTEST_MARKER, len(ran), failed, "" if not failed else " -- FAIL"))
+    return 0 if not failed else 1
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else list(argv)
+    if argv == ["--self-test"]:
+        return self_test()
+    if argv[:1] == ["--host-equality"]:
+        if len(argv) != 2:
+            die("--host-equality takes one value, the labels, comma-separated, and nothing else. See --help.")
+        return run_host_equality(argv[1])
     o = parse_cli(argv)
     if o["help"]:
         sys.stdout.write(__doc__ or "profile-compile: no help text (python -OO)\n")
         return 0
 
     augment_path()
-    repo = resolve_repo(o["repo"])
+    repo = resolve_repo()
     # ★★★ NAME THE CONFIG TREE. `findShippedConfig` prefers $DSS_CONFIG_ROOT and
     # otherwise WALKS UP FROM THE CWD, so a leg driven over ssh (cwd = $HOME) finds
     # nothing and the compile dies, while a leg driven from Windows INTO WSL silently
@@ -547,7 +844,9 @@ def main(argv=None):
     if o["gcc_reference"]:
         say(label, "gcc yardstick (same TUs, same manifest)")
         rc, _ = support(repo, support_path, ["gcc-reference", "--manifest", man, "--out", out,
-                                             "--jobs", str(effective_jobs(o["jobs"]))])
+                                             "--jobs", str(effective_jobs(o["jobs"])),
+                                             "--cc=%s" % o["reference_cc"], "--opt=%s" % o["reference_opt"],
+                                             "--link-libs=%s" % o["reference_link_libs"]])
         if rc != 0:
             die("the gcc reference failed")
 

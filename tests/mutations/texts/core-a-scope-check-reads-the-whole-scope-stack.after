@@ -1,0 +1,1 @@
+    ScopeView const scopeView{.top     = noScope ? ScopeKind::None : [&] { ScopeKind t = ScopeKind::None; for (ScopeEntry const e : scopes_) t = e.kind; return t; }(),

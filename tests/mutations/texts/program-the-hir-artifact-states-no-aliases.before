@@ -1,0 +1,1 @@
+        hirCtx.symbolAliases = &front->hir->symbolAliases;

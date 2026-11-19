@@ -1,0 +1,1 @@
+            common.commonAlignmentStated = alignLog2 == 0u ? 0u : alignment;

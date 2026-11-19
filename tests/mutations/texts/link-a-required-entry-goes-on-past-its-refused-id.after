@@ -1,0 +1,2 @@
+    ExternImport required;
+    required.symbol              = id.value_or(SymbolId{});

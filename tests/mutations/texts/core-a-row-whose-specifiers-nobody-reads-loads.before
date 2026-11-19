@@ -1,0 +1,2 @@
+                        } else if (attributeTableOf(cfg, d).answer == AttributeTableAnswer::Unread
+                                   && !borrows) {

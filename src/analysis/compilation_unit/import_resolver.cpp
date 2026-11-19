@@ -314,6 +314,18 @@ private:
                                               directive.span, directive.filename,
                                               r.ambiguousCandidates);
                 };
+                // A candidate nobody could EXAMINE (a looping link, a refusal): the
+                // search ended at it, and it is refused naming it -- never the miss
+                // below (a soft warning for a local include, which would compile on
+                // without it), never a later directory's answer. gcc and clang stop
+                // at such a candidate, fatal (✔MEASURED 2026-10-28).
+                auto const unexaminable = [&](HeaderSearchResult const& r) {
+                    reportDriver(context.diagnostics,
+                                 directive.isSystem ? DiagnosticCode::F_ShippedLibDescriptorMalformed
+                                                    : DiagnosticCode::P_PreprocessorIncludeError,
+                                 DiagnosticSeverity::Error, sourceBuffer, directive.span,
+                                 directive.filename + ": " + describeUnexaminable(r));
+                };
                 auto const unresolved = [&] {
                     if (directive.isSystem) {
                         reportDriver(context.diagnostics, DiagnosticCode::F_ShippedHeaderNotFound,
@@ -359,6 +371,9 @@ private:
                     if (resolved.status == HeaderSearchStatus::AmbiguousCase) {
                         ambiguous(resolved); continue;
                     }
+                    if (resolved.status == HeaderSearchStatus::Unexaminable) {
+                        unexaminable(resolved); continue;
+                    }
                     if (resolved.status != HeaderSearchStatus::Found) {
                         unresolved(); continue;
                     }
@@ -397,6 +412,16 @@ private:
                                     context.diagnostics, sourceBuffer,
                                     directive.span, missingHeader,
                                     outcome.ambiguousCandidates);
+                                return;
+                            }
+                            // An edge whose descriptor nobody could examine: the
+                            // shipped tree cannot be read there -- not a miss.
+                            if (outcome.status == HeaderSearchStatus::Unexaminable) {
+                                reportDriver(context.diagnostics,
+                                             DiagnosticCode::F_ShippedLibDescriptorMalformed,
+                                             DiagnosticSeverity::Error, sourceBuffer,
+                                             directive.span,
+                                             missingHeader + ": " + describeUnexaminable(outcome));
                                 return;
                             }
                             reportDriver(context.diagnostics,
@@ -451,6 +476,9 @@ private:
                                        context.headerSearch);
                 if (resolved.status == HeaderSearchStatus::AmbiguousCase) {
                     ambiguous(resolved); continue;
+                }
+                if (resolved.status == HeaderSearchStatus::Unexaminable) {
+                    unexaminable(resolved); continue;
                 }
                 if (resolved.status != HeaderSearchStatus::Found) {
                     unresolved(); continue;

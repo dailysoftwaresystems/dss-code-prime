@@ -1,0 +1,2 @@
+        // LSP server and the diagnostic corpus analyze although it did not parse.
+        if (tree.kind(c) != NodeKind::Internal) continue;

@@ -33,7 +33,9 @@
 
 #include <gtest/gtest.h>
 
+#include <optional>
 #include <string>
+#include <vector>
 
 using namespace dss;
 using namespace dss::sem_test;
@@ -207,6 +209,222 @@ TEST(BuiltinCompileTimeOperators, OffsetofNonConstantIndexFailsLoud) {
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_OffsetofInvalidMember), 1u)
         << "a non-constant designator index must refuse, never assume 0";
+}
+
+
+// ── [[D-C-A-CONSTANTS-MEMBER-NAME-IS-RESOLVED-BY-A-SCOPE-WALK]] (P69, lane `cs`) ──
+//
+// The member name of a constant — each step of `offsetof`, the `&((T *)0)->m`
+// spelling, the member step of an object-size operand — is resolved by the ONE
+// member rule (`anon_member_search::memberByteOffset`): the composite's OWN member,
+// or one promoted through its anonymous members, the composite keyed by its
+// unqualified type. Before that function each asker walked the SCOPE CHAIN from the
+// member scope, which is wrong both ways, and every pin below is one of the shapes
+// ✔MEASURED 2026-10-08 against gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and
+// cl 14.51 (the lane's probe `mo1`).
+
+namespace {
+
+// The text of every diagnostic of `code`, in emission order.
+[[nodiscard]] std::vector<std::string> textsOf(SemanticModel const& model, DiagnosticCode code) {
+    std::vector<std::string> out;
+    for (ParseDiagnostic const& d : model.diagnostics().all())
+        if (d.code == code) out.push_back(d.actual);
+    return out;
+}
+
+// Did the bound of the array named `name` fold to a LENGTH? A declined fold leaves
+// the array without one — no array type at all, or the lattice's negative "not a
+// constant" length — so a pin that a constant must NOT fold reads this, not a value.
+[[nodiscard]] bool boundFoldedToALength(SemanticModel const& model, std::string_view name) {
+    auto const dim = foldedArrayDim(model, name);
+    return dim.has_value() && *dim >= 0;
+}
+
+} // namespace
+
+// ★ FACE 1 — A NAME THAT IS NOT A MEMBER, BUT IS BOUND IN A SCOPE THAT ENCLOSES THE
+// STRUCT. The walk found it there and read ITS `fieldIndex` as a member's: `offsetof`
+// COMPILED and answered another member's offset (0 for the first three shapes, 4 for
+// the last two) where all four references say "no member named". Each shape is
+// refused BY NAME, and — the half a count cannot see — its array bound does not fold.
+TEST(BuiltinCompileTimeOperators, OffsetofRefusesANameBoundOutsideTheStruct) {
+    struct Shape {
+        char const* what;
+        char const* declarations;
+        char const* type;
+        char const* name;
+    };
+    Shape const shapes[] = {
+        {"a file-scope object", "int g;\nstruct S { int a; int b; };\n", "struct S", "g"},
+        {"a function", "int fn(void);\nstruct S { int a; int b; };\n", "struct S", "fn"},
+        {"an enumerator of the enclosing scope",
+         "enum { ENUMERATOR = 1 };\nstruct S { int a; int b; };\n", "struct S", "ENUMERATOR"},
+        {"an enumerator declared INSIDE the struct",
+         "struct S { enum { INNER = 1 } e; int b; };\n", "struct S", "INNER"},
+        {"a typedef name", "typedef int alias_t;\nstruct S { int a; int b; };\n", "struct S",
+         "alias_t"},
+        {"a member of the ENCLOSING struct",
+         "struct O { int first; struct I { int x; int y; } i; };\n", "struct I", "i"},
+    };
+    for (Shape const& shape : shapes) {
+        SCOPED_TRACE(shape.what);
+        std::string const call = std::string{"__builtin_offsetof("} + shape.type + ", "
+                               + shape.name + ")";
+        // (a) the refusal, by name and by reason.
+        auto const asked = analyzeWithLayout(
+            std::string{shape.declarations} + "int main(void){ return (int)" + call + "; }\n");
+        auto const texts = textsOf(asked, DiagnosticCode::S_OffsetofInvalidMember);
+        ASSERT_EQ(texts.size(), 1u) << "exactly one refusal of the designator";
+        EXPECT_NE(texts[0].find(std::string{"'"} + shape.name
+                                + "' is not a member of that struct/union"),
+                  std::string::npos)
+            << texts[0];
+        // (b) no plausible offset reaches a constant: the bound does not fold.
+        auto const bound = analyzeWithLayout(
+            std::string{shape.declarations} + "int dss_dim[" + call + " + 1];\n"
+            "int main(void){ return 0; }\n");
+        EXPECT_TRUE(bound.diagnostics().hasErrors());
+        EXPECT_FALSE(boundFoldedToALength(bound, "dss_dim"))
+            << "the walk folded this to another member's offset plus one: "
+            << foldedArrayDim(bound, "dss_dim").value_or(-1);
+    }
+}
+
+// ★ FACE 2 — A MEMBER REACHED THROUGH ANONYMOUS MEMBERS (C23 6.7.3.2p15: it IS a
+// member of the containing struct). Refused as "not a member" until the member rule
+// was asked; every reference folds each of these. The offsets are SUMS along the
+// anonymous members crossed: `c` is 4 + 4, `f` is 16 + 0 + 2 — an answer that read
+// only the member's own index inside its anonymous struct would say 4 and 2.
+TEST(BuiltinCompileTimeOperators, OffsetofReachesAMemberThroughAnonymousMembers) {
+    auto model = analyzeWithLayout(
+        "struct A { char a; struct { int b; int c; };\n"
+        "           union { long long d; struct { char e; short f; }; }; };\n"
+        "struct B { struct A in; char tail; };\n"
+        "struct T { char lead; struct A wide[2]; };\n"
+        "int d_one[__builtin_offsetof(struct A, c)];\n"
+        "int d_two[__builtin_offsetof(struct A, f)];\n"
+        "int d_dotted[__builtin_offsetof(struct B, in.c)];\n"
+        "int d_indexed[__builtin_offsetof(struct T, wide[1].c)];\n"
+        "int d_address[(unsigned long)&((struct A *)0)->f];\n"
+        "_Static_assert((unsigned long)&((struct A *)0)->c == 8, \"c\");\n"
+        "_Static_assert(__builtin_offsetof(struct A, d) == 16, \"d\");\n"
+        "int main(void){ return 0; }\n");
+    EXPECT_FALSE(model.diagnostics().hasErrors())
+        << (model.diagnostics().all().empty() ? std::string{}
+                                              : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(foldedArrayDim(model, "d_one"), 8) << "one anonymous level";
+    EXPECT_EQ(foldedArrayDim(model, "d_two"), 18)
+        << "two: a struct inside a union inside the struct";
+    EXPECT_EQ(foldedArrayDim(model, "d_dotted"), 8) << "a later step of a dotted designator";
+    EXPECT_EQ(foldedArrayDim(model, "d_indexed"), 40)
+        << "after a subscript: wide is at 8, one element is 24, c adds 8";
+    EXPECT_EQ(foldedArrayDim(model, "d_address"), 18) << "the `&((T *)0)->m` spelling";
+}
+
+// A BIT-FIELD inside an anonymous member is found — and refused as what it is. The
+// walk said "not a member", which is false; the address spelling must not fold it
+// either.
+TEST(BuiltinCompileTimeOperators, OffsetofNamesABitFieldInsideAnAnonymousMember) {
+    auto const asked = analyzeWithLayout(
+        "struct F { int a; struct { int bf : 3; int z; }; };\n"
+        "int main(void){ return (int)__builtin_offsetof(struct F, bf); }\n");
+    auto const texts = textsOf(asked, DiagnosticCode::S_OffsetofInvalidMember);
+    ASSERT_EQ(texts.size(), 1u);
+    EXPECT_NE(texts[0].find("'bf' is a BIT-FIELD"), std::string::npos) << texts[0];
+
+    auto const address = analyzeWithLayout(
+        "struct F { int a; struct { int bf : 3; int z; }; };\n"
+        "int dss_dim[(unsigned long)&((struct F *)0)->bf + 1];\n"
+        "int main(void){ return 0; }\n");
+    EXPECT_TRUE(address.diagnostics().hasErrors());
+    EXPECT_FALSE(boundFoldedToALength(address, "dss_dim"));
+}
+
+// Two DIFFERENT members of one spelling through sibling anonymous members: neither
+// is THE member, and the designator says so rather than taking the first.
+TEST(BuiltinCompileTimeOperators, OffsetofRefusesAnAmbiguousPromotedMember) {
+    auto const model = analyzeWithLayout(
+        "struct M { struct { int x; int p; }; struct { int q; int x; }; };\n"
+        "int main(void){ return (int)__builtin_offsetof(struct M, x); }\n");
+    auto const texts = textsOf(model, DiagnosticCode::S_OffsetofInvalidMember);
+    ASSERT_EQ(texts.size(), 1u);
+    EXPECT_NE(texts[0].find("'x' names two different members"), std::string::npos) << texts[0];
+}
+
+// ★ FACE 3 — A QUALIFIED CONTAINER. The member scope is registered under the
+// UNQUALIFIED type; the walk looked it up under the qualified one, found none, and
+// called a complete struct "INCOMPLETE here". All four references fold these.
+TEST(BuiltinCompileTimeOperators, OffsetofSeesThroughTheContainersQualifiers) {
+    auto model = analyzeWithLayout(
+        "struct S { int a; int b; };\n"
+        "struct O { char lead; volatile struct S in; };\n"
+        "int d_volatile[__builtin_offsetof(volatile struct S, b)];\n"
+        "int d_both[__builtin_offsetof(const volatile struct S, b)];\n"
+        "int d_member[__builtin_offsetof(struct O, in.b)];\n"
+        "int d_address[(unsigned long)&((volatile struct S *)0)->b];\n"
+        "int d_address_both[(unsigned long)&((const volatile struct S *)0)->b];\n"
+        "int main(void){ return 0; }\n");
+    EXPECT_FALSE(model.diagnostics().hasErrors())
+        << (model.diagnostics().all().empty() ? std::string{}
+                                              : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(foldedArrayDim(model, "d_volatile"), 4);
+    EXPECT_EQ(foldedArrayDim(model, "d_both"), 4);
+    EXPECT_EQ(foldedArrayDim(model, "d_member"), 8)
+        << "a volatile-qualified MEMBER on the way of a dotted designator";
+    EXPECT_EQ(foldedArrayDim(model, "d_address"), 4);
+    EXPECT_EQ(foldedArrayDim(model, "d_address_both"), 4);
+}
+
+// ★ FACE 4 — THE OBJECT-SIZE BUILTIN'S MEMBER OPERAND. "Unknown" is an answer the
+// builtin is allowed to give, so nothing was wrong — but gcc, clang and mingw-w64 gcc
+// answer the subobject's bytes for a promoted member, and so does the member rule.
+TEST(BuiltinCompileTimeOperators, ObjectSizeSizesAMemberPromotedThroughAnonymousMembers) {
+    auto model = analyzeWithLayout(
+        "struct A { char a; struct { int b; int c; };\n"
+        "           union { long long d; struct { char e; short f; }; }; };\n"
+        "struct A ga;\n"
+        "int d_closest[__builtin_object_size(&ga.c, 1)];\n"
+        "int d_whole[__builtin_object_size(&ga.f, 0)];\n"
+        "int d_direct[__builtin_object_size(&ga.a, 1)];\n"
+        "int main(void){ return 0; }\n");
+    EXPECT_FALSE(model.diagnostics().hasErrors())
+        << (model.diagnostics().all().empty() ? std::string{}
+                                              : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(foldedArrayDim(model, "d_closest"), 4) << "the subobject `c` itself";
+    EXPECT_EQ(foldedArrayDim(model, "d_whole"), 6) << "from `f` (at 18) to the end of 24";
+    EXPECT_EQ(foldedArrayDim(model, "d_direct"), 1) << "the control: a direct member";
+}
+
+// `offsetof` KEEPS THE SENTENCE FOR EACH WAY THERE IS NO ANSWER. The texts moved
+// from five inline branches to one switch over the member rule's reason; each
+// reachable reason is asked for by name.
+TEST(BuiltinCompileTimeOperators, OffsetofStillSaysWhyThereIsNoOffset) {
+    struct Case {
+        char const* source;
+        char const* text;
+    };
+    Case const cases[] = {
+        {"struct S { int a; };\n"
+         "int main(void){ return (int)__builtin_offsetof(struct S, a.x); }\n",
+         "'x' cannot be reached: the type it is looked up in is not a struct or union"},
+        {"struct Later;\n"
+         "int main(void){ return (int)__builtin_offsetof(struct Later, m); }\n",
+         "'m' cannot be reached: its containing struct/union is INCOMPLETE here"},
+        {"struct S { int a; };\n"
+         "int main(void){ return (int)__builtin_offsetof(struct S, nosuch); }\n",
+         "'nosuch' is not a member of that struct/union"},
+        {"struct S { unsigned a : 3; unsigned b : 5; };\n"
+         "int main(void){ return (int)__builtin_offsetof(struct S, b); }\n",
+         "'b' is a BIT-FIELD, which has no byte offset"},
+    };
+    for (Case const& c : cases) {
+        SCOPED_TRACE(c.text);
+        auto const model = analyzeWithLayout(c.source);
+        auto const texts = textsOf(model, DiagnosticCode::S_OffsetofInvalidMember);
+        ASSERT_EQ(texts.size(), 1u);
+        EXPECT_NE(texts[0].find(c.text), std::string::npos) << texts[0];
+    }
 }
 
 

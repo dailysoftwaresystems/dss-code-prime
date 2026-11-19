@@ -1,0 +1,1 @@
+                if (speculationDepth + f.relSpeculationPeak < config.maxSpeculationDepth

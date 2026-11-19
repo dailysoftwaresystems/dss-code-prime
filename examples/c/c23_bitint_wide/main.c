@@ -17,13 +17,25 @@
  * (RED-ON-DISABLE: the carry, the borrow, the top-limb mask, the signed compare, the
  * widening fill, and the high-limb reads are all load-bearing on the 42).
  *
- * sizeof/_Alignof are const-folded to size_t (x86-64 psABI: _BitInt(128) is 16B align
- * 8, _BitInt(200) is 32B align 8 — ceil(N/64)*8, NOT 16-aligned). */
+ * sizeof/_Alignof are const-folded to size_t, and they are the TARGET's: a _BitInt(N>64) is made of the
+ * target's bit-precise chunk. The x86-64 psABI's chunk is 8 bytes (_BitInt(128) is 16B align 8, _BitInt(129)
+ * 24B, _BitInt(200) 32B — ceil(N/64)*8, NOT 16-aligned); AAPCS64's is 16 (_BitInt(128) is 16B align 16,
+ * _BitInt(129) and _BitInt(200) 32B). MEASURED: clang 18.1.3 and Apple clang 21 for x86-64; Apple clang 21 for
+ * arm64 up to 128 bits (no arm64 reference has the type past 128, where the AAPCS64 document decides). */
 
+#if defined(__x86_64__)
 _Static_assert(sizeof(_BitInt(128))          == 16, "sizeof(_BitInt(128)) == 16");
 _Static_assert(_Alignof(_BitInt(128))        ==  8, "_Alignof(_BitInt(128)) == 8");
 _Static_assert(sizeof(_BitInt(200))          == 32, "sizeof(_BitInt(200)) == 32");
 _Static_assert(sizeof(unsigned _BitInt(129)) == 24, "sizeof(unsigned _BitInt(129)) == 24");
+#elif defined(__aarch64__)
+_Static_assert(sizeof(_BitInt(128))          == 16, "sizeof(_BitInt(128)) == 16");
+_Static_assert(_Alignof(_BitInt(128))        == 16, "_Alignof(_BitInt(128)) == 16");
+_Static_assert(sizeof(_BitInt(200))          == 32, "sizeof(_BitInt(200)) == 32");
+_Static_assert(sizeof(unsigned _BitInt(129)) == 32, "sizeof(unsigned _BitInt(129)) == 32");
+#else
+#error "c23_bitint_wide: no _BitInt layout is stated for this target"
+#endif
 
 /* CRIT-B: a struct with a PLAIN (non-bit-field) wide `_BitInt` member — its copy must
  * move ALL 16 bytes byte-wise, never a flat-scalar 8-byte field Load. */

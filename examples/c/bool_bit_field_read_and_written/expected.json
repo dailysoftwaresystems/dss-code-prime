@@ -1,0 +1,46 @@
+{
+  "$comment": "P69 (lane lm): a `_Bool` bit-field (C 6.7.2.1p5) read and written - a static and an automatic object, a pointer, `=` of a non-zero value (converted to 1, C 6.3.1.2), `++` and `+=` on the field, neighbours sharing its byte kept by every write. MEASURED 2026-10-15 (pe64, both pipelines): EVERY read and EVERY write of a `_Bool` bit-field was refused, `L_UnsupportedLoweringForOpcode` `Trunc result: TypeKind ordinal 0` - the extract and the insert (hir_to_mir.cpp) narrowed the promoted unit back to `_Bool` with a Trunc, a conversion no target realizes (a `_Bool` is made by a comparison) - where gcc 13, clang 18, AppleClang 21, mingw-w64 gcc 13.2 and cl 19.51 build and run it. The read is now the bit compared with zero; the write merges the unit as the byte it is. RED-ON-DISABLE: restore the Trunc in `emitBitfieldExtract` -> the compile is refused again (not exit 42). The release arm reads the same fields through the optimizer.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": [
+        "darwin"
+      ],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release",
+      "mustDifferFromBaseline": true
+    }
+  ]
+}

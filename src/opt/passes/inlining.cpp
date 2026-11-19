@@ -1,5 +1,6 @@
 #include "opt/passes/inlining.hpp"
 
+#include "core/types/call_payload.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/symbol_attrs.hpp"
 #include "mir/mir_cfg.hpp"
@@ -400,14 +401,33 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
             // silent-miscompile fix, not a speculative guard.
             if (op == MirOpcode::ReadIndirectResult) return std::nullopt;
             // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: a fixed by-value
-            // aggregate received WHOLLY from the incoming stack (it straddled the
-            // reg/stack boundary) reads the CALLEE's incoming overflow area via a
-            // frame-relative `RecvByValueStackParam`; spliced into the caller it would
-            // bind to the CALLER's incoming frame (garbage — the caller is not the one
-            // that stacked the aggregate). Refuse, like ReadIndirectResult (fail-SAFE:
-            // forgoes the optimization, never miscompiles). Reachable under the shipped
-            // release.pipeline.json (which runs Inlining), so a real fix not a guard.
-            if (op == MirOpcode::RecvByValueStackParam) return std::nullopt;
+            // aggregate received WHOLLY from the incoming stack reads the CALLEE's
+            // incoming overflow area via a frame-relative `RecvByValueStackParam`;
+            // spliced AS IT STANDS into the caller it would bind to the CALLER's
+            // incoming frame (garbage — the caller is not the one that stacked it).
+            // ★ P69 (lane `cs`, fold f26c — D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET):
+            // so a reception that STATES its flat call-operand position (`payload2` =
+            // position + 1, mir_node.hpp — every aggregate reception) is MAPPED rather
+            // than refused: the caller's operand at that position is the
+            // `ByValueStackArg` carrier, whose value IS the address of the caller's
+            // private copy — exactly what the reception yields in the callee's frame —
+            // and the splice (`emitCalleeInst`) maps it there as it maps an `Arg`. A
+            // SysV MEMORY-class aggregate parameter is received this way since the
+            // fold (it was a pointer `Arg`), so the old blanket refusal would have
+            // silently stopped inlining every SysV function taking a struct over 16
+            // bytes. Refused still (fail-SAFE): a reception stating no position (the
+            // x87 `long double` scalar parameter), and one whose operand is not a
+            // carrier of its type — a structural call/signature mismatch.
+            if (op == MirOpcode::RecvByValueStackParam) {
+                std::uint32_t const p2 = mir.instPayload2(cid);
+                if (p2 == 0 || p2 - 1u >= callArgCount) return std::nullopt;
+                MirInstId const actual = callOps[1 + (p2 - 1u)];
+                if (mir.instOpcode(actual) != MirOpcode::ByValueStackArg
+                    || !mir.instType(cid).valid()
+                    || mir.instType(cid).v != mir.instType(actual).v) {
+                    return std::nullopt;
+                }
+            }
             // D-OPT-VARIADIC-RELEASE-MISCOMPILE: refuse to inline a callee that CALLS
             // va_start. The three va_start leaves (VaRegSaveAreaAddr /
             // VaOverflowArgAreaAddr / VaHomeArgAreaAddr) materialize in lir_callconv to
@@ -499,6 +519,20 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
             if (op == MirOpcode::StackSave || op == MirOpcode::StackRestore) {
                 return std::nullopt;
             }
+            // P69 (lane `cs`, review M2): do NOT inline a callee holding a RUNTIME-SIZED
+            // `Alloca` (one with a size operand — `__builtin_alloca(n)`; a VLA's own comes
+            // with the StackSave refused above, a fixed local's has no operand). Its block
+            // lives until the function holding it RETURNS: spliced into a caller it lives
+            // until the CALLER returns, and in the caller's loop no iteration gives its
+            // memory back. ✔MEASURED 2026-10-07 (lane `cs`'s probe il1): `static int h(int n)
+            // { char *p = __builtin_alloca(n); … }` called 10000 times with n = 4096
+            // overflowed the stack in the release pipeline (PE 0xC00000FD, ELF SIGSEGV) where
+            // gcc 13.3.0, clang 18.1.3 and mingw-w64 13.2.0 at -O2 run it to 42 — gcc's
+            // documented rule: a function that calls alloca is not inlined unless it is
+            // `always_inline`. Fail-SAFE: not inlining is unobservable.
+            if (op == MirOpcode::Alloca && !mir.instOperands(cid).empty()) {
+                return std::nullopt;
+            }
             // ── FRAME-SENSITIVE INTRINSIC REFUSAL ──
             // D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC
             // Refuse to inline a callee whose body contains an `IntrinsicCall`.
@@ -563,6 +597,22 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
                 std::uint32_t const pos = mir.argPosition(cid);
                 if (pos >= callArgCount) {
                     return std::nullopt;
+                }
+                // ★ P69 (lane `cs`, fold f26d — review-csf26c2 N1): an `Arg` is a FIXED
+                // parameter, so it maps only an operand the call passes as a fixed one —
+                // never one it passes through `...` (`call_payload::passesThroughEllipsis`,
+                // the one boundary every tier asks). A call whose fixed operands end before
+                // its callee's parameters do is a call and a callee that disagree about
+                // where `...` begins: refuse (fail-SAFE). The argument region starts past a
+                // prepended x8 result operand; such a callee is refused below anyway.
+                {
+                    std::uint32_t const callPayload = mir.instPayload(callId);
+                    std::uint32_t const irr =
+                        ::dss::call_payload::hasIndirectResult(callPayload) ? 1u : 0u;
+                    if (pos >= irr
+                        && ::dss::call_payload::passesThroughEllipsis(callPayload, pos - irr)) {
+                        return std::nullopt;
+                    }
                 }
                 // Type-consistency backstop (design-audit F6): the actual at
                 // this position must share the Arg's MIR type. This bug class
@@ -741,6 +791,22 @@ void emitCalleeInst(Mir const& src, MirInstId cid, MirOpcode cop,
             return;
         }
         local.emplace(cid.v, actualArgs[pos]);
+        return;
+    }
+    // ★ P69 (lane `cs`, fold f26c — D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET):
+    // a stacked by-value aggregate's reception maps to the caller's operand at the
+    // position it states (`payload2` = position + 1) — the `ByValueStackArg`
+    // carrier, whose value is the address of the caller's private copy. The gate
+    // admitted only such a reception; anything else here is the defensive
+    // fail-loud guard the `Arg` arm keeps.
+    if (cop == MirOpcode::RecvByValueStackParam) {
+        std::uint32_t const p2 = src.instPayload2(cid);
+        if (p2 == 0 || p2 - 1u >= actualArgs.size()) {
+            malformed = true;
+            if (!actualArgs.empty()) local.emplace(cid.v, actualArgs[0]);
+            return;
+        }
+        local.emplace(cid.v, actualArgs[p2 - 1u]);
         return;
     }
     if (cop == MirOpcode::Const) {
@@ -1042,13 +1108,19 @@ public:
         // OWN rebuild (it does not go through `MirFunctionRebuilder`), so it is a
         // second, independently-editable copy site for all four trailing flags —
         // and the only one for which no pass-behaviour test could notice a drop.
-        dst_.addFunction(src_.funcSignature(caller), src_.funcSymbol(caller),
-                         src_.funcBinding(caller), src_.funcVisibility(caller),
+        MirFuncId const copied = dst_.addFunction(src_.funcSignature(caller), src_.funcSymbol(caller),
+                         // P69: the linkage is copied as its ONE record
+                         // (binding, visibility, weak kind).
+                         src_.funcLinkage(caller),
                          src_.funcNoInline(caller), src_.funcAlwaysInline(caller),
                          src_.funcNoOptimize(caller),
                          src_.funcNoSanitizeThread(caller),
                          // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN
                          src_.funcStaticInit(caller));
+        // ★ P69 (lane `cs`, fold f26d): the counting of the convention the function is called by crosses
+        // with it — a clone that took the builder's default would count a foreign-convention function
+        // by the pair's.
+        dst_.stateFunctionArgCounting(copied, src_.funcArgCounting(caller));
 
         std::uint32_t const nb = src_.funcBlockCount(caller);
 
@@ -1321,20 +1393,25 @@ private:
             case MirOpcode::Br:
                 remember(dst_.addBr(mapSucc(oldSucc[0])));
                 return;
-            case MirOpcode::CondBr:
-                remember(dst_.addCondBr(mapCallerValue(oldOps[0], id),
-                                        mapSucc(oldSucc[0]), mapSucc(oldSucc[1])));
+            case MirOpcode::CondBr: {
+                MirInstId const  cond    = mapCallerValue(oldOps[0], id);
+                MirBlockId const onTrue  = mapSucc(oldSucc[0]);
+                MirBlockId const onFalse = mapSucc(oldSucc[1]);
+                remember(dst_.addCondBr(cond, onTrue, onFalse));
                 return;
+            }
             case MirOpcode::Switch: {
                 std::vector<std::pair<MirInstId, MirBlockId>> cases;
                 std::size_t const ncases = oldSucc.size() - 1;
                 cases.reserve(ncases);
                 for (std::size_t i = 0; i < ncases; ++i) {
-                    cases.emplace_back(mapCallerValue(oldOps[1 + i], id),
-                                       mapSucc(oldSucc[i]));
+                    MirInstId const  value  = mapCallerValue(oldOps[1 + i], id);
+                    MirBlockId const target = mapSucc(oldSucc[i]);
+                    cases.emplace_back(value, target);
                 }
-                remember(dst_.addSwitch(mapCallerValue(oldOps[0], id), cases,
-                                        mapSucc(oldSucc[ncases])));
+                MirInstId const  selector = mapCallerValue(oldOps[0], id);
+                MirBlockId const fallback = mapSucc(oldSucc[ncases]);
+                remember(dst_.addSwitch(selector, cases, fallback));
                 return;
             }
             case MirOpcode::Return: {
@@ -1389,7 +1466,9 @@ private:
                 return;
             }
             case MirOpcode::Unreachable:
-                remember(dst_.addUnreachable());
+                // P69: what the terminator asserts survives the clone.
+                remember(dst_.addUnreachable(
+                    static_cast<MirUnreachableKind>(src_.instPayload(id))));
                 return;
             default:
                 std::fprintf(stderr,
@@ -1720,7 +1799,9 @@ private:
                 return;
             }
             case MirOpcode::Unreachable:
-                remember(dst_.addUnreachable());
+                // P69: what the terminator asserts survives the clone.
+                remember(dst_.addUnreachable(
+                    static_cast<MirUnreachableKind>(src_.instPayload(cid))));
                 return;
             default:
                 std::fprintf(stderr,

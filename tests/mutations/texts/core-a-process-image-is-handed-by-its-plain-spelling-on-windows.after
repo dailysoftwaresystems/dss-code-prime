@@ -1,0 +1,2 @@
+    std::wstring const dos       = reference.size() > 6 && reference[5] == L':' ? reference.substr(4)
+                                                                              : dosSpellingOf(reference);

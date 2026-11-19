@@ -7,7 +7,8 @@
 // binder sketch (`src/analysis/syntactic/binder_sketch.hpp`): a name it knows as
 // a value rolls back to the expression reading, a name it knows as a type
 // commits, and a name it does not know at all reaches the Unknown arm — which in
-// `sizeof ( X )` has no following operand to read, so it COMMITS AS A TYPE.
+// `sizeof ( X )` once COMMITTED AS A TYPE (the `preferType` polarity) and now rolls
+// back to the expression reading (`requireKnownType`, P69 L2b2).
 //
 // Two kinds of value never reached the sketch, so they took that arm and the
 // semantic tier refused them S_UnknownType:
@@ -25,10 +26,13 @@
 // exit 42 on all four (gcc's -pedantic-errors refuses only the non-ISO spelling
 // `__FUNCTION__`, which clang and MSVC accept). DSS refused every one.
 //
-// ★ THE FALLBACK STAYS: a name the sketch does not know is still read as a type,
-// because a type it cannot see (a typedef from another tree of the compilation
-// unit, before the unit's oracle reparse) must keep working. The last test pins
-// that the fallback still fires.
+// ★ THE FALLBACK IS GONE (P69 L2b2, lane `lm`): a name the sketch does not know is
+// one NOTHING the unit can see declares — the sketch knows the source's own names,
+// the shipped descriptors' typedefs and values, and the language's predefined and
+// builtin names — so `sizeof ( X )` reads X as the expression it is, and the semantic
+// tier names it undeclared, the references' answer (MEASURED 2026-11-04, probe f05:
+// gcc 13.3.0 and clang 18.1.3 "'zzz' undeclared" at 1:37, cl C2065; none says
+// "unknown type"). The last test pins it.
 //
 // ── RED-ON-DISABLE (the lane's transcript carries each build and its names) ──
 //   * the predefined-identifier seed removed from the sketch → the `__func__` /
@@ -167,8 +171,8 @@ TEST(SizeofValueNames, AnEnumerationConstantTakesTheExpressionReading) {
     });
 }
 
-// ── the controls: a TYPE stays a type, and an unknown name keeps the fallback ─
-TEST(SizeofValueNames, ATypeNameAndAnUnknownNameStillTakeTheTypeReading) {
+// ── the controls: a TYPE stays a type, and an undeclared name is a value ─────
+TEST(SizeofValueNames, ATypeNameTakesTheTypeReadingAndAnUndeclaredNameTheValueReading) {
     expectReadings({
         {"a typedef name",
          "typedef char T5[5];\nint main(void) { return sizeof(T5) == 5 ? 0 : 1; }\n",
@@ -179,14 +183,16 @@ TEST(SizeofValueNames, ATypeNameAndAnUnknownNameStillTakeTheTypeReading) {
          "int main(void) { typedef long long T; return sizeof(T) == 8 ? 0 : 1; }\n",
          kSizeofValue, kSizeofType, true},
     });
-    // An identifier NOTHING declares still reaches the Unknown arm and commits as
-    // a type — the fallback a type the sketch cannot see relies on — and the
-    // semantic tier refuses the name there.
+    // An identifier NOTHING declares reaches the Unknown arm, which rolls back to the
+    // expression reading; the semantic tier names it undeclared — never "unknown type".
     auto cu = buildShippedUnit(
         "c", {std::string{"int main(void) { return (int)sizeof(zzz); }\n"}});
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
-    EXPECT_EQ(countRule(*cu, kSizeofType), 1u)
-        << "an undeclared name must still take the type-name reading";
-    EXPECT_TRUE(hasCode(model.diagnostics(), DiagnosticCode::S_UnknownType))
-        << "and the semantic tier must still refuse it as an unknown type";
+    EXPECT_EQ(countRule(*cu, kSizeofType), 0u)
+        << "an undeclared name must take the expression reading";
+    EXPECT_EQ(countRule(*cu, kSizeofValue), 1u);
+    EXPECT_TRUE(hasCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier))
+        << "and the semantic tier must name it undeclared";
+    EXPECT_FALSE(hasCode(model.diagnostics(), DiagnosticCode::S_UnknownType))
+        << "no reference calls an undeclared name an unknown type";
 }

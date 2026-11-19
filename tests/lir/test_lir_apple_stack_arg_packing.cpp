@@ -272,18 +272,18 @@ vaOverflowPayload(Mir const& m) {
 constexpr char const* kCharShortVariadic =
     "int pick(int a0,int a1,int a2,int a3,int a4,int a5,int a6,int a7,"
     " char c, short s, ...) {\n"
-    "    va_list ap; va_start(ap, s);\n"
-    "    int v = va_arg(ap, int);\n"
-    "    va_end(ap);\n"
+    "    __builtin_va_list ap; __builtin_va_start(ap, s);\n"
+    "    int v = __builtin_va_arg(ap, int);\n"
+    "    __builtin_va_end(ap);\n"
     "    return (int)c + (int)s + v;\n"
     "}\n";
 
 constexpr char const* kIntCharIntVariadic =
     "int pick2(int a0,int a1,int a2,int a3,int a4,int a5,int a6,int a7,"
     " int i0, char c0, int i1, ...) {\n"
-    "    va_list ap; va_start(ap, i1);\n"
-    "    int v = va_arg(ap, int);\n"
-    "    va_end(ap);\n"
+    "    __builtin_va_list ap; __builtin_va_start(ap, i1);\n"
+    "    int v = __builtin_va_arg(ap, int);\n"
+    "    __builtin_va_end(ap);\n"
     "    return i0 + (int)c0 + i1 + v;\n"
     "}\n";
 

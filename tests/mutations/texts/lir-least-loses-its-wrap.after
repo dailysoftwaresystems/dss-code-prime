@@ -1,0 +1,1 @@
+        page % align == 0 ? (align - push % align) : 0u;   /*S6d*/

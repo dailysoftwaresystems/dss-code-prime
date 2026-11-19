@@ -1,0 +1,2 @@
+            if (root.root == Root::None || (root.root == Root::SelectAny && root.definition != fn.symbol)) {
+                refuseRootless("function", objNames.definedName(fn.symbol, "sym_"), signature);

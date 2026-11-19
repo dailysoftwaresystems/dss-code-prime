@@ -1,0 +1,1 @@
+    return {HeaderSearchResult::found(dir / fs::path{*stored}), reaches};

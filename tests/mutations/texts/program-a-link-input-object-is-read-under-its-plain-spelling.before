@@ -1,0 +1,1 @@
+        auto opened = core::openInputStream(objectPath, std::ios::binary);

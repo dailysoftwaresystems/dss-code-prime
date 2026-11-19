@@ -4,6 +4,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <string>
@@ -105,6 +106,22 @@ enum class ConfigDocumentParseFailure : std::uint8_t {
     // One object declares the same member name twice. `pointer` addresses the
     // SECOND declaration.
     DuplicateKey,
+    // A container nests deeper than every config document may (cycle P69 L2,
+    // lane `lm`). `pointer` addresses the first container past the limit, and
+    // `message` names the depth it reached, the limit, and where the limit is
+    // declared. Refused here, before any reader walks or copies the document:
+    // the loaders' walks over a body, and the json library's own deep copy,
+    // recurse once per level.
+    TooDeep,
+};
+
+// The deepest a config document may nest, counting the document's own top-level
+// container as level 1, and the place that declares it, for the refusal's
+// sentence. A limit of no levels, or one naming no declaring place, is a
+// caller's misuse: the parse stops the process naming it.
+struct ConfigNestingLimit {
+    std::size_t      levels = 0;
+    std::string_view declaredIn;
 };
 
 struct DSS_EXPORT ConfigDocumentParseError {
@@ -138,9 +155,9 @@ struct DSS_EXPORT ConfigDocumentParseError {
     // prefix, UNCHANGED from what that caller emitted before this owner
     // existed — so routing a reader through here moves no existing message.
     [[nodiscard]] std::string detailText(std::string_view notJsonPrefix) const {
-        return kind == ConfigDocumentParseFailure::DuplicateKey
-                   ? message
-                   : std::string{notJsonPrefix} + message;
+        return kind == ConfigDocumentParseFailure::NotJson
+                   ? std::string{notJsonPrefix} + message
+                   : message;
     }
 
     // The same two shapes for a channel that has NO separate path field:
@@ -163,8 +180,26 @@ struct DSS_EXPORT ConfigDocumentParseError {
 // every caller has already performed its own checked read
 // (D-CORE-SHIPPED-CONFIG-LOADERS-DRAIN-A-STREAM-WITHOUT-CHECKING-IT) and knows
 // what to call the document in a diagnostic.
+//
+// Refuses (`TooDeep`) a container nested deeper than the config tree's own
+// limit, `configNestingLimit()`.
 [[nodiscard]] DSS_EXPORT std::expected<nlohmann::json, ConfigDocumentParseError>
 parseConfigDocument(std::string_view jsonText);
+
+// The same parse under an explicit limit (a test drives the refusal with a
+// small one). The one-argument form above is this one under
+// `configNestingLimit()`.
+[[nodiscard]] DSS_EXPORT std::expected<nlohmann::json, ConfigDocumentParseError>
+parseConfigDocument(std::string_view jsonText, ConfigNestingLimit limit);
+
+// THE CONFIG TREE'S NESTING LIMIT (cycle P69 L2, lane `lm`): `maxNesting` of the
+// config tree's configure-time document (`configure-time/config-documents.json`,
+// whose `$comment` gives the value's reason), read by CMake when the build is
+// configured and compiled in — never read at run time, because it governs the
+// reading of every config document, that one's included. The build refuses to
+// configure without a usable one, and this library refuses to compile without
+// its forward: no default stands in for it.
+[[nodiscard]] DSS_EXPORT ConfigNestingLimit configNestingLimit() noexcept;
 
 // The RFC 6901 §3 escape for ONE pointer segment: `~` becomes `~0` and `/`
 // becomes `~1`, in that order. Exposed because the test that pins the pointer

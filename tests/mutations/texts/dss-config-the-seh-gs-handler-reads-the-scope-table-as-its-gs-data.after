@@ -1,0 +1,1 @@
+    ULONG const *gs     = scopes;

@@ -1,0 +1,1 @@
+            said = "; ".join(problems).replace("\r", " ").replace("\n", " ")

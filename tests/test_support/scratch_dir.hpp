@@ -82,7 +82,8 @@ canonicalizeLikeTheProduct(std::filesystem::path const& p) {
     // `make_preferred` for the same reason `PathIdentity::path()` does it:
     // this value becomes a DIRECTORY that tests hand to `cmd.exe`, and a
     // forward-slashed Windows path is fine for every API except the shell.
-    return std::filesystem::path{dss::core::canonicalIdentityKey(p)}
+    // A DIRECTORY's key (P69 H6c, A2): the directory tests write into -- a CONTAINER.
+    return std::filesystem::path{dss::core::canonicalIdentityKey(p, dss::core::Use::Container)}
         .make_preferred();
 }
 
@@ -202,17 +203,31 @@ public:
         // refuse to remove a dir that's the current process cwd.
         std::filesystem::current_path(originalCwd_, ec);
         ec.clear();
-        std::filesystem::remove_all(path_, ec);
+        // `removeTree`, never `remove_all`: a scratch may hold a LINK a case made (to a directory
+        // outside it, among others), and libstdc++'s `remove_all` on Windows follows a directory
+        // link and empties its TARGET (the substrate's header has the measurement). The substrate's
+        // removal takes a link as itself on every build.
+        auto const removal = dss::core::removeTree(path_);
         // A dtor must not throw, but it must not hide this either: every
         // silent failure here leaves a directory behind forever, and it was
         // exactly that accumulation which made the (now-fixed) path-collision
         // bug fire. Warn so the leak is visible while it is still small.
-        if (ec) {
+        if (removal.failures != 0) {
+            // The entry left may carry a name the narrow spelling cannot render (a case's non-ASCII
+            // fixture), and a throw out of a destructor ends the process: spelled as UTF-8, and
+            // named as unrenderable rather than not at all.
+            std::string first;
+            try {
+                first = removal.firstPath.spelling().generic();   // the value's rendering, UTF-8 (H6c)
+            } catch (...) {
+                first = "<a name with no UTF-8 spelling>";
+            }
             std::fprintf(stderr,
-                "ScratchDir: WARNING — could not remove scratch dir '%s': %s. "
-                "Stale scratch directories accumulate under the base dir; "
+                "ScratchDir: WARNING — could not remove scratch dir '%s' (%s entr%s left, the first "
+                "'%s': %s). Stale scratch directories accumulate under the base dir; "
                 "delete them if the count grows.\n",
-                path_.generic_string().c_str(), ec.message().c_str());
+                path_.generic_string().c_str(), std::to_string(removal.failures).c_str(),
+                removal.failures == 1 ? "y" : "ies", first.c_str(), removal.firstError.message().c_str());
         }
     }
 

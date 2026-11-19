@@ -1,0 +1,1 @@
+        { "introducer": "DeclspecKeyword", "qualifier": "__declspec", "availableObjectFormats": ["pe"], "afterCompositeBody": "declaration" }

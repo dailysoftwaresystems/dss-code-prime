@@ -1,0 +1,3 @@
+            DeclaredQualification params;
+            params.params = q->params;
+            if (!params.empty()) {

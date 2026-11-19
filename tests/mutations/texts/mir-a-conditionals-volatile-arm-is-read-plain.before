@@ -1,0 +1,2 @@
+        MirInstFlags const srcVf =
+            volatileFlagFor(armNode) | volatileFlagForType(hir.typeId(armNode));

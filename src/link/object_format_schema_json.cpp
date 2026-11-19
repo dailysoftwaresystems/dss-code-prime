@@ -6,6 +6,7 @@
 #include "core/substrate/diagnostic_collector.hpp"
 #include "core/substrate/mint_monotonic_id.hpp"
 #include "core/substrate/relocation_table_json.hpp"
+#include "core/types/type_lattice/type_layout.hpp"  // scalarByteSize -- the TLS array's stride
 #include "core/types/artifact_profile.hpp"  // isRegisteredArtifactProfile / registeredArtifactProfileList (AP3, shared w/ grammar loader)
 #include "core/types/config_document_parse.hpp"  // THE ONE config-document parse
 #include "core/types/include_path_resolve.hpp"  // shippedConfigRelativePathEscapes — the SHARED containment check for a config-root-relative source path
@@ -25,6 +26,8 @@
 #include <span>     // the per-ARM key vocabularies are selected as spans
 #include <string>
 #include <string_view>
+#include <tuple>
+#include <type_traits>
 #include <utility>
 #include <vector>   // the root key vocabulary is a UNION built at load time
 
@@ -374,7 +377,100 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // 43 -> 44 (P68 round 12, lane `cs`): `enumCompatibleTypeRule`, the integer
     // type an enumeration without a fixed underlying type is compatible with
     // (`EnumCompatibleTypeRule`).
-    static constexpr std::array<std::string_view, 44> kFormatDocumentKeys{
+    // 44 -> 45 (P69, lane `xa`): `importAddressSymbolPrefix`, the spelling an
+    // object gives an import's address slot (COFF `__imp_`,
+    // D-LK-PE-DLLIMPORT-OBJECT-REFERENCE-UNRESOLVED). OPTIONAL: only the four PE
+    // documents declare it — the two images to read it, the relocatable and the
+    // static library to write it.
+    // 45 -> 46 (P69 review M1 (c) + MINOR 8, lane `xa`): `pcRelativeImportAddress`,
+    // what an image makes of a unit's PC-relative, non-branch reference to an
+    // import (`PcRelativeImportAddress`). OPTIONAL: declared exactly where
+    // `externAddrBinding` is, on an image.
+    // 46 -> 47 (P69 round 3, lane `xa`): `archiveCommonResolution`, what a static
+    // link's archive search does for a name it holds as a COMMON
+    // (`ArchiveCommonResolution`, D-LK-ARCHIVE-SEARCH-FETCHED-A-DEFINITION-FOR-A-COMMON).
+    // OPTIONAL: stated by the archive-member documents whose linkers were measured.
+    // 47 -> 48 (P69, lane `lm`): `entryTransition`, whether the platform's
+    // loader CALLS or JUMPS to the entry
+    // (D-LK-PROCESS-ENTRY-BIAS-TAKEN-FROM-THE-CALLING-CONVENTION). Paired with
+    // `processExit`: the seven exec documents declare it.
+    // 48 -> 49 (P69, lane `lm`): `weakResolvedToNothing`, what a reference naming
+    // a weak symbol the image resolves to nothing computes, per field class
+    // (`WeakResolvedToNothing`, D-LK-WEAK-UNDEFINED-SYMBOL-NAMED-DIRECTLY-IS-NOT-ADDRESS-ZERO).
+    // OPTIONAL: the ten images that refuse an undefined import declare it.
+    // 49 -> 50 (P69 round 4, lane `xa`): `commonYieldsTo`, which definitions a
+    // COMMON yields to — a strong one only (ELF), or a weak one too (Mach-O, PE)
+    // (`CommonYieldsTo`, D-LK-COMMON-OUTRANKED-A-WEAK-DEFINITION-IN-EVERY-FORMAT).
+    // OPTIONAL: stated by the documents a link resolves units for, an image or a
+    // relocatable artifact; refused on an archive document.
+    // 50 -> 51 (P69 round 4, lane `lm`): `archiveWeakReferenceSearch`, whether a
+    // static link's archive search fetches a member for an undefined weak
+    // reference (`ArchiveWeakReferenceSearch`,
+    // D-LK-ARCHIVE-SEARCH-FETCHES-A-MEMBER-FOR-A-WEAK-REFERENCE). OPTIONAL:
+    // stated by the five archive-member documents.
+    // 51 -> 52 (P69 fold 2, lane `xa`): `supersededDefinition`, what becomes of a
+    // definition whose name another definition wins — its bytes stay and what
+    // names them stays on them, or it is replaced with every label it carries
+    // (`SupersededDefinition`,
+    // D-LK-WEAK-NAME-REFERENCE-BOUND-TO-THE-BODY-NOT-THE-NAME); one answer, or
+    // one per kind of weak definition. OPTIONAL: stated by the 22 documents that
+    // describe relocations — the images and relocatable objects a link resolves
+    // units for, and the archive documents, whose members a relocatable writer
+    // writes.
+    // 52 -> 53 (P69 fold 3, lane `xa`): `weakDefinitionBesideStrong`, what a weak
+    // definition is beside a strong definition of its name — replaced by it, or
+    // a duplicate of it (`WeakBesideStrong`,
+    // D-LK-WEAK-EXTERNAL-BODY-OUTRANKED-A-SELECT-ANY-DEFINITION-BY-LINK-ORDER);
+    // one answer, or one per kind of weak definition. OPTIONAL: stated by the
+    // documents a link resolves units for, an image or a relocatable artifact —
+    // the documents that state `commonYieldsTo`; refused on an archive document.
+    // 53 -> 54 (P69, lane `cs`, the alias fold): `symbolAliasUnsupportedReason`,
+    // why a program of this format may give no definition a second name (the C
+    // `alias` attribute), a closed verb whose sentence the semantic tier's
+    // refusal carries (`SymbolAliasUnsupportedReason`). OPTIONAL: stated by the
+    // eight Mach-O documents; absent, an alias is supported.
+    // 54 -> 55 (P69, lane `xa`, the re-review of fold 3b, MAJOR 1):
+    // `commonAlignmentFromSizeAtMost`, the alignment every linker gives a COMMON
+    // that states none — its size rounded up to a power of two, at most this
+    // (`CommonsStatement`). OPTIONAL: stated by the four PE documents, whose
+    // commons state their alignment only by a directive one linker ignores.
+    // 55 -> 57 (P69 fold 3c, lane `xa`, the review of the fix fold, A1 and A4):
+    // `commonAlignmentFromSizeAtMost` is now what a linker that IGNORES that
+    // directive gives (link.exe, 32), and `commonAlignmentEveryLinkerGivesAtMost`
+    // what EVERY linker gives a common that states none (GNU ld's cap, 4) — above
+    // it the writer states the alignment; and
+    // `tentativeDefinitionBeyondCommonAlignment`, what a tentative definition
+    // wider than a common may be is written as in an object another linker reads
+    // (`TentativeBeyondCommonAlignment`). OPTIONAL: the first stated by the four
+    // PE documents, the second by the two PE object documents; the PE backend
+    // refuses a PE document that states commons without them.
+    // 57 -> 59 (P69 fold f26b, lane `cs`): `weakDefinitionBesideWeak`, what two
+    // different weak definitions of one name are — the first holds the name, or
+    // the pair is refused where another unit names it (`WeakBesideWeak`); one
+    // answer, or one per kind. OPTIONAL: stated by the three PE documents a link
+    // resolves units for; refused on an archive document. And
+    // `visibilityWrittenAs`, the visibility a format writes for each one it
+    // cannot (`VisibilityStandIn`). OPTIONAL: stated by the four PE and the eight
+    // Mach-O documents; absent, every visibility is written as itself.
+    // 59 -> 60 (P69 fold H5, lane `hm`): `compilerSupport`, the role whose row
+    // realizes what a reference toolchain's own static runtime defines for its
+    // objects, and the /GS cookie seeder DSS's PE startup calls. OPTIONAL:
+    // stated by the four PE documents.
+    // 60 -> 61 (P69 fold 3d, lane `xa`): `imageDefinedSymbols`, the names an
+    // image's linker defines at its own header (PE `__ImageBase`, ELF
+    // `__ehdr_start`, Mach-O `__mh_execute_header`, ...). OPTIONAL: stated by
+    // the four PE, the ten ELF and the eight Mach-O documents.
+    // 61 -> 62 (P69 fold 3e, lane `xa`): `entryPrecedence`, which of two
+    // realizable entries a program of both is entered through. OPTIONAL:
+    // stated by the PE exec document.
+    // 62 -> 63 (P69 fold 3e, lane `xa`, the orchestrator's ledger 577):
+    // `inputSectionNames`, how a relocatable-object reader maps an input
+    // section's name to a row (`InputSectionNames`: the subsection separators,
+    // and the reader-only names a reference toolchain emits). OPTIONAL at load
+    // (absent: exact row names alone, for the documents tests build inline);
+    // the 22 shipped documents that declare relocations state it in the same
+    // change, and a TEST holds every shipped one to it.
+    static constexpr std::array<std::string_view, 63> kFormatDocumentKeys{
         // identity + loader gates
         "dssObjectFormatVersion", "format",
         // C-family ABI axes (every one a silent-miscompile risk if it typos)
@@ -404,8 +500,9 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         // WHICH target this format serves — the name half of the pairing
         // check that replaced `kTargetArchMachineCodes`.
         "targetArch",
-        // program-entry cluster
-        "entryPoint", "entryCallingConvention", "processExit", "processArgs",
+        // program-entry cluster (`entryTransition`: how the loader enters the
+        // image — D-LK-PROCESS-ENTRY-BIAS-TAKEN-FROM-THE-CALLING-CONVENTION)
+        "entryPoint", "entryCallingConvention", "entryTransition", "processExit", "processArgs",
         // the set of program-entry materialization VERBS this format realizes
         // (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE — a typo here means a verb the format
         // really does realize drops out of the intersection, so every entry that
@@ -414,8 +511,32 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         // strict, so a stale file carrying the old key is REFUSED AT LOAD rather
         // than loading with an empty verb set.
         "entryVerbs",
+        // P69 fold 3e: which of two realizable entry names a program starts at
+        // (`entryPrecedence`, groups of `entryVerbs`).
+        "entryPrecedence",
         // import / link contract
         "externCallDispatch", "dataImportBinding", "externAddrBinding",
+        // D-LK-PE-DLLIMPORT-OBJECT-REFERENCE-UNRESOLVED: the spelling an
+        // object gives an import's ADDRESS SLOT (`__imp_`). Registered so a
+        // typo is refused at load: a misspelled key would leave every
+        // dllimport-compiled object unlinkable with no sign of why.
+        "importAddressSymbolPrefix",
+        // P69 review M1 (c) + MINOR 8: what a unit's `leaq puts(%rip)` means in
+        // an image of this format. Registered so a typo is refused at load: a
+        // misspelled key would leave the image unable to answer, which the
+        // loader then refuses by its pairing rule — but naming the typo is the
+        // useful refusal.
+        "pcRelativeImportAddress",
+        // P69 (lane `lm`): what a reference naming a weak symbol this image
+        // resolves to nothing computes. Registered so a typo is refused at load:
+        // a misspelled key would leave every direct reference to such a symbol
+        // refused (the safe default) with no sign of why.
+        "weakResolvedToNothing",
+        // P69 round 4 (lane `lm`): whether an archive search fetches a member for
+        // an undefined weak reference. A typo would leave the document unstated,
+        // which a static link refuses only when a weak reference meets an
+        // archive, far from the misspelt file.
+        "archiveWeakReferenceSearch",
         // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT: WHICH
         // symbol bindings `externCallDispatch: indirect-slot` applies to.
         // Registered here so a typo is REFUSED AT LOAD naming the file rather
@@ -444,6 +565,11 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         // wrong-IMAGE bind, i.e. the eager-import 0xC0000139 class on pe and an
         // undefined symbol elsewhere — never a silent fallback.
         "runtimeLibraries", "sehPersonality", "atomicsRuntime",
+        // the routines a reference toolchain's own static runtime defines for
+        // its objects, and the cookie seeder DSS's PE startup calls (P69 H5)
+        "compilerSupport",
+        // the names the image defines for a reference no unit defines (P69 3d)
+        "imageDefinedSymbols",
         // stack-reserve capability + its remedy axis
         "stackReserveControl", "stackReserveUnsupportedReason",
         // where an image records its library search path (DT_RUNPATH /
@@ -451,6 +577,11 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         // ten image documents that declare it recording NOTHING while the gate
         // accepted every request.
         "runpath", "runpathUnsupportedReason",
+        // why a program of this format may give no definition a second name
+        // (the C `alias` attribute); absent = supported. A typo would leave the
+        // Mach-O documents silently ACCEPTING what every compiler of the
+        // platform refuses.
+        "symbolAliasUnsupportedReason",
         // the weak-DEFINITION spelling (D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED).
         // A typo here does NOT silently default: the walker refuses
         // an unanswered schema the moment it meets a weak definition, so the
@@ -460,7 +591,40 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         "weakDefinition",
         // section / relocation description
         "sections", "relocations", "relocationAddends", "inputSectionPlacement",
+        // how a reader maps an input section's name to a row — a typo would
+        // leave a document reading exact names alone, refused here instead
+        "inputSectionNames",
         "supportedDataSections",
+        // what a static link's archive search does for a COMMON's name — a typo
+        // would leave the document unstated, which a static link then refuses
+        // only when a common meets an archive, far from the misspelt file
+        "archiveCommonResolution",
+        // which definitions a COMMON yields to — a typo would leave the document
+        // unstated, which a link then refuses only when a common meets a weak
+        // definition of its name
+        "commonYieldsTo",
+        // the two alignments a COFF common that states none is given, and what a
+        // tentative definition wider than a common may be becomes — a typo would
+        // leave the document unstated, which the PE backend refuses at load
+        // (an unstated rule once wrote a common a linker misaligns in silence)
+        "commonAlignmentFromSizeAtMost", "commonAlignmentEveryLinkerGivesAtMost",
+        "tentativeDefinitionBeyondCommonAlignment",
+        // what becomes of a definition whose name another definition wins — a
+        // typo would leave the document unstated, which a link then refuses only
+        // when a relocation names such a definition
+        "supersededDefinition",
+        // what a weak definition is beside a strong one of its name — a typo
+        // would leave the document unstated, which a link then refuses only
+        // when a weak definition meets a strong one
+        "weakDefinitionBesideStrong",
+        // what two different weak definitions of one name are — a typo would
+        // leave the document unstated, which a link then reads as the first
+        // holding the name, and a pair the format's linkers refuse would link
+        "weakDefinitionBesideWeak",
+        // the visibility a format writes for one it cannot — a typo would leave
+        // the document unstated, and a writer would be handed a visibility its
+        // symbol table has no field for
+        "visibilityWrittenAs",
         // WHO RUNS THE STATIC-INITIALIZER SCHEDULE
         // (D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN). It sits
         // with the program-entry cluster in spirit — it answers a question about
@@ -1336,6 +1500,28 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         }
     }
 
+    // D-LK-PROCESS-ENTRY-BIAS-TAKEN-FROM-THE-CALLING-CONVENTION:
+    // `entryTransition` — "called" or "jumped", how the platform's loader
+    // enters the image. Paired with `processExit` (validate() below); an
+    // unknown value fails loud here, naming the closed set.
+    if (doc.contains("entryTransition")) {
+        if (!doc.at("entryTransition").is_string()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/entryTransition",
+                      std::format("'entryTransition' must be a string ({})",
+                                  allowedList(allNames(kEntryTransitionTable), " or ")));
+        } else {
+            auto const s = doc.at("entryTransition").get<std::string>();
+            auto const t = entryTransitionFromName(s);
+            if (!t.has_value()) {
+                coll.emit(DiagnosticCode::C_MalformedJson, "/entryTransition",
+                          std::format("unknown entryTransition '{}' — accepted: {}", s,
+                                      allowedList(allNames(kEntryTransitionTable), ", ")));
+            } else {
+                data.entryTransition = *t;
+            }
+        }
+    }
+
     // D-FFI-EXTERN-CALL-DISPATCH: `externCallDispatch` — the format's
     // extern-call shape ("indirect-slot" / "direct-plt"). Optional in
     // the JSON (a relocatable / WASM / SPIR-V format, or an exec format
@@ -1612,11 +1798,11 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
 
     // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): `externAddrBinding`
     // — the format's extern-ADDRESS materialization binding ("got").
-    // Optional in the JSON (only the arm64 relocatable + static-archive
-    // formats declare it; the DSS-linked exec/pie/dyn formats omit it and
-    // materialize an `&extern` value via the ordinary lea). Present-but-
-    // unknown IS a fail-loud HERE at load (a typo must NOT silently
-    // degrade to "no GOT-address support" — the externCallDispatch /
+    // Optional in the JSON; WHO declares it is stated once, on the field
+    // (`ObjectFormatData::externAddrBinding` — since P69 the relocatable
+    // documents, the ELF `-dyn` and every Mach-O image, and the PE images).
+    // Present-but-unknown IS a fail-loud HERE at load (a typo must NOT
+    // silently degrade to "no GOT-address support" — the externCallDispatch /
     // dataImportBinding discipline).
     if (doc.contains("externAddrBinding")) {
         if (!doc.at("externAddrBinding").is_string()) {
@@ -1640,6 +1826,124 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
             } else {
                 data.externAddrBinding = *b;
             }
+        }
+    }
+
+    // D-LK-PE-DLLIMPORT-OBJECT-REFERENCE-UNRESOLVED (P69):
+    // `importAddressSymbolPrefix` — the spelling an object gives an import's
+    // address slot (COFF: `__imp_`). Optional; a non-string or an EMPTY
+    // string is refused, because an empty prefix would read every name as a
+    // slot.
+    if (doc.contains("importAddressSymbolPrefix")) {
+        auto const& v = doc.at("importAddressSymbolPrefix");
+        if (!v.is_string() || v.get<std::string>().empty()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      "/importAddressSymbolPrefix",
+                      "'importAddressSymbolPrefix' must be a non-empty string — "
+                      "the spelling an object gives an import's address slot "
+                      "(COFF: \"__imp_\"); an empty one would read every name "
+                      "as a slot");
+        } else {
+            data.importAddressSymbolPrefix = v.get<std::string>();
+        }
+    }
+
+    // P69 review M1 (c) + MINOR 8: `pcRelativeImportAddress` — what an image
+    // makes of a unit's PC-relative, non-branch reference to an import. Read by
+    // name through the closed table; where it may appear is validate()'s.
+    if (doc.contains("pcRelativeImportAddress")) {
+        auto const& v = doc.at("pcRelativeImportAddress");
+        auto const meaning =
+            v.is_string()
+                ? kPcRelativeImportAddressTable.fromName(v.get<std::string>())
+                : std::nullopt;
+        if (!meaning.has_value()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/pcRelativeImportAddress",
+                      std::format("expected one of: {}",
+                                  allowedList(
+                                      allNames(kPcRelativeImportAddressTable),
+                                      ", ")));
+        } else {
+            data.pcRelativeImportAddress = *meaning;
+        }
+    }
+
+    // P69 (lane `lm`, D-LK-WEAK-UNDEFINED-SYMBOL-NAMED-DIRECTLY-IS-NOT-ADDRESS-ZERO):
+    // `weakResolvedToNothing` — what a reference naming a weak symbol this image
+    // resolves to nothing computes, per field class. A PRESENT block is strict:
+    // a closed key vocabulary, every class stated (a class left out would be a
+    // silent `refused` nobody chose), each answer read by name through the
+    // closed table. Where it may appear, and which answer a class may take, is
+    // validate()'s.
+    static constexpr std::array<std::string_view, 3> kWeakResolvedToNothingKeys{
+        "absolute", "pcRelative", "branch"};
+    DSS_CHECK_KEY_VOCABULARY(kWeakResolvedToNothingKeys);
+    if (doc.contains("weakResolvedToNothing")) {
+        auto const& w = doc.at("weakResolvedToNothing");
+        if (!w.is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/weakResolvedToNothing",
+                      std::format("'weakResolvedToNothing' must be an object with "
+                                  "key(s) {}",
+                                  allowedList(kWeakResolvedToNothingKeys, ", ")));
+        } else {
+            rejectUnknownKeys(w, kWeakResolvedToNothingKeys, "/weakResolvedToNothing",
+                              "the 'weakResolvedToNothing' block", coll);
+            WeakResolvedToNothing answers;
+            bool complete = true;
+            auto const readClass = [&](std::string const& key, WeakNullReference& out) {
+                std::string const path = std::format("/weakResolvedToNothing/{}", key);
+                if (!w.contains(key)) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              std::format("the 'weakResolvedToNothing' block states "
+                                          "no '{}' answer — every class is stated, "
+                                          "one of: {}",
+                                          key,
+                                          allowedList(allNames(kWeakNullReferenceTable),
+                                                      ", ")));
+                    complete = false;
+                    return;
+                }
+                auto const& v = w.at(key);
+                auto const answer =
+                    v.is_string() ? kWeakNullReferenceTable.fromName(v.get<std::string>())
+                                  : std::nullopt;
+                if (!answer.has_value()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              std::format("expected one of: {}",
+                                          allowedList(allNames(kWeakNullReferenceTable),
+                                                      ", ")));
+                    complete = false;
+                    return;
+                }
+                out = *answer;
+            };
+            readClass("absolute", answers.absolute);
+            readClass("pcRelative", answers.pcRelative);
+            readClass("branch", answers.branch);
+            if (complete) data.weakResolvedToNothing = answers;
+        }
+    }
+
+    // P69 round 4 (lane `lm`, D-LK-ARCHIVE-SEARCH-FETCHES-A-MEMBER-FOR-A-WEAK-REFERENCE):
+    // `archiveWeakReferenceSearch` — whether a static link's archive search
+    // fetches a member for an undefined weak reference. OPTIONAL; read by name
+    // through the closed table, so a typo in the value is refused naming the
+    // values (and one in the key by the root vocabulary). Where it may appear is
+    // validate()'s.
+    if (doc.contains("archiveWeakReferenceSearch")) {
+        auto const& v = doc.at("archiveWeakReferenceSearch");
+        auto const answer =
+            v.is_string()
+                ? kArchiveWeakReferenceSearchTable.fromName(v.get<std::string>())
+                : std::nullopt;
+        if (!answer.has_value()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/archiveWeakReferenceSearch",
+                      std::format("expected one of: {}",
+                                  allowedList(
+                                      allNames(kArchiveWeakReferenceSearchTable),
+                                      ", ")));
+        } else {
+            data.archiveWeakReferenceSearch = *answer;
         }
     }
 
@@ -1701,8 +2005,9 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // that listed four. A retyped set produces a wrong SENTENCE; a note about a
     // retyped set produces a wrong NOTE. Only the projection removes both
     // (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET).
-    static constexpr std::array<std::string_view, 4> kTlsAccessKeys{
-        "model", "segmentPrefixByte", "baseDisplacement", "tlsIndexSlotName"};
+    static constexpr std::array<std::string_view, 5> kTlsAccessKeys{
+        "model", "segmentPrefixByte", "baseDisplacement", "tlsIndexSlotName",
+        "bootstrap"};
     DSS_CHECK_KEY_VOCABULARY(kTlsAccessKeys);
     if (doc.contains("tlsAccess")) {
         auto const& ta = doc.at("tlsAccess");
@@ -1810,6 +2115,71 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                         ta.at("tlsIndexSlotName").get<std::string>();
                 }
             }
+            // P69 fold 3f (ledger 716): the `macho-tlv` BOOTSTRAP -- the routine each TLV
+            // descriptor's word0 is bound to, as the object file spells it, and the ROLE of the
+            // image that exports it (the `sehPersonality` shape). REQUIRED for `macho-tlv`,
+            // refused for the models that bind none. Only the role's SPELLING is judged here: its
+            // image is the role table's answer where the writer binds it -- the family's, for a
+            // flavour whose own table does not declare the role (the dylib's), which one
+            // document cannot see.
+            static constexpr std::array<std::string_view, 2> kTlsBootstrapKeys{"role",
+                                                                               "mangledName"};
+            DSS_CHECK_KEY_VOCABULARY(kTlsBootstrapKeys);
+            if (ta.contains("bootstrap")) {
+                auto const& bs = ta.at("bootstrap");
+                if (!bs.is_object()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, "/tlsAccess/bootstrap",
+                              std::format("'tlsAccess.bootstrap' must be an object with the "
+                                          "keys {}",
+                                          allowedList(kTlsBootstrapKeys, ", ")));
+                    ok = false;
+                } else {
+                    rejectUnknownKeys(bs, kTlsBootstrapKeys, "/tlsAccess/bootstrap",
+                                      "the 'tlsAccess.bootstrap' block", coll);
+                    std::optional<RuntimeLibraryRole> role;
+                    if (bs.contains("role") && bs.at("role").is_string()) {
+                        role = runtimeLibraryRoleFromName(bs.at("role").get<std::string>());
+                    }
+                    if (!role.has_value() || *role == RuntimeLibraryRole::None) {
+                        coll.emit(DiagnosticCode::C_MalformedJson, "/tlsAccess/bootstrap/role",
+                                  std::format("'tlsAccess.bootstrap.role' must name the "
+                                              "runtime-library role of the image exporting the "
+                                              "bootstrap -- accepted: {}",
+                                              allowedList(kSelectableRuntimeLibraryRoleNames,
+                                                          ", ")));
+                        ok = false;
+                    } else {
+                        info.bootstrapRole = *role;
+                    }
+                    if (!bs.contains("mangledName") || !bs.at("mangledName").is_string()
+                        || bs.at("mangledName").get<std::string>().empty()) {
+                        coll.emit(DiagnosticCode::C_MissingField,
+                                  "/tlsAccess/bootstrap/mangledName",
+                                  "'tlsAccess.bootstrap.mangledName' must be the non-empty "
+                                  "on-disk name of the routine each TLV descriptor's word0 is "
+                                  "bound to (Darwin: \"__tlv_bootstrap\")");
+                        ok = false;
+                    } else {
+                        info.bootstrapMangledName = bs.at("mangledName").get<std::string>();
+                    }
+                }
+            }
+            if (ok && info.model == TlsAccessModel::MachoTlv
+                && info.bootstrapMangledName.empty()) {
+                coll.emit(DiagnosticCode::C_MissingField, "/tlsAccess/bootstrap",
+                          "'tlsAccess.bootstrap' is REQUIRED for the 'macho-tlv' model -- each "
+                          "TLV descriptor's word0 is bound to that routine (Darwin: {\"role\": "
+                          "\"cLibrary\", \"mangledName\": \"__tlv_bootstrap\"}); without it the "
+                          "image binds its descriptors to nothing");
+                ok = false;
+            }
+            if (ok && info.model != TlsAccessModel::MachoTlv && ta.contains("bootstrap")) {
+                coll.emit(DiagnosticCode::C_MalformedJson, "/tlsAccess/bootstrap",
+                          std::format("'tlsAccess.bootstrap' belongs to the 'macho-tlv' model "
+                                      "alone -- the '{}' model binds no bootstrap routine",
+                                      tlsAccessModelName(info.model)));
+                ok = false;
+            }
             if (ok && info.model == TlsAccessModel::PeIndexed
                 && info.tlsIndexSlotName.empty()) {
                 coll.emit(DiagnosticCode::C_MissingField,
@@ -1821,7 +2191,13 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                           "without it cannot lower a thread-local access");
                 ok = false;
             }
-            if (ok) data.tlsAccess = info;
+            if (ok) {
+                // The array's stride, the data model's pointer width (`dataModel`
+                // is read above, and required).
+                info.blockPointerBytes = static_cast<std::uint8_t>(
+                    scalarByteSize(TypeKind::Ptr, data.dataModel).value_or(0));
+                data.tlsAccess = info;
+            }
         }
     }
 
@@ -1848,8 +2224,13 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // in both directions: neither is an unfilled role, both are two owners for
     // one body (the refusal `shippedLibs`' own `library`/`realization` pair has
     // made since D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF).
-    static constexpr std::array<std::string_view, 3>
-        kRuntimeLibraryRowKeys{"role", "image", "source"};
+    //
+    // ★ `sources` (P69 H5): a body of SEVERAL shipped units -- two or more --
+    // is ONE row, because a role names one provider (the duplicate-role refusal
+    // below). A body of one unit keeps `source`; `sources` holding one unit is
+    // refused, naming `source`, so each shape has exactly one spelling.
+    static constexpr std::array<std::string_view, 4>
+        kRuntimeLibraryRowKeys{"role", "image", "source", "sources"};
     DSS_CHECK_KEY_VOCABULARY(kRuntimeLibraryRowKeys);
     if (doc.contains("runtimeLibraries")) {
         if (!doc.at("runtimeLibraries").is_array()) {
@@ -1904,41 +2285,85 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                     };
                 auto const image  = nonEmptyString("image");
                 auto const source = nonEmptyString("source");
-                if (image.has_value() == source.has_value()) {
+                bool const listed = row.contains("sources");
+                int const providers = (image.has_value() ? 1 : 0)
+                                    + (source.has_value() ? 1 : 0)
+                                    + (listed ? 1 : 0);
+                if (providers != 1) {
                     coll.emit(DiagnosticCode::C_MissingField, path,
-                              image.has_value()
-                                  ? "declares BOTH a non-empty 'image' and a "
-                                    "non-empty 'source' — a role has exactly "
-                                    "ONE provider, and two owners for one body "
-                                    "is the defect this pair exists to refuse. "
+                              providers > 1
+                                  ? "declares more than one of a non-empty "
+                                    "'image', a non-empty 'source' and "
+                                    "'sources' — a role has exactly ONE "
+                                    "provider, and two owners for one body is "
+                                    "the defect this pair exists to refuse. "
                                     "Name the platform image the entries are "
-                                    "IMPORTED from, or the shipped source DSS "
-                                    "COMPILES to define them, never both."
+                                    "IMPORTED from, or the shipped source(s) "
+                                    "DSS COMPILES to define them, never both."
                                   : "requires exactly one of a non-empty "
                                     "'image' (the DLL / shared-object / dylib "
-                                    "identity the entries are IMPORTED from) or "
+                                    "identity the entries are IMPORTED from), "
                                     "a non-empty 'source' (a path under "
                                     "`runtime/<tier>/src/`, relative to "
                                     "src/dss-config/, whose compiled body "
-                                    "DEFINES them). A row with neither is an "
-                                    "unfilled role.");
+                                    "DEFINES them), or 'sources' (two or more "
+                                    "such paths, one body of several units). "
+                                    "A row with none is an unfilled role.");
                     continue;
                 }
-                if (source.has_value()
-                 && shippedConfigRelativePathEscapes(*source)) {
-                    coll.emit(DiagnosticCode::C_MalformedJson, path + "/source",
-                              std::format(
-                                  "'source' must be a path RELATIVE to "
-                                  "src/dss-config/, spelled with forward "
-                                  "slashes and no '.'/'..' components, got "
-                                  "'{}' — the same shape a shipped-lib "
-                                  "descriptor's `realization.<format>.source` "
-                                  "takes, because it names a file in the same "
-                                  "tree and is compiled by the same driver "
-                                  "seam.",
-                                  *source));
-                    continue;
+                std::vector<std::string> sources;
+                if (source.has_value()) sources.push_back(*source);
+                if (listed) {
+                    auto const& list = row.at("sources");
+                    bool shaped = list.is_array() && list.size() >= 2;
+                    for (std::size_t k = 0; shaped && k < list.size(); ++k) {
+                        shaped = list[k].is_string()
+                              && !list[k].get<std::string>().empty();
+                        if (shaped) sources.push_back(list[k].get<std::string>());
+                    }
+                    if (!shaped) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  path + "/sources",
+                                  "'sources' must be an ARRAY of TWO OR MORE "
+                                  "non-empty paths — the units of ONE body a "
+                                  "role is played by. A body of one unit is "
+                                  "written 'source', so each shape has one "
+                                  "spelling.");
+                        continue;
+                    }
                 }
+                bool sourcesOk = true;
+                for (std::size_t k = 0; k < sources.size(); ++k) {
+                    std::string const at = listed
+                        ? std::format("{}/sources/{}", path, k) : path + "/source";
+                    if (shippedConfigRelativePathEscapes(sources[k])) {
+                        coll.emit(DiagnosticCode::C_MalformedJson, at,
+                                  std::format(
+                                      "a shipped source must be a path RELATIVE "
+                                      "to src/dss-config/, spelled with forward "
+                                      "slashes and no '.'/'..' components, got "
+                                      "'{}' — the same shape a shipped-lib "
+                                      "descriptor's `realization.<format>.source` "
+                                      "takes, because it names a file in the "
+                                      "same tree and is compiled by the same "
+                                      "driver seam.",
+                                      sources[k]));
+                        sourcesOk = false;
+                    } else if (std::find(sources.begin(), sources.begin()
+                                             + static_cast<std::ptrdiff_t>(k),
+                                         sources[k])
+                               != sources.begin() + static_cast<std::ptrdiff_t>(k)) {
+                        coll.emit(DiagnosticCode::C_MalformedJson, at,
+                                  std::format(
+                                      "names the unit '{}' twice — one body's "
+                                      "units are a SET of paths, and a unit "
+                                      "named twice would be built twice into "
+                                      "one archive",
+                                      sources[k]));
+                        sourcesOk = false;
+                    }
+                }
+                if (!sourcesOk) continue;
                 if (data.runtimeLibraries.rowForRole(*role) != nullptr) {
                     coll.emit(DiagnosticCode::C_MalformedJson, path + "/role",
                               std::format(
@@ -1951,7 +2376,7 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                 data.runtimeLibraries.bindings.push_back(
                     RuntimeLibraryBinding{*role,
                                           image.value_or(std::string{}),
-                                          source.value_or(std::string{})});
+                                          std::move(sources)});
             }
         }
     }
@@ -2006,9 +2431,15 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                     if (!declared.empty()) declared += ", ";
                     declared += runtimeLibraryRoleName(b.role);
                     declared += " -> ";
-                    declared += b.source.empty() ? b.image
-                                                 : ("(shipped source) "
-                                                    + b.source);
+                    if (b.sources.empty()) {
+                        declared += b.image;
+                    } else {
+                        declared += "(shipped source) ";
+                        for (std::size_t k = 0; k < b.sources.size(); ++k) {
+                            if (k != 0) declared += " + ";
+                            declared += b.sources[k];
+                        }
+                    }
                 }
                 if (declared.empty()) declared = "<none>";
                 coll.emit(DiagnosticCode::C_MissingField, rolePath,
@@ -2169,6 +2600,130 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         }
     }
 
+    // ── P69 H5: `compilerSupport` ──────────────────────────────────────────
+    //
+    // `{"role": <runtimeLibraries role>, "securityCookieInitializer":
+    //   <non-empty>}`. BOTH halves REQUIRED when the block is present: the role
+    // names the row whose units define what a reference toolchain's own static
+    // runtime defines for its objects
+    // (D-LK-PE-FOREIGN-OBJECT-STACK-PROBE-ROUTINE-UNDEFINED,
+    // D-LK-PE-FOREIGN-OBJECT-GS-COOKIE-ROUTINES-UNDEFINED),
+    // and the initializer is the ONE of them DSS's PE startup calls before any
+    // initializer and before the entry, so a /GS frame never compares against
+    // the cookie the runtime's object ships. A block with no initializer would
+    // define the cookie and leave it at the value every attacker knows.
+    //
+    // OPTIONAL as a block: a format that declares none realizes no such routine,
+    // and a foreign object naming one is refused at the link, undefined, by name.
+    static constexpr std::array<std::string_view, 2>
+        kCompilerSupportKeys{"role", "securityCookieInitializer"};
+    DSS_CHECK_KEY_VOCABULARY(kCompilerSupportKeys);
+    if (doc.contains("compilerSupport")) {
+        if (!doc.at("compilerSupport").is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/compilerSupport",
+                      std::format("'compilerSupport' must be an object with "
+                                  "the keys {}",
+                                  allowedList(kCompilerSupportKeys, ", ")));
+        } else {
+            auto const& cs = doc.at("compilerSupport");
+            rejectUnknownKeys(cs, kCompilerSupportKeys, "/compilerSupport",
+                              "the 'compilerSupport' block", coll);
+            CompilerSupport out;
+            bool ok = resolveRuntimeRole(cs, "/compilerSupport", out.libraryPath);
+            if (ok) {
+                out.role = *runtimeLibraryRoleFromName(
+                    cs.at("role").get<std::string>());
+            }
+            char const* const kInitKey = "securityCookieInitializer";
+            if (!cs.contains(kInitKey) || !cs.at(kInitKey).is_string()
+             || cs.at(kInitKey).get<std::string>().empty()) {
+                coll.emit(DiagnosticCode::C_MissingField,
+                          std::string{"/compilerSupport/"} + kInitKey,
+                          "requires a non-empty 'securityCookieInitializer' — "
+                          "the routine DSS's PE startup calls before any "
+                          "initializer and the entry to seed the /GS cookie "
+                          "(pe: \"__security_init_cookie\"). Without it a "
+                          "guarded frame compares against the value the "
+                          "runtime's object ships.");
+                ok = false;
+            } else {
+                out.securityCookieInitializerMangledName =
+                    cs.at(kInitKey).get<std::string>();
+            }
+            if (ok) data.compilerSupport = std::move(out);
+        }
+    }
+
+    // ── P69 fold 3d: `imageDefinedSymbols` ─────────────────────────────────
+    //
+    // `[{"name": <non-empty>, "address": <ImageDefinedAddress>}, …]`, each name
+    // once: the names every reference linker of this format defines in an image,
+    // at an address of the image, for a reference no linked unit defines
+    // (D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL). OPTIONAL: absent, the image
+    // defines no name. WHICH documents may state one -- an image whose backend
+    // writes the address -- is `validate()`'s question, asked of the loaded data.
+    static constexpr std::array<std::string_view, 2>
+        kImageDefinedSymbolKeys{"name", "address"};
+    DSS_CHECK_KEY_VOCABULARY(kImageDefinedSymbolKeys);
+    if (doc.contains("imageDefinedSymbols")) {
+        auto const& list = doc.at("imageDefinedSymbols");
+        if (!list.is_array()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/imageDefinedSymbols",
+                      std::format("'imageDefinedSymbols' must be an array of "
+                                  "objects with the keys {}",
+                                  allowedList(kImageDefinedSymbolKeys, ", ")));
+        } else {
+            std::vector<std::string> seen;
+            for (std::size_t i = 0; i < list.size(); ++i) {
+                std::string const at = "/imageDefinedSymbols/" + std::to_string(i);
+                auto const& row = list[i];
+                if (!row.is_object()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, at,
+                              std::format("an 'imageDefinedSymbols' row must be an "
+                                          "object with the keys {}",
+                                          allowedList(kImageDefinedSymbolKeys, ", ")));
+                    continue;
+                }
+                rejectUnknownKeys(row, kImageDefinedSymbolKeys, at,
+                                  "an 'imageDefinedSymbols' row", coll);
+                ImageDefinedSymbol out;
+                bool ok = true;
+                if (!row.contains("name") || !row.at("name").is_string()
+                 || row.at("name").get<std::string>().empty()) {
+                    coll.emit(DiagnosticCode::C_MissingField, at + "/name",
+                              "requires a non-empty 'name' -- the link-level "
+                              "name a unit's reference names (pe: \"__ImageBase\")");
+                    ok = false;
+                } else {
+                    out.name = row.at("name").get<std::string>();
+                    if (std::find(seen.begin(), seen.end(), out.name) != seen.end()) {
+                        coll.emit(DiagnosticCode::C_ConflictingField, at + "/name",
+                                  std::format("states '{}' a second time -- one "
+                                              "name denotes one address of the image",
+                                              out.name));
+                        ok = false;
+                    }
+                    seen.push_back(out.name);
+                }
+                std::optional<ImageDefinedAddress> address;
+                if (row.contains("address") && row.at("address").is_string()) {
+                    address = imageDefinedAddressFromName(
+                        row.at("address").get<std::string>());
+                }
+                if (!address.has_value()) {
+                    coll.emit(DiagnosticCode::C_MissingField, at + "/address",
+                              std::format("requires 'address', the address of the "
+                                          "image the name denotes: one of {}",
+                                          allowedList(allNames(kImageDefinedAddressTable), ", ")));
+                    ok = false;
+                } else {
+                    out.address = *address;
+                }
+                if (ok) data.imageDefinedSymbols.push_back(std::move(out));
+            }
+        }
+    }
+
     // ── UCRT-P4: `entryVerbs` — the REALIZED materialization-verb set ────
     //
     // An ARRAY of closed-vocabulary verb names: `["none", "argc-argv"]`.
@@ -2246,6 +2801,47 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                     break;
                 }
                 if (!dupe) data.entryVerbs.push_back(*v);
+            }
+        }
+    }
+
+    // ── P69 fold 3e: `entryPrecedence` — groups of `entryVerbs`, the first
+    // outranking the next (see the field). An ARRAY of non-empty ARRAYS of verb
+    // names; whether it partitions `entryVerbs` is `validate()`'s question.
+    if (doc.contains("entryPrecedence")) {
+        auto const& groups = doc.at("entryPrecedence");
+        if (!groups.is_array()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/entryPrecedence",
+                      "'entryPrecedence' must be an ARRAY of groups, each a non-empty "
+                      "ARRAY of materialization verb names, the first group "
+                      "outranking the next");
+        } else {
+            for (std::size_t g = 0; g < groups.size(); ++g) {
+                auto const gPath = std::format("/entryPrecedence/{}", g);
+                if (!groups[g].is_array() || groups[g].empty()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, gPath,
+                              "each precedence group must be a non-empty ARRAY of "
+                              "materialization verb names");
+                    continue;
+                }
+                std::vector<EntryMaterialization> group;
+                for (std::size_t k = 0; k < groups[g].size(); ++k) {
+                    auto const& row = groups[g][k];
+                    auto const  v   = row.is_string()
+                                          ? entryMaterializationFromName(row.get<std::string>())
+                                          : std::nullopt;
+                    if (!v.has_value()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("{}/{}", gPath, k),
+                                  std::format("not an entry materialization verb — "
+                                              "accepted: {}",
+                                              allowedList(allNames(kEntryMaterializationTable),
+                                                          ", ")));
+                        continue;
+                    }
+                    group.push_back(*v);
+                }
+                data.entryPrecedence.push_back(std::move(group));
             }
         }
     }
@@ -2791,6 +3387,28 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         }
     }
 
+    // P69 (lane `cs`): `symbolAliasUnsupportedReason` — why a program of this
+    // format may give no definition a second name; absent = supported. The
+    // runpath reason's shape: one closed verb, refused by name when it is not one.
+    if (doc.contains("symbolAliasUnsupportedReason")) {
+        auto const& ar = doc.at("symbolAliasUnsupportedReason");
+        std::optional<SymbolAliasUnsupportedReason> reason;
+        if (ar.is_string()) {
+            reason = symbolAliasUnsupportedReasonFromName(ar.get<std::string>());
+        }
+        if (!reason.has_value()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      "/symbolAliasUnsupportedReason",
+                      std::format("'symbolAliasUnsupportedReason' must be one of: "
+                                  "{}",
+                                  allowedList(
+                                      allNames(kSymbolAliasUnsupportedReasonTable),
+                                      ", ")));
+        } else {
+            data.symbolAliasUnsupportedReason = *reason;
+        }
+    }
+
     // D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED: `weakDefinition` block —
     // HOW this format spells a weak definition. PRESENCE is the declaration and
     // absence is the ABSENCE OF AN ANSWER, never the claim that the format
@@ -2828,8 +3446,8 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
             // A BLOCK with one verb, so a future dialect needing per-arm
             // parameters gains a sibling key here rather than a second root
             // key (the `cSymbolDecoration` precedent).
-            static constexpr std::array<std::string_view, 1>
-                kWeakDefinitionKeys{"dialect"};
+            static constexpr std::array<std::string_view, 2>
+                kWeakDefinitionKeys{"dialect", "byKind"};
             DSS_CHECK_KEY_VOCABULARY(kWeakDefinitionKeys);
             rejectUnknownKeys(wd, kWeakDefinitionKeys, "/weakDefinition",
                               "the 'weakDefinition' block", coll);
@@ -2906,6 +3524,69 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                             backendWeakDialectList(backend)));
                 } else {
                     data.weakDefinition = WeakDefinition{*dv};
+                }
+            }
+            // P69: `byKind` — the KINDS of weak definition that take another
+            // dialect than `dialect`, keyed by the kinds' own names. The
+            // sibling key this block was shaped to grow (see `WeakDefinition`).
+            // Each value is checked exactly as `dialect` is: a real spelling,
+            // and one THIS document's backend writes — a per-kind dialect its
+            // walker has no encoder for would be a definition of that kind
+            // refused at its first encode, long after the config was written.
+            if (wd.contains("byKind")) {
+                auto const& bk = wd.at("byKind");
+                if (!bk.is_object() || bk.empty()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/weakDefinition/byKind",
+                              std::format("'weakDefinition.byKind' must be a "
+                                          "non-empty object keyed by a kind of "
+                                          "weak definition ({}), each value a "
+                                          "dialect ({}). A format with ONE "
+                                          "spelling omits the key.",
+                                          allowedList(allNames(kWeakDefinitionKindTable), " or "),
+                                          allowedList(allNames(kWeakDefinitionDialectTable), " or ")));
+                } else {
+                    for (auto it = bk.begin(); it != bk.end(); ++it) {
+                        std::string const key   = it.key();
+                        auto const&       value = it.value();
+                        std::string const path  = "/weakDefinition/byKind/" + key;
+                        auto const kind = weakDefinitionKindFromName(key);
+                        if (!kind.has_value()) {
+                            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                                      std::format("'{}' is not a kind of weak "
+                                                  "definition — accepted: {}",
+                                                  key,
+                                                  allowedList(allNames(kWeakDefinitionKindTable), ", ")));
+                            continue;
+                        }
+                        auto const dv = value.is_string()
+                                            ? weakDefinitionDialectFromName(value.get<std::string>())
+                                            : std::optional<WeakDefinitionDialect>{};
+                        if (!dv.has_value()) {
+                            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                                      std::format("the dialect of a '{}' weak "
+                                                  "definition must be one of: "
+                                                  "{}",
+                                                  key,
+                                                  allowedList(allNames(kWeakDefinitionDialectTable), ", ")));
+                            continue;
+                        }
+                        if (!backendSpellsWeakDialect(backend, *dv)) {
+                            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                                      std::format("a '{}' weak definition is "
+                                                  "given the dialect '{}', "
+                                                  "which the '{}' walker does "
+                                                  "not write (it writes: {}) — "
+                                                  "it would refuse the first "
+                                                  "definition of that kind it "
+                                                  "met",
+                                                  key, weakDefinitionDialectName(*dv),
+                                                  backend->configName(),
+                                                  backendWeakDialectList(backend)));
+                            continue;
+                        }
+                        data.weakDefinitionByKind.emplace_back(*kind, *dv);
+                    }
                 }
             }
         }
@@ -3139,12 +3820,14 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                     // so these two arms are exhaustive.
                     static constexpr std::array<std::string_view, 1>
                         kProcessArgsCommonKeys{"mechanism"};
-                    static constexpr std::array<std::string_view, 4>
+                    // P69 fold 3f (F3 P16): `vectorSlotBytes` is no key of the arm -- an
+                    // entry-stack slot is a pointer of the data model -- so a document
+                    // stating it is refused by name (`rejectUnknownArmKeys`).
+                    static constexpr std::array<std::string_view, 3>
                         kProcessArgsStackVectorKeys{"argcStackOffset",
                                                     "argvStackOffset",
-                                                    "envpFollowsArgvTerminator",
-                                                    "vectorSlotBytes"};
-                    static constexpr std::array<std::string_view, 12>
+                                                    "envpFollowsArgvTerminator"};
+                    static constexpr std::array<std::string_view, 15>
                         kProcessArgsCrtKeys{"role", "configureNarrowArgvFn",
                                             "configureWideArgvFn",
                                             "argcAccessorFn",
@@ -3154,7 +3837,10 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                                             "initializeNarrowEnvironmentFn",
                                             "narrowEnvironmentAccessorFn",
                                             "initializeWideEnvironmentFn",
-                                            "wideEnvironmentAccessorFn"};
+                                            "wideEnvironmentAccessorFn",
+                                            "narrowWinMainCommandLineFn",
+                                            "wideWinMainCommandLineFn",
+                                            "winMainStartupRoutines"};
                     DSS_CHECK_KEY_VOCABULARY(kProcessArgsCommonKeys);
                     DSS_CHECK_KEY_VOCABULARY(kProcessArgsStackVectorKeys);
                     DSS_CHECK_KEY_VOCABULARY(kProcessArgsCrtKeys);
@@ -3237,7 +3923,6 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                         // slot width, or a width for no vector, is refused.
                         bool const hasEnvpKey =
                             pa.contains("envpFollowsArgvTerminator");
-                        bool const hasSlotKey = pa.contains("vectorSlotBytes");
                         if (hasEnvpKey
                          && !pa.at("envpFollowsArgvTerminator").is_boolean()) {
                             coll.emit(DiagnosticCode::C_MalformedJson,
@@ -3250,37 +3935,7 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                             out.envpFollowsArgvTerminator =
                                 pa.at("envpFollowsArgvTerminator").get<bool>();
                         }
-                        if (hasSlotKey) {
-                            auto const& slot = pa.at("vectorSlotBytes");
-                            if (!slot.is_number_unsigned()
-                             || slot.get<std::uint64_t>() == 0
-                             || slot.get<std::uint64_t>() > 64) {
-                                coll.emit(DiagnosticCode::C_MalformedJson,
-                                          "/processArgs/vectorSlotBytes",
-                                          "'vectorSlotBytes' must be an unsigned "
-                                          "slot width in bytes, 1..64 (the width "
-                                          "of one entry-stack vector slot)");
-                                armOk = false;
-                            } else {
-                                out.vectorSlotBytes = static_cast<std::uint32_t>(
-                                    slot.get<std::uint64_t>());
-                            }
-                        }
-                        if (armOk
-                         && out.envpFollowsArgvTerminator != hasSlotKey) {
-                            coll.emit(DiagnosticCode::C_MalformedJson,
-                                      "/processArgs",
-                                      out.envpFollowsArgvTerminator
-                                          ? "'envpFollowsArgvTerminator' is true "
-                                            "but 'vectorSlotBytes' is absent — "
-                                            "the environment vector's position "
-                                            "needs the slot width to be computed"
-                                          : "'vectorSlotBytes' is declared but "
-                                            "'envpFollowsArgvTerminator' is not "
-                                            "true — a slot width for no "
-                                            "environment vector is dead config");
-                            armOk = false;
-                        }
+
                     } else {
                         out.mechanism = *m;
                         // Shared by both CRT arms: a per-field non-empty-string
@@ -3451,6 +4106,83 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                                          out.initializeWideEnvironmentFn,
                                          "wideEnvironmentAccessorFn",
                                          out.wideEnvironmentAccessorFn);
+                            // P69 fold 3f (lane `xa`): the GUI startups' values
+                            // -- each OPTIONAL here, declared only by a format
+                            // realizing a WinMain verb; `validate()` holds the
+                            // verbs and the declarations together (a verb whose
+                            // value is undeclared is unrealizable, a declaration
+                            // no verb reads is dead config).
+                            if (pa.contains("narrowWinMainCommandLineFn")
+                             && !requireStr("narrowWinMainCommandLineFn",
+                                            out.narrowWinMainCommandLineFn)) {
+                                armOk = false;
+                            }
+                            if (pa.contains("wideWinMainCommandLineFn")
+                             && !requireStr("wideWinMainCommandLineFn",
+                                            out.wideWinMainCommandLineFn)) {
+                                armOk = false;
+                            }
+                            if (pa.contains("winMainStartupRoutines")) {
+                                static constexpr std::array<std::string_view, 3>
+                                    kWinMainStartupRoutineKeys{
+                                        "role", "moduleInstanceFn", "showWindowFn"};
+                                DSS_CHECK_KEY_VOCABULARY(kWinMainStartupRoutineKeys);
+                                std::string const wrPath =
+                                    "/processArgs/winMainStartupRoutines";
+                                auto const& wr = pa.at("winMainStartupRoutines");
+                                if (!wr.is_object()) {
+                                    coll.emit(DiagnosticCode::C_MalformedJson, wrPath,
+                                              std::format(
+                                                  "'winMainStartupRoutines' must be "
+                                                  "an object with the keys {}",
+                                                  allowedList(
+                                                      kWinMainStartupRoutineKeys,
+                                                      ", ")));
+                                    armOk = false;
+                                } else {
+                                    rejectUnknownKeys(
+                                        wr, kWinMainStartupRoutineKeys, wrPath,
+                                        "the 'winMainStartupRoutines' block", coll);
+                                    ProcessArgs::WinMainStartupRoutines routines;
+                                    bool routinesOk = resolveRuntimeRole(
+                                        wr, wrPath, routines.libraryPath);
+                                    if (routinesOk) {
+                                        routines.role = *runtimeLibraryRoleFromName(
+                                            wr.at("role").get<std::string>());
+                                    }
+                                    struct RoutineKey {
+                                        char const* key;
+                                        std::string* out;
+                                        char const* what;
+                                    };
+                                    std::array<RoutineKey, 2> const routineKeys{{
+                                        {"moduleInstanceFn", &routines.moduleInstanceFn,
+                                         "the zero-argument routine whose result is "
+                                         "the image's module instance"},
+                                        {"showWindowFn", &routines.showWindowFn,
+                                         "the zero-argument routine whose result is "
+                                         "the show-window value"}}};
+                                    for (auto const& k : routineKeys) {
+                                        if (!wr.contains(k.key)
+                                         || !wr.at(k.key).is_string()
+                                         || wr.at(k.key).get<std::string>().empty()) {
+                                            coll.emit(DiagnosticCode::C_MissingField,
+                                                      wrPath + "/" + k.key,
+                                                      std::format(
+                                                          "requires a non-empty '{}' "
+                                                          "-- {}", k.key, k.what));
+                                            routinesOk = false;
+                                        } else {
+                                            *k.out = wr.at(k.key).get<std::string>();
+                                        }
+                                    }
+                                    if (routinesOk) {
+                                        out.winMainStartupRoutines = std::move(routines);
+                                    } else {
+                                        armOk = false;
+                                    }
+                                }
+                            }
                         } else {
                             // Closed-enum discipline: a new ArgsMechanism member
                             // must add its own field-set arm HERE. Falling through
@@ -3501,7 +4233,7 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         std::vector<RuntimeLibraryRole> named;
         for (char const* blockKey : {"processExit", "processArgs",
                                      "sehPersonality", "librarySynthesis",
-                                     "atomicsRuntime"}) {
+                                     "atomicsRuntime", "compilerSupport"}) {
             if (!doc.contains(blockKey) || !doc.at(blockKey).is_object()) continue;
             auto const& blk = doc.at(blockKey);
             if (!blk.contains("role") || !blk.at("role").is_string()) continue;
@@ -3509,6 +4241,21 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                     runtimeLibraryRoleFromName(blk.at("role").get<std::string>())) {
                 named.push_back(*r);
             }
+        }
+        // ★ P69 fold 3f (ledger 563 (A)): a block may also name a role by the MEMBER its
+        // image is, rather than by a `role` key -- the elf block's `interpreter` path names
+        // the `programInterpreter` row, whose image the elf backend checks is that path's last
+        // component. Enumerated as data, like the block keys above.
+        struct RoleNamedByMember {
+            char const*        block;
+            char const*        member;
+            RuntimeLibraryRole role;
+        };
+        for (RoleNamedByMember const& n :
+             {RoleNamedByMember{"elf", "interpreter", RuntimeLibraryRole::ProgramInterpreter}}) {
+            if (doc.contains(n.block) && doc.at(n.block).is_object()
+                && doc.at(n.block).contains(n.member))
+                named.push_back(n.role);
         }
         for (auto const& b : data.runtimeLibraries.bindings) {
             if (std::find(named.begin(), named.end(), b.role) != named.end()) {
@@ -3524,7 +4271,9 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                           "reading it and therefore nothing contradicting it. "
                           "Remove the row, or name it from the block that needs "
                           "it. (D-FFI-PE-CRT-UCRT-MIGRATION.)",
-                          runtimeLibraryRoleName(b.role), b.image));
+                          runtimeLibraryRoleName(b.role),
+                          b.sources.empty() ? b.image
+                                            : "(shipped source) " + b.sources.front()));
         }
     }
 
@@ -3721,26 +4470,22 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                 return false;
             }
             info.nativeId = static_cast<std::uint32_t>(v);
-            // D-LK-OBJECT-EXTERN-CALL-RELOCATABLE: optional PLT-variant
-            // nativeId (e.g. R_X86_64_PLT32=4) emitted for an undefined-extern
-            // call in a relocatable object. Absent → 0 (no PLT variant).
+            // ★ `pltNativeId` IS RETIRED (P69,
+            // D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB) and REFUSED as
+            // inert config: nothing reads it any more, and a key that is
+            // parsed and ignored reads as authority while it drifts. It was a
+            // second wire id emitted instead of `nativeId` when a row reached
+            // an undefined extern function — how ELF x86_64's PC32 row came to
+            // stand for calls too. A call is a row of its own now.
             if (r.contains("pltNativeId")) {
-                if (!r.at("pltNativeId").is_number_integer()) {
-                    c.emit(DiagnosticCode::C_MalformedJson,
-                           std::format("/relocations/{}/pltNativeId", i),
-                           "'pltNativeId' must be an integer");
-                    return false;
-                }
-                std::int64_t const pv =
-                    r.at("pltNativeId").get<std::int64_t>();
-                if (pv <= 0 || pv > 0xFFFFFFFFLL) {
-                    c.emit(DiagnosticCode::C_MalformedJson,
-                           std::format("/relocations/{}/pltNativeId", i),
-                           std::format("'pltNativeId' ({}) must be in (0, 2^32)",
-                                       pv));
-                    return false;
-                }
-                info.pltNativeId = static_cast<std::uint32_t>(pv);
+                c.emit(DiagnosticCode::C_MalformedJson,
+                       std::format("/relocations/{}/pltNativeId", i),
+                       "'pltNativeId' is retired: declare the CALL as a row of "
+                       "its own and mark it `\"isCall\": true` (ELF x86_64: "
+                       "R_X86_64_PLT32 on the `rel32` kind) — a second wire id "
+                       "on an address row is how one relocation kind came to "
+                       "mean both a call and an address");
+                return false;
             }
             // D-LK-MACHO-ISDATA-NO-CALL-SIGNAL: the DECLARED call/branch role.
             // True iff this format's native wire relocation can only target
@@ -3827,6 +4572,21 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                             static_cast<std::uint32_t>(v)});
                 }
             }
+            // P69: whether those types ALSO lower the addend by their byte
+            // count (COFF's REL32_1.._5) — see
+            // `ObjectFormatRelocationInfo::bytesAfterFieldLowersTheAddend`.
+            // Absent -> false (Mach-O's SIGNED_1/_2/_4 differ in the type
+            // alone). That it sits beside a family is `validate()`'s.
+            if (r.contains("bytesAfterFieldLowersTheAddend")) {
+                if (!r.at("bytesAfterFieldLowersTheAddend").is_boolean()) {
+                    c.emit(DiagnosticCode::C_MalformedJson,
+                           std::format("/relocations/{}/bytesAfterFieldLowersTheAddend", i),
+                           "'bytesAfterFieldLowersTheAddend' must be a boolean");
+                    return false;
+                }
+                info.bytesAfterFieldLowersTheAddend =
+                    r.at("bytesAfterFieldLowersTheAddend").get<bool>();
+            }
             // P68 round 9: the instruction words a SHARED wire type decodes to
             // this row for (Mach-O arm64 ARM64_RELOC_PAGEOFF12) — see
             // `ObjectFormatRelocationInfo::decodeWhenInstruction`. What the
@@ -3908,9 +4668,10 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
             // (`opt/optimizer_json.cpp`, `ffi/shipped_lib_descriptor.cpp`)
             // missing the `$`-prose carve-out outright. The TABLE stays here,
             // with the fields it describes — only the loop moved.
-            static constexpr std::array<std::string_view, 8> kRelocationRowKeys{
+            static constexpr std::array<std::string_view, 9> kRelocationRowKeys{
                 "name", "kind", "nativeId", "pltNativeId", "isCall", "emitOnly",
-                "nativeIdByBytesAfterField", "decodeWhenInstruction"};
+                "nativeIdByBytesAfterField", "bytesAfterFieldLowersTheAddend",
+                "decodeWhenInstruction"};
             DSS_CHECK_KEY_VOCABULARY(kRelocationRowKeys);
             bool rowClean = true;
             detail::rejectUnknownKeys(r, kRelocationRowKeys, "a relocation row",
@@ -3969,6 +4730,304 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                                       ", ")));
         } else {
             data.inputSectionPlacement = *placement;
+        }
+    }
+
+    // inputSectionNames — how a relocatable-object reader maps an input section's
+    // name to a row (`InputSectionNames`, P69 fold 3e). OPTIONAL; its entries
+    // are judged against the rows by `validate()`; here each key and value is
+    // read by its type.
+    if (doc.contains("inputSectionNames")) {
+        auto const& isn = doc.at("inputSectionNames");
+        static constexpr std::array<std::string_view, 2> kInputSectionNamesKeys{"subsectionSeparators", "readAs"};
+        DSS_CHECK_KEY_VOCABULARY(kInputSectionNamesKeys);
+        static constexpr std::array<std::string_view, 3> kReadAsKeys{"segment", "name", "row"};
+        DSS_CHECK_KEY_VOCABULARY(kReadAsKeys);
+        static constexpr std::array<std::string_view, 2> kRowKeys{"segment", "name"};
+        DSS_CHECK_KEY_VOCABULARY(kRowKeys);
+        if (!isn.is_object() || !isn.contains("subsectionSeparators") || !isn.contains("readAs")
+            || !isn.at("subsectionSeparators").is_array() || !isn.at("readAs").is_array()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/inputSectionNames",
+                      "'inputSectionNames' is an object of two arrays, 'subsectionSeparators' (strings) and "
+                      "'readAs' (objects of 'segment', 'name' and 'row')");
+        } else {
+            rejectUnknownKeys(isn, kInputSectionNamesKeys, "/inputSectionNames", "the 'inputSectionNames' block",
+                              coll);
+            InputSectionNames names;
+            bool well = true;
+            auto const& seps = isn.at("subsectionSeparators");
+            for (std::size_t i = 0; i < seps.size(); ++i) {
+                if (!seps[i].is_string()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::format("/inputSectionNames/subsectionSeparators/{}", i),
+                              "a subsection separator is a string");
+                    well = false;
+                    continue;
+                }
+                names.subsectionSeparators.push_back(seps[i].get<std::string>());
+            }
+            auto const stringAt = [&](json const& obj, std::string const& key, std::string const& at,
+                                      bool required) -> std::optional<std::string> {
+                if (!obj.contains(key)) {
+                    if (!required) return std::string{};
+                    coll.emit(DiagnosticCode::C_MalformedJson, at, std::format("'{}' is required", key));
+                    return std::nullopt;
+                }
+                if (!obj.at(key).is_string()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, at + "/" + std::string{key},
+                              std::format("'{}' is a string", key));
+                    return std::nullopt;
+                }
+                return obj.at(key).get<std::string>();
+            };
+            auto const& readAs = isn.at("readAs");
+            for (std::size_t i = 0; i < readAs.size(); ++i) {
+                std::string const at = std::format("/inputSectionNames/readAs/{}", i);
+                auto const& e = readAs[i];
+                if (!e.is_object() || !e.contains("row") || !e.at("row").is_object()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, at,
+                              "a 'readAs' entry is an object of 'segment' (optional), 'name' and 'row' "
+                              "('segment' optional, 'name')");
+                    well = false;
+                    continue;
+                }
+                rejectUnknownKeys(e, kReadAsKeys, at, "a 'readAs' entry", coll);
+                rejectUnknownKeys(e.at("row"), kRowKeys, at + "/row", "a 'readAs' entry's row", coll);
+                auto const segment    = stringAt(e, "segment", at, false);
+                auto const name       = stringAt(e, "name", at, true);
+                auto const rowSegment = stringAt(e.at("row"), "segment", at + "/row", false);
+                auto const rowName    = stringAt(e.at("row"), "name", at + "/row", true);
+                if (!segment || !name || !rowSegment || !rowName) {
+                    well = false;
+                    continue;
+                }
+                names.readAs.push_back(InputSectionAlias{*segment, *name, *rowSegment, *rowName});
+            }
+            if (well) data.inputSectionNames = std::move(names);
+        }
+    }
+
+    // archiveCommonResolution — what a static link's archive search does for a
+    // name it holds as a COMMON (`ArchiveCommonResolution`, P69 round 3).
+    // OPTIONAL; read by name through the closed table, so a typo in the value is
+    // refused naming the values (and one in the key by the root vocabulary).
+    if (doc.contains("archiveCommonResolution")) {
+        auto const& v = doc.at("archiveCommonResolution");
+        auto const resolution =
+            v.is_string()
+                ? kArchiveCommonResolutionTable.fromName(v.get<std::string>())
+                : std::nullopt;
+        if (!resolution.has_value()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/archiveCommonResolution",
+                      std::format("expected one of: {}",
+                                  allowedList(
+                                      allNames(kArchiveCommonResolutionTable),
+                                      ", ")));
+        } else {
+            data.archiveCommonResolution = *resolution;
+        }
+    }
+
+    // commonYieldsTo — which definitions a COMMON yields to (`CommonYieldsTo`,
+    // P69 round 4). OPTIONAL; read by name through the closed table, as
+    // `archiveCommonResolution` is.
+    if (doc.contains("commonYieldsTo")) {
+        auto const& v = doc.at("commonYieldsTo");
+        auto const yields =
+            v.is_string() ? kCommonYieldsToTable.fromName(v.get<std::string>()) : std::nullopt;
+        if (!yields.has_value()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/commonYieldsTo",
+                      std::format("expected one of: {}",
+                                  allowedList(allNames(kCommonYieldsToTable), ", ")));
+        } else {
+            data.commonYieldsTo = *yields;
+        }
+    }
+
+    // commonAlignmentFromSizeAtMost — the alignment a linker that ignores a
+    // COMMON's stated alignment gives it — and commonAlignmentEveryLinkerGivesAtMost
+    // — the alignment every linker gives one that states none
+    // (`CommonsStatement`). OPTIONAL; each a power of two.
+    for (auto const& [key, slot, what] :
+         {std::tuple{"commonAlignmentFromSizeAtMost", &data.commonAlignmentFromSizeAtMost,
+                     "the most bytes of alignment a linker that ignores a common's stated "
+                     "alignment gives it"},
+          std::tuple{"commonAlignmentEveryLinkerGivesAtMost", &data.commonAlignmentEveryLinkerGivesAtMost,
+                     "the most bytes of alignment every linker gives a common that states none"}}) {
+        if (!doc.contains(key)) continue;
+        auto const& v = doc.at(key);
+        std::uint64_t const n = v.is_number_unsigned() ? v.get<std::uint64_t>() : 0u;
+        if (n == 0u || (n & (n - 1u)) != 0u) {
+            coll.emit(DiagnosticCode::C_MalformedJson, std::string{"/"} + key,
+                      std::string{"expected a power of two: "} + what);
+        } else {
+            *slot = n;
+        }
+    }
+
+    // tentativeDefinitionBeyondCommonAlignment — what a tentative definition
+    // wider than a common may be is written as in an object another linker reads
+    // (`TentativeBeyondCommonAlignment`). OPTIONAL.
+    if (doc.contains("tentativeDefinitionBeyondCommonAlignment")) {
+        auto const& v = doc.at("tentativeDefinitionBeyondCommonAlignment");
+        auto const beyond = v.is_string()
+                                ? kTentativeBeyondCommonAlignmentTable.fromName(v.get<std::string>())
+                                : std::nullopt;
+        if (!beyond.has_value()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/tentativeDefinitionBeyondCommonAlignment",
+                      std::format("expected one of: {}",
+                                  allowedList(allNames(kTentativeBeyondCommonAlignmentTable), ", ")));
+        } else {
+            data.tentativeDefinitionBeyondCommonAlignment = *beyond;
+        }
+    }
+
+    // supersededDefinition — what becomes of a definition whose name another
+    // definition wins (`SupersededDefinition`, P69 fold 2). OPTIONAL. A STRING
+    // is the answer for every definition; an OBJECT states one per kind of weak
+    // definition, keyed by the kinds' own names (`kWeakDefinitionKindTable`),
+    // every kind exactly once — a kind left out would be a definition the
+    // document says nothing of, found only when a link meets one. Both
+    // vocabularies are read by name through their closed tables.
+    //
+    // ★ ONE READER FOR EVERY KEY OF THIS SHAPE (P69 fold 3). A second key took
+    // the same two forms — `weakDefinitionBesideStrong` — and the reader below
+    // is the one `supersededDefinition` had, made a function of the key's name
+    // and of its answers' table: its refusals are the same sentences, at the
+    // key's own path.
+    auto const readWeakKindStatement = [&](std::string const& key, auto const& answerTable,
+                                           auto& statement) {
+        if (!doc.contains(key)) return;
+        using Statement = std::remove_cvref_t<decltype(statement)>;
+        using Answer    = typename decltype(statement.forEveryDefinition)::value_type;
+        auto const& v = doc.at(key);
+        auto const answerOf = [&](json const& a) -> std::optional<Answer> {
+            return a.is_string() ? answerTable.fromName(a.get<std::string>())
+                                 : std::nullopt;
+        };
+        auto const expectedAnswer = [&] {
+            return std::format("expected one of: {}",
+                               allowedList(allNames(answerTable), ", "));
+        };
+        if (v.is_string()) {
+            if (auto const answer = answerOf(v); answer.has_value()) {
+                statement.forEveryDefinition = *answer;
+            } else {
+                coll.emit(DiagnosticCode::C_MalformedJson, "/" + key, expectedAnswer());
+            }
+        } else if (v.is_object()) {
+            Statement perKind;
+            bool      ok = true;
+            for (auto const& [kindName, answerJson] : v.items()) {
+                auto const kind   = weakDefinitionKindFromName(kindName);
+                auto const answer = answerOf(answerJson);
+                if (!kind.has_value()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/" + key + "/" + kindName,
+                              std::format("'{}' is no kind of weak definition: expected one of: {}",
+                                          kindName,
+                                          allowedList(allNames(kWeakDefinitionKindTable), ", ")));
+                    ok = false;
+                    continue;
+                }
+                if (!answer.has_value()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/" + key + "/" + kindName, expectedAnswer());
+                    ok = false;
+                    continue;
+                }
+                perKind.byKind.emplace_back(*kind, *answer);
+            }
+            for (auto const& row : kWeakDefinitionKindTable.rows) {
+                bool listed = false;
+                for (auto const& [of, answer] : perKind.byKind) listed = listed || of == row.first;
+                if (!listed && ok) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, "/" + key,
+                              std::format("an answer per kind of weak definition states one for "
+                                          "EVERY kind, and '{}' is missing (the kinds: {})",
+                                          row.second,
+                                          allowedList(allNames(kWeakDefinitionKindTable), ", ")));
+                    ok = false;
+                }
+            }
+            if (ok) statement = std::move(perKind);
+        } else {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/" + key,
+                      std::format("expected one answer for every definition (a string, one of: "
+                                  "{}), or an object stating one per kind of weak definition "
+                                  "({})",
+                                  allowedList(allNames(answerTable), ", "),
+                                  allowedList(allNames(kWeakDefinitionKindTable), ", ")));
+        }
+    };
+    readWeakKindStatement("supersededDefinition", kSupersededDefinitionTable,
+                          data.supersededDefinition);
+    // weakDefinitionBesideStrong — what a weak definition is beside a strong
+    // definition of its name (`WeakBesideStrong`, P69 fold 3): replaced by it, or
+    // a duplicate of it. OPTIONAL; the same two forms, read by the same reader.
+    readWeakKindStatement("weakDefinitionBesideStrong", kWeakBesideStrongTable,
+                          data.weakDefinitionBesideStrong);
+    // weakDefinitionBesideWeak — what two different weak definitions of one name
+    // are (`WeakBesideWeak`, P69 fold f26b): the first holds the name, or the
+    // pair is refused where another unit names it. OPTIONAL; the same two
+    // forms, read by the same reader.
+    readWeakKindStatement("weakDefinitionBesideWeak", kWeakBesideWeakTable,
+                          data.weakDefinitionBesideWeak);
+
+    // visibilityWrittenAs — the visibility this format writes for each one it
+    // cannot (`VisibilityStandIn`, P69 fold f26b). OPTIONAL. An object from a
+    // visibility to the one written in its place, both read by name through
+    // `kSymbolVisibilityTable`. `default` is written by every format, so it is no
+    // key; a stand-in must be a visibility the format writes, so no value is
+    // itself a key — refused here, at the key's own path, rather than settled
+    // into a visibility the writer then cannot write either.
+    if (doc.contains("visibilityWrittenAs")) {
+        auto const& v = doc.at("visibilityWrittenAs");
+        auto const  names = allowedList(allNames(kSymbolVisibilityTable), ", ");
+        if (!v.is_object() || v.empty()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/visibilityWrittenAs",
+                      std::format("expected an object from each visibility this format "
+                                  "cannot write to the one it writes in its place "
+                                  "(visibilities: {})", names));
+        } else {
+            std::vector<VisibilityStandIn> standIns;
+            bool                           ok = true;
+            for (auto const& [fromName, toJson] : v.items()) {
+                std::string const path = "/visibilityWrittenAs/" + fromName;
+                auto const from = kSymbolVisibilityTable.fromName(fromName);
+                auto const to   = toJson.is_string()
+                                      ? kSymbolVisibilityTable.fromName(toJson.get<std::string>())
+                                      : std::nullopt;
+                if (!from.has_value() || !to.has_value()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              std::format("'{}' and its value must each be a visibility: "
+                                          "expected one of: {}", fromName, names));
+                    ok = false;
+                    continue;
+                }
+                if (*from == SymbolVisibility::Default) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              "'default' is written by every format, so no format states "
+                              "a visibility in its place");
+                    ok = false;
+                    continue;
+                }
+                standIns.push_back(VisibilityStandIn{*from, *to});
+            }
+            for (VisibilityStandIn const& s : standIns) {
+                for (VisibilityStandIn const& other : standIns) {
+                    if (s.writtenAs != other.unwritable) continue;
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/visibilityWrittenAs/" + std::string{kSymbolVisibilityTable.name(s.unwritable)},
+                              std::format("'{}' is written as '{}', which this document states the "
+                                          "format cannot write either: a stand-in is a visibility "
+                                          "the format writes",
+                                          kSymbolVisibilityTable.name(s.unwritable),
+                                          kSymbolVisibilityTable.name(s.writtenAs)));
+                    ok = false;
+                }
+            }
+            if (ok) data.visibilityWrittenAs = std::move(standIns);
         }
     }
 

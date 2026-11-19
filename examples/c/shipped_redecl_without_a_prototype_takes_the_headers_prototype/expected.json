@@ -1,0 +1,21 @@
+{
+  "$comment": "D-CSUBSET-INCOMPATIBLE-REDECL-DIAGNOSED-AT-CALL-SITE-NOT-DECLARATION, restated by P69 (lane cs, fold f26d — main's ledgers 554, 598, 599). `extern int printf();` over `#include <stdio.h>` declares printf WITHOUT a prototype (ledger 554), and beside the header's `int printf(const char *, ...)` it is the pair C 6.7.6.3p15 judges: an ellipsis is never compatible with no prototype, so the pair is diagnosed AT THE DECLARATION (S_PrototypeIncompatibleWithADeclarationWithoutOne at 25:12, the declared NAME) by the ONE judgement the redeclaration sweep asks too (`prototypeFitsADeclarationWithoutOne`). A WARNING, because cl builds and runs the program: MEASURED (lane cs probe rcp, built and RUN) cl 19.52 at its default standard and /std:clatest; gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and Apple clang 21 refuse it ('conflicting types for printf'). The header's prototype is then the function's type at every call, as cl takes it: the call is a VARIADIC call with an `int` through `...` (on pe through the UCRT shim that stands for printf), and it must print 42 and return 3. The pe and elf targets realize printf differently (a compiler-synthesized UCRT shim on pe, a libc import on elf) and the verdict must not depend on that. This example replaces shipped_redecl_conflict_no_call_error, whose S_IncompatibleRedeclaration was the C23 `()` = `(void)` reading DSS no longer takes. RED-ON-DISABLE: route the pair back to the prototype oracle and the file is refused; stop reading the header's prototype at the call and the call is lowered without one.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "42\r\n",
+  "expectWarnings": [
+    { "code": "S_PrototypeIncompatibleWithADeclarationWithoutOne", "line": 25, "col": 12 }
+  ],
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"], "expectedStdout": "42\n" },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64",
+      "expectedStdout": "42\n" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "",
+      "expectedStdout": "42\n" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

@@ -40,6 +40,8 @@
 //
 // Runs natively on the x86_64-Linux CI leg.
 
+#include <stdarg.h>
+
 struct Pt { long a; double b; };
 struct LL { long a; long b; };
 struct DD { double a; double b; };

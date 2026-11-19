@@ -1,6 +1,8 @@
 {
   "$comment": "D-OPT-SWITCH-JUMP-TABLE (c70): the sqlite VDBE-dispatch shape — a ~350-case DENSE contiguous switch (0..349) evaluated in a loop, exactly like sqlite3VdbeExec (the sqlite-green blocker c70 clears). Pre-c70 this exhausted the register allocator (~350 live case-constant vregs -> L_VirtualRegInPostRegalloc); the jump table makes it O(1) and the vregs vanish. step(op)=op*3+7 for op in [0..349] else -1; run() sums a fixed program in a loop to 3578; main() checks that plus first/last/above-max/below-min/interior boundary ops. gcc/clang emit a jump table and exit 42 (cross-checked x86_64 -O0/-O1, aarch64 -O1 qemu). This is the proof that c70 unblocks sqlite's switch shape. The release optimizedPipeline arm runs the shipped optimizer over the jump-table lowering.",
   "language": "c",
+  "$commentForbidDiagnostics": "P69: this example holds a value-returning function whose last statement is not a plain `return` (found by a mechanical scan of the corpus for exactly that shape), so the function is complete only because DSS SEES that control never arrives at its closing brace. Until P69 losing that sight REFUSED the compile. Under C it no longer does: C23 6.9.2p13 accepts a non-void function whose end is reached, so the compile succeeds with the warning H_NonVoidFunctionEndReachable and the program may run unchanged. This key keeps the red: the arm fails when that code is reported, in both runners, where the exit code could not see the regression.",
+  "forbidDiagnostics": ["H_NonVoidFunctionEndReachable"],
   "source": "main.c",
   "exitCode": 42,
   "targets": [

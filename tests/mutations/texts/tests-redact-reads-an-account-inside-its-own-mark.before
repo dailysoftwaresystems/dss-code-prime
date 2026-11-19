@@ -1,0 +1,1 @@
+            text = _outside_marks(own, rx, text, lambda _m: "<user>")

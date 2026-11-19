@@ -1,0 +1,1 @@
+        m = _DIRECTIVE.search(line)

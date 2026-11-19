@@ -1,0 +1,1 @@
+        if(NOT IS_DIRECTORY "${_dss_dep_dir}")

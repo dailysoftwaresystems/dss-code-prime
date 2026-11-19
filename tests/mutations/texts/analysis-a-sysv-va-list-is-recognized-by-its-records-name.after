@@ -1,0 +1,1 @@
+                return inner.valid() && in.kind(inner) == TypeKind::Struct && in.name(inner) == "__va_list_tag";

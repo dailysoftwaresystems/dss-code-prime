@@ -1,0 +1,1 @@
+        line = _outside_marks(own, rx, line, lambda _m: "<host>")

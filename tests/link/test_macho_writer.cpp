@@ -23,6 +23,7 @@
 // loads cleanly via `loadShipped`.
 
 #include "asm/asm.hpp"
+#include "core/types/config_path_walk.hpp"   // findShippedConfig: a shipped document edited in memory
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
@@ -41,11 +42,14 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iterator>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <span>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -909,11 +913,18 @@ constexpr std::uint32_t kVersion11_0    = 0x000B0000u;
 // sibling). Omit the key there and every member of a `.a` draws the warning.
 // RED-ON-DISABLE: delete the `image` block from any one of the four files and
 // exactly that row fails.
+// ★ AND EACH STATES ITS FAMILY'S IMAGE VERSION -- the exec document's minOs and
+// sdk -- ONE fact per family (P69 fold 3f): an object built for a newer OS than
+// the image it joins makes ld64 warn, and DSS's image link too (run 20261117-192243-260e95c2), so an
+// object DSS writes must never be one its own family's image link warns of. The
+// x86_64 object and archive documents stated 11.0 beside their exec's 10.14
+// until fold 3f.
 TEST(MachOFormatJson, AllRelocatableDarwinFormatsDeclareBuildVersion) {
-    for (char const* name : {"macho64-arm64-darwin",
-                             "macho64-x86_64-darwin",
-                             "macho64-arm64-darwin-staticlib",
-                             "macho64-x86_64-darwin-staticlib"}) {
+    for (auto const& [name, execName] :
+         {std::pair{"macho64-arm64-darwin", "macho64-arm64-darwin-exec"},
+          std::pair{"macho64-x86_64-darwin", "macho64-x86_64-darwin-exec"},
+          std::pair{"macho64-arm64-darwin-staticlib", "macho64-arm64-darwin-exec"},
+          std::pair{"macho64-x86_64-darwin-staticlib", "macho64-x86_64-darwin-exec"}}) {
         auto f = ObjectFormatSchema::loadShipped(name);
         ASSERT_TRUE(f.has_value()) << name;
         auto const& fmt = **f;
@@ -924,8 +935,13 @@ TEST(MachOFormatJson, AllRelocatableDarwinFormatsDeclareBuildVersion) {
                        "image.buildVersion or ld64 warns on every link";
         EXPECT_EQ(static_cast<std::uint32_t>(bv->platform), kPlatformMacOs)
             << name;
-        EXPECT_EQ(bv->minOs, kVersion11_0) << name;
-        EXPECT_EQ(bv->sdk, kVersion11_0) << name;
+        auto e = ObjectFormatSchema::loadShipped(execName);
+        ASSERT_TRUE(e.has_value()) << execName;
+        auto const& image = (**e).machoImage().buildVersion;
+        ASSERT_TRUE(image.has_value()) << execName;
+        EXPECT_EQ(bv->platform, image->platform) << name << " vs " << execName;
+        EXPECT_EQ(bv->minOs, image->minOs) << name << " vs " << execName;
+        EXPECT_EQ(bv->sdk, image->sdk) << name << " vs " << execName;
     }
 }
 
@@ -1819,9 +1835,11 @@ TEST(MachOFormatJson, Arm64ObjectDeclaresDataSectionRows) {
     EXPECT_EQ(bss->type, 1u);                // S_ZEROFILL
 }
 
-// (6) A reloc-bearing RODATA item stays fail-loud (allow=false — the
-// RodataDataItemWithRelocationFailsLoud discipline shared with ELF): a
-// relocated slot cannot live in never-written `__TEXT,__const`.
+// (6) A reloc-bearing RODATA item stays fail-loud (allow=false): Mach-O's
+// object reader puts a read-only item that carries relocations in relro
+// (`__DATA,__const`), so this writer is never handed one and refuses it,
+// naming that rule. (ELF's reader does produce one — a jump table — and the
+// ELF writers take it: ElfExecWriter.RodataDataItemWithRelocationIsPatchedInPlace.)
 TEST(MachOWriter, Arm64ObjectRodataItemWithRelocationFailsLoud) {
     auto loaded = loadShippedArm64();
     AssembledModule mod;
@@ -2164,6 +2182,7 @@ TEST(MachOExecWriter, SchemaTextVaInconsistentWithTextFileOffFailsLoud) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -2850,6 +2869,7 @@ TEST(MachOExecFormatJsonValidate, ExecMissingLoadDylibsRejected) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 0 },
       "image": { "pageZeroSize": 4294967296, "dylinkerPath": "/usr/lib/dyld" },
       "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}]
@@ -2928,6 +2948,7 @@ TEST(MachOExecFormatJsonValidate, SectionVaBelowPageZeroRejected) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 0 },
       "image": { "pageZeroSize": 4294967296, "dylinkerPath": "/usr/lib/dyld", "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },
       "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
@@ -2968,6 +2989,7 @@ TEST(MachOExecFormatJsonValidate, MissingDylinkerPathRejected) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 0 },
       "image": { "pageZeroSize": 4294967296, "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },
       "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}]
@@ -2992,7 +3014,15 @@ TEST(MachOExecWriter, EmptyTextFailsLoud) {
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(bytes.empty());
-    EXPECT_GT(rep.errorCount(), 0u);
+    // An MH_EXECUTE whose one function holds no byte is a program with no
+    // instruction to start at: refused under K_ProgramEntryUndefined alone
+    // (P69 fold 3d; K_RelocationKindMismatch before).
+    std::size_t entryUndefined = 0;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_ProgramEntryUndefined) ++entryUndefined;
+        EXPECT_NE(d.code, DiagnosticCode::K_RelocationKindMismatch) << d.actual;
+    }
+    EXPECT_EQ(entryUndefined, 1u);
 }
 
 TEST(MachOExecWriter, RelocOffsetPastFunctionBytesFailsLoud) {
@@ -3448,6 +3478,7 @@ TEST(MachOExecWriter, BindNowFalseFailsLoudCitingDLK613) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -3512,6 +3543,7 @@ TEST(MachOExecFormatJson, UseChainedFixupsDefaultsToFalse) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -3542,6 +3574,7 @@ TEST(MachOExecFormatJson, UseChainedFixupsAcceptsTrue) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -3577,6 +3610,7 @@ TEST(MachOExecFormatJson, UseChainedFixupsRejectsNonBoolean) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -3638,6 +3672,7 @@ loadChainedFixupsExecFormat() {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -3698,6 +3733,7 @@ loadChainedFixupsExecFormatWithData() {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -3924,6 +3960,7 @@ loadLegacyBindingExecFormat() {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -4128,6 +4165,7 @@ loadDataImportExecFormat(bool useChainedFixups) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "dataImportBinding": "got-indirect",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
@@ -4745,6 +4783,7 @@ TEST(MachOExecFormatJson, BindNowDefaultsToTrue) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -4784,6 +4823,7 @@ TEST(MachOExecFormatJson, PageZeroSizeMustBePowerOfTwo) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 12884901888,
@@ -4933,6 +4973,7 @@ TEST(MachOExecFormatJson, BindNowTypeCheckRejectsNonBoolean) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -4976,6 +5017,7 @@ TEST(MachOExecWriter, MultipleExternsInTwoLibrariesEmitTwoLcLoadDylibRefs) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -5675,6 +5717,184 @@ TEST(MachOTlvWriter, NoThreadLocalEmitsNoThreadSectionsSqliteDormant) {
     // closure pin — it goes red if the TLV bit is ever made unconditional.
     EXPECT_EQ(readU32LE(bytes, 24) & 0x00800000u, 0u)
         << "no-TLS image must NOT set MH_HAS_TLV_DESCRIPTORS";
+}
+
+// ══ P69 fold 3f (ledger 716): THE TLV BOOTSTRAP IS THE FORMAT'S ════════════════════════════════
+//
+// The routine every descriptor's word0 is bound to, and the image exporting it, are stated by the
+// format (`tlsAccess.bootstrap`: `{"role", "mangledName"}`), REQUIRED for `macho-tlv` and refused
+// for the other models; the writer binds the declared name from the role table's image -- the
+// family's, for the dylib, whose own table declares no `cLibrary`. Until this fold they were two
+// literals in the writer. ✔MEASURED 2026-11-17 (Apple clang 21, macOS 26, probe-reference-cc): the
+// reference exec of a `__thread` unit names `(undefined) external __tlv_bootstrap (from libSystem)`
+// (`nm -m`) and loads /usr/lib/libSystem.B.dylib (`otool -L`).
+namespace {
+
+// A SHIPPED format document's text with each `from` replaced by its `to` -- each `from` standing in
+// it EXACTLY ONCE, so a mutation that misses is a failed cell, never a silent no-op -- loaded from
+// text. The document is the shipped one; the edit is the only delta.
+[[nodiscard]] dss::link_format::test::FormatLoadResult
+loadShippedFormatEdited(std::string_view name,
+                        std::vector<std::pair<std::string, std::string>> const& edits) {
+    auto const path = findShippedConfig(ShippedConfigLocator{
+        name, "object-formats", ".format.json", "object format", DiagnosticCode::C_InvalidFormatName});
+    if (!path.has_value()) {
+        ADD_FAILURE() << "the shipped format '" << name << "' is not located";
+        return std::unexpected(path.error());
+    }
+    std::ifstream in{*path, std::ios::binary};
+    std::ostringstream buf;
+    buf << in.rdbuf();
+    std::string text = buf.str();
+    std::erase(text, '\r');
+    for (auto const& [from, to] : edits) {
+        std::size_t const at = text.find(from);
+        if (at == std::string::npos || text.find(from, at + 1) != std::string::npos) {
+            ADD_FAILURE() << "the edit's text does not stand exactly once in " << name << ": " << from;
+        } else {
+            text.replace(at, from.size(), to);
+        }
+    }
+    return ObjectFormatSchema::loadFromText(text, std::string{name} + "-edited.format.json");
+}
+
+constexpr char const* kShippedBootstrap =
+    R"("bootstrap": { "role": "cLibrary", "mangledName": "__tlv_bootstrap" })";
+
+}  // namespace
+
+// The writer binds the routine the format NAMES: the shipped exec's declaration, read back, is the
+// reference's (MEASURED, above), and a document naming another routine gets exactly that routine
+// bound at every descriptor and the shipped name nowhere.
+// RED-ON-DISABLE: the writer binding a literal `__tlv_bootstrap` -> the edited document's image
+// binds `__tlv_bootstrap`, never the declared probe.
+TEST(MachOTlvWriter, EachDescriptorIsBoundToTheBootstrapTheFormatDeclares) {
+    auto L = loadArm64MachoExec();
+    ASSERT_TRUE(L.target && L.format);
+    auto const& shipped = L.format->tlsAccess();
+    ASSERT_TRUE(shipped.has_value());
+    EXPECT_EQ(shipped->bootstrapMangledName, "__tlv_bootstrap");
+    EXPECT_EQ(shipped->bootstrapRole, RuntimeLibraryRole::CLibrary);
+
+    auto const edited = loadShippedFormatEdited(
+        "macho64-arm64-darwin-exec",
+        {{R"("mangledName": "__tlv_bootstrap")", R"("mangledName": "__dss_tlv_bootstrap_probe")"}});
+    ASSERT_TRUE(edited.has_value()) << rejectSummary(edited);
+    auto mod = buildMachoTlvModule(/*withTbss=*/true);
+    DiagnosticReporter rep;
+    auto const bytes = encodeUntrampolined(mod, *L.target, **edited, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    auto const dec = decodeMacho(bytes);
+    std::size_t probe = 0, shippedName = 0;
+    for (auto const& b : dec.binds) {
+        if (b.sym == "__dss_tlv_bootstrap_probe") ++probe;
+        if (b.sym == "__tlv_bootstrap") ++shippedName;
+    }
+    EXPECT_EQ(probe, 2u) << "one bind of the declared routine per descriptor";
+    EXPECT_EQ(shippedName, 0u) << "the writer bound a routine the document does not name";
+}
+
+// The bootstrap's image is the role table's answer: a document naming a role its family does not
+// declare is refused BY NAME where the bind is written, and no image is made.
+// RED-ON-DISABLE: the writer resolving `cLibrary` whatever the document names -> the edited
+// document's image is made, bound to libSystem.
+TEST(MachOTlvWriter, ABootstrapRoleTheFamilyDoesNotAnswerIsRefusedByName) {
+    auto L = loadArm64MachoExec();
+    ASSERT_TRUE(L.target && L.format);
+    auto const edited = loadShippedFormatEdited(
+        "macho64-arm64-darwin-exec",
+        {{R"({ "role": "cLibrary", "mangledName": "__tlv_bootstrap" })",
+          R"({ "role": "unwindPersonality", "mangledName": "__tlv_bootstrap" })"}});
+    ASSERT_TRUE(edited.has_value()) << rejectSummary(edited);
+    auto mod = buildMachoTlvModule(/*withTbss=*/false);
+    DiagnosticReporter rep;
+    auto const bytes = encodeUntrampolined(mod, *L.target, **edited, rep);
+    EXPECT_TRUE(bytes.empty()) << "an image bound its descriptors to a routine no image exports";
+    std::size_t named = 0;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_SymbolUndefined
+            && d.actual.find("'unwindPersonality'") != std::string::npos) {
+            ++named;
+        }
+    }
+    EXPECT_EQ(named, 1u) << "the refusal names the role";
+}
+
+// A `macho-tlv` block states its bootstrap or is refused at load, and the bootstrap's own shape is
+// refused by name -- each case for that reason alone; the unedited document loads.
+// RED-ON-DISABLE: the loader's requirement removed -> the document without a bootstrap loads.
+TEST(MachOTlvWriter, AMachoTlvModelStatesItsBootstrapOrIsRefusedAtLoad) {
+    struct Case {
+        char const* what;
+        std::string from;
+        std::string to;
+        char const* path;
+    };
+    std::string const shipped = kShippedBootstrap;
+    std::vector<Case> const cases{
+        {"no bootstrap", ",\n    " + shipped, "", "/tlsAccess/bootstrap"},
+        {"an unknown role", R"("role": "cLibrary", "mangledName": "__tlv_bootstrap")",
+         R"("role": "cLibraryX", "mangledName": "__tlv_bootstrap")", "/tlsAccess/bootstrap/role"},
+        {"an empty name", R"("mangledName": "__tlv_bootstrap")", R"("mangledName": "")",
+         "/tlsAccess/bootstrap/mangledName"},
+        {"an unknown key", R"("mangledName": "__tlv_bootstrap" })",
+         R"("mangledName": "__tlv_bootstrap", "image": "/usr/lib/libSystem.B.dylib" })",
+         "/tlsAccess/bootstrap"},
+        {"not an object", shipped, R"("bootstrap": "__tlv_bootstrap")", "/tlsAccess/bootstrap"},
+    };
+    for (Case const& c : cases) {
+        SCOPED_TRACE(c.what);
+        auto const r = loadShippedFormatEdited("macho64-arm64-darwin-exec", {{c.from, c.to}});
+        EXPECT_FALSE(r.has_value()) << c.what << " loaded";
+        EXPECT_EQ(countAtPath(r, c.path), 1u) << rejectSummary(r);
+        EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    }
+    auto const control = loadShippedFormatEdited("macho64-arm64-darwin-exec", {});
+    EXPECT_TRUE(control.has_value()) << rejectSummary(control);
+}
+
+// A bootstrap belongs to `macho-tlv` alone: stated on the local-exec model (the ELF exec) it is
+// refused by name.
+// RED-ON-DISABLE: the refusal removed -> the ELF document with a bootstrap loads.
+TEST(MachOTlvWriter, ABootstrapOnAnotherModelIsRefusedAtLoad) {
+    auto const r = loadShippedFormatEdited(
+        "elf64-x86_64-linux-exec",
+        {{R"("model": "local-exec",)", std::string{R"("model": "local-exec", )"} + kShippedBootstrap + ","}});
+    EXPECT_FALSE(r.has_value());
+    EXPECT_EQ(countAtPath(r, "/tlsAccess/bootstrap"), 1u) << rejectSummary(r);
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+}
+
+// Every shipped flavour of the `macho-tlv` model states the reference's routine, and its role
+// resolves -- through the flavour's own table, or its family's (the dylib's own table declares no
+// `cLibrary`) -- to the image the reference binds it from.
+TEST(MachOTlvWriter, EveryShippedMachoTlvFlavourBindsTheReferencesBootstrap) {
+    auto const dir = findShippedConfigDir("object-formats");
+    ASSERT_TRUE(dir.has_value());
+    constexpr std::string_view kSuffix = ".format.json";
+    std::vector<std::string> names;
+    for (auto const& e : std::filesystem::directory_iterator{*dir}) {
+        std::string const file = e.path().filename().string();
+        if (file.size() > kSuffix.size() && file.ends_with(kSuffix))
+            names.push_back(file.substr(0, file.size() - kSuffix.size()));
+    }
+    std::sort(names.begin(), names.end());
+    std::size_t seen = 0;
+    for (std::string const& n : names) {
+        auto const f = ObjectFormatSchema::loadShipped(n);
+        ASSERT_TRUE(f.has_value()) << n;
+        auto const& ta = (*f)->tlsAccess();
+        if (!ta.has_value() || ta->model != TlsAccessModel::MachoTlv) continue;
+        SCOPED_TRACE(n);
+        ++seen;
+        EXPECT_EQ(ta->bootstrapMangledName, "__tlv_bootstrap");
+        FormatRuntimeLibraryRoleResolver const roles{**f};
+        std::string refusal;
+        RuntimeLibraryBinding const* const row = roles.rowForRole(ta->bootstrapRole, refusal);
+        ASSERT_NE(row, nullptr) << refusal;
+        EXPECT_EQ(row->image, "/usr/lib/libSystem.B.dylib");
+    }
+    EXPECT_GE(seen, 2u) << "the exec and the dylib state the model";
 }
 
 // ══ D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT ═══════

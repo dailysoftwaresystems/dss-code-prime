@@ -1,0 +1,1 @@
+        if (reaches == core::EntryKind::Absent) return HeaderSearchResult::notFound();

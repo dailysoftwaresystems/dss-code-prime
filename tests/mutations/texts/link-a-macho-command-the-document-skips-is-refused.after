@@ -1,0 +1,1 @@
+                                [&](MachOSkippedLoadCommand const& s) { return s.command == cmd && false; })) {

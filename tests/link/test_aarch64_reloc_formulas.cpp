@@ -57,7 +57,7 @@ loadOneRelocTarget(std::string_view formula, std::uint32_t kind = 1) {
                 break;
             default:
                 twinRow = R"(, { "name": "twin", "kind": )" + std::to_string(twinKind)
-                        + R"(, "formula": "linear", "pcRelative": true, "addendBias": 0, "widthBytes": 4 })";
+                        + R"(, "formula": "linear", "pcRelative": true, "addendBias": 0, "widthBytes": 4, "fieldRange": "signed" })";
                 break;
         }
         twinKey = R"(, "gotSlotTwin": "twin")";
@@ -236,7 +236,7 @@ TEST(X86_64GotPcRel, ApplyFailsLoudRatherThanFabricatingADirectReference) {
       "target": {"name":"x86_64_test_control"},
       "relocations":[
         { "name": "control_pcrel32", "kind": 1, "formula": "linear",
-          "pcRelative": true, "addendBias": 0, "widthBytes": 4 }
+          "pcRelative": true, "addendBias": 0, "widthBytes": 4, "fieldRange": "signed" }
       ],
       "opcodes":[ {"mnemonic":"invalid","result":"none"} ]
     })");

@@ -2,11 +2,12 @@
 
 // ── THE SEMANTIC TIER'S HALF OF ONE `<target>:<format>` PAIR ────────────────
 //
-// `analyze()` takes a pair's consequences as EIGHT separate arguments — the data
+// `analyze()` takes a pair's consequences as TEN separate arguments — the data
 // model, the aggregate layout with two format overlays, the `va_list` strategy of
 // the resolved calling convention, the format kind, the target's name, the
-// `long double` representation, the target itself and the runtime-library role
-// resolver — and every one of them has a default, because unit tests and
+// `long double` representation, the target itself, the runtime-library role
+// resolver, the enumeration compatible-type rule and (P69 round 4) the NAME of the
+// resolved calling convention — and every one of them has a default, because unit tests and
 // format-blind callers need one. That made "analyze under a pair" something each
 // caller had to REASSEMBLE, and only one caller ever did: the driver's front
 // half. The LSP called `analyze(cu, budget)` and so did the FFI header parser.
@@ -136,8 +137,11 @@ struct DSS_EXPORT TargetFormatAnalysis {
 // the format's two bit-field overlays, the `va_list` strategy of
 // `callingConvention`, the format's kind (the per-format availability gate), the
 // target's name (the shipped-struct variant selector), the format's `long double`
-// representation, the target (the inline-asm constraint and clobber checks) and
-// the format's runtime-library role resolver.
+// representation, the target (the inline-asm constraint and clobber checks), the
+// format's runtime-library role resolver, its enumeration compatible-type rule,
+// and the NAME of `callingConvention` — what an attribute that names a calling
+// convention is judged against (the active one is a no-op, another convention of
+// the target is refused by name).
 //
 // `callingConvention` is the pair's resolved calling convention — the entry of
 // `target.callingConventions()` that `ffi::resolveAbi(target, format, …)`

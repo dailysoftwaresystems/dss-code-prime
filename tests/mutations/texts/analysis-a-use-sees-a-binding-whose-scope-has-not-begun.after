@@ -1,0 +1,1 @@
+    return seenEverywhere || earliest.has_value();

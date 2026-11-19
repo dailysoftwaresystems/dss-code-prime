@@ -1,0 +1,57 @@
+{
+  "$comment": "P69 (lane lm, at its merge step after lane cs's fold — D-C-LIBRARY-BUILTIN-REFUSES-A-SHIPPED-SOURCE-BODY): a LIBRARY builtin (`__builtin_snprintf`, `__builtin_sprintf`, `__builtin_printf`) called with no header binds to the function the platform's realization gives a bare prototype of the name — and on pe and Mach-O the printf family's body is DSS's own runtime (runtime/platform/src/stdio.c), so the builtin must reach that runtime unit, not refuse (S_LibraryBuiltinUnavailable, what the binder answered for a shipped-source row) and not the platform's printf. The C23 %b/%B conversions are the witness: only DSS's runtime has them on the UCRT and libSystem. ✔MEASURED 2026-10-07 (probe-reference-cc, this source with -std=c2x): gcc 13.3.0 with glibc 2.39 prints the line below and exits 42 on x86_64 (run 20261007-051854-ead488c9) and aarch64 (run 20261007-051902-5b67920e); mingw-w64 gcc 13.2.0 ACCEPTS the builtins on pe and prints `[b] 3 [B] 3`, exit 1 (run 20261007-051903-0fa0f569) — the UCRT's printf, which has no %b: the defect DSS's runtime fills there (examples/c/c23_formatted_io).",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "[101] 5 [0B11] 6\r\n",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "expectedStdout": "[101] 5 [0B11] 6\n"
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64",
+      "expectedStdout": "[101] 5 [0B11] 6\n"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": [
+        "darwin"
+      ],
+      "emulator": "",
+      "expectedStdout": "[101] 5 [0B11] 6\n"
+    },
+    {
+      "spec": "x86_64:macho64-x86_64-darwin-exec",
+      "artifact": "main",
+      "runOn": [
+        "darwin"
+      ],
+      "emulator": "",
+      "expectedStdout": "[101] 5 [0B11] 6\n"
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release", "mustDifferFromBaseline": true
+    }
+  ]
+}

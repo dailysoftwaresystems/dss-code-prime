@@ -1,0 +1,1 @@
+    for (Tree const& tree : std::span<Tree const>{trees_}.first(trees_.empty() ? 0 : 1)) {

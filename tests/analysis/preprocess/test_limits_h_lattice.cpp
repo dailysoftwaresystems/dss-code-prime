@@ -236,7 +236,6 @@ struct PairRun {
                                      ObjectFormatSchema const& format,
                                      std::string source) {
     UnitBuilder builder{grammar, DiagnosticBudget::libraryDefault()};
-    applySystemDirs(builder, *grammar);
     applyTargetFormatPair(builder, target, format);
     builder.addInMemory(std::move(source), "probe.c");
     auto const cu = std::make_shared<CompilationUnit const>(std::move(builder).finish());
@@ -347,7 +346,6 @@ TEST(LimitsHLattice, TheUndefRefusalIsUndeclaredIdentifier) {
     auto formatR = ObjectFormatSchema::loadShipped("elf64-aarch64-linux-exec");
     ASSERT_TRUE(targetR.has_value() && formatR.has_value());
     UnitBuilder builder{cLanguage(), DiagnosticBudget::libraryDefault()};
-    applySystemDirs(builder, *cLanguage());
     applyTargetFormatPair(builder, **targetR, **formatR);
     builder.addInMemory("#include <limits.h>\n#undef LONG_MAX\nlong f(void) { return LONG_MAX; }\n",
                         "probe.c");

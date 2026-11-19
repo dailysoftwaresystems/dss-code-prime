@@ -1,0 +1,5 @@
+            if (!id.valid()) {
+                reportExhaustedSymbolIds(sink_, who, SymbolIdSpaceKind::CountingEnd, trial.value());
+                *end_ = trial;
+                return std::nullopt;
+            }

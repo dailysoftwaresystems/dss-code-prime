@@ -1,8 +1,10 @@
 #include "program/cross_validate_target_format.hpp"
 
 #include "core/types/parse_diagnostic.hpp"
+#include "lir/lowering/mir_to_lir.hpp"   // guardedRegionSealMnemonics
 
 #include <format>
+#include <string_view>
 
 namespace dss {
 
@@ -116,6 +118,42 @@ bool crossValidateTargetFormat(TargetSchema const&       target,
                                 format.name(), format.targetArch(),
                                 target.name()));
         return false;
+    }
+
+    // ── (3) WHAT A DECLARED HANDLER ROUTINE NEEDS OF THE TARGET ────────────
+    //
+    // A format that declares a handler routine (`sehPersonality`) is one whose
+    // programs may guard a region (`__try`), and a guarded region adds two
+    // terminators of its own to its function: the opener's jump into the
+    // guarded body, and the terminator of the block left where the filter
+    // stood, which control never leaves. The lowering asks the target for both
+    // BY NAME (`guardedRegionSealMnemonics`, the lowering's own two rows — not
+    // spelled a second time here), and a target that states one of them not
+    // would refuse at the first `__try` somebody compiled. The pair is read
+    // HERE, so that is where it is refused: under the code the lowering's own
+    // missing-opcode refusal has, naming the opcode and both documents.
+    //
+    // Which shipped documents this reaches is not written here: the shipped
+    // corpus is SWEPT (`program/test_cross_validate_target_format` pairs every
+    // format that declares a handler routine with every target the two rules
+    // above accept for it), so a document added later is read by the sweep
+    // without anyone editing a list.
+    if (format.sehPersonality().has_value()) {
+        for (std::string_view const mnemonic : guardedRegionSealMnemonics()) {
+            if (target.opcodeByMnemonic(mnemonic).has_value()) continue;
+            dss::report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+                        DiagnosticSeverity::Error,
+                        std::format("target '{}' declares no '{}' opcode, and object "
+                                    "format '{}' declares a handler routine "
+                                    "(`sehPersonality`): a program for this pair may "
+                                    "guard a region with `__try`, and the blocks a "
+                                    "guarded region adds to its function are sealed "
+                                    "with that opcode. State it in the target "
+                                    "document, or pair the target with a format that "
+                                    "declares no handler routine",
+                                    target.name(), mnemonic, format.name()));
+            return false;
+        }
     }
 
     return true;

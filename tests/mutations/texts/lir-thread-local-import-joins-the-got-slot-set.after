@@ -1,0 +1,3 @@
+                if (e.isData && !imageDefines(e)) {
+                    slotIndirectAddrSymbols_.insert(e.symbol.v);
+                }

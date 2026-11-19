@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <vector>
 
 // ── FC6: the struct/union/array LAYOUT engine (realizes D-FF3-1-TARGET-AGGREGATE-LAYOUT-PARAMS, layout half) ──
@@ -60,6 +61,20 @@ struct StructLayout {
     // `unitBytes == 0`. A zero-width bit-field is a packing break only — it gets a
     // `fieldOffsets` slot (so indices stay parallel) with `unitBytes == 0`.
     std::vector<BitFieldPlacement> bitFields;
+    // ★ P69 (lane `cs`, fold f26c2 — review-csf26c F14): the alignment the type's
+    // MEMBERS give it, BEFORE its own whole-composite request (`aligned(N)` on a
+    // struct/union definition, C 6.7.5's raise) and before an alias's type-level
+    // alignment. AAPCS64 reads THIS one where it places an argument: "the natural
+    // alignment of a composite type is the maximum of each of the member alignments
+    // of the 'top-level' members of the composite type i.e. before any alignment
+    // adjustment of the entire composite is applied" — and so does nothing else, so
+    // every other reader asks `align`. Equal to `align` for every type with neither
+    // request. Set by the engine for every layout it computes (`layoutOne`).
+    // ✔MEASURED (lane `cs`, probes f14 and f14r): aarch64 gcc 13.3.0 and clang 18.1.3
+    // put `struct { _Alignas(16) long a; long b; }` on a 16-aligned stack slot and an
+    // even register pair, and `struct __attribute__((aligned(16))) { long a, b; }` on
+    // neither.
+    Alignment                  membersAlign{};
 };
 
 // Side-table keyed by TypeId — the per-CU memoized layout table FC7 reads.
@@ -72,16 +87,30 @@ using TypeLayoutTable = substrate::ArenaAttribute<TypeInterner, StructLayout>;
 [[nodiscard]] DSS_EXPORT std::optional<std::uint64_t>
 scalarByteSize(TypeKind kind, DataModel dm) noexcept;
 
-// C23 _BitInt(N) (D-CSUBSET-BITINT): the TypeId-aware companion to
-// `scalarByteSize`. A `_BitInt(N)`'s size cannot be derived from its KIND alone
-// (the width N lives in the interned record's scalars), so a caller that has a
-// TypeId — a data-global leaf, an aggregate-ABI leaf — routes through here: it
-// returns the `_BitInt(N)` CONTAINER byte size (N≤64 → {1,2,4,8}; N>64 →
-// ceil(N/64) eightbytes, the C2 multi-limb layout) and, for every OTHER kind,
-// exactly `scalarByteSize(kind, dm)`. nullopt for a non-sized kind (aggregate /
-// Void / FnSig / …) — the caller's fail-loud signal, same as `scalarByteSize`.
-[[nodiscard]] DSS_EXPORT std::optional<std::uint64_t>
-sizeOfScalarOrBitInt(TypeInterner const& interner, TypeId id, DataModel dm) noexcept;
+// ★ ADMISSIBILITY, ONE PREDICATE (P69 fold 3f, review-xa3e F3): whether the back
+// end can lower a data model's widths at all. A model is admitted when it states
+// a pointer size (`scalarByteSize(TypeKind::Ptr, dm)`, the one home of the
+// pointer width) and that size is the back end's ADDRESS width,
+// `kBackEndAddressBytes` (data_model.hpp; the LIR's flags-0 width is defined
+// from it). The answer is the refusal's reason, in the operator's words, or
+// nullopt when the model is admitted. The semantic gate reads it
+// (S_UnsupportedDataModel carries the reason), so a data model added later that
+// states another width, or a value that names no model, is refused by the same
+// question that refuses ILP32, never by an identity test of one name.
+[[nodiscard]] DSS_EXPORT std::optional<std::string>
+dataModelTheBackEndCannotLower(DataModel dm);
+
+// A data model in the operator's words, for a refusal that names one: "data
+// model LP64", or "a data model no table row names (value N)" for a value of
+// `DataModel` that names no model. The one spelling such a refusal reads (P69
+// fold 3f): the predicate above and the `.eh_frame` decoder's.
+[[nodiscard]] DSS_EXPORT std::string dataModelSpelled(DataModel dm);
+
+// ⓘ A `_BitInt(N)`'s size is NOT `scalarByteSize`'s to answer (its width lives in the
+// interned record, and above 64 bits its chunk is the target's): a caller holding a
+// TypeId asks `computeLayout`, the one size ladder. (P69 fold f26d deleted a second,
+// TypeId-aware ladder beside it, which answered the x86-64 psABI's chunk for every
+// target.)
 
 // ── The WIDE-INTEGER facade (D-CSUBSET-BITINT-C2-WIDE + D-CSUBSET-UINT128-TYPE) ──
 //
@@ -377,5 +406,19 @@ struct NonObjectTypeSizes {
 operandLayout(TypeId id, TypeInterner const& interner,
               AggregateLayoutParams params, DataModel dm,
               NonObjectTypeSizes const& sizes);
+
+// ★ P69 (lane `cs`, fold f26e) — THE ALIGNMENT A TYPE HAS, A VARIABLY MODIFIED ONE INCLUDED
+// (D-CSUBSET-ALIGNOF-VALUE-OVERALIGNED-OBJECT). `computeLayout`'s alignment wherever a layout
+// exists; for an array with a run-time length, which has none, the alignment it still has: C23
+// 6.5.4.4p3 gives an array its element's, and the length never enters. Walked from the outside
+// in, a level whose OWN record carries a type-level alignment answers it -- the skin replaces,
+// as `layoutOne` makes it replace -- and otherwise its element answers. nullopt where no
+// alignment exists: an incomplete type, a function, an array of unknown size. The ONE answer
+// every reader of a variably modified type's alignment asks: the constant fold, the type
+// positions that decide whether a request mints a skin, the HIR lowering of `_Alignof`, and the
+// alignment a frame slot -- a VLA's alloca included -- is placed at.
+[[nodiscard]] DSS_EXPORT std::optional<Alignment>
+typeAlignment(TypeId id, TypeInterner const& interner,
+              AggregateLayoutParams params, DataModel dm);
 
 } // namespace dss

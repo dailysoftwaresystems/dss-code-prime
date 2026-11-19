@@ -264,3 +264,50 @@ dss_add_test(NAME analysis/preprocess/test_os_identity_predefines
              SOURCES test_os_identity_predefines.cpp)
 target_include_directories(dss_analysis_preprocess_test_os_identity_predefines
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P69 (lane lm — D-FFI-FCNTL-AARCH64-OPEN-FLAGS-TAKE-X86-64-VALUES): the descriptor splice reads a
+# preprocessor-visible constant with the pair's TARGET, so an arch-keyed arm reaches `#if` as the
+# semantic tier injects it — over a scratch descriptor and over the real <fcntl.h> on both Linux ISAs.
+# Reads the shipped config, so it runs through ctest (the config snapshot).
+dss_add_test(NAME analysis/preprocess/test_descriptor_splice_full_pair
+             SOURCES test_descriptor_splice_full_pair.cpp)
+target_include_directories(dss_analysis_preprocess_test_descriptor_splice_full_pair
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P69 (lane lm — M4 of D-FFI-INTTYPES-H-SHIPS-FOUR-FORMAT-MACROS): the `type-format` predefine
+# kind — the 120 `__<T>_FMT<c>__` names are exactly the references' union, as language rows naming
+# SHIPPED typedefs; on every executable pair each value is C 7.23.6.1's length modifier of the
+# reference's own type for that typedef, then the conversion letter; the loader refuses every
+# malformed row and `typeFormatModifiers` entry; the merge refuses a type the table cannot format.
+# Reads the shipped config, so it runs through ctest (the config snapshot).
+dss_add_test(NAME analysis/preprocess/test_type_format_predefines
+             SOURCES test_type_format_predefines.cpp)
+target_include_directories(dss_analysis_preprocess_test_type_format_predefines
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P69 round 4 (lane lm — D-FFI-DESCRIPTOR-FLOAT-CONSTANTS-INVISIBLE-TO-THE-PREPROCESSOR): <math.h>'s
+# INFINITY, NAN and HUGE_VAL are MACROS of the references' types (float, float, double) on every real
+# pair, usable as constant expressions; a program's own fallback is taken only without the header;
+# `#undef` removes one like any macro; each spelling form over a scratch descriptor; and a type no form
+# spells is refused on a live include only. Reads the shipped config, so it runs through ctest.
+dss_add_test(NAME analysis/preprocess/test_math_h_float_constants
+             SOURCES test_math_h_float_constants.cpp)
+target_include_directories(dss_analysis_preprocess_test_math_h_float_constants
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P69 round 4 (lane lm; the re-review of lane cs, finding 1): THE SWEEP — every name of the C
+# document's `semantics.libraryBuiltins` on every real pair: `#if __has_builtin(__builtin_<name>)`
+# answers 1 exactly where the semantic tier binds a use of the builtin and 0 exactly where it
+# refuses the use, both read from one translation unit compiled through the driver's two halves. A
+# failure names the builtin and the pair. Reads the shipped config, so it runs through ctest.
+dss_add_test(NAME analysis/preprocess/test_library_builtin_answer_sweep
+             SOURCES test_library_builtin_answer_sweep.cpp)
+
+# P69 fold 3f (lane `xa`) -- `#pragma comment(kind[, "text"])`, a request to the program's LINK, read as the C
+# document's `comment` row says: each kind that asks something recorded with its text in reach order, the operand
+# macro-expanded and its literals concatenated, a kind with no text silent, a form cl cannot read warned and
+# recorded as nothing, a dead branch's nothing; and the loader's refusal of a row that does not state its kinds.
+dss_add_test(NAME analysis/preprocess/test_pragma_comment
+             SOURCES test_pragma_comment.cpp)
+target_include_directories(dss_analysis_preprocess_test_pragma_comment
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)

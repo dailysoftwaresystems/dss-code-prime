@@ -1,0 +1,1 @@
+                text.substr(i, j - i);

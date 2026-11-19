@@ -1,0 +1,1 @@
+R_AARCH64_ABS32 = 258; R_AARCH64_CALL26 = 283 is a branch displacement ORed into a data word

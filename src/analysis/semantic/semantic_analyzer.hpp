@@ -12,6 +12,7 @@
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <vector>
 
 // Phase #8 entry point: drive symbol/scope/type analysis over a built
 // CompilationUnit and return a SemanticModel. The implementation is
@@ -165,6 +166,48 @@ analyze(std::shared_ptr<CompilationUnit const> cu,
         // serves direct-API callers (unit tests) and pairs with the default
         // `dataModel` (LP64): the platform those callers model is an LP64 one, whose
         // ABIs all use this rule — the same reason `dataModel` defaults to LP64.
-        EnumCompatibleTypeRule enumCompatibleTypeRule = EnumCompatibleTypeRule::Gnu);
+        EnumCompatibleTypeRule enumCompatibleTypeRule = EnumCompatibleTypeRule::Gnu,
+        // P69 round 4 (lane `cs`): the NAME of the calling convention the pair
+        // compiles for — the row of the target document's `callingConventions`
+        // the format's `cCallingConvention` selects (`sysv_amd64`, `ms_x64`, …),
+        // threaded by the pair derivation from the SAME resolved convention
+        // `vaListStrategy` is read from. It is what an attribute that NAMES a
+        // convention is judged against (the language document maps the attribute
+        // to a convention id; `AttributeEffect::CallingConvention`): the active
+        // one is a silent no-op, another convention of this target is refused by
+        // name, a name that is no convention of this target takes the
+        // unknown-attribute path. The analyzer never learns an architecture.
+        //
+        // ⚠ `nullopt` (the default, and every direct-API / LSP-fallback / test
+        // caller with no pair) ⇒ an attribute that names a convention is REFUSED
+        // BY NAME, never accepted: with no pair there is nothing to compare the
+        // name against, and accepting it would be a guess about a call sequence —
+        // the `longDoubleFormat` posture, for the same reason.
+        std::optional<std::string_view> activeCallingConvention = std::nullopt,
+        // P69 (lane `cs`): the active format's `symbolAliasUnsupportedReason` —
+        // present when the platform's own C compilers refuse to give a definition
+        // a second name (the Mach-O documents), and then the `alias` attribute is
+        // refused BY NAME with the reason's sentence. `nullopt` ⇒ the format
+        // states no refusal and an alias is built; a direct-API caller with no
+        // pair builds it too, since what an alias MEANS does not depend on the
+        // target — only whether the platform's compilers accept it does.
+        std::optional<SymbolAliasUnsupportedReason> symbolAliasUnsupported = std::nullopt,
+        // P69 (lane `cs`): whether the active format's document STATES COMMONS
+        // (`ObjectFormatSchema::statesCommons`). False ⇒ the `common` attribute is
+        // refused by name: a common cannot be stated there. The default (and a
+        // direct-API caller with no pair) is true — `common` then adds nothing to a
+        // tentative definition, which is what it adds on every format that has one.
+        bool formatStatesCommons = true,
+        // P69 fold 3e (lane `xa`, class C's N3): the materialization verbs the
+        // pair's format REALIZES (`ObjectFormatSchema::entryVerbs`; empty for a
+        // format that starts no program). The entry gate asks the one vocabulary
+        // (`realizedEntryNames`, core/types/entry_names.hpp) which names are a
+        // program's entry on that format: a definition of another name is an
+        // ordinary function, and a definition of an entry name whose signature
+        // is none of the realized rows is entered with the richest of them and
+        // WARNED (S_EntryShapeNotDeclared). `nullopt` (the default: a direct-API
+        // or language-server caller with no pair) counts every verb the grammar
+        // declares as realized.
+        std::optional<std::vector<EntryMaterialization>> realizedEntryVerbs = std::nullopt);
 
 } // namespace dss

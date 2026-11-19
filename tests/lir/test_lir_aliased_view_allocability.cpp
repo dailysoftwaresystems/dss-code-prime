@@ -420,6 +420,8 @@ TEST(LirAliasedViewAllocability, ACcNamingTheDViewIsRefusedAsASubRegister) {
     auto mutated = test_support::mutateShippedTargetSchemaDoc(
         "arm64", [](nlohmann::json& doc) {
             for (auto& cc : doc.at("callingConventions")) {
+                // A row that derives its pool (`derivesFrom`) takes the mutated base's.
+                if (!cc.contains("argFprs")) continue;
                 cc.at("argFprs")[0] = "d0";
             }
         });

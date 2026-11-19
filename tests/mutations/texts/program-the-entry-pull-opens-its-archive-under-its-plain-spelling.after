@@ -1,0 +1,2 @@
+        std::expected<std::ifstream, std::error_code> opened{std::in_place, archivePaths[ai], std::ios::binary};   // the plain spelling
+        if (!opened->is_open()) opened = std::unexpected(std::make_error_code(std::errc::io_error));

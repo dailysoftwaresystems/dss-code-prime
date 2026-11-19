@@ -57,6 +57,15 @@ enum class DataModel : std::uint8_t {
     Ilp32 = 3,  // int 32 / long 32 / ptr 32 — declared-only (wasm32 / spirv)
 };
 
+// ★ THE BACK END'S ADDRESS WIDTH (P69 fold 3f, review-xa3e F3): the byte width the
+// back end's width-default address arithmetic carries — lea, a member's or an
+// element's byte offset, the index products — and the one the LIR's flags-0
+// operation width is defined from (lir_node.hpp asserts `lirInstWidthBits(0)`
+// against it, so the two cannot drift). A data model is lowered only when its
+// pointer size is this width: `dataModelTheBackEndCannotLower`
+// (type_layout.hpp), the ONE admissibility predicate, asks exactly that.
+inline constexpr std::uint64_t kBackEndAddressBytes = 8;
+
 // ── THE ONE OWNER OF THE DATA-MODEL SPELLINGS ─────────────────────────────
 //
 // ⚠ THIS USED TO BE A SWITCH PLUS AN IF-CHAIN, and the comment that stood here

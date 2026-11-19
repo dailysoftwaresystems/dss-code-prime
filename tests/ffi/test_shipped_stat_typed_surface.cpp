@@ -86,6 +86,7 @@
 #include "core/types/type_lattice/type_registry.hpp"
 #include "ffi/shipped_lib_descriptor.hpp"
 #include "repo_root.hpp"
+#include "validation_va_list_binding.hpp"   // the descriptor word a validation read binds (c82)
 
 #include <gtest/gtest.h>
 
@@ -138,7 +139,7 @@ struct Read {
             path, interner, typeReg, rep, dm,
             arch.empty() ? std::optional<std::string_view>{}
                          : std::optional<std::string_view>{arch},
-            fmt);
+            fmt, dss::test_support::validationVaListBinding(interner));
     }
 
     [[nodiscard]] ShippedSymbol const* symbol(std::string_view name) const {
@@ -693,7 +694,6 @@ namespace {
     if (!cfg) throw std::runtime_error(dss::test::configRootDiagnostic());
     auto schema = loadShippedSchema("c");
     UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
-    builder.addSystemDir(*cfg / "shippedLibs");
     builder.setActiveFormat(fmt);
     builder.addInMemory(std::move(src), "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());

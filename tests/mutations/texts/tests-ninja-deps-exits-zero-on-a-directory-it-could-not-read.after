@@ -1,0 +1,3 @@
+    if verdict == "fatal":
+        print(shown(message))
+        return 0

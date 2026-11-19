@@ -1,0 +1,1 @@
+    return linkPositionPrecedes(candidate.place, prior.place);

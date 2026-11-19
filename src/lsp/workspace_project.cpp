@@ -1,5 +1,7 @@
 #include "lsp/workspace_project.hpp"
 
+#include "core/substrate/every_unit.hpp"      // runEveryUnit: every root, manifest and target before a refusal
+#include "core/substrate/path_identity.hpp"   // reachedKind: a manifest is an entry by what it reaches
 #include "core/types/diagnostic_reporter.hpp"
 // ★ THE ONE PROJECT-MANIFEST PARSER — now reached DOWNWARD, not across
 // (D-LSP-PROJECT-CONFIG-LIVES-ABOVE-ITS-CONSUMERS, closed 2026-08-13).
@@ -42,23 +44,41 @@ namespace dss::lsp {
 
 namespace {
 
-// Render the first diagnostic a `DiagnosticReporter`-based loader produced.
-// `project_config.cpp` routes its prose through `ParseDiagnostic::actual` (via
-// the shared `dss::report` shim), and every message it builds is already
-// prefixed with the source label — so this is the whole user-facing text.
-[[nodiscard]] std::string firstReported(DiagnosticReporter const& rep) {
-    auto const all = rep.all();
-    if (all.empty()) {
-        // The loader returned failure without reporting. That is a defect in
-        // the loader, not a state to paper over — say so rather than emit an
-        // empty reason the operator cannot act on.
-        return "the project-config loader failed without reporting a reason";
+// ★ THE LIST THE WORKSPACE IS REFUSED WITH, AND ITS NET (P69 H6c2). Every unit -- a root, a manifest, a target --
+// adds its own refusals here; the several-unit net counts them, so a unit that failed having added none is named,
+// with the reason a loader that fails without reporting used to get ("failed without reporting a reason"), under
+// the substrate-contract guard's code.
+struct RefusalList {
+    WorkspaceProjectRefusals list;
+
+    bool refuse(WorkspaceProjectErrorKind kind, std::string detail,
+                DiagnosticCode code = DiagnosticCode::D_UnknownFileExtension) {
+        list.refusals.push_back(WorkspaceProjectError{kind, std::move(detail), code});
+        return false;
     }
-    std::string out{diagnosticCodeName(all[0].code)};
-    out += ": ";
-    out += all[0].actual;
-    return out;
-}
+    // One refusal PER error a loader reported, each under its own code: every cause, never the first alone.
+    bool refuseWithEvery(WorkspaceProjectErrorKind kind, std::string const& where, DiagnosticReporter const& rep,
+                         bool keepCodes) {
+        for (auto const& d : rep.all()) {
+            if (d.severity != DiagnosticSeverity::Error) continue;
+            refuse(kind, where + std::string{diagnosticCodeName(d.code)} + ": " + d.actual,
+                   keepCodes ? d.code : DiagnosticCode::D_UnknownFileExtension);
+        }
+        return false;
+    }
+    [[nodiscard]] std::size_t count() const noexcept { return list.refusals.size(); }
+
+    // The net for the units of one step: `what(i)` names unit i, `kind` is the step's refusal kind.
+    template <class What, class Step>
+    [[nodiscard]] auto naming(WorkspaceProjectErrorKind kind, What what, Step&& step) {
+        return substrate::namingSilentFailures(
+            std::forward<Step>(step), [this] { return count(); },
+            [this, kind, what](std::size_t i) {
+                refuse(kind, what(i) + " failed without reporting a reason (a defect of the reader)",
+                       DiagnosticCode::D_CompileUnitNullNoDiagnostic);
+            });
+    }
+};
 
 // Render the first `ConfigDiagnostic` from a `LoadResult` failure.
 [[nodiscard]] std::string firstConfigDiag(
@@ -88,25 +108,64 @@ namespace {
     return out;
 }
 
-// Collect every `*.dss-project.json` directly inside `root`, sorted.
+// Why the manifests of one workspace root could not all be read.
+struct ManifestScanFailure {
+    WorkspaceProjectErrorKind kind;
+    std::string               detail;
+};
+
+// Collect every `*.dss-project.json` directly inside `root` (the caller sorts).
 // SORTED, not directory order: two developers on two filesystems must get the
 // same answer out of the same tree, and the union below only stays
 // order-independent if the inputs are.
-void collectManifests(fs::path const& root, std::vector<fs::path>& out) {
-    std::error_code ec;
-    // Non-throwing overload: an unreadable / absent root contributes nothing
-    // and is reported by the caller as "no manifest found", with the root
-    // named. Throwing here would take down the LSP message loop for a mistyped
-    // rootUri.
-    for (auto const& entry : fs::directory_iterator(root, ec)) {
-        if (!entry.is_regular_file()) continue;
-        const auto name = entry.path().filename().string();
-        if (name.size() < kProjectFileSuffix.size()) continue;
-        if (name.compare(name.size() - kProjectFileSuffix.size(),
-                         kProjectFileSuffix.size(),
-                         kProjectFileSuffix) != 0) continue;
-        out.push_back(entry.path());
+//
+// Never a throw -- that would take down the LSP message loop for a mistyped
+// rootUri. An ABSENT root contributes nothing, and the caller reports "no
+// manifest found" with the root named. Anything the substrate's walk could not
+// read is the returned FAILURE, naming it: a root that is there but cannot be
+// listed, and an entry named as a project file whose reach cannot be examined
+// (a looping link) -- a project file the editor could not read is not one it
+// may silently go without. A manifest is an entry by what it REACHES (the
+// substrate's answer, never the library's: libstdc++ on Windows calls a dangling
+// link a regular file); an entry NOT named as one is no manifest whatever it
+// reaches, so its reach is never asked.
+[[nodiscard]] std::optional<ManifestScanFailure> collectManifests(fs::path const& root,
+                                                                  std::vector<fs::path>& out) {
+    auto const named = [](fs::path const& p) {
+        std::string const name = p.filename().string();
+        return name.size() >= kProjectFileSuffix.size()
+            && name.compare(name.size() - kProjectFileSuffix.size(), kProjectFileSuffix.size(),
+                            kProjectFileSuffix) == 0;
+    };
+    std::error_code rootEc;
+    // A CONTAINER (H6c, A2): the workspace root, walked.
+    if (core::reachedKind(root, core::Use::Container, rootEc) == core::EntryKind::Absent && !rootEc)
+        return std::nullopt;
+    std::optional<ManifestScanFailure> unreadable;
+    auto const walk = core::walkTree(
+        root,
+        [&](core::TreeEntry const& entry) {
+            if (!named(entry.at.filename())) return core::WalkStep::Prune;
+            if (entry.reachError) {
+                unreadable = ManifestScanFailure{
+                    WorkspaceProjectErrorKind::ProjectFileLoadFailed,
+                    "project file `" + entry.at.spelling().display() + "` cannot be read: what it reaches cannot be "
+                        "examined (" + core::reasonText(entry.reachError) + ")"};
+                return core::WalkStep::Stop;
+            }
+            if (entry.reaches == core::EntryKind::File) out.push_back(entry.storeRoutePath);
+            return core::WalkStep::Prune;
+        },
+        core::TreeWalkOptions{.handOutUnreadableLinks = true});
+    if (unreadable) return unreadable;
+    if (walk.error) {
+        return ManifestScanFailure{
+            WorkspaceProjectErrorKind::ProjectFileNotFound,
+            "the workspace root `" + root.string() + "` could not be read: the walk stopped at `"
+                + walk.where.spelling().display() + "` (" + core::reasonText(walk.error) + "), so no `"
+                + std::string{kProjectFileSuffix} + "` project file in it could be found"};
     }
+    return std::nullopt;
 }
 
 // Does THIS platform's path type model `//authority/...` as a root name?
@@ -125,10 +184,13 @@ void collectManifests(fs::path const& root, std::vector<fs::path>& out) {
 // the round trip. Where they do not, the same text names a remote HOST, and
 // turning it into `//server/share/x` would be the guess that
 // `NonFileUriIsRefusedRatherThanGuessed` exists to refuse.
+//
+// ★★ AND IT IS ASKED OF `core::rootSpelling` SINCE P69 H6, NOT OF `root_name()`: the two Windows libraries disagree
+// (MS STL's `root_name()` of `//server/share` is `//server`, MinGW's is empty -- ✔MEASURED, the parse's header), so the
+// MinGW build refused a share URI Windows names a path by. The host's path grammar decides: a share is a root of the
+// Win32 grammar, and POSIX's `//` an implementation-defined `Authority`, no share.
 [[nodiscard]] bool platformModelsUncRoots() {
-    static bool const modelled =
-        !fs::path{"//dss-unc-probe/share"}.root_name().empty();
-    return modelled;
+    return core::rootSpelling(fs::path{"//dss-unc-probe/share"}).kind == core::RootSpelling::Kind::Share;
 }
 
 [[nodiscard]] int hexValue(char c) noexcept {
@@ -193,9 +255,12 @@ std::optional<fs::path> pathFromFileUri(std::string_view uri) {
     // ⇒ A non-empty, non-`localhost` authority is put back where it came from:
     // `//authority` + the decoded path, which is exactly what `fileUriFromPath`
     // took apart. ★ IT IS NOT A WIDENING TO "ACCEPT ANYTHING": the forward
-    // function emits an authority ONLY when the path type reports a non-empty
-    // `root_name()`, so on the platforms that never produce one this arm is
-    // unreachable and nothing changes. And the result is still a path the OS
+    // function emits an authority ONLY when the substrate's root parse reads a
+    // SHARE (`core::rootSpelling`, since P69 H6; `root_name()` before it, which is
+    // empty under MinGW, so that build both wrote the authority-discarding
+    // `file:///server/...` and refused the share coming back), and
+    // `platformModelsUncRoots` asks the SAME parse — so on a grammar with no share
+    // this arm is refused and nothing changes. And the result is still a path the OS
     // must resolve — an unreachable share fails to open, it does not silently
     // become a local file, which is the concern the old sentence was reaching
     // for.
@@ -268,11 +333,12 @@ std::optional<fs::path> pathFromFileUri(std::string_view uri) {
 //   * WINDOWS DRIVE LETTERS — `C:/dir` is `file:///C:/dir`: the URI grammar's
 //     leading slash is added here and stripped there. `:` is deliberately NOT
 //     encoded, matching what every LSP client emits;
-//   * UNC — `//server/share` is `file://server/share`, so the authority is the
-//     server rather than empty. `pathFromFileUri` refuses a non-`localhost`
-//     authority, which is correct for INBOUND (a remote host is not a local
-//     directory) and is why a UNC path round-trips to a uri but not back.
-//     Stated, not silently asymmetric.
+//   * UNC — where the host's root parse reads `//server/share` as a SHARE it is
+//     `file://server/share`, the server the authority; `pathFromFileUri` puts it
+//     back, so the trip is lossless. Where the parse reads no share (POSIX: a `//`
+//     root is a local directory), the spelling stays in the URI's PATH after an
+//     empty authority (`file:////server/share`), and a NAMED authority coming in
+//     is refused — a remote host is not a local directory.
 //
 // A path is percent-encoded UTF-8 BY DEFINITION (RFC 3986 §2.5), so the bytes
 // come from `u8string()` — the narrow `string()` would emit ACP bytes on
@@ -285,24 +351,28 @@ std::string fileUriFromPath(std::string_view path) {
 }
 
 std::string fileUriFromPath(fs::path const& path) {
-    const std::u8string u8 = path.generic_u8string();
+    // `core::genericSpellingU8`, NOT `generic_u8string()`: on the MinGW model the latter renders a share's root with a
+    // SINGLE leading slash (✔MEASURED, the substrate's header), and the URI then named a path on the local drive.
+    std::u8string u8 = core::genericSpellingU8(path);
+    // A VERBATIM text keeps its `\` as a path (the substrate's generic rule, H6c A10: under `\\?\` a `/` is a
+    // character), but a URI's PATH separates its segments by `/` alone (RFC 3986), so the encoder writes the URI
+    // grammar's separator; `pathFromFileUri` puts the verbatim form back. Only a Win32-grammar host parses one.
+    if (core::rootSpelling(path).kind == core::RootSpelling::Kind::Verbatim)
+        std::replace(u8.begin(), u8.end(), char8_t{'\\'}, char8_t{'/'});
     std::string_view bytes(reinterpret_cast<char const*>(u8.data()), u8.size());
 
     std::string out = "file://";
     // UNC: `//server/share` — the server IS the authority, so the leading
     // separator(s) are consumed by the `file://` prefix already emitted.
     //
-    // ⚠ DETECTED FROM `root_name()`, NOT from the generic string, and that is a
-    // MEASURED correction rather than a preference. This first tested
-    // `bytes[0] == '/' && bytes[1] == '/'` and produced `file:///server/...`
-    // for `//server/share/x.c`: on this toolchain `generic_u8string()` renders
-    // the UNC root with a SINGLE leading slash, so the double slash the check
-    // was looking for is not there to find. `root_name()` is the API that
-    // actually models "this path has an authority", and it survives the
-    // normalisation.
-    const std::u8string rootName = path.root_name().u8string();
-    const bool unc = rootName.size() > 1
-                  && (rootName[0] == u8'/' || rootName[0] == u8'\\');
+    // ⚠ DETECTED FROM THE ROOT'S PARSE, NOT from the bytes and NOT from `root_name()`. Testing
+    // `bytes[0] == '/' && bytes[1] == '/'` produced `file:///server/...` from `generic_u8string()`'s single slash; and
+    // `root_name()` -- the second cut -- is `//server` under MS STL, EMPTY under MinGW (so the MinGW build still wrote
+    // `file:///server/...`), and `\\?` under MS STL for `\\?\C:\x` (a URI whose authority was `?`). Since P69 H6 the
+    // substrate's `rootSpelling` decides it, one answer on every build: a SHARE gives its server as the authority; a
+    // device or verbatim prefix (`\\.\`, `\\?\`) is no authority, and its spelling stays in the URI's PATH after an
+    // empty authority (`file:////%3F/C:/x`, RFC 8089's form for a path that begins with two slashes).
+    const bool unc = core::rootSpelling(path).kind == core::RootSpelling::Kind::Share;
     if (unc) {
         // Skip however many leading separators this platform's rendering kept.
         while (!bytes.empty() && (bytes.front() == '/' || bytes.front() == '\\')) {
@@ -339,17 +409,26 @@ std::string fileUriFromPath(fs::path const& path) {
 WorkspacePreferenceResult resolveWorkspaceLanguagePreference(
     std::span<fs::path const> workspaceRoots) {
     if (workspaceRoots.empty()) {
-        return std::unexpected(WorkspaceProjectError{
+        return std::unexpected(WorkspaceProjectRefusals{{WorkspaceProjectError{
             WorkspaceProjectErrorKind::NoWorkspaceRoot,
             "the client named no workspace folder (no `workspaceFolders`, "
             "`rootUri` or `rootPath` in `initialize`), so there is no "
             "directory to look for a `" + std::string{kProjectFileSuffix}
-                + "` project file in"});
+                + "` project file in"}}});
     }
 
+    RefusalList           refused;
     std::vector<fs::path> manifests;
-    for (auto const& root : workspaceRoots) collectManifests(root, manifests);
+    static_cast<void>(substrate::runEveryUnit(
+        workspaceRoots.size(),
+        refused.naming(WorkspaceProjectErrorKind::ProjectFileNotFound,
+                       [&](std::size_t r) { return "the workspace root `" + workspaceRoots[r].string() + "`"; },
+                       [&](std::size_t r) {
+                           auto failure = collectManifests(workspaceRoots[r], manifests);
+                           return !failure || refused.refuse(failure->kind, std::move(failure->detail));
+                       })));
     std::sort(manifests.begin(), manifests.end());
+    if (manifests.empty() && refused.count() != 0) return std::unexpected(std::move(refused.list));
 
     if (manifests.empty()) {
         std::string roots;
@@ -357,18 +436,25 @@ WorkspacePreferenceResult resolveWorkspaceLanguagePreference(
             if (!roots.empty()) roots += ", ";
             roots += r.string();
         }
-        return std::unexpected(WorkspaceProjectError{
+        return std::unexpected(WorkspaceProjectRefusals{{WorkspaceProjectError{
             WorkspaceProjectErrorKind::ProjectFileNotFound,
             "no `" + std::string{kProjectFileSuffix} + "` project file was "
             "found directly inside the workspace root(s) [" + roots
                 + "]; without one the editor has no compile target and cannot "
-                  "choose between languages that claim the same file extension"});
+                  "choose between languages that claim the same file extension"}}});
     }
 
     WorkspaceLanguagePreference pref;
     pref.projectFiles = manifests;
 
-    for (auto const& manifest : manifests) {
+    // EVERY manifest, and every target of each, is read before the workspace is
+    // refused (the one home), each failed one a refusal of the list.
+    static_cast<void>(substrate::runEveryUnit(
+        manifests.size(),
+        refused.naming(WorkspaceProjectErrorKind::ProjectFileLoadFailed,
+                       [&](std::size_t m) { return "project file `" + manifests[m].string() + "`"; },
+                       [&](std::size_t m) {
+        fs::path const& manifest = manifests[m];
         // ★ THE SHARED PARSER, NOT A SECOND READER. Its closed key vocabulary,
         // its required-field rules and its diagnostics are the compiler's — an
         // editor that accepted a manifest the compiler rejects (or vice versa)
@@ -376,45 +462,51 @@ WorkspacePreferenceResult resolveWorkspaceLanguagePreference(
         DiagnosticReporter rep;
         auto cfg = loadProjectConfig(manifest, rep);
         if (!cfg.has_value()) {
-            return std::unexpected(WorkspaceProjectError{
-                WorkspaceProjectErrorKind::ProjectFileLoadFailed,
-                "project file `" + manifest.string() + "` could not be loaded — "
-                    + firstReported(rep)});
+            return refused.refuseWithEvery(WorkspaceProjectErrorKind::ProjectFileLoadFailed,
+                                           "project file `" + manifest.string() + "` could not be loaded — ", rep,
+                                           /*keepCodes=*/false);
         }
 
-        for (auto const& spec : cfg->targets) {
+        return substrate::runEveryUnit(
+            cfg->targets.size(),
+            refused.naming(WorkspaceProjectErrorKind::TargetConfigLoadFailed,
+                           [&](std::size_t s) {
+                               return "target `" + cfg->targets[s] + "` of project file `" + manifest.string() + "`";
+                           },
+                           [&](std::size_t s) {
+            std::string const& spec = cfg->targets[s];
             // ★ THE DRIVER'S OWN SPLITTER. `<targetName>:<formatName>` is the
             // driver's convention and `TargetSpec::parse` is where it lives,
             // including the four remediation-distinct rejection modes.
             auto parsed = TargetSpec::parse(spec);
             if (!parsed.has_value()) {
-                return std::unexpected(WorkspaceProjectError{
+                return refused.refuse(
                     WorkspaceProjectErrorKind::TargetSpecMalformed,
                     "project file `" + manifest.string() + "` declares target `"
                         + spec + "` which is not a `<targetName>:<formatName>` "
                         "spec ("
-                        + std::string{targetSpecErrorName(parsed.error())} + ")"});
+                        + std::string{targetSpecErrorName(parsed.error())} + ")");
             }
 
             auto target = TargetSchema::loadShipped(parsed->targetName);
             if (!target.has_value()) {
-                return std::unexpected(WorkspaceProjectError{
+                return refused.refuse(
                     WorkspaceProjectErrorKind::TargetConfigLoadFailed,
                     "project file `" + manifest.string() + "` declares target `"
                         + parsed->targetName
                         + "` whose `<name>.target.json` could not be loaded — "
-                        + firstConfigDiag(target.error())});
+                        + firstConfigDiag(target.error()));
             }
 
             const auto language = (*target)->defaultAssemblyLanguage();
             if (language.empty()) {
-                return std::unexpected(WorkspaceProjectError{
+                return refused.refuse(
                     WorkspaceProjectErrorKind::TargetDeclaresNoAssemblyLanguage,
                     "target `" + parsed->targetName + "` (declared by project "
                         "file `" + manifest.string() + "`) declares no "
                         "`defaultAssemblyLanguage`, so it cannot say which "
                         "source language spells its assembly; add the key to "
-                        "its `.target.json`"});
+                        "its `.target.json`");
             }
 
             // Dedup by NAME: two targets that prefer the SAME language are not
@@ -424,9 +516,11 @@ WorkspacePreferenceResult resolveWorkspaceLanguagePreference(
                 == pref.languages.end()) {
                 pref.languages.emplace_back(language);
             }
-        }
-    }
+            return true;
+        }));
+    })));
 
+    if (refused.count() != 0) return std::unexpected(std::move(refused.list));
     return pref;
 }
 
@@ -453,11 +547,15 @@ std::string describeUnresolvedSchema(
         out += joinNames(preference->languages);
         out += "].";
     } else {
-        out += " The workspace could not name a preferred language [";
-        out += workspaceProjectErrorName(preference.error().kind);
-        out += "]: ";
-        out += preference.error().detail;
-        out += '.';
+        // Every refusal, in the list's order: the workspace is refused with every reason, and the message says each.
+        out += " The workspace could not name a preferred language:";
+        for (auto const& refusal : preference.error().refusals) {
+            out += " [";
+            out += workspaceProjectErrorName(refusal.kind);
+            out += "]: ";
+            out += refusal.detail;
+            out += '.';
+        }
     }
     return out;
 }
@@ -466,27 +564,9 @@ std::string describeUnresolvedSchema(
 
 namespace {
 
-// The first diagnostic a loader reported: its code, and the "CODE: text" the
-// operator reads. A loader that failed WITHOUT reporting is a loader defect and
-// says so under `fallback` rather than producing an empty reason.
-struct ReportedCause {
-    DiagnosticCode code;
-    std::string    text;
-};
-
-[[nodiscard]] ReportedCause firstCause(DiagnosticReporter const& rep,
-                                       DiagnosticCode            fallback) {
-    auto const all = rep.all();
-    if (all.empty()) {
-        return {fallback, "the loader failed without reporting a reason"};
-    }
-    return {all[0].code, std::string{diagnosticCodeName(all[0].code)} + ": "
-                             + all[0].actual};
-}
-
-[[nodiscard]] std::unexpected<WorkspaceProjectError>
+[[nodiscard]] std::unexpected<WorkspaceProjectRefusals>
 refusal(WorkspaceProjectErrorKind kind, DiagnosticCode code, std::string detail) {
-    return std::unexpected(WorkspaceProjectError{kind, std::move(detail), code});
+    return std::unexpected(WorkspaceProjectRefusals{{WorkspaceProjectError{kind, std::move(detail), code}}});
 }
 
 // A manifest `includes` entry, resolved by the BUILD's own two steps: THE one
@@ -500,7 +580,7 @@ refusal(WorkspaceProjectErrorKind kind, DiagnosticCode code, std::string detail)
                                         std::string const& entry) {
     fs::path const p{resolveManifestPathSpelling(manifestDir, entry)};
     std::error_code ec;
-    fs::path const abs = core::absoluteKeepingRoot(p, ec);
+    fs::path const abs = core::storeRouteAbsolute(p, ec);   // the include search's store route (H6d)
     return ec ? p : abs;
 }
 
@@ -514,9 +594,20 @@ WorkspaceBuildResult resolveWorkspaceBuild(
                        "the client named no workspace folder, so there is no "
                        "project file to read a build configuration from");
     }
+    RefusalList           refused;
     std::vector<fs::path> manifests;
-    for (auto const& root : workspaceRoots) collectManifests(root, manifests);
+    static_cast<void>(substrate::runEveryUnit(
+        workspaceRoots.size(),
+        refused.naming(WorkspaceProjectErrorKind::ProjectFileNotFound,
+                       [&](std::size_t r) { return "the workspace root `" + workspaceRoots[r].string() + "`"; },
+                       [&](std::size_t r) {
+                           auto failure = collectManifests(workspaceRoots[r], manifests);
+                           return !failure
+                               || refused.refuse(failure->kind, std::move(failure->detail),
+                                                 DiagnosticCode::D_DirectoryScanFailed);
+                       })));
     std::sort(manifests.begin(), manifests.end());
+    if (manifests.empty() && refused.count() != 0) return std::unexpected(std::move(refused.list));
     if (manifests.empty()) {
         return refusal(WorkspaceProjectErrorKind::ProjectFileNotFound,
                        DiagnosticCode::D_UnknownFileExtension,
@@ -525,16 +616,22 @@ WorkspaceBuildResult resolveWorkspaceBuild(
                              "root(s), so no build configuration exists");
     }
 
+    // EVERY manifest, and every target of each, is read before the workspace is
+    // refused (the one home), each failed one a refusal of the list, and every
+    // cause of a `sources[]` expansion one refusal each, under its own code.
     WorkspaceBuild build;
-    for (auto const& manifest : manifests) {
-        std::string const where = "project file `" + manifest.string() + "`";
+    static_cast<void>(substrate::runEveryUnit(
+        manifests.size(),
+        refused.naming(WorkspaceProjectErrorKind::ProjectFileLoadFailed,
+                       [&](std::size_t i) { return "project file `" + manifests[i].string() + "`"; },
+                       [&](std::size_t i) {
+        fs::path const&   manifest = manifests[i];
+        std::string const where    = "project file `" + manifest.string() + "`";
         DiagnosticReporter rep;
         auto cfg = loadProjectConfig(manifest, rep);
         if (!cfg.has_value()) {
-            auto const cause = firstCause(rep, DiagnosticCode::D_SchemaLoadFailed);
-            return refusal(WorkspaceProjectErrorKind::ProjectFileLoadFailed,
-                           cause.code,
-                           where + " could not be loaded — " + cause.text);
+            return refused.refuseWithEvery(WorkspaceProjectErrorKind::ProjectFileLoadFailed,
+                                           where + " could not be loaded — ", rep, /*keepCodes=*/true);
         }
         fs::path const dir = manifest.parent_path();
 
@@ -550,58 +647,58 @@ WorkspaceBuildResult resolveWorkspaceBuild(
         // against the manifest's directory (see `includeDirs` in the header).
         DiagnosticReporter sourcesRep;
         auto files = expandAndDedupProjectSources(cfg->sources, dir, sourcesRep);
-        if (!files.has_value()) {
-            auto const cause =
-                firstCause(sourcesRep, DiagnosticCode::D_FileNotFound);
-            return refusal(WorkspaceProjectErrorKind::SourcesUnresolved,
-                           cause.code,
-                           where + " names sources the build cannot find — "
-                               + cause.text);
-        }
-        m.sources.reserve(files->size());
-        for (auto const& f : *files) {
-            m.sources.push_back(core::PathIdentity::of(fs::path{f}));
+        bool const sourcesOk = files.has_value()
+            || refused.refuseWithEvery(WorkspaceProjectErrorKind::SourcesUnresolved,
+                                       where + " names sources the build cannot find — ", sourcesRep,
+                                       /*keepCodes=*/true);
+        if (files.has_value()) {
+            m.sources.reserve(files->size());
+            for (auto const& f : *files) {
+                m.sources.push_back(core::PathIdentity::of(fs::path{f}, core::Use::Leaf));   // a source FILE
+            }
         }
 
-        for (auto const& spec : cfg->targets) {
+        bool const targetsOk = substrate::runEveryUnit(
+            cfg->targets.size(),
+            refused.naming(WorkspaceProjectErrorKind::TargetConfigLoadFailed,
+                           [&](std::size_t s) { return "target `" + cfg->targets[s] + "` of " + where; },
+                           [&](std::size_t s) {
+            std::string const& spec = cfg->targets[s];
             auto parsed = TargetSpec::parse(spec);
             if (!parsed.has_value()) {
-                return refusal(WorkspaceProjectErrorKind::TargetSpecMalformed,
-                               DiagnosticCode::D_InvalidTargetSpec,
-                               where + " declares target `" + spec
-                                   + "` which is not a `<targetName>:<formatName>` "
-                                     "spec ("
-                                   + std::string{targetSpecErrorName(parsed.error())}
-                                   + ")");
+                return refused.refuse(WorkspaceProjectErrorKind::TargetSpecMalformed,
+                                      where + " declares target `" + spec
+                                          + "` which is not a `<targetName>:<formatName>` "
+                                            "spec ("
+                                          + std::string{targetSpecErrorName(parsed.error())}
+                                          + ")",
+                                      DiagnosticCode::D_InvalidTargetSpec);
             }
             auto target = TargetSchema::loadShipped(parsed->targetName);
             if (!target.has_value()) {
-                return refusal(WorkspaceProjectErrorKind::TargetConfigLoadFailed,
-                               DiagnosticCode::D_SchemaLoadFailed,
-                               where + " declares target `" + parsed->targetName
-                                   + "` whose `<name>.target.json` could not be "
-                                     "loaded — "
-                                   + firstConfigDiag(target.error()));
+                return refused.refuse(WorkspaceProjectErrorKind::TargetConfigLoadFailed,
+                                      where + " declares target `" + parsed->targetName
+                                          + "` whose `<name>.target.json` could not be "
+                                            "loaded — "
+                                          + firstConfigDiag(target.error()),
+                                      DiagnosticCode::D_SchemaLoadFailed);
             }
             auto format = ObjectFormatSchema::loadShipped(parsed->formatName);
             if (!format.has_value()) {
-                return refusal(WorkspaceProjectErrorKind::FormatConfigLoadFailed,
-                               DiagnosticCode::D_SchemaLoadFailed,
-                               where + " declares format `" + parsed->formatName
-                                   + "` whose `<name>.format.json` could not be "
-                                     "loaded — "
-                                   + firstConfigDiag(format.error()));
+                return refused.refuse(WorkspaceProjectErrorKind::FormatConfigLoadFailed,
+                                      where + " declares format `" + parsed->formatName
+                                          + "` whose `<name>.format.json` could not be "
+                                            "loaded — "
+                                          + firstConfigDiag(format.error()),
+                                      DiagnosticCode::D_SchemaLoadFailed);
             }
             DiagnosticReporter abiRep;
             auto abi = ffi::resolveAbi(**target, **format, abiRep);
             if (!abi.has_value()) {
-                auto const cause =
-                    firstCause(abiRep, DiagnosticCode::F_AbiUnknownTuple);
-                return refusal(WorkspaceProjectErrorKind::CallingConventionUnresolved,
-                               cause.code,
-                               where + " declares target `" + spec
-                                   + "`, for which no calling convention "
-                                     "resolves — " + cause.text);
+                return refused.refuseWithEvery(WorkspaceProjectErrorKind::CallingConventionUnresolved,
+                                               where + " declares target `" + spec
+                                                   + "`, for which no calling convention resolves — ",
+                                               abiRep, /*keepCodes=*/true);
             }
             WorkspaceBuildTarget t;
             t.spec              = spec;
@@ -609,9 +706,13 @@ WorkspaceBuildResult resolveWorkspaceBuild(
             t.target            = std::move(*target);
             t.format            = std::move(*format);
             m.targets.push_back(std::move(t));
-        }
+            return true;
+        }));
+        if (!sourcesOk || !targetsOk) return false;
         build.manifests.push_back(std::move(m));
-    }
+        return true;
+    })));
+    if (refused.count() != 0) return std::unexpected(std::move(refused.list));
     return build;
 }
 
@@ -646,7 +747,7 @@ DocumentBuildSelection selectDocumentConfigurations(
     // stored identities, and the document's path is reduced the same way.
     std::vector<WorkspaceBuildManifest const*> chosen;
     if (documentPath.has_value()) {
-        auto const id = core::PathIdentity::of(*documentPath);
+        auto const id = core::PathIdentity::of(*documentPath, core::Use::Leaf);   // the document, a FILE
         for (auto const& m : build.manifests) {
             if (std::find(m.sources.begin(), m.sources.end(), id)
                 != m.sources.end()) {

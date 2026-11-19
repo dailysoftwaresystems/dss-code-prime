@@ -1,0 +1,1 @@
+    return arith.has_value() ? integerPromotedType(in, t, *arith) : t;

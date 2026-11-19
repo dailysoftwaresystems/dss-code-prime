@@ -1,0 +1,1 @@
+    auto const     reached = fs::status(at, ec).type();

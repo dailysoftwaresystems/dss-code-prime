@@ -1,0 +1,2 @@
+                    ++cacheStats().scopeHits;   // read once in this scope: no second read
+                    return &it->second;

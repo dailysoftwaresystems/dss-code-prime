@@ -1,0 +1,1 @@
+_Static_assert((constexpr struct S){ .t = { 42 } }.t.v == 42, "");

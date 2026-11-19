@@ -1,0 +1,2 @@
+    return namedConstantRead(s.lattice.interner(), *initExpr, rec.scope.v, rec.type,
+                             s.charIsUnsigned);

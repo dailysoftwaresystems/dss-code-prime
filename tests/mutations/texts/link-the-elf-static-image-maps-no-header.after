@@ -1,0 +1,2 @@
+        appendPhdr(pFlags1, hText.offset, secText->virtualAddress, seg1FileEnd - hText.offset,
+                   seg1FileEnd - hText.offset,

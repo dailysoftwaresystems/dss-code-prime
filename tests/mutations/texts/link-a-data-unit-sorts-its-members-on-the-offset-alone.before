@@ -1,0 +1,3 @@
+                      auto const oa = dataItems[a].inputSection->offset;
+                      auto const ob = dataItems[b].inputSection->offset;
+                      return oa != ob ? oa < ob : a < b;

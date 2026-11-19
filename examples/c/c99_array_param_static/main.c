@@ -60,6 +60,14 @@ int sumcs(int a[const static 3]) { return a[0] + a[1] + a[2]; }
 int gstar(int a[*]);
 int gstar(int a[3]) { return a[0] + a[1] + a[2]; }
 
+// An INNER `[*]` (P69, lane `cs`): the prototype's parameter is a pointer to an array of
+// unspecified size, the definition gives the row its bound, and a caller passes a fixed
+// `int[2][3]`. ✔MEASURED 2026-10-15 (lane `cs` probe vm cell 8): gcc 13.3.0 and clang 18.1.3
+// build and RUN this shape at -O0 (exit 42). The callee indexes with the DEFINITION's stride,
+// so the prototype's withheld bound never reaches an index.
+int growstar(int n, int a[n][*]);
+int growstar(int n, int a[n][3]) { return a[1][2] + n; }
+
 int main(void) {
     int x[3];
     x[0] = 40;
@@ -71,6 +79,9 @@ int main(void) {
     if (firstc(x)  != 40) return 3;   // int a[const 3]
     if (sumcs(x)   != 42) return 4;   // int a[const static 3]
     if (gstar(x)   != 42) return 5;   // int a[*]             (unspecified-size marker)
+
+    int y[2][3] = {{0, 0, 0}, {0, 0, 40}};
+    if (growstar(2, y) != 42) return 6;   // int a[n][*]      (an inner unspecified size)
 
     return 42;
 }

@@ -144,7 +144,7 @@ struct Pipeline {
             mb.addReturn(acc);
         })};
     if (schema == nullptr) { ADD_FAILURE() << "null schema"; return p; }
-    p.lir = lowerToLir(p.synth.mir, *schema, p.synth.interner, p.reporter);
+    p.lir = lowerToLir(p.synth.mir, *schema, p.synth.interner, p.reporter, ccIndex);
     if (!p.lir.ok) {
         ADD_FAILURE() << "MIR->LIR lowering failed";
         return p;

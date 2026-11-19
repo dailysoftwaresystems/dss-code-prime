@@ -1,0 +1,3 @@
+                                    bool const owns = out.effect == owner;
+                                    if (!row.contains(key)) {
+                                        if (false && owns) {

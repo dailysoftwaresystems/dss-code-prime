@@ -8,6 +8,7 @@
 #include "link/object_format_schema.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 // PE/COFF relocatable object (.obj) writer — plan 14 LK2 cycle 1.
@@ -47,7 +48,9 @@ namespace dss::pe {
 // The request's RUNPATHS are accepted and recorded nowhere — PE declares no
 // runpath carrier, and the linker gate's warning says so; the entry refusal in
 // `enforceImageRequest` still applies here (D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH).
-[[nodiscard]] DSS_EXPORT std::vector<std::uint8_t>
+// ★ P69 (lane `cs`, fold f26e -- B1): `nullopt` is the walker's REFUSAL, every reason already reported (a
+// fresh symbol id the import-slot residue runner could not take among them); an engaged value is the bytes.
+[[nodiscard]] DSS_EXPORT std::optional<std::vector<std::uint8_t>>
 encode(AssembledModule const&    module,
        TargetSchema const&       targetSchema,
        ObjectFormatSchema const& objectFormatSchema,

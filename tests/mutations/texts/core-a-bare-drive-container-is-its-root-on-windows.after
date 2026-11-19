@@ -1,0 +1,1 @@
+    bool const appended  = container && !separatesIn(plain.back(), PathGrammar::Win32, false);

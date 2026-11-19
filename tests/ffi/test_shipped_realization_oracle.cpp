@@ -78,7 +78,9 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
+#include <cctype>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -151,7 +153,7 @@ using dss::ffi_test::FixtureRoleResolver;
     // descriptor is silently absent — the shape that once made `abort` link and
     // `putchar` not. Any consistent stand-in works; nothing here reads the id.
     std::array<NamedTypeBinding, 1> const named{
-        NamedTypeBinding{"va_list",
+        NamedTypeBinding{dss::ffi::kVaListDescriptorTypeName,
                          interner.pointer(interner.primitive(TypeKind::Void))}};
     FixtureRoleResolver const roles{fmt};
     auto const realized = realizeShippedExternSymbols(
@@ -580,8 +582,9 @@ TEST(ShippedRealizationOracle, RemovingOneLibraryKeyIsCaughtOnTheHandDeclaredPat
 // decided by corpus relPath order, on rows the user never wrote.
 //
 // ✔MEASURED on the shipped corpus: no choice is made there today (only
-// `stdio.json` and `threads.json` carry `synthesize` rows and nothing on either
-// surface is declared twice), which is exactly why the pin BUILDS the second
+// `threads.json` carries `synthesize` rows — stdio.json's went when P69 made the pe
+// printf family DSS's runtime source — and nothing on its surface is declared
+// twice), which is exactly why the pin BUILDS the second
 // declaring descriptor instead of waiting for the corpus to grow one — a latent
 // order-dependence is still an order-dependence.
 //
@@ -592,8 +595,9 @@ TEST(ShippedRealizationOracle, RemovingOneLibraryKeyIsCaughtOnTheHandDeclaredPat
 
 namespace {
 
-// TWO rows: a pe `synthesize` recipe (`printf` — a real id from the closed recipe
-// vocabulary, since the reader refuses an unknown one at read time) and ONE
+// TWO rows: a pe `synthesize` recipe (`thrd_yield` — a real id from the closed recipe
+// vocabulary, since the reader refuses an unknown one at read time; it was `printf`
+// until P69 retired the stdio recipes) and ONE
 // ordinary COMPANION row whose pe image is the caller's. The recipe rows are
 // IDENTICAL across both descriptors on purpose: step (2b) must stay silent, so
 // anything the run reports comes from the companion surface alone.
@@ -601,8 +605,8 @@ namespace {
                                        char const* companionImage) {
     return std::string{R"({ "header": ")"} + header
          + R"(", "library": { "pe": "shared.dll" }, "symbols": [ )"
-         + R"({ "name": "printf", "signature": "fn(ptr<char>, ...) -> i32", )"
-         + R"("availableObjectFormats": ["pe"], "synthesize": "printf" }, )"
+         + R"({ "name": "thrd_yield", "signature": "fn() -> void", )"
+         + R"("availableObjectFormats": ["pe"], "synthesize": "thrd_yield" }, )"
          + R"({ "name": "dupcore", "signature": "fn(i32) -> i32", )"
          + R"("availableObjectFormats": ["pe"], "library": { "pe": ")"
          + companionImage + R"(" } } ] })";
@@ -611,7 +615,7 @@ namespace {
 } // namespace
 
 TEST(ShippedRealizationOracle, ShimCompanionSurfaceDivergenceIsRefused) {
-    // Both arms: `printf` resolves to the SAME recipe with the SAME image, so the
+    // Both arms: `thrd_yield` resolves to the SAME recipe with the SAME image, so the
     // requested-name rule (2b) has nothing to say. Only `dupcore` — a row the
     // caller never asked about and would import anyway — diverges.
     for (bool alphaFirst : {true, false}) {
@@ -627,17 +631,17 @@ TEST(ShippedRealizationOracle, ShimCompanionSurfaceDivergenceIsRefused) {
         if (::testing::Test::HasFatalFailure()) return;
 
         DiagnosticReporter rep;
-        OracleRun const r = ask(dir.path(), {"printf"}, ObjectFormatKind::Pe,
+        OracleRun const r = ask(dir.path(), {"thrd_yield"}, ObjectFormatKind::Pe,
                                 DataModel::Llp64, rep);
         ASSERT_TRUE(r.located) << "the synthetic corpus was not located at all";
-        ASSERT_TRUE(r.row.has_value()) << "'printf' vanished from the answer";
+        ASSERT_TRUE(r.row.has_value()) << "'thrd_yield' vanished from the answer";
         ASSERT_EQ(r.row->status, ShippedRealizationStatus::Realized);
         ASSERT_FALSE(r.row->recipeId.empty())
-            << "'printf' did not resolve to a SHIM row, so the companion-surface "
+            << "'thrd_yield' did not resolve to a SHIM row, so the companion-surface "
                "path this test is about was never reached — re-point the fixture, "
                "do not delete the test";
         EXPECT_GT(r.conflicts, 0u)
-            << "two descriptors both realize the `printf` recipe and name two "
+            << "two descriptors both realize the `thrd_yield` recipe and name two "
                "different pe images for the companion `dupcore` the shim body "
                "would call — whichever descriptor the surface fetch picked would "
                "have decided that import silently, by relPath sort";
@@ -663,7 +667,7 @@ TEST(ShippedRealizationOracle, AgreeingShimCompanionSurfacesAreAccepted) {
 
     DiagnosticReporter rep;
     OracleRun const r =
-        ask(dir.path(), {"printf"}, ObjectFormatKind::Pe, DataModel::Llp64, rep);
+        ask(dir.path(), {"thrd_yield"}, ObjectFormatKind::Pe, DataModel::Llp64, rep);
     ASSERT_TRUE(r.located);
     EXPECT_EQ(r.conflicts, 0u)
         << "two descriptors mirroring one shim surface byte-identically were "
@@ -705,4 +709,80 @@ TEST(ShippedRealizationOracle, ANonShimRequestDoesNotHoldTheWholeSurface) {
            "read only because it declares 'agreed', was refused — the "
            "hand-declared path is now STRICTER than `#include`, which is this "
            "defect re-introduced by its own fix: " << r.firstMessage;
+}
+
+// ★ THE RECIPES' COMPANION REFUSALS COME IN RECIPE-NAME ORDER (P69 fold 3f). Step (4) walks the names
+// it answered and reports each recipe's companion disagreement as the walk meets it; the answer is a
+// hash table, so walking it put the refusals in the order the C++ library that built DSS hashes the
+// names. Every pe recipe row the shipped threads.json declares is mirrored by two descriptors of its
+// own that disagree on one companion of its own; the names are asked in an order that is neither
+// ascending nor descending, and the refusals must name the companions in the recipes' ascending order.
+TEST(ShippedRealizationOracle, ShimCompanionRefusalsComeInRecipeNameOrder) {
+    auto const cfg = dss::test::findConfigRoot();
+    ASSERT_TRUE(cfg.has_value()) << dss::test::configRootDiagnostic();
+    nlohmann::json threads;
+    {
+        std::ifstream in{*cfg / "shippedLibs" / "threads.json", std::ios::binary};
+        ASSERT_TRUE(in.good()) << "threads.json, the recipes' corpus, was not found";
+        threads = nlohmann::json::parse(in, nullptr, false);
+    }
+    ASSERT_FALSE(threads.is_discarded());
+    ASSERT_TRUE(threads.contains("symbols") && threads.at("symbols").is_array());
+    std::vector<nlohmann::json> recipes;   // the pe recipe rows, as the corpus writes them
+    for (auto const& row : threads.at("symbols")) {
+        if (!row.is_object() || !row.contains("synthesize")) continue;
+        nlohmann::json const formats = row.value("availableObjectFormats", nlohmann::json::array());
+        if (std::find(formats.begin(), formats.end(), nlohmann::json("pe")) == formats.end()) continue;
+        recipes.push_back(row);
+    }
+    ASSERT_GE(recipes.size(), 3u) << "too few pe recipes for a walk's order to be seen";
+
+    ScratchDir dir{Location::Temp, "oracle-shim-recipe-order"};
+    fs::path const libs = shippedLibsDirOf(dir);
+    std::vector<std::string> ascending;
+    for (auto const& row : recipes) {
+        std::string const name = row.at("name").get<std::string>();
+        ascending.push_back(name);
+        for (std::string const side : {"alpha", "beta"}) {
+            nlohmann::json companion = nlohmann::json::object();
+            companion["name"] = "companion_" + name;
+            companion["signature"] = "fn(i32) -> i32";
+            companion["availableObjectFormats"] = nlohmann::json::array({"pe"});
+            companion["library"] = nlohmann::json::object({{"pe", "core-" + side + ".dll"}});
+            nlohmann::json doc = nlohmann::json::object();
+            doc["header"] = name + "_" + side + ".h";
+            doc["library"] = nlohmann::json::object({{"pe", "shared.dll"}});
+            doc["symbols"] = nlohmann::json::array({row, companion});
+            writeDesc(libs, (name + "_" + side + ".json").c_str(), doc.dump(2));
+            if (::testing::Test::HasFatalFailure()) return;
+        }
+    }
+    std::sort(ascending.begin(), ascending.end());
+    // Asked from the middle outward, alternating: neither ascending nor descending, so neither a walk
+    // in the order asked nor one in its reverse reads as the order wanted.
+    std::vector<std::string> asked;
+    std::size_t const mid = ascending.size() / 2;
+    for (std::size_t k = 0; asked.size() < ascending.size(); ++k) {
+        if (mid + k < ascending.size()) asked.push_back(ascending[mid + k]);
+        if (k < mid) asked.push_back(ascending[mid - 1 - k]);
+    }
+
+    DiagnosticReporter rep;
+    OracleRun const r = ask(dir.path(), asked, ObjectFormatKind::Pe, DataModel::Llp64, rep);
+    ASSERT_TRUE(r.located) << "the synthetic corpus was not located at all";
+    std::string const lead = "companion_";
+    std::vector<std::string> refused;   // the recipe whose companion each refusal names, in report order
+    for (auto const& d : rep.all()) {
+        if (d.code != DiagnosticCode::F_ShippedCorpusInvariantBroken) continue;
+        auto const at = d.actual.find(lead);
+        if (at == std::string::npos) continue;
+        auto end = at + lead.size();
+        while (end < d.actual.size()
+               && (std::isalnum(static_cast<unsigned char>(d.actual[end])) != 0 || d.actual[end] == '_'))
+            ++end;
+        std::string const recipe = d.actual.substr(at + lead.size(), end - at - lead.size());
+        if (refused.empty() || refused.back() != recipe) refused.push_back(recipe);
+    }
+    EXPECT_EQ(refused, ascending)
+        << "the recipes' companion refusals are not reported in ascending recipe name";
 }

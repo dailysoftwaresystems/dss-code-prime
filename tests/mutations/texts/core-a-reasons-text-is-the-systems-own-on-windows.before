@@ -1,0 +1,1 @@
+             + (text.empty() ? std::string{"<no message text for this code>"} : wtf8Of(text));

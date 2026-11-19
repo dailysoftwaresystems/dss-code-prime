@@ -8,6 +8,7 @@
 #include "mir/mir_asm_descriptor.hpp"
 #include "core/types/section_kind.hpp"
 #include "mir/mir_text.hpp"
+#include "link_facts.hpp"   // linkageOf (P69: a weak MIR definition states its kind)
 
 #include <gtest/gtest.h>
 
@@ -16,6 +17,7 @@
 #include <cstdint>
 #include <format>
 #include <limits>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -60,7 +62,7 @@ TEST(MirText, EmptyModuleRoundTrips) {
     DiagnosticReporter r;
     MirTextContext ctx{&ti};
     std::string out = emitMir(m, ctx, r);
-    EXPECT_NE(out.find("dssir 3"), std::string::npos);
+    EXPECT_NE(out.find("dssir 8"), std::string::npos);
     EXPECT_NE(out.find("module {"), std::string::npos);
 }
 
@@ -289,7 +291,7 @@ TEST(MirText, MalformedHeaderEmitsMalformedDiagnostic) {
 
 TEST(MirText, EmptyModuleParseRoundTripsToEmpty) {
     DiagnosticReporter r;
-    auto res = parseMir("dssir 3\nmodule { }\n", CompilationUnitId{1}, r);
+    auto res = parseMir("dssir 8\nmodule { }\n", CompilationUnitId{1}, r);
     EXPECT_TRUE(res->ok);
     EXPECT_EQ(res->mir.moduleFuncCount(), 0u);
 }
@@ -452,7 +454,7 @@ TEST(MirText, AVoidParameterIsSpelledAndReadDistinctFromNoParameter) {
 // diagnostics from the rest of the input).
 TEST(MirText, MissingFunctionLBraceDoesNotCascade) {
     std::string text =
-        "dssir 3\n"
+        "dssir 8\n"
         "symbols { %1 \"f\" }\n"
         "module {\n"
         "  function %1 : fn() -> i32\n"   // <-- missing `{`
@@ -480,7 +482,7 @@ TEST(MirText, MalformedNumericLiteralEmitsDiagnostic) {
     // Integer-but-out-of-range case (e.g. 9999999999999999999 as int32),
     // parseNumber emits the malformed diagnostic. Use that case:
     std::string text =
-        "dssir 3\n"
+        "dssir 8\n"
         "symbols { %1 \"f\" }\n"
         "module {\n"
         "  function %1 : fn() -> i32 {\n"
@@ -560,8 +562,9 @@ TEST(MirText, FunctionAttributesSurviveRoundTrip) {
     MirBlockId e2 = b.createBlock(StructCfMarker::EntryBlock);
     b.beginBlock(e2); b.addReturn();
     // %3 — weak, NOT noinline: proves the flags are independent, not one bit.
-    (void)b.addFunction(fnSig, SymbolId{3}, SymbolBinding::Weak,
-                        SymbolVisibility::Default, /*noInline=*/false);
+    (void)b.addFunction(fnSig, SymbolId{3},
+                        dss::test_support::linkageOf(SymbolBinding::Weak),
+                        /*noInline=*/false);
     MirBlockId e3 = b.createBlock(StructCfMarker::EntryBlock);
     b.beginBlock(e3); b.addReturn();
     // %4 — everything default: must round-trip with NO attribute list.
@@ -938,7 +941,7 @@ TEST(MirText, NoSanitizeThreadAttributeSurvivesRoundTrip) {
 // permissive direction is closed by construction.
 TEST(MirText, UnknownFunctionAttributeIsMalformed) {
     char const* text =
-        "dssir 3\n"
+        "dssir 8\n"
         "module {\n"
         "  function %1 : fn() -> void [frobnicate] {\n"
         "    block %b0 [entry] {\n"
@@ -1170,17 +1173,17 @@ TEST(MirText, StaticInitScheduleSurvivesRoundTripWithItsPriority) {
 TEST(MirTextParse, TruncatedOperandListIsRefusedRatherThanLoopingForever) {
     struct Case { char const* name; char const* text; };
     Case const cases[] = {
-        {"tuple",  "dssir 3\nmodule {\n  global %1 : tuple<i32"},
+        {"tuple",  "dssir 8\nmodule {\n  global %1 : tuple<i32"},
         // v1's inline composite, refused at its head since v2 and still consumed.
-        {"struct", "dssir 3\nmodule {\n  global %1 : struct \"S\" { i32"},
-        {"union",  "dssir 3\nmodule {\n  global %1 : union \"U\" { i32"},
+        {"struct", "dssir 8\nmodule {\n  global %1 : struct \"S\" { i32"},
+        {"union",  "dssir 8\nmodule {\n  global %1 : union \"U\" { i32"},
         // v2's `types` table: a truncated entry, and a truncated section.
-        {"types-struct",  "dssir 3\ntypes {\n  type 1 = struct \"S\" { i32"},
-        {"types-union",   "dssir 3\ntypes {\n  type 1 = union \"U\" { i32, "},
-        {"types-section", "dssir 3\ntypes {\n  type 1 = struct \"S\" {i32}\n"},
-        {"types-head",    "dssir 3\ntypes {\n  type 1 = struct"},
-        {"fn",     "dssir 3\nmodule {\n  function %2 : fn(i32"},
-        {"agg",    "dssir 3\nmodule {\n  global %1 : i64 = lit agg { lit int 1 : i64"},
+        {"types-struct",  "dssir 8\ntypes {\n  type 1 = struct \"S\" { i32"},
+        {"types-union",   "dssir 8\ntypes {\n  type 1 = union \"U\" { i32, "},
+        {"types-section", "dssir 8\ntypes {\n  type 1 = struct \"S\" {i32}\n"},
+        {"types-head",    "dssir 8\ntypes {\n  type 1 = struct"},
+        {"fn",     "dssir 8\nmodule {\n  function %2 : fn(i32"},
+        {"agg",    "dssir 8\nmodule {\n  global %1 : i64 = lit agg { lit int 1 : i64"},
     };
     for (Case const& c : cases) {
         DiagnosticReporter r;
@@ -1191,4 +1194,292 @@ TEST(MirTextParse, TruncatedOperandListIsRefusedRatherThanLoopingForever) {
             << c.name << ": a truncated operand list must be refused BY NAME, "
                          "never silently accepted as a shorter type";
     }
+}
+
+// ── P69 (lane `cs`, row 5): `.dssir` v4 ─────────────────────────────────────────────────────────
+// A NaN other than the canonical quiet one — a payload (`__builtin_nan("1")`), a sign, a signalling
+// NaN — is spelled by its bit pattern, `float nanbits <u64>`: `std::format` spells every NaN `nan`,
+// which the reader turns into the CANONICAL quiet NaN, so a payload read back as a different value
+// through a clean reporter. The canonical one keeps its `nan` spelling.
+// RED-ON-DISABLE: write every NaN through `std::format` again → the payload rows read back canonical.
+TEST(MirText, ANanReadsBackWithItsPayloadAndSign) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const f64 = ti.primitive(TypeKind::F64);
+    std::uint64_t const patterns[] = {
+        0x7ff8000000000000ull,   // the canonical quiet NaN — spelled `nan`, as before
+        0x7ff8000000000001ull,   // a payload: `__builtin_nan("1")`
+        0xfff8000000000000ull,   // a negative quiet NaN
+        0x7ff8000020000000ull,   // `__builtin_nanf("1")`'s payload, held in a double
+        0x7ff0000000000001ull,   // a signalling NaN
+    };
+    MirBuilder b;
+    std::uint32_t sym = 1;
+    for (std::uint64_t const bits : patterns) {
+        MirLiteralValue lit;
+        lit.value = std::bit_cast<double>(bits);
+        lit.core  = TypeKind::F64;
+        b.addGlobal(f64, SymbolId{sym++}, b.literalPoolAdd(lit), MirFuncId{}, SymbolBinding::Global,
+                    SymbolVisibility::Default, /*isConst=*/false, MirThreadStorage::Shared);
+    }
+    Mir m = std::move(b).finish();
+    std::vector<std::string> names{"", "a", "b", "c", "d", "e"};
+    auto rt = roundTrip(m, ti, names);
+    ASSERT_TRUE(rt.parseOk) << rt.firstEmit;
+    EXPECT_EQ(rt.firstEmit, rt.secondEmit);
+    EXPECT_NE(rt.firstEmit.find("lit float nan : f64"), std::string::npos)
+        << "CONTROL: the canonical quiet NaN keeps its spelling\n" << rt.firstEmit;
+    EXPECT_NE(rt.firstEmit.find(std::format("lit float nanbits {} : f64", patterns[1])), std::string::npos)
+        << rt.firstEmit;
+    DiagnosticReporter r;
+    auto const parsed = parseMir(rt.firstEmit, CompilationUnitId{2}, r);
+    ASSERT_TRUE(parsed->ok);
+    for (std::uint32_t i = 0; i < std::size(patterns); ++i) {
+        MirGlobalId const g = parsed->mir.globalAt(i);
+        double const back = std::get<double>(parsed->mir.literalValue(parsed->mir.globalInitLiteralIndex(g)).value);
+        EXPECT_EQ(std::bit_cast<std::uint64_t>(back), patterns[i]) << "global " << i;
+    }
+}
+
+// A `nanbits` pattern that is not a NaN is refused by name — never read as the number it spells.
+TEST(MirText, ANanbitsPatternThatIsNotANanIsRefused) {
+    DiagnosticReporter r;
+    auto const parsed = parseMir(
+        "dssir 8\nsymbols {\n  %1 \"g\"\n}\nmodule {\n  global %1 : f64 = lit float nanbits "
+        "4607182418800017408 : f64\n}\n",   // the bits of 1.0
+        CompilationUnitId{3}, r);
+    EXPECT_FALSE(parsed->ok);
+    bool named = false;
+    for (auto const& d : r.all()) {
+        named = named || (d.code == DiagnosticCode::I_TextMalformed
+                          && d.actual.find("nanbits") != std::string::npos);
+    }
+    EXPECT_TRUE(named) << "the refusal must name the `nanbits` pattern";
+}
+
+// A DELIBERATE trap (`__builtin_trap`, a wide division by zero) is `unreachable trap`; an assumed-
+// unreachable point stays `unreachable`. A reader that dropped `trap` would rebuild a point the
+// optimizer may delete — the byte-identical second emit proves the kind came back.
+// RED-ON-DISABLE: stop writing `trap` → the first assertion fails (and the kind is lost).
+TEST(MirText, ADeliberateTrapIsSpelledAndReadBackDistinctFromAnAssumedUnreachable) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const voidTy = ti.primitive(TypeKind::Void);
+    TypeId const fnSig  = ti.fnSig(std::span<TypeId const>{}, voidTy, CallConv::CcSysV);
+    MirBuilder b;
+    (void)b.addFunction(fnSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    b.addUnreachable(MirUnreachableKind::Trap);
+    (void)b.addFunction(fnSig, SymbolId{2});
+    MirBlockId const entry2 = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry2);
+    b.addUnreachable();
+    Mir m = std::move(b).finish();
+    std::vector<std::string> names{"", "traps", "assumes"};
+    auto rt = roundTrip(m, ti, names);
+    ASSERT_TRUE(rt.parseOk) << rt.firstEmit;
+    EXPECT_NE(rt.firstEmit.find("unreachable trap\n"), std::string::npos) << rt.firstEmit;
+    EXPECT_NE(rt.firstEmit.find("unreachable\n"), std::string::npos)
+        << "CONTROL: an assumed-unreachable point carries no `trap`\n" << rt.firstEmit;
+    EXPECT_EQ(rt.firstEmit, rt.secondEmit);
+}
+
+// ── P69 (lane `cs`, D-C-A-STATIC-UNION-INITIALIZED-THROUGH-A-LATER-MEMBER-IS-NOT-ENCODED): `.dssir` v5 ──
+// A UNION value names the member its one field initializes — `lit agg member N {…} : union` — because
+// an initializer may designate any member (C 6.7.9p17) and the field's type cannot say which: here
+// both members are `i32`, so ONLY the index tells member 1 from member 0. The `.dss.mir` body payload
+// is this text, so a member it dropped would be encoded against a guess in the module that read it.
+// RED-ON-DISABLE: stop writing `member N` → the reader refuses the union literal (no member) and the
+// spelling assertion fails; stop reading it → the reader refuses its own writer's output.
+TEST(MirText, AUnionValueNamesItsMemberAndReadsBackWithIt) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    std::array<TypeId, 2> const twoInts{i32, i32};
+    TypeId const u = ti.unionType("U", twoInts);
+    std::array<TypeId, 2> const sf{i32, u};
+    TypeId const s = ti.structType("S", sf);
+    auto const int32 = [](std::int64_t v) {
+        MirLiteralValue l;
+        l.value = v;
+        l.core  = TypeKind::I32;
+        return l;
+    };
+    auto const unionOf = [](MirLiteralValue field, std::uint32_t member) {
+        MirAggregateValue a;
+        a.fields.push_back(std::move(field));
+        a.unionMember = member;
+        MirLiteralValue l;
+        l.value = std::move(a);
+        l.core  = TypeKind::Union;
+        return l;
+    };
+    MirBuilder b;
+    // %1: the union itself, through its SECOND member; %2: the same union NESTED in a structure,
+    // through its FIRST member — the control, and the nesting the writer's frame stack walks.
+    b.addGlobal(u, SymbolId{1}, b.literalPoolAdd(unionOf(int32(42), 1)), MirFuncId{},
+                SymbolBinding::Global, SymbolVisibility::Default, /*isConst=*/false,
+                MirThreadStorage::Shared);
+    {
+        MirAggregateValue sa;
+        sa.fields.push_back(int32(7));
+        sa.fields.push_back(unionOf(int32(9), 0));
+        MirLiteralValue sl;
+        sl.value = std::move(sa);
+        sl.core  = TypeKind::Struct;
+        b.addGlobal(s, SymbolId{2}, b.literalPoolAdd(std::move(sl)), MirFuncId{},
+                    SymbolBinding::Global, SymbolVisibility::Default, /*isConst=*/false,
+                    MirThreadStorage::Shared);
+    }
+    Mir m = std::move(b).finish();
+    std::vector<std::string> names{"", "u", "s"};
+    auto rt = roundTrip(m, ti, names);
+    ASSERT_TRUE(rt.parseOk) << rt.firstEmit;
+    EXPECT_NE(rt.firstEmit.find("lit agg member 1 {lit int 42 : i32} : union"), std::string::npos)
+        << rt.firstEmit;
+    EXPECT_NE(rt.firstEmit.find("lit agg member 0 {lit int 9 : i32} : union"), std::string::npos)
+        << "the first member is NAMED too — absence is not member 0\n" << rt.firstEmit;
+    EXPECT_EQ(rt.firstEmit, rt.secondEmit) << "the round trip must be byte-identical";
+
+    // The VALUE that came back carries the member, not merely the text.
+    DiagnosticReporter r;
+    auto const parsed = parseMir(rt.firstEmit, CompilationUnitId{2}, r);
+    ASSERT_TRUE(parsed->ok) << rt.firstEmit;
+    std::vector<std::optional<std::uint32_t>> members;
+    for (std::uint32_t i = 0; i < parsed->mir.moduleGlobalCount(); ++i) {
+        MirGlobalId const g = parsed->mir.globalAt(i);
+        forEachLiteralNode(parsed->mir.literalValue(parsed->mir.globalInitLiteralIndex(g)),
+                           [&](MirLiteralValue const& n) {
+                               if (auto const* a = std::get_if<MirAggregateValue>(&n.value);
+                                   a != nullptr && n.core == TypeKind::Union)
+                                   members.push_back(a->unionMember);
+                           });
+    }
+    EXPECT_EQ(members, (std::vector<std::optional<std::uint32_t>>{1u, 0u}));
+}
+
+// What the v5 reader refuses, each by name: `member` on a literal that is not a union, a union
+// literal with a field and NO member (its value has no encoding — the writer never spells it), and a
+// `member` with no index.
+TEST(MirText, AUnionMemberSpellingIsReadOnlyWhereItMeansSomething) {
+    struct Case {
+        char const* name;
+        char const* literal;
+        char const* needle;
+    };
+    for (Case const& c : {
+             Case{"member on a struct", "lit agg member 1 { lit int 1 : i32 } : struct",
+                  "only a union value names its member"},
+             Case{"union without a member", "lit agg { lit int 1 : i32 } : union",
+                  "must name the member it initializes"},
+             Case{"member without an index", "lit agg member x { lit int 1 : i32 } : union",
+                  "expected a member index"},
+         }) {
+        std::string const text = std::string{"dssir 8\nsymbols {\n  %1 \"g\"\n}\nmodule {\n  "
+                                             "global %1 : i32 = "} + c.literal + "\n}\n";
+        DiagnosticReporter r;
+        auto const parsed = parseMir(text, CompilationUnitId{4}, r);
+        EXPECT_FALSE(parsed->ok) << c.name;
+        bool named = false;
+        for (auto const& d : r.all()) {
+            named = named || (d.code == DiagnosticCode::I_TextMalformed
+                              && d.actual.find(c.needle) != std::string::npos);
+        }
+        EXPECT_TRUE(named) << c.name << ": the refusal must say why";
+    }
+}
+
+// ★ P69 (lane `cs`, fold f26d): EVERY FACT OF A MODULE AND EACH FUNCTION'S OWN ARG COUNTING SURVIVE THE ROUND TRIP.
+// The text wrote the module's counting alone: a module read back lost its strict-aliasing mode and its char-types
+// rule (READ: the reader's builder took its defaults), and a function counted by another convention than the
+// module's had no spelling. Each fact that is not the default is a header line (`aliasing strict_tbaa`,
+// `char_types_alias_all false`), and a function whose counting is not the module's carries `arg_counting(...)`.
+// Function %1 is stamped flat in a per-class module and receives a double then a long, written flat (the verifier
+// re-reads the module on load, so the stamp must arrive for the text to read at all); %2 takes the default.
+// CONTROL: a module of default facts writes neither header line nor the attribute, so every golden stays unchanged.
+// RED-ON-DISABLE: drop the `aliasing` line, and the module reads back permissive; drop the function's attribute,
+// and the module reads back refused.
+TEST(MirText, ADataModelIsReadByItsTableNameAndAnyOtherWordIsRefused) {
+    // P69 (lane `xa`, fold 3f): the `data_model` header line, spelled by data_model.hpp's table: each row reads
+    // back as itself, a text without the line states none, and a word no row names is refused by name.
+    for (auto const& [word, model] : {std::pair{"LP64", DataModel::Lp64}, std::pair{"LLP64", DataModel::Llp64},
+                                      std::pair{"ILP32", DataModel::Ilp32}}) {
+        DiagnosticReporter r;
+        auto parsed = parseMir(std::string{"dssir 8\ndata_model "} + word + "\nmodule {\n}\n", CompilationUnitId{1}, r);
+        ASSERT_NE(parsed, nullptr);
+        ASSERT_TRUE(parsed->ok) << word;
+        EXPECT_EQ(parsed->mir.moduleFacts().dataModel, model) << word;
+    }
+    {
+        DiagnosticReporter r;
+        auto parsed = parseMir("dssir 8\nmodule {\n}\n", CompilationUnitId{1}, r);
+        ASSERT_NE(parsed, nullptr);
+        ASSERT_TRUE(parsed->ok);
+        EXPECT_EQ(parsed->mir.moduleFacts().dataModel, DataModel{}) << "a text without the line states no model";
+    }
+    for (char const* word : {"LP32", "lp64", "8"}) {
+        DiagnosticReporter r;
+        auto parsed = parseMir(std::string{"dssir 8\ndata_model "} + word + "\nmodule {\n}\n", CompilationUnitId{1}, r);
+        ASSERT_NE(parsed, nullptr);
+        EXPECT_FALSE(parsed->ok) << word;
+        bool named = false;
+        for (auto const& d : r.all()) named = named || d.actual.find("'data_model' takes one of") != std::string::npos;
+        EXPECT_TRUE(named) << word;
+    }
+}
+
+TEST(MirText, EveryModuleFactAndAFunctionsOwnArgCountingRoundTrip) {
+    TypeInterner ti{CompilationUnitId{1}};
+    TypeId const voidTy = ti.primitive(TypeKind::Void);
+    TypeId const f64    = ti.primitive(TypeKind::F64);
+    TypeId const i64    = ti.primitive(TypeKind::I64);
+    std::array<TypeId, 2> const ps{f64, i64};
+    TypeId const mixed = ti.fnSig(ps, voidTy, CallConv::CcMS64);
+    TypeId const plain = ti.fnSig(std::span<TypeId const>{}, voidTy, CallConv::CcSysV);
+
+    MirBuilder b;
+    b.stateArgCounting(MirArgCounting::PerClass);
+    b.setAliasingMode(MirAliasingMode::StrictTBAA);
+    b.setCharTypesAliasAll(false);
+    b.stateDataModel(DataModel::Llp64);
+    MirFuncId const own = b.addFunction(mixed, SymbolId{1});
+    b.stateFunctionArgCounting(own, MirArgCounting::Flat);
+    MirBlockId const e1 = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(e1);
+    (void)b.addArg(0, f64, /*position=*/0);
+    (void)b.addArg(1, i64, /*position=*/1);
+    b.addReturn();
+    (void)b.addFunction(plain, SymbolId{2});
+    MirBlockId const e2 = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(e2); b.addReturn();
+    Mir m = std::move(b).finish();
+
+    std::vector<std::string> names{"", "own", "plain"};
+    DiagnosticReporter r1, r2;
+    MirTextContext ctx{&ti, &names};
+    std::string const text = emitMir(m, ctx, r1);
+    EXPECT_NE(text.find("\naliasing strict_tbaa\n"), std::string::npos) << text;
+    EXPECT_NE(text.find("\nchar_types_alias_all false\n"), std::string::npos) << text;
+    EXPECT_NE(text.find("\ndata_model LLP64\n"), std::string::npos) << text;
+    EXPECT_NE(text.find("arg_counting(flat)"), std::string::npos) << text;
+    auto parsed = parseMir(text, CompilationUnitId{1}, r2);
+    ASSERT_NE(parsed, nullptr);
+    ASSERT_TRUE(parsed->ok) << "the module reads back (the verifier re-reads it on load)\n" << text;
+    EXPECT_EQ(parsed->mir.moduleFacts(), m.moduleFacts()) << "the module's facts read back whole\n" << text;
+    ASSERT_EQ(parsed->mir.moduleFuncCount(), 2u);
+    EXPECT_EQ(parsed->mir.funcArgCounting(parsed->mir.funcAt(0)), MirArgCounting::Flat) << text;
+    EXPECT_EQ(parsed->mir.funcArgCounting(parsed->mir.funcAt(1)), MirArgCounting::PerClass) << text;
+
+    // CONTROL: the default facts write no line of their own.
+    MirBuilder d;
+    d.stateArgCounting(MirArgCounting::PerClass);
+    (void)d.addFunction(plain, SymbolId{2});
+    MirBlockId const e3 = d.createBlock(StructCfMarker::EntryBlock);
+    d.beginBlock(e3); d.addReturn();
+    Mir dm = std::move(d).finish();
+    DiagnosticReporter r3;
+    std::string const plainText = emitMir(dm, ctx, r3);
+    EXPECT_EQ(plainText.find("aliasing"), std::string::npos) << plainText;
+    EXPECT_EQ(plainText.find("char_types_alias_all"), std::string::npos) << plainText;
+    EXPECT_EQ(plainText.find("data_model"), std::string::npos) << "a module stating no model writes none\n"
+                                                                << plainText;
+    EXPECT_EQ(plainText.find("arg_counting("), std::string::npos) << plainText;
 }

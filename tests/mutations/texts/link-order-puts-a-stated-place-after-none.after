@@ -1,0 +1,1 @@
+    return b.has_value() && *a < *b;

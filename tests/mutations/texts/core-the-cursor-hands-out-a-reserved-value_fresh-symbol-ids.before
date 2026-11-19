@@ -1,0 +1,1 @@
+        while (end_ != kLast && isWriterReservedSymbolIdValue(end_)) ++end_;

@@ -73,7 +73,14 @@
 // ── AGNOSTIC ──────────────────────────────────────────────────────────────
 // No language / target / object-format branch. `targetIdentity` is compared
 // for equality only. Every container that feeds a DECISION is ordered or
-// sorted before it is read — see the determinism note on `SummaryIndex`.
+// sorted before it is read — see the determinism note on `SummaryIndex`. What
+// a FORMAT says of a weak definition's kind is read from the link's document
+// (`buildSummaryIndex`'s `linkFormat`) by the function every door of the
+// cross-unit fold calls; no kind and no format is named here.
+
+namespace dss {
+class ObjectFormatSchema;   // link/object_format_schema.hpp — the link's document (`buildSummaryIndex`)
+}  // namespace dss
 
 namespace dss::mirsum {
 
@@ -199,8 +206,11 @@ struct SummaryIndex {
     // One row per module, in module order.
     std::vector<Tier2KeyInputs> tier2KeyInputs;
 
-    // Names defined more than once with STRONG binding across TUs. Reported,
-    // not silently resolved.
+    // Names whose definitions across TUs the fold REFUSED: defined more than
+    // once with STRONG binding; defined strong beside a weak definition of a
+    // kind the link's format does not let a strong one replace; or a pair the
+    // link's document does not decide. Reported, not silently resolved. Sorted
+    // and deduplicated.
     std::vector<std::string> conflictingNames;
 
     // Look up a name's winning definition, or nullopt. THE LAZY IMPORT EDGE'S
@@ -237,9 +247,23 @@ isInlineCandidate(SummaryFunction const& f, SummaryIndexPolicy const& policy,
 // is REPORTED and recorded in `conflictingNames`, and the build proceeds with
 // the resolver's winner — matching `mergeCuMirs`, which does the same thing
 // for the same reason.
+//
+// ★ `linkFormat` IS THE DOCUMENT OF THE LINK THESE UNITS ARE BOUND FOR (P69
+// fold 3). The election is one program's: the unit linker reads from that
+// document what a weak definition of each KIND is beside a strong one, beside a
+// common and beside the other kind, and so does the cross-unit merge. The index
+// is the third door of the same fold, so it states each row's answers through
+// the function they do (`linker::stateTheLinksAnswers`) and words the fold's
+// refusals through the one wording they share (`linker::refusalOf`) — a weak
+// definition the format does not let a strong one replace, and a pair the
+// document does not decide, are REPORTED and recorded in `conflictingNames`
+// exactly as a two-strong pair is. Until then the index knew a binding and
+// nothing else: it ranked every weak definition alike, and it reported two
+// units' tentative definitions of one name as two strong ones.
 [[nodiscard]] DSS_EXPORT std::optional<SummaryIndex>
 buildSummaryIndex(std::span<ModuleSummary const> summaries,
                   SummaryIndexPolicy const&      policy,
+                  ObjectFormatSchema const&      linkFormat,
                   DiagnosticReporter&            reporter);
 
 } // namespace dss::mirsum

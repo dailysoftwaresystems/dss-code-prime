@@ -1,0 +1,2 @@
+                        found = blockFunctionDeclarationBefore(
+                            s, tree.id(), resolved.name, streamRank(s, tree, resolved.node));

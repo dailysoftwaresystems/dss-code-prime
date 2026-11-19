@@ -1,0 +1,2 @@
+                    && !constIntExpr(s, tree, *bound, here, &cfg,
+                                     IntegerConstantPosition::ArrayBound).has_value()) {

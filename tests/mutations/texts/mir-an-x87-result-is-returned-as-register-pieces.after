@@ -1,0 +1,2 @@
+        if (abi->kind == AbiPassing::Kind::X87 && abi->pieces.size() > 2u) {
+            if (abi->pieces.empty()) {

@@ -1,0 +1,2 @@
+    if (!taken.has_value()) return false;
+    std::vector<SymbolId> const& veneerId = *taken;

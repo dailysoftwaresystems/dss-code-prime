@@ -3,7 +3,9 @@
 #include "core/export.hpp"
 #include "core/substrate/arena_attribute.hpp"
 #include "core/substrate/arena_container.hpp"
+#include "core/types/data_model.hpp"   // MirModuleFacts::dataModel
 #include "core/types/strong_ids.hpp"
+#include "core/types/symbol_id_cursor.hpp"   // the one home of a fresh SymbolId: the module's doors
 #include "core/types/type_lattice/type_id.hpp"
 #include "mir/mir_asm_descriptor.hpp"
 #include "mir/mir_literal_pool.hpp"
@@ -14,8 +16,10 @@
 #include <cstdint>
 #include <cstdio>       // AsmGotoResult::continuation's fail-loud (inline, see below)
 #include <cstdlib>      //   ditto — std::abort
+#include <expected>     // joinUnitFacts: the facts joined, or the one that disagrees
 #include <optional>
 #include <span>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -54,6 +58,110 @@ namespace dss {
 // `D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING` end-to-end.
 enum class MirAliasingMode : std::uint8_t { Permissive, StrictTBAA };
 
+// ★ P69 (lane `cs`, fold f26d — review-csf26c2 N2): HOW A FUNCTION NUMBERS ITS `Arg`s — `MirArgCounting`
+// (mir_node.hpp, beside the function record that carries it). Each FUNCTION is stamped with the counting of the
+// convention it is called by: `addFunction` stamps the builder's stated default (the pair's convention:
+// HIR→MIR from the convention's `slotAligned`, the merge from its units, the `.dssir` reader from the text's
+// header, a unit test by hand), a function of another convention is restated (`stateFunctionArgCounting`), and
+// every clone copies the stamp — never inferred from the `Arg`s, because the `Arg`s cannot say it: a
+// mixed-class signature written with flat ordinals on a per-class convention (`addArg(0, f64), addArg(1, i64)`)
+// is dense when the classes are counted together, and lir_callconv then reads the `long` from the second
+// general register, where every caller wrote the first (design audit N2-3). The MIR verifier holds every
+// function's `Arg`s DENSE under its own stamp and refuses a function that holds an `Arg` and is stamped with
+// none (`Unstated`). Data, not a target identity: nothing is derived from the `CallConv` a signature names.
+// THE RULE, its one home: a convention that aligns its arguments to slots (`slotAligned`, Win64) counts
+// them FLAT, every other one PER REGISTER CLASS. Asked by every producer that states a module's counting
+// from a convention (HIR->MIR, the startup module of a link that compiles nothing).
+[[nodiscard]] constexpr MirArgCounting argCountingOf(bool conventionIsSlotAligned) noexcept {
+    return conventionIsSlotAligned ? MirArgCounting::Flat : MirArgCounting::PerClass;
+}
+
+// ★★ P69 (lane `cs`, fold f26d): A MODULE'S FACTS, THEIR ONE LIST — what a module STATES about how its contents
+// are read, as opposed to what it holds: its alias-analysis polarity, its char-types rule, and the counting of
+// the pair's convention (the default every function it gains is stamped with). `Mir` and `MirBuilder` hold the
+// list WHOLE and every carrier copies it whole: a rebuild (`MirBuilder::carryModuleFactsOf`), the moves, the
+// merge of units (`joinUnitFacts`), the `.dssir` text (a header line for each fact that is not the default).
+// ✔MEASURED/READ before it (the facts row of fold f26d): the synthesis rebuilds kept the symbol ids alone and
+// dropped the rest; the merge read the aliasing mode and the char-types rule from unit 0 alone; the text wrote
+// neither. A fact added here is a binding added to each structured binding over the list (the join, the text
+// writer), which do not compile until it is read.
+// ★ P69 (lane `xa`, fold 3f — review-xa3e F3, its Lowerer half): the DATA MODEL the module was lowered for, the
+// one home every pointer width below MIR is read from (`scalarByteSize(TypeKind::Ptr, dataModel)`). HIR→MIR
+// states its unit's, the startup module of a link that compiles nothing its format's, the merge its units'
+// joined, the `.dssir` reader its text's header. The zero value names no model (data_model.hpp's table has no row
+// for it): a module stating none is refused by the join and by the MIR→LIR lowering, each by name -- the width
+// of every address the lowering writes is never a default.
+struct MirModuleFacts {
+    MirAliasingMode aliasingMode      = MirAliasingMode::Permissive;
+    bool            charTypesAliasAll = true;
+    MirArgCounting  argCounting       = MirArgCounting::Unstated;
+    DataModel       dataModel{};
+
+    friend constexpr bool operator==(MirModuleFacts const&, MirModuleFacts const&) = default;
+};
+
+// A fact two units state DIFFERENTLY where it must be equal across the units one module joins: its NAME (the
+// field's, as the `.dssir` header spells it) and both values, so the merge's refusal names the fact that
+// disagrees -- never the first such fact the list happened to have.
+struct MirFactsDisagreement {
+    char const*   fact;   // the field's name: "argCounting", ...
+    std::uint32_t a;      // the earlier unit's value
+    std::uint32_t b;      // the later unit's
+};
+
+// What a unit that states NO value of a must-agree fact does at the join -- stated by each fact, never a default
+// (ledger 637): `AddsNothing`, the other unit's value stands (the pair's counting: a module that lowered no
+// function counts nothing); `IsRefused`, every unit must state it and an unstated one is refused by the fact's
+// name exactly as a mismatch is -- adopting another unit's value would be a silent default.
+enum class MirUnstatedFact : std::uint8_t { AddsNothing, IsRefused };
+
+// ONE must-agree fact of two units, joined: the agreed value, or the disagreement by `fact`'s name.
+template <typename T>
+[[nodiscard]] constexpr std::expected<T, MirFactsDisagreement>
+joinMustAgreeFact(char const* fact, T a, T b, T unstated, MirUnstatedFact rule) noexcept {
+    auto const refused = [&] {
+        return std::unexpected(
+            MirFactsDisagreement{fact, static_cast<std::uint32_t>(a), static_cast<std::uint32_t>(b)});
+    };
+    if (a == unstated || b == unstated) {
+        if (rule == MirUnstatedFact::IsRefused) return refused();
+        return a == unstated ? b : a;
+    }
+    if (a != b) return refused();
+    return a;
+}
+
+// THE MERGED MODULE'S FACTS, of two units' (the merge folds every unit's through it): strict TBAA only where
+// BOTH state it — a permissive unit's accesses were never promised to follow the effective-type rule, so the
+// one module they join is read permissively; the char-types rule where EITHER states it (the same direction:
+// the rule that assumes less); the pair's counting where they agree, a unit that states none adding nothing.
+// A fact that MUST BE EQUAL across the units (the pair's counting): two DIFFERENT values are the disagreement,
+// by the fact's name — the units were lowered for two pairs, which one link never merges (the merge refuses).
+// Each function's own counting crosses with the function, not through this. ★ A FACT ADDED to the list is a
+// binding added below (the structured bindings do not compile until it is), joined either by a rule like the
+// first two or, when it must be equal, by ONE `joinMustAgreeFact` line stating its own unstated rule — the
+// record stays a plain list joined field by field. The data model must be equal AND stated by every unit
+// (`IsRefused`, ledger 639): units lowered for two models were lowered for two pairs, and a unit stating none
+// would take another's in silence.
+[[nodiscard]] constexpr std::expected<MirModuleFacts, MirFactsDisagreement>
+joinUnitFacts(MirModuleFacts a, MirModuleFacts b) noexcept {
+    auto const& [aAliasing, aCharTypes, aCounting, aModel] = a;   // every fact of the list is joined below
+    auto const& [bAliasing, bCharTypes, bCounting, bModel] = b;
+    auto const counting = joinMustAgreeFact("argCounting", aCounting, bCounting, MirArgCounting::Unstated,
+                                            MirUnstatedFact::AddsNothing);
+    if (!counting.has_value()) return std::unexpected(counting.error());
+    auto const model = joinMustAgreeFact("dataModel", aModel, bModel, DataModel{}, MirUnstatedFact::IsRefused);
+    if (!model.has_value()) return std::unexpected(model.error());
+    MirModuleFacts joined;
+    joined.aliasingMode = aAliasing == MirAliasingMode::StrictTBAA && bAliasing == MirAliasingMode::StrictTBAA
+                              ? MirAliasingMode::StrictTBAA
+                              : MirAliasingMode::Permissive;
+    joined.charTypesAliasAll = aCharTypes || bCharTypes;
+    joined.argCounting = *counting;
+    joined.dataModel = *model;
+    return joined;
+}
+
 class DSS_EXPORT Mir {
 public:
     using InstArena   = substrate::ArenaContainer<detail::MirInst,   MirInstId,   MirModuleId>;
@@ -73,7 +181,9 @@ public:
     // REQUIRED — no defaults — so a direct call site can't silently
     // produce a sound-but-wrong-shape module by omitting them.
     // `MirBuilder::finish` is the only intended producer and threads
-    // both through explicitly.
+    // both through explicitly. (The module's symbol-id end is not an
+    // argument: the constructor counts it past every symbol the arenas
+    // define, and `MirBuilder::finish` raises it to the builder's.)
     Mir(InstArena instArena, BlockArena blockArena, FuncArena funcArena,
         GlobalArena globalArena,
         std::vector<MirBlockId> instBlock, std::vector<MirInstId> operandPool,
@@ -280,11 +390,22 @@ public:
     // linkage attributes consumed by the optimizer's DCE pass and the
     // downstream link-tier emitter. `isExternallyVisible(binding,
     // visibility)` is the DCE-protect predicate.
+    //
+    // ★ P69: `funcLinkage` IS THE ACCESSOR A COPY USES. It returns the WHOLE
+    // record (`MirLinkage`: binding, visibility, the weak kind, the tentative
+    // mark) and a site that re-adds a function hands it to
+    // `MirBuilder::addFunction` as it came — never the fields one by one, which
+    // is how a fact added later is dropped at one of nine sites in silence.
+    // `funcBinding` / `funcVisibility` stay for a reader that ASKS one question
+    // (DCE's keep predicate, the inliner's weak refusal); they read the record.
+    [[nodiscard]] MirLinkage funcLinkage(MirFuncId id) const {
+        return funcArena_.at(id).linkage;
+    }
     [[nodiscard]] SymbolBinding funcBinding(MirFuncId id) const {
-        return funcArena_.at(id).binding;
+        return funcArena_.at(id).linkage.binding;
     }
     [[nodiscard]] SymbolVisibility funcVisibility(MirFuncId id) const {
-        return funcArena_.at(id).visibility;
+        return funcArena_.at(id).linkage.visibility;
     }
     // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): TRUE iff the source declared this function
     // `__attribute__((noinline))`. The inliner's §2.9 legality gate REFUSES to
@@ -350,11 +471,56 @@ public:
     // discipline as `funcBinding` / `funcVisibility`. A global
     // with `isExternallyVisible(binding, visibility) == true` MUST
     // survive DCE / unused-symbol elimination.
+    // ★ P69: `globalLinkage` is the accessor a COPY uses — the whole record, on
+    // the terms `funcLinkage` states above. It is also the only reader of a
+    // global's weak kind and of its tentative mark.
+    [[nodiscard]] MirLinkage globalLinkage(MirGlobalId id) const {
+        return globalArena_.at(id).linkage;
+    }
+    // ── IS THIS GLOBAL A COMMON? — the ONE statement (P69 fold 3, lane `xa`) ──
+    //    D-C-TENTATIVE-DEFINITIONS-OF-ONE-NAME-IN-TWO-UNITS-REFUSED
+    //
+    // A COMMON is a tentative definition the link FOLDS with the other units'
+    // (C 6.9.2p2; the common extension, C11 J.5.11): `int x;` in two units is
+    // one object, and beside an initialized definition elsewhere it is that
+    // object. Two readers ask — the cross-unit merge, which folds two of them
+    // (`mergeCuMirs`), and the pipeline, which states a unit's as the COMMON
+    // row every object reader already produces (`ExternImport::commonSize`) —
+    // and they ask HERE so that they cannot disagree about which definitions
+    // those are. It is the tentative mark, READ ALONE: the mark means "may be
+    // written as a common", the tier above states it once and clears it on every
+    // definition that is its unit's outright (P69, lane `cs`: `nocommon`, a
+    // variable an `alias` names, and the two below), and the builders refuse it
+    // where it could not mean that (`mirLinkageDefect`) — so no reader restates
+    // the list. The two a reader once asked beside the mark, now defects:
+    //   * A WEAK BINDING. A weak tentative definition
+    //     (`__attribute__((weak)) int t;`) is a WEAK definition: its kind
+    //     decides what it is beside every other, and no reference writes it as
+    //     a common.
+    //   * THREAD STORAGE. ✔MEASURED 2026-10-12: no reference writes a
+    //     thread-local tentative definition as a common — cl 19.44 and clang
+    //     19.1.5 put `_Thread_local int t;` in `.tls$`, gcc 13.3 and clang 18.1
+    //     on ELF in `.tbss` even under `-fcommon`, MinGW gcc 13.2 in its
+    //     emulated-TLS control object — and two units holding one are REFUSED
+    //     by link.exe, lld-link, GNU ld and ld.lld alike (7 of 7 cells), as two
+    //     strong definitions are. So it stays a definition, and the pair stays
+    //     refused. Mach-O agrees (✔MEASURED 2026-10-12, Apple clang 21: the
+    //     object is in `__DATA,__thread_vars`, and the pair is refused as a
+    //     duplicate symbol by ld-1267 on arm64 and x86_64 and by `-ld_classic`,
+    //     6 of 6).
+    // The builders refuse the mark there, on a local global and beside an
+    // initializer alike (`mirLinkageDefect`), so none is asked again.
+    // (The reading itself is `mirLinkageIsCommon`, mir/mir_node.hpp, so that a
+    // reader holding the record WITHOUT a module — the decoder of a stored
+    // summary — is judged by the same words.)
+    [[nodiscard]] bool globalIsCommon(MirGlobalId id) const {
+        return mirLinkageIsCommon(globalArena_.at(id).linkage);
+    }
     [[nodiscard]] SymbolBinding globalBinding(MirGlobalId id) const {
-        return globalArena_.at(id).binding;
+        return globalArena_.at(id).linkage.binding;
     }
     [[nodiscard]] SymbolVisibility globalVisibility(MirGlobalId id) const {
-        return globalArena_.at(id).visibility;
+        return globalArena_.at(id).linkage.visibility;
     }
     // D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL: true iff the source declared this
     // global `const`. The assembler's section selection routes an INITIALIZED
@@ -414,14 +580,71 @@ public:
     // (`mir_rebuild_helper`) propagates this mode to every pass's fresh
     // `MirBuilder` so a release pipeline doesn't silently downgrade
     // strict-TBAA to Permissive after the first rebuild.
-    [[nodiscard]] MirAliasingMode aliasingMode() const noexcept { return aliasingMode_; }
+    [[nodiscard]] MirAliasingMode aliasingMode() const noexcept { return facts_.aliasingMode; }
     // Per-source-language C99 §6.5 ¶7 character-type exception flag.
     // Composes with `aliasingMode`: Rule 5 in `mirMayAlias` fires only
     // when this is `true`. Default `true` matches C/C++/Objective-C;
     // Rust / strict-typed DSLs declare `false`.
-    [[nodiscard]] bool charTypesAliasAll() const noexcept { return charTypesAliasAll_; }
+    [[nodiscard]] bool charTypesAliasAll() const noexcept { return facts_.charTypesAliasAll; }
+
+    // ── how the module's functions number their `Arg`s (P69, review-csf26c2 N2) ──
+    // Each FUNCTION's (`funcArgCounting`): the counting of the convention it is called by. `argCounting()` is the
+    // module's DEFAULT — the pair's convention's, which every function the builder added was stamped with unless
+    // it was restated for itself; `Unstated` where nobody stated one.
+    [[nodiscard]] MirArgCounting argCounting() const noexcept { return facts_.argCounting; }
+    [[nodiscard]] MirArgCounting funcArgCounting(MirFuncId id) const { return funcArena_.at(id).argCounting; }
+    // The module's facts, whole (`MirModuleFacts`) — what a carrier copies.
+    [[nodiscard]] MirModuleFacts const& moduleFacts() const noexcept { return facts_; }
+
+    // ── the module's SYMBOL-ID SPACE (P69 round 5,
+    //    D-MIR-SYNTHESIZED-SYMBOL-MINTED-INSIDE-THE-NAME-TABLE) ──
+    // ONE PAST the highest SymbolId.v of the id space this module's symbols are
+    // numbered in: the name table the module was made from (its semantic model's
+    // records, or a merge's allocation), every symbol the module defines, and
+    // every id minted for it since. Most of that space the module never holds — a
+    // local, a parameter, a typedef, a tag, an enum constant, an extern another
+    // unit defines — and whoever lowers or merges the module names each of its ids
+    // through that table, so a symbol synthesized for the module is numbered from
+    // HERE and nowhere else: `MirBuilder::mintSymbol`, the one door. Carried by
+    // every rebuild (`MirBuilder::continueSymbolIdsOf`). 1 for the empty module —
+    // 0 is the invalid id.
+    [[nodiscard]] std::uint32_t symbolIdEnd() const noexcept { return symbolIdEnd_; }
+
+    // Whether that end was STATED, or only COUNTED.
+    //   STATED — whoever made the module said where its id space ends: the name
+    //   table it was made from (`MirBuilder::stateSymbolIdEnd`), its maker's word
+    //   that nothing stands beside it (`MirBuilder::stateSelfContainedSymbolIds`),
+    //   or the module it replaces, when THAT module's end was stated
+    //   (`MirBuilder::continueSymbolIdsOf` copies the fact and never invents it).
+    //   COUNTED — nobody said. `symbolIdEnd()` is then one past the symbols the
+    //   arenas define and no more, and it reads exactly like a real end.
+    // That likeness is how an entrance got through in silence: the door aborted on
+    // a BUILDER never told its end, the frozen module dropped the fact, and the
+    // first rebuild's `continueSymbolIdsOf` turned a counted end into a stated one
+    // (✔MEASURED 2026-10-08: the `.dssir` reader stated nothing, a text declaring
+    // `%1 "f"` and `%2 "g"` and defining `f` alone read back ending at 2, and
+    // MIR→LIR named a block `%2` — `g`'s id — with no diagnostic). The fact now
+    // travels WITH the module, and both leaves of the door refuse to mint past a
+    // counted end (`MirBuilder::mintSymbol`, `MirSymbolIdContinuation::mint`), so
+    // an entrance that forgets its statement is loud at the first id it needs.
+    [[nodiscard]] bool symbolIdEndIsStated() const noexcept { return symbolIdEndStated_; }
+
+    // ── SECOND NAMES OF THE MODULE's DEFINITIONS (P69, lane `cs`) ──
+    // Every `alias("target")` the module defines (`MirAlias`, mir/mir_node.hpp),
+    // in the order the builder was handed them. A name here is a definition of
+    // the module: the object producer writes it as one more symbol row on its
+    // target's definition, and a symbol-keyed reader that asks "does this module
+    // define the name" asks here too.
+    [[nodiscard]] std::span<MirAlias const> aliases() const noexcept { return aliases_; }
+    [[nodiscard]] std::size_t moduleAliasCount() const noexcept { return aliases_.size(); }
 
 private:
+    // `MirBuilder::finish` hands the built module the builder's symbol-id end —
+    // the one fact of a module its arenas cannot state (the constructor's own
+    // count covers the symbols they define, never the name table's) — and the
+    // module's aliases, which no arena holds.
+    friend class MirBuilder;
+
     InstArena                   instArena_;
     BlockArena                  blockArena_;
     FuncArena                   funcArena_;
@@ -437,8 +660,10 @@ private:
     std::vector<MirBlockId>     succPool_;      // terminator CFG successors
     MirLiteralPool              literalPool_;
     MirAsmDescriptorPool        asmDescriptorPool_;  // inline-asm templates + constraints
-    MirAliasingMode             aliasingMode_ = MirAliasingMode::Permissive;
-    bool                        charTypesAliasAll_ = true;
+    MirModuleFacts              facts_;   // the module's facts, whole (`MirModuleFacts`)
+    std::uint32_t               symbolIdEnd_ = 1;   // see `symbolIdEnd()`
+    bool                        symbolIdEndStated_ = false;   // see `symbolIdEndIsStated()`
+    std::vector<MirAlias>       aliases_;           // see `aliases()`
 };
 
 // `MirAttribute<T>` — the HIR-style side-table over the instruction tier (the
@@ -493,10 +718,119 @@ public:
     // `finish()` (last value wins); the optimizer rebuild substrate
     // (`mir_rebuild_helper`) also calls these on its own builders to
     // propagate the mode through every pipeline pass.
-    void setAliasingMode(MirAliasingMode mode) noexcept { aliasingMode_ = mode; }
-    [[nodiscard]] MirAliasingMode aliasingMode() const noexcept { return aliasingMode_; }
-    void setCharTypesAliasAll(bool v) noexcept { charTypesAliasAll_ = v; }
-    [[nodiscard]] bool charTypesAliasAll() const noexcept { return charTypesAliasAll_; }
+    void setAliasingMode(MirAliasingMode mode) noexcept { facts_.aliasingMode = mode; }
+    [[nodiscard]] MirAliasingMode aliasingMode() const noexcept { return facts_.aliasingMode; }
+    void setCharTypesAliasAll(bool v) noexcept { facts_.charTypesAliasAll = v; }
+    [[nodiscard]] bool charTypesAliasAll() const noexcept { return facts_.charTypesAliasAll; }
+
+    // ── how the module's functions number their `Arg`s (`MirArgCounting`, P69 N2) ──
+    // `stateArgCounting`: the counting of the PAIR's convention — the default every function this builder adds
+    // AFTERWARDS is stamped with (`addFunction`). Stated where the module is MADE: HIR→MIR from the convention's
+    // `slotAligned`, the merge from its units, the `.dssir` reader from the text's header, a unit test by hand.
+    // A rebuild states nothing of its own: it copies the module it replaces (`carryModuleFactsOf`).
+    // `stateFunctionArgCounting`: a function's OWN counting — one of another convention, or a clone's copy.
+    void stateArgCounting(MirArgCounting counting) noexcept { facts_.argCounting = counting; }
+    [[nodiscard]] MirArgCounting argCounting() const noexcept { return facts_.argCounting; }
+    // The data model the module is lowered for (`MirModuleFacts::dataModel`), stated where the module is MADE,
+    // as the counting is: HIR→MIR from its config, the startup module of a link that compiles nothing from its
+    // format, the `.dssir` reader from the text's header, a unit test by hand. A rebuild copies it.
+    void stateDataModel(DataModel model) noexcept { facts_.dataModel = model; }
+    void stateFunctionArgCounting(MirFuncId function, MirArgCounting counting);
+    // The module's facts, whole (`MirModuleFacts`): stated at once by the merge (its units' joined).
+    void stateModuleFacts(MirModuleFacts const& facts) noexcept { facts_ = facts; }
+    [[nodiscard]] MirModuleFacts const& moduleFacts() const noexcept { return facts_; }
+
+    // ── THE SYMBOL-ID SPACE: the ONE DOOR a fresh SymbolId comes through ──
+    // (P69 round 5, D-MIR-SYNTHESIZED-SYMBOL-MINTED-INSIDE-THE-NAME-TABLE)
+    //
+    // A symbol synthesized for a module — a literal's global, an optimizer's
+    // constant, a startup function, a funclet, a helper import — needs an id no
+    // other symbol of the module's id space has, and most of that space is in
+    // the NAME TABLE the module was made from, not in the module (see
+    // `Mir::symbolIdEnd`). Five sites each scanned the module and added one;
+    // four were in time handed the table's end by their caller, and the fifth
+    // never was (✔MEASURED 2026-10-08: the optimizer's rodata zero took id 154
+    // in a unit whose table ends at 159, and where that id was an extern
+    // import's the release build of a 12-line program was refused, or linked
+    // and crashed). So the MODULE carries the end and hands out the ids:
+    //   * `stateSymbolIdEnd(end)` — a module MADE FROM A NAME TABLE states the
+    //     table's end where it is made (HIR→MIR: the semantic table's size; the
+    //     merge: its allocator's end; the `.dssir` reader: the text's own
+    //     table);
+    //   * `stateSelfContainedSymbolIds()` — a module MADE FROM NOTHING BUT
+    //     ITSELF says so: no name table stands beside it, and the only ids of
+    //     its space it does not define are the ones handed to the door beside
+    //     it and kept clear of there (`keepSymbolIdsClearOf`,
+    //     `MirSymbolIdContinuation::keepClearOf`: an import row, a recipe's
+    //     reserved id). Its end is the counted one, STATED. That is the
+    //     hand-built module of a unit test; no product file makes one
+    //     (tests/mir/test_synth_symbol_floor.cpp holds every file under src/ to
+    //     that);
+    //   * `continueSymbolIdsOf(rebuilt)` — a module that REPLACES another
+    //     continues that module's ids AND carries whether they were ever
+    //     stated: it COPIES that fact, it does not make it (it once set it, and
+    //     so turned a counted end into a stated one at the first rebuild — see
+    //     `Mir::symbolIdEndIsStated`). Every rebuild does (the clone-globals
+    //     helpers), and a pass that mints does so before it mints;
+    //   * `mintSymbol(sink, who)` — the module's OPTIONAL door (P69 f26e, B1;
+    //     core/types/symbol_id_cursor.hpp): the next id, the space grown by one.
+    //     At exhaustion (the next id would be the last value, and the end could
+    //     not move past it) the refusal is REPORTED under the sink's code —
+    //     HIR→MIR's `H_SymbolIdSpaceExhausted` — nothing is written, and the
+    //     answer is nullopt, which the caller tests at the take. It ABORTS on a
+    //     builder whose end nobody stated — no statement made here, and none by
+    //     a module it continues: an id counted from the symbols a builder happens
+    //     to hold is exactly the defect, so no caller is left a way to mint
+    //     without the module's end. It never returns a value a format WRITER
+    //     defines for itself (`isWriterReservedSymbolIdValue`): the end steps
+    //     over it.
+    //   * `mintSymbolOrAbort(who)` — the module's ABORT door, for a caller that
+    //     has no diagnostic to give (a pass over a frozen module cannot position
+    //     an error on source text): at exhaustion it is fatal, naming `who`.
+    // The statements only RAISE the end, a symbol the builder is handed
+    // (`addFunction`, `addGlobal`) raises it past itself, and
+    // `keepSymbolIdsClearOf` raises it past an id something BESIDE the module
+    // already uses for it (an import row, a recipe's reserved id) — in a module
+    // made from a table those are all below the end already; it matters to a
+    // hand-built one, whose end is otherwise one past the symbols it defines.
+    // Raising the end states nothing: `keepSymbolIdsClearOf` alone leaves a
+    // builder's end COUNTED.
+    void stateSymbolIdEnd(std::uint32_t end) noexcept;
+    void stateSelfContainedSymbolIds() noexcept;
+    void continueSymbolIdsOf(Mir const& rebuilt) noexcept;
+    void keepSymbolIdsClearOf(SymbolId taken) noexcept;
+    [[nodiscard]] std::optional<SymbolId> mintSymbol(SymbolIdRefusalSink sink, std::string_view who);
+    [[nodiscard]] SymbolId mintSymbolOrAbort(std::string_view who);
+    [[nodiscard]] std::uint32_t symbolIdEnd() const noexcept { return symbolIdEnd_.value(); }
+    [[nodiscard]] bool symbolIdEndIsStated() const noexcept { return symbolIdEndStated_; }
+
+    // ── THE ONE PLACE a module that REPLACES another copies what the MODULE
+    //    carries ──
+    // Not what a function or a global carries — that is cloned where the function
+    // or the global is — but the facts that belong to the module as a whole: the
+    // alias-analysis polarity, the character-type aliasing rule, the
+    // symbol-id space (`continueSymbolIdsOf`), and how its functions number their
+    // `Arg`s (`MirArgCounting`, P69 N2). Every rebuild calls it: the three
+    // clone-globals helpers (opt/passes/mir_rebuild_helper.cpp), through which
+    // every optimizer pass and synthesis pass rebuilds, and DCE's own rebuild. A
+    // module-level fact added later is added HERE and reaches them all. Each
+    // rebuild once copied its own list, which is how strict-TBAA was silently
+    // downgraded after the first pass
+    // (D-OPT-LOAD-ALIAS-ANALYSIS-PIPELINE-PROPAGATE) and how a fourth list could
+    // have forgotten the id space. P69 (lane `cs`): the module's ALIASES too
+    // (`Mir::aliases`) — keyed by symbol ids, which no rebuild renumbers, so they
+    // are carried whole; DCE roots each target, so no rebuild drops one.
+    void carryModuleFactsOf(Mir const& rebuilt);
+
+    // ── A SECOND NAME OF A DEFINITION (P69, lane `cs`) ──
+    // States that this module defines `alias` as the definition `target` is
+    // (`MirAlias`). Aborts, by name, on a producer's bug: an invalid id, a name
+    // that is its own target, a name already stated as an alias here, a tentative
+    // mark (an alias has no storage), or a linkage record the one rule refuses
+    // (`mirLinkageDefect`). Whether the module DEFINES `target`, and defines
+    // `alias` in no other way, is a fact of the whole module: `MirVerifier` holds
+    // it (`checkAliases`), and the `.dssir` reader asks it before calling here.
+    void addAlias(SymbolId alias, SymbolId target, MirLinkage linkage);
 
     // ── function / block lifecycle ──
     // Open a function. Closes any open function first (which requires its current
@@ -539,6 +873,29 @@ public:
     // one single-flag record somewhere, not that every record is single-flag. For
     // THIS flag that discipline is the only detector available at all, since no
     // codegen difference exists to observe.
+    //
+    // ★★ P69 (lane `xa`) — THE LINKAGE IS ONE RECORD, AND THERE ARE TWO FORMS.
+    //   * THE RECORD FORM (`MirLinkage linkage`, the first declaration below) is
+    //     the one a site that COPIES a function uses — it passes
+    //     `src.funcLinkage(f)` whole — and the one a producer that knows the
+    //     symbol's weak kind uses (HIR→MIR, the text reader, a synthesis pass
+    //     whose function is weak). It REFUSES, each by name: a weak binding that
+    //     states no kind (the object writers spell the two kinds differently on
+    //     PE, so "weak, kind unknown" has no honest spelling); a kind beside a
+    //     binding that is not weak (a kind nobody may read); and a `tentative`
+    //     mark, which is a global's fact.
+    //   * THE (binding, visibility) FORM stays as the form for a symbol that is
+    //     NEITHER weak NOR tentative — a synthesized entry, a funclet, a test's
+    //     plain function. It REFUSES a weak binding by name instead of guessing a
+    //     kind for it, so no caller can make a kindless weak definition through
+    //     the shorter spelling.
+    MirFuncId addFunction(TypeId signature, SymbolId symbol,
+                          MirLinkage       linkage,
+                          bool             noInline     = false,
+                          bool             alwaysInline = false,
+                          bool             noOptimize   = false,
+                          bool             noSanitizeThread = false,
+                          StaticInitSchedule staticInit = {});
     MirFuncId addFunction(TypeId signature, SymbolId symbol,
                           SymbolBinding    binding      = SymbolBinding::Global,
                           SymbolVisibility visibility   = SymbolVisibility::Default,
@@ -591,6 +948,25 @@ public:
     // alignmentBytes)` — `MirThreadStorage` admits neither conversion, so
     // both mistakes are compile errors (see the enum's doc in mir_node.hpp;
     // propagation sites bridge via `mirThreadStorageOf(bool)`).
+    //
+    // ★★ P69 (lane `xa`) — THE LINKAGE IS ONE RECORD, in two forms, on the terms
+    // `addFunction` states above: the RECORD form is what a site that copies a
+    // global passes (`src.globalLinkage(g)`, whole) and what a producer that
+    // knows the weak kind or the tentative mark passes; the (binding,
+    // visibility) form is for a global that is neither weak nor tentative and
+    // refuses a weak binding. The record form refuses, each by name: a weak
+    // binding with no kind; a kind beside a binding that is not weak; a
+    // `tentative` mark on a module-private (`Local`) global, which the link
+    // never folds; and a `tentative` mark beside an initializer of either shape
+    // — a tentative definition is by its definition the one with none (C
+    // 6.9.2p2).
+    MirGlobalId addGlobal(TypeId type, SymbolId symbol,
+                          std::uint32_t initLiteralIndex,
+                          MirFuncId     initFunc,
+                          MirLinkage       linkage,
+                          bool             isConst,
+                          MirThreadStorage threadStorage,
+                          std::uint32_t    alignmentBytes = 0);
     MirGlobalId addGlobal(TypeId type, SymbolId symbol,
                           std::uint32_t initLiteralIndex,
                           MirFuncId     initFunc,
@@ -599,6 +975,20 @@ public:
                           bool             isConst,
                           MirThreadStorage threadStorage,
                           std::uint32_t    alignmentBytes = 0);
+
+    // ── THE ONE DOOR THAT DOES NOT ASK THE LINKAGE RULE (P69 fold 3) ───────────
+    //
+    // Replaces the linkage record of a function or a global this builder
+    // already holds, UNJUDGED: `mirLinkageDefect` is not asked. It exists for
+    // the reason `addInst` takes a raw payload — so that the VERIFIER's half of
+    // a rule the builders also hold can be reached and shown to fire. Both
+    // `addFunction` and `addGlobal` abort on an ill-formed record, which left
+    // `MirVerifier`'s refusal of one (`checkLinkageRecords`) with no module that
+    // could reach it, and a refusal nothing can reach is one nobody can pin.
+    // NO PRODUCER CALLS IT: a module that comes out of one of these is the
+    // verifier's to refuse, by name.
+    void restateLinkageUnjudged(MirFuncId function, MirLinkage linkage);
+    void restateLinkageUnjudged(MirGlobalId global, MirLinkage linkage);
 
     // Reserve a basic block in the current function WITHOUT opening it, returning
     // its id so terminators can target it before it is filled (forward branches).
@@ -913,7 +1303,8 @@ public:
     // pieces (SysV ≤16B → 2). Each `values[i]` is a piece value (I64/F64); the
     // callconv pass moves piece i into its per-class return register.
     MirInstId addReturnMulti(std::span<MirInstId const> values);
-    MirInstId addUnreachable();
+    // P69: `kind` is the `MirUnreachableKind` the terminator asserts (its payload).
+    MirInstId addUnreachable(MirUnreachableKind kind = MirUnreachableKind::Assumed);
 
     // ── introspection (read-only on the in-progress build) ──
     // True iff the currently-open block has been sealed (i.e. one of the
@@ -1010,8 +1401,19 @@ private:
     std::vector<MirBlockId>     succPool_;
     MirLiteralPool              literalPool_;
     MirAsmDescriptorPool        asmDescriptorPool_;
-    MirAliasingMode             aliasingMode_ = MirAliasingMode::Permissive;
-    bool                        charTypesAliasAll_ = true;
+    MirModuleFacts              facts_;   // the module's facts, whole (`MirModuleFacts`)
+    // The symbol-id space's end (see `mintSymbol`), and whether it was ever
+    // STATED — here (`stateSymbolIdEnd`, `stateSelfContainedSymbolIds`) or by a
+    // module this builder continues (`continueSymbolIdsOf`). `finish` hands both
+    // to the module.
+    SymbolIdEnd                 symbolIdEnd_;
+    bool                        symbolIdEndStated_ = false;
+    std::vector<MirAlias>       aliases_;   // `addAlias`; handed over by `finish`
+    void raiseSymbolIdEndTo_(std::uint32_t end) noexcept {
+        symbolIdEnd_.keepClearOf(SymbolIdEnd::startingAt(end));
+    }
+    // The module's end, for a door to take from -- refused BY NAME when nobody stated it (both doors ask here).
+    [[nodiscard]] SymbolIdEnd& statedEnd_();
 
     // Per-phi pending incomings, keyed by the phi instruction's slot (.v),
     // flushed into `phiPool_` (contiguously per phi) at `finish`.
@@ -1022,6 +1424,62 @@ private:
 
     MirFuncId  openFunc_;   // invalid ⇒ no open function
     MirBlockId openBlock_;  // invalid ⇒ no open block
+};
+
+// ── The door's second leaf: ids PAST a FROZEN module's symbol-id space ──
+//
+// A tier that lowers a module into its own representation needs symbols there
+// that the module never holds (MIR→LIR names its blocks, its jump tables and its
+// sign masks). It cannot ask a `MirBuilder` — the module is frozen and the symbols
+// are not the module's — but its ids must still clear everything
+// `Mir::symbolIdEnd` covers: the name table the module was made from, every
+// import beside it, and every symbol minted for the module that is neither a
+// function nor an object of it (a block symbol HIR→MIR pre-mints for a label
+// whose address a static initializer takes) — none of which a scan of the module,
+// or of a set a caller hands in, is guaranteed to see. This CONTINUES the
+// module's ids: the first `mint()` is `mir.symbolIdEnd()`. It mints through the
+// same one place as `MirBuilder::mintSymbol`, so it never returns a
+// writer-reserved value either — and, like it, ABORTS rather than mint past an
+// end nobody stated (`Mir::symbolIdEndIsStated`): a module whose end was only
+// counted may have a table beside it that this leaf cannot see, and the first id
+// it handed out would be one of that table's. Constructing a continuation over
+// such a module is no error; minting from it is.
+//
+// ⚠ ONE continuation per lowering of a module, and its ids are unique within the
+// OUTPUT it lowers into: the lowering's result carries the continuation's end
+// (`MirToLirResult::symbolIdEnd`) and the module compiled from it carries that end
+// (`lowerMirModuleToAssembly`, P69 f26e, B1 A7), so a pass minting on the output
+// continues past every id this one handed out. It does not write back — the module
+// is const — so two continuations of one module hand out the same ids: two outputs
+// of one `Mir` are two id spaces, which the link's merge maps apart by (module, id).
+// So ONLY the lowering makes one (P69 f26e, main's M1: the constructor is private,
+// and `MirToLirLoweringAccess`, lir/lowering/mir_to_lir.cpp, is its one friend).
+class DSS_EXPORT MirSymbolIdContinuation {
+public:
+    // Raise the end past an id something BESIDE the module already uses for it —
+    // an import row handed to the lowering next to a hand-built module (in a
+    // module made from a table every import's id is below the end already).
+    // It states nothing: a counted end stays counted.
+    void keepClearOf(SymbolId taken) noexcept;
+    // THE OPTIONAL DOOR past a frozen module (P69 f26e, B1): the next id; at
+    // exhaustion the refusal is REPORTED under the sink's code
+    // (`L_SymbolIdSpaceExhausted`) ONCE per continuation, nothing is written,
+    // and the answer is nullopt from then on — the lowering's error gate then
+    // withholds the module. Aborts, by name, over a module whose end was only
+    // counted.
+    [[nodiscard]] std::optional<SymbolId> mint(SymbolIdRefusalSink sink, std::string_view who);
+    // One past the highest id handed out so far.
+    [[nodiscard]] std::uint32_t end() const noexcept { return end_.value(); }
+    // Whether the module's end was stated (see `Mir::symbolIdEndIsStated`).
+    [[nodiscard]] bool endIsStated() const noexcept { return stated_; }
+
+private:
+    friend struct MirToLirLoweringAccess;
+    explicit MirSymbolIdContinuation(Mir const& mir) noexcept;
+
+    SymbolIdEnd end_;
+    bool        stated_;
+    bool        refused_ = false;
 };
 
 } // namespace dss

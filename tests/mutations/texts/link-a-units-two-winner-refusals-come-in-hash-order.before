@@ -1,0 +1,14 @@
+            // The definitions in the unit's table order, as `namesEachCopyCarries` walks them (P69 fold f26d, the
+            // host-toolchain class): this walk reports a refusal per definition, and walking the hash map itself
+            // reported a unit's several refusals in the standard library's hash order of their ids.
+            std::vector<std::uint32_t> inOrder;
+            for (auto const& s : m.symbols) {
+                if (s.binding == SymbolBinding::Local || s.name.empty()) continue;
+                auto& names = externalNamesOf[s.symbol.v];
+                if (names.empty()) inOrder.push_back(s.symbol.v);
+                bool const repeated = std::any_of(names.begin(), names.end(),
+                                                  [&](ModuleSymbol const* n) { return n->name == s.name; });
+                if (!repeated) names.push_back(&s);
+            }
+            for (std::uint32_t const id : inOrder) {
+                std::vector<ModuleSymbol const*> const& names = externalNamesOf.at(id);

@@ -59,6 +59,16 @@ dss_add_test(NAME asm/test_asm_text_to_lir    SOURCES test_asm_text_to_lir.cpp)
 target_link_libraries(dss_asm_test_asm_text_to_lir
     PRIVATE nlohmann_json::nlohmann_json)
 
+# P69 fold H5 (lane `hm`): a direct TAIL BRANCH to a symbol in the asm route -- `jmp ext` and `jmp other_fn`
+# leave the function for the symbol's code, elected among the row's return-class opcodes that take a symbol;
+# a row naming none keeps the refusal. The lowering on the shipped att dialect, and an image linked for pe and
+# ELF on every leg and run where the host is its platform.
+dss_add_test(NAME asm/test_asm_tail_branch SOURCES test_asm_tail_branch.cpp)
+target_link_libraries(dss_asm_test_asm_tail_branch
+    PRIVATE nlohmann_json::nlohmann_json)
+target_include_directories(dss_asm_test_asm_tail_branch
+    PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)
+
 # Plan 29 P5: the EMBEDDED template path (`lowerAsmTemplateToLirRun`) — the
 # SECOND caller of the one text->LIR engine. Drives the SHIPPED dialects and
 # the SHIPPED targets unmutated, and pins BYTES rather than opcodes, because a
@@ -491,3 +501,13 @@ target_link_libraries(dss_asm_test_asm_arm64_address_forms
     PRIVATE nlohmann_json::nlohmann_json)
 target_include_directories(dss_asm_test_asm_arm64_address_forms
     PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)
+
+# P69 (lane xa): a template's names of the EMBEDDING program — the symbol its
+# unit resolved, else the import its caller mints — answered through
+# `AsmTemplateProgramNames`, read against a test double that stands for the
+# caller (an address, a displacement, the page and its offset on ELF and
+# Mach-O, a call; an import and what it states; a template label and an
+# `asm goto` label never a program name; no names handed in = every name
+# refused by name). Reads the shipped documents, so it runs through ctest.
+dss_add_test(NAME asm/test_asm_template_program_names
+             SOURCES test_asm_template_program_names.cpp)

@@ -73,6 +73,7 @@ Mir buildDiamondModule(TypeInterner& interner, std::uint32_t n) {
     TypeId const fnSig    = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     for (std::uint32_t k = 0; k < n; ++k) {
         mb.addFunction(fnSig, SymbolId{100u + k});
         MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);

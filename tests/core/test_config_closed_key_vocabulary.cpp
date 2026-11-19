@@ -24,6 +24,7 @@
 #include "core/types/config_path_walk.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "shipped_row_pointer.hpp"   // a row named by its key, never its position
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
@@ -84,7 +85,8 @@ void injectAt(nlohmann::json& doc, std::string_view pointer,
               std::string_view key, std::string_view where) {
     nlohmann::json* node = nullptr;
     try {
-        node = &doc.at(nlohmann::json::json_pointer{std::string{pointer}});
+        node = &doc.at(nlohmann::json::json_pointer{
+            dss::test_support::resolveRowPointer(doc, pointer).pointer});
     } catch (std::exception const& e) {
         throw VocabularyProbeError{
             std::string{"["} + std::string{where} + "] the JSON pointer '" +
@@ -148,7 +150,7 @@ constexpr Block kBlocks[] = {
     {"c", "/numberStyle/exponent",            "an 'exponent' block"},
     {"asm-arm64-gas", "/numberStyle/integerPrefixes/0",
                                                      "an 'integerPrefixes' entry"},
-    {"c", "/numberStyle/integerPrefixes/0/float",
+    {"c", "/numberStyle/integerPrefixes/{float}/float",
                                                      "a prefix's 'float' block"},
     {"asm-arm64-gas", "/numberStyle/emitKind",       "the 'emitKind' block"},
     // ── grammar surface ──
@@ -162,10 +164,13 @@ constexpr Block kBlocks[] = {
     // ── semantics ──
     {"c", "/semantics",                       "the 'semantics' block"},
     {"c", "/semantics/declarators",           "the 'declarators' block"},
-    {"c", "/semantics/declarations/0",        "'declarations[0]'"},
-    {"c", "/semantics/declarations/2/gatedMarkers/0",
+    // P69 L2b2 (lane `lm`): a declarations row by its RULE (`shipped_row_pointer.hpp`)
+    // — `forDecl` was `/2/` and `topLevelDecl` `/7/` until two rows landed before them;
+    // the loader's own `declarations[N]` follows the row through `{index}`.
+    {"c", "/semantics/declarations/{rule=varDecl}", "'declarations[{index}]'"},
+    {"c", "/semantics/declarations/{rule=forDecl}/gatedMarkers/0",
                                                      "a 'gatedMarkers' entry"},
-    {"c", "/semantics/declarations/7/entryFunctions/main/0",
+    {"c", "/semantics/declarations/{rule=topLevelDecl}/entryFunctions/main/0",
                                                      "an 'entryFunctions' shape"},
     {"c", "/semantics/attributeSemantics",    "the 'attributeSemantics' block"},
     {"c", "/semantics/attributeSemantics/effects/0",
@@ -188,14 +193,15 @@ constexpr Block kBlocks[] = {
     {"asm-arm64-gas", "/assembly",                   "the 'assembly' block"},
     {"asm-arm64-gas", "/assembly/operandForms",      "the 'operandForms' map"},
     {"asm-arm64-gas", "/assembly/instructions/0",    "an 'instructions' row"},
-    // ⚠ Re-aimed 40 → 42 (P68 round 8): the `ldaxr` / `stlxr` rows landed ahead
-    // of the first `cset` row, the first to carry `operandSelectors`; 42 → 43
-    // (P68 round 9): the `adrp` row landed ahead of it too.
-    {"asm-arm64-gas", "/assembly/instructions/43/operandSelectors/0",
+    // The first row that carries `operandSelectors`, by the key it carries
+    // (`shipped_row_pointer.hpp`): this row was re-aimed BY HAND twice — 40 → 42
+    // (P68 round 8, `ldaxr` / `stlxr` landed ahead of the first `cset` row) and
+    // 42 → 43 (P68 round 9, `adrp`) — and a key names it however rows move (P69 L2b2).
+    {"asm-arm64-gas", "/assembly/instructions/{operandSelectors}/operandSelectors/0",
                                                      "an 'operandSelectors' entry"},
     // P68 round 9 (the aarch64 twins): a row's implied address part (`adrp`)
     // and the address-part spellings.
-    {"asm-arm64-gas", "/assembly/instructions/24/impliedSymbolPart",
+    {"asm-arm64-gas", "/assembly/instructions/{impliedSymbolPart}/impliedSymbolPart",
                                                      "an 'impliedSymbolPart' object"},
     {"asm-arm64-gas", "/assembly/symbolParts/0",     "a 'symbolParts' row"},
     {"asm-arm64-gas", "/assembly/directives/0",      "a 'directives' row"},
@@ -235,11 +241,14 @@ TEST(ClosedKeyVocabulary, UnknownKeyIsRefusedInEveryClosedKeyBlock) {
     for (auto const& b : kBlocks) {
         SCOPED_TRACE(std::string{b.language} + b.pointer);
         auto doc = shippedLanguageDoc(b.language);
+        // The label as the loader spells the ROW the pointer named (`{index}`).
+        std::string const label = dss::test_support::withSelectedIndex(
+            b.label, dss::test_support::resolveRowPointer(doc, b.pointer));
         injectAt(doc, b.pointer, kUnknownProbe, b.pointer);
         auto const text = doc.dump();
         auto       r    = GrammarSchema::loadFromText(text, b.language);
         ASSERT_FALSE(r.has_value())
-            << "an unknown key in " << b.label
+            << "an unknown key in " << label
             << " must FAIL the load — a silently-dropped key leaves the feature "
                "it names switched off with no diagnostic";
         EXPECT_TRUE(says(r.error(),
@@ -249,8 +258,8 @@ TEST(ClosedKeyVocabulary, UnknownKeyIsRefusedInEveryClosedKeyBlock) {
             << summarize(r.error());
         // ★ The refusal must name THIS block. Without it, a row aimed at the
         // wrong pointer would be satisfied by a neighbouring block's refusal.
-        EXPECT_TRUE(says(r.error(), std::string{b.label}))
-            << "the diagnostic must name " << b.label << ':'
+        EXPECT_TRUE(says(r.error(), label))
+            << "the diagnostic must name " << label << ':'
             << summarize(r.error());
     }
 }
@@ -265,11 +274,13 @@ TEST(ClosedKeyVocabulary, DocumentationKeyStaysExemptInEveryClosedKeyBlock) {
     for (auto const& b : kBlocks) {
         SCOPED_TRACE(std::string{b.language} + b.pointer);
         auto doc = shippedLanguageDoc(b.language);
+        std::string const label = dss::test_support::withSelectedIndex(
+            b.label, dss::test_support::resolveRowPointer(doc, b.pointer));
         injectAt(doc, b.pointer, kDocProbe, b.pointer);
         auto const text = doc.dump();
         auto       r    = GrammarSchema::loadFromText(text, b.language);
         EXPECT_TRUE(r.has_value())
-            << "a '$'-prefixed documentation key in " << b.label
+            << "a '$'-prefixed documentation key in " << label
             << " is PROSE and must never trip the typo discriminator:"
             << summarize(r.error());
     }
@@ -302,6 +313,14 @@ namespace {
 //   `entryFunctions` — the key is an entry function NAME in the configured
 //       source language, and `$` is a legal identifier character in the
 //       references DSS follows.
+//   `entryLabels` (an assembly dialect's, P69 fold 3e) — the same fact in a
+//       dialect: the key is a LABEL of the configured assembly language, and
+//       `$` is a legal symbol character to the assemblers DSS follows.
+//   `kinds` of a `pragmaEffects` row (P69 fold 3f) — the key is the KIND a
+//       program writes as `#pragma comment`'s first operand, matched against
+//       that token: an identifier of the configured language, the key space
+//       `entryFunctions` has. Only that map: a `typeSpelling.kinds` key is a
+//       type-kind name the loader owns, and keeps the carve-out.
 //
 // Reserving `$` in any of these would silently DELETE a legal spelling from the
 // configured language, which is a worse failure than the missing annotation:
@@ -309,13 +328,15 @@ namespace {
 // keys really are the loader's own.
 [[nodiscard]] bool keysAreSourceTextNotLoaderVocabulary(std::string_view path) {
     for (std::string_view const owner :
-         {"/tokens", "/linkageSpecifiers", "/entryFunctions"}) {
+         {"/tokens", "/linkageSpecifiers", "/entryFunctions", "/entryLabels"}) {
         if (path.size() >= owner.size() &&
             path.substr(path.size() - owner.size()) == owner) {
             return true;
         }
     }
-    return false;
+    constexpr std::string_view kPragmaEffects = "/pragmaEffects/";
+    constexpr std::string_view kKinds         = "/kinds";
+    return path.find(kPragmaEffects) != std::string_view::npos && path.ends_with(kKinds);
 }
 
 } // namespace

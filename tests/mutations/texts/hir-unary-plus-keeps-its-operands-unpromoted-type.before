@@ -1,0 +1,3 @@
+        folded.value = wrapToIntTarget(*bits, *domain);
+        folded.core  = intKindFromWidth(static_cast<std::uint32_t>(domain->bits),
+                                        domain->isSigned);

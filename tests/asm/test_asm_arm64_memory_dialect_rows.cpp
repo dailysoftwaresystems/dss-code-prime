@@ -161,7 +161,7 @@ runOn(std::shared_ptr<GrammarSchema> dialect,
     builder.beginBlock(entry);
 
     run->ok = lowerAsmTemplateToLirRun(*tree, *run->dialect, *run->target,
-                                       {}, builder, run->reporter);
+                                       {}, builder, run->reporter, nullptr);
 
     auto const retOp = run->target->opcodeByMnemonic("ret");
     if (!retOp.has_value()) throw std::runtime_error{"target has no `ret`"};
@@ -882,6 +882,8 @@ TEST(AsmArm64MemoryRows, ACallingConventionNamingTheAliasIsRejectedAtLoad) {
     auto const mutant = mutateShippedTargetSchemaDoc(
         kTarget, [&sawViolation](nlohmann::json& doc) {
             for (auto& cc : doc.at("callingConventions")) {
+                // A row that derives its pool (`derivesFrom`) takes the mutated base's.
+                if (!cc.contains("argFprs")) continue;
                 auto& pool = cc.at("argFprs");
                 if (pool.empty()) continue;
                 // Replace the FIRST arg register with its alias spelling: one

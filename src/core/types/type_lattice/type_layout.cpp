@@ -32,13 +32,20 @@ namespace {
 
 // Pointer byte width under a data model (the one OS-dependent layout dimension —
 // every other scalar's width is already baked into its TypeKind by FC3).
-[[nodiscard]] std::uint64_t pointerBytes(DataModel dm) noexcept {
+// ★ NONE OUTSIDE THE TABLE (P69 fold 3f, review-xa3e F3): `DataModel` is an
+// `enum class : std::uint8_t`, so every value of its underlying type is a value
+// of it — the zero sentinel and any unlisted one among them — and such a value
+// names no model and states no pointer size. The answer is nullopt, which
+// `scalarByteSize` hands on and `dataModelTheBackEndCannotLower` refuses by
+// name. This used to be `return 8; // unreachable for a valid model`: the
+// class's fallback of none, decided inside its own home by a literal.
+[[nodiscard]] std::optional<std::uint64_t> pointerBytes(DataModel dm) noexcept {
     switch (dm) {
         case DataModel::Lp64:
         case DataModel::Llp64: return 8;
         case DataModel::Ilp32: return 4;
     }
-    return 8;  // unreachable for a valid model
+    return std::nullopt;   // no model, so no pointer size
 }
 
 // The alignment of a scalar/pointer of `size` bytes under the params. The bounded
@@ -80,10 +87,19 @@ namespace {
 // Returns nullopt when the stored value is not a representable alignment — an
 // upstream bug (`completeComposite` rejects it at the sink) — so layout fails LOUD
 // rather than silently mis-aligning, mirroring the member-alignas `fromBytes` reject.
+//
+// ★ P69 (lane `cs`, fold f26c2 — review-csf26c F14): `Ignored` seeds 1 whatever the
+// composite requests, so the fold ends at its MEMBERS' alignment — the one AAPCS64
+// places an argument by (`StructLayout::membersAlign`, which `layoutOne` computes
+// this way). Every other caller honours the request.
+enum class CompositeRequest : std::uint8_t { Honoured, Ignored };
+
 [[nodiscard]] std::optional<Alignment>
-compositeSeedAlign(TypeInterner const& interner, TypeId id) noexcept {
+compositeSeedAlign(TypeInterner const& interner, TypeId id,
+                   CompositeRequest request) noexcept {
     std::uint32_t const req = interner.explicitCompositeAlign(id);
-    if (req == 0) return Alignment::of<1>();   // no request → the unchanged path
+    if (req == 0 || request == CompositeRequest::Ignored)
+        return Alignment::of<1>();   // no request → the unchanged path
     return Alignment::fromBytes(req);
 }
 
@@ -790,22 +806,27 @@ std::optional<std::uint64_t> scalarByteSize(TypeKind kind, DataModel dm) noexcep
     }
 }
 
-std::optional<std::uint64_t>
-sizeOfScalarOrBitInt(TypeInterner const& interner, TypeId id, DataModel dm) noexcept {
-    if (!id.valid()) return std::nullopt;
-    TypeKind const k = interner.kind(id);
-    if (k != TypeKind::BitInt) return scalarByteSize(k, dm);
-    // C23 _BitInt(N) (D-CSUBSET-BITINT): the CONTAINER size (params-independent, so
-    // no AggregateLayoutParams needed) — mirrors the `computeLayout` BitInt arm's
-    // size ladder exactly (N≤64 → {1,2,4,8}; N>64 → ceil(N/64) eightbytes).
-    std::int64_t const n = interner.bitIntWidth(id);
-    if (n <= 0) return std::nullopt;
-    std::uint64_t const bits = static_cast<std::uint64_t>(n);
-    if (bits <= 8)  return 1;
-    if (bits <= 16) return 2;
-    if (bits <= 32) return 4;
-    if (bits <= 64) return 8;
-    return ((bits + 63) / 64) * 8;
+// See the header: a data model in the operator's words.
+std::string dataModelSpelled(DataModel dm) {
+    std::string_view const name = dataModelName(dm);
+    return name.empty() ? "a data model no table row names (value " + std::to_string(static_cast<unsigned>(dm)) + ")"
+                        : "data model " + std::string{name};
+}
+
+// See the header: whether the back end can lower a data model's widths at all.
+std::optional<std::string> dataModelTheBackEndCannotLower(DataModel dm) {
+    std::string const spelled = dataModelSpelled(dm);
+    std::optional<std::uint64_t> const bytes = scalarByteSize(TypeKind::Ptr, dm);
+    if (!bytes.has_value()) {
+        return spelled + " states no pointer size, and every address the back end lowers has one";
+    }
+    if (*bytes != kBackEndAddressBytes) {
+        return spelled + " has " + std::to_string(*bytes) + "-byte pointers, and the back end lowers "
+             + std::to_string(kBackEndAddressBytes) + "-byte addresses only: its address arithmetic (lea, a "
+               "member's or an element's byte offset, the index products) carries "
+             + std::to_string(8 * kBackEndAddressBytes) + " bits";
+    }
+    return std::nullopt;
 }
 
 // ── The WIDE-INTEGER facade (D-CSUBSET-BITINT-C2-WIDE + D-CSUBSET-UINT128-TYPE) ──
@@ -822,7 +843,8 @@ bool isWideInt(TypeInterner const& interner, TypeId id) noexcept {
         // like `_BitInt(128)`. They join by SHAPE; the standard-rank vs bit-precise
         // distinction is a SEMANTIC one (type_rules.hpp `kindAtRank`) and does not
         // belong here. ⚠ `_BitInt(128)` (align 8) and U128 (align 16) remain
-        // INDEPENDENT layouts — see computeLayout's BitInt arm vs scalarByteSize.
+        // INDEPENDENT layouts on x86_64 — see computeLayout's BitInt arm vs scalarByteSize
+        // (on arm64 the target's 16-byte `bitPreciseChunk` makes the two coincide).
         case TypeKind::I128:
         case TypeKind::U128:
             return true;
@@ -946,10 +968,12 @@ namespace {
 // THROUGH the skin to the material type; the alignment itself is applied by
 // `layoutOne`, the thin wrapper just below this function. Nothing in this body reads
 // it, and nothing in this body should.
+// `request` is `CompositeRequest::Ignored` only for `layoutOne`'s second reading of a
+// composite that requests an alignment (`StructLayout::membersAlign`).
 [[nodiscard]] std::optional<StructLayout>
 layoutOneMaterial(TypeId id, TypeInterner const& interner,
                   AggregateLayoutParams params, DataModel dm,
-                  LayoutMemo const& memo) {
+                  LayoutMemo const& memo, CompositeRequest request) {
     TypeKind const kind = interner.kind(id);
 
     // D-CSUBSET-SELF-REFERENTIAL-STRUCT: an INCOMPLETE composite (a forward-declared
@@ -979,10 +1003,15 @@ layoutOneMaterial(TypeId id, TypeInterner const& interner,
             // C23 _BitInt(N) (D-CSUBSET-BITINT): the ABI layout. scalars[0] = N bits.
             // N≤64 → the smallest native container {1,2,4,8}B, align == size (matches
             // gcc/clang: sizeof(_BitInt(4))==1, _BitInt(17)==4, _BitInt(40)==8). N>64
-            // (C2 multi-limb; C1 rejects it at semantic, but layout is ready) →
-            // ceil(N/64) eightbytes, align 8 per the x86-64 psABI — sizeof(_BitInt(128))
-            // ==16 but _Alignof==8 (NOT 16). A non-positive N is malformed (the
-            // semantic gate rejects it first) → fail loud (nullopt).
+            // → whole CHUNKS of the target's `aggregateLayout.bitPreciseChunk`, aligned to
+            // one. ★ P69 (lane `cs`, fold f26d — D-TARGET-A-WIDE-BITINT-TAKES-THE-X86-64-ALIGNMENT-ON-ARM64):
+            // the chunk is the TARGET's, never written here — this arm used to answer the
+            // x86-64 psABI's 8 for every target. x86_64: 8 (ceil(N/64) eightbytes, align 8 —
+            // sizeof(_BitInt(128)) 16 but _Alignof 8); arm64: 16 (AAPCS64 — _BitInt(128)
+            // 16/16, _BitInt(129) 32/16). An undeclared chunk (0) lays out no wide `_BitInt`
+            // (nullopt), and so does a non-positive N (the semantic gate rejects it first).
+            // This arm is the ONE size ladder of a bit-precise integer: the data-global
+            // encoder and the aggregate-ABI leaves ask `computeLayout`.
             auto const sc = interner.scalars(id);
             if (sc.empty() || sc[0] <= 0) return std::nullopt;
             std::uint64_t const n = static_cast<std::uint64_t>(sc[0]);
@@ -993,8 +1022,11 @@ layoutOneMaterial(TypeId id, TypeInterner const& interner,
             else if (n <= 32) { size = 4; alignBytes = 4; }
             else if (n <= 64) { size = 8; alignBytes = 8; }
             else {
-                size       = ((n + 63) / 64) * 8;   // ceil(N/64) eightbytes
-                alignBytes = 8;                       // psABI: align 8 even at N>64
+                std::uint64_t const chunk = params.bitPreciseChunk;
+                if (chunk == 0) return std::nullopt;   // undeclared: no guessed ABI
+                std::uint64_t const chunkBits = chunk * 8;
+                size       = ((n + chunkBits - 1) / chunkBits) * chunk;
+                alignBytes = chunk;
             }
             return StructLayout{size, scalarAlign(alignBytes, params), {}, false};
         }
@@ -1043,7 +1075,7 @@ layoutOneMaterial(TypeId id, TypeInterner const& interner,
             // packers, which each end with `out.align.alignUp(...)`. Field OFFSETS
             // are unaffected: they are placed from the per-FIELD `effectiveAlign`,
             // never from `out.align`.
-            auto const seed = compositeSeedAlign(interner, id);
+            auto const seed = compositeSeedAlign(interner, id, request);
             if (!seed) return std::nullopt;   // unrepresentable stored request
             out.align = *seed;
             out.fieldOffsets.reserve(fields.size());
@@ -1238,7 +1270,7 @@ layoutOneMaterial(TypeId id, TypeInterner const& interner,
             // `out.align.alignUp(maxSize)` then grows the union's size to match.
             // clang: `union U { char a; int b; } __attribute__((aligned(32)));`
             // is sizeof 32 / _Alignof 32 (MEASURED).
-            auto const seed = compositeSeedAlign(interner, id);
+            auto const seed = compositeSeedAlign(interner, id, request);
             if (!seed) return std::nullopt;   // unrepresentable stored request
             out.align = *seed;
             out.fieldOffsets.assign(fields.size(), 0);  // every variant at offset 0
@@ -1467,9 +1499,22 @@ layoutOneMaterial(TypeId id, TypeInterner const& interner,
 [[nodiscard]] std::optional<StructLayout>
 layoutOne(TypeId id, TypeInterner const& interner,
           AggregateLayoutParams params, DataModel dm, LayoutMemo const& memo) {
-    auto out = layoutOneMaterial(id, interner, params, dm, memo);
+    auto out = layoutOneMaterial(id, interner, params, dm, memo, CompositeRequest::Honoured);
+    if (!out.has_value()) return out;
+    // ★ P69 (lane `cs`, fold f26c2 — review-csf26c F14): the members' alignment, before
+    // the composite's own request (`StructLayout::membersAlign`). A composite that
+    // requests one is read a second time with the request ignored — the same body, so
+    // the members' fold cannot be spelled twice; its children come from `memo`, so the
+    // second reading lays out nothing below this level. The type-level alignment below
+    // never reaches it.
+    out->membersAlign = out->align;
+    if (interner.explicitCompositeAlign(id) != 0) {
+        auto const bare = layoutOneMaterial(id, interner, params, dm, memo, CompositeRequest::Ignored);
+        if (!bare.has_value()) return std::nullopt;
+        out->membersAlign = bare->align;
+    }
     std::uint32_t const want = interner.typeAlignOverride(id);
-    if (!out.has_value() || want == 0) return out;
+    if (want == 0) return out;
     auto const a = Alignment::fromBytes(want);
     // Unrepresentable (0 / non-power-of-two / over max) ⇒ FAIL LOUD, exactly as the
     // member-`alignas` fold does. The semantic tier validates the request long before
@@ -1756,6 +1801,26 @@ operandLayout(TypeId id, TypeInterner const& interner,
     // 1 it happens to agree — an agreement that would quietly stop holding if a
     // dialect ever declared 2.
     return StructLayout{*declared, Alignment{}, {}, false};
+}
+
+std::optional<Alignment>
+typeAlignment(TypeId id, TypeInterner const& interner,
+              AggregateLayoutParams params, DataModel dm) {
+    // Bounded by the interner it walks: one step per level, and a level is a distinct record.
+    TypeId cur = id;
+    for (std::size_t steps = 0; steps <= interner.size(); ++steps) {
+        if (!cur.valid()) return std::nullopt;
+        if (auto const lay = computeLayout(cur, interner, params, dm)) return lay->align;
+        // No layout: only an array of KNOWN extent -- fixed or run-time -- still has an alignment.
+        if (interner.kind(cur) != TypeKind::Array || interner.isIncompleteArray(cur))
+            return std::nullopt;
+        if (std::uint32_t const own = interner.typeAlignOverride(cur); own != 0)
+            return Alignment::fromBytes(own);
+        auto const ops = interner.operands(cur);
+        if (ops.empty()) return std::nullopt;
+        cur = ops[0];
+    }
+    return std::nullopt;
 }
 
 } // namespace dss

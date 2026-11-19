@@ -1,0 +1,2 @@
+        return c.verb.has_value()
+            && std::find(entryScope.verbs.begin(), entryScope.verbs.end(), *c.verb) != entryScope.verbs.end();

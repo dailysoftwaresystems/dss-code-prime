@@ -1,0 +1,1 @@
+                if (ex.symbol == h.personality && ex.isData) {

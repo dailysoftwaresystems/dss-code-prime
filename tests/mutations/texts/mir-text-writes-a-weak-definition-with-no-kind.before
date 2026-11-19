@@ -1,0 +1,1 @@
+            if (auto const kind = linkage.statedWeakKind(); kind.has_value()) {

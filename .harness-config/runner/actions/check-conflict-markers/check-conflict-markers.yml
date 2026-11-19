@@ -1,0 +1,26 @@
+# PURPOSE: refuse a line that is a merge-conflict marker git writes -- seven `<`, seven vertical bars or seven `>` at its start, and seven `=` alone between an opener and its closer -- in any text file of the tree git tracks or would add.
+name: check-conflict-markers
+description: >-
+  The action refuses every merge-conflict marker line in the tree's text files, tracked or untracked and
+  not ignored, then can prove its own rules.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+  Gated by ctest as `conflict_markers_guard` (the tree), and its self-test as
+  `harness/conflict_markers_selftest`, one case per arm.
+steps:
+  - name: verify
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-conflict-markers.py
+    successPattern: '^conflict-markers: OK \(\d+ text file\(s\)'
+    requireInputsUnmoved: true
+
+  # The self-test ALONE, without judging the tree -- `dssharness run check-conflict-markers --manual-step self-test`.
+
+  - name: self-test
+    manual: true
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-conflict-markers.py --self-test
+    successPattern: '^conflict-markers self-test: \d+ arm\(s\), 0 failed$'
+    requireInputsUnmoved: true

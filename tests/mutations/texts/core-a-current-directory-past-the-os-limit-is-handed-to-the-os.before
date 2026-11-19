@@ -1,0 +1,1 @@
+        if (handed.size() > std::size_t{MAX_PATH - 2}) {

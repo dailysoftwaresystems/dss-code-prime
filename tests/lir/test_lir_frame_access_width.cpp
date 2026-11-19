@@ -147,6 +147,8 @@ struct PipelineOut {
     TypeId const params[] = {f64, f64};
     auto const sig = interner.fnSig(params, i32, conv);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
+    mb.stateArgCounting(argCountingOf(conv == CallConv::CcMS64));
     mb.addFunction(sig, SymbolId{1});
     MirBlockId const bb = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(bb);
@@ -173,7 +175,7 @@ struct PipelineOut {
 void runToBytes(Mir& mir, TypeInterner const& interner,
                 TargetSchema const& target, std::uint16_t ccIndex,
                 PipelineOut& out) {
-    auto lir = lowerToLir(mir, target, interner, out.rep);
+    auto lir = lowerToLir(mir, target, interner, out.rep, ccIndex);
     ASSERT_TRUE(lir.ok) << "MIR->LIR failed";
     auto const liveness = analyzeLiveness(lir.lir);
     auto const alloc = allocateRegisters(lir.lir, target, liveness, ccIndex,
@@ -222,6 +224,18 @@ savedRegStores(LirFuncCfi const& cfi) {
         out.emplace_back(cfi.ops[i].inst, cfi.ops[i].reg.ordinal);
     }
     return out;
+}
+
+// How many bytes of its register the saved-register rule attached to `inst`
+// STATES were stored (`LirCfiOp::savedBytes`); UINT32_MAX when no rule of the
+// function is attached to that instruction.
+[[nodiscard]] std::uint32_t statedBytes(LirFuncCfi const& cfi, LirInstId inst) {
+    for (auto const& op : cfi.ops) {
+        if (op.kind == CfiOpKind::RegAtCfaOffset && op.inst.v == inst.v) {
+            return op.savedBytes;
+        }
+    }
+    return UINT32_MAX;
 }
 
 [[nodiscard]] bool containsBytes(std::vector<std::uint8_t> const& hay,
@@ -392,6 +406,13 @@ TEST(LirFrameAccessWidth, MsX64PrologueSavesTheWholeXmmIntoItsWholeSlot) {
             << "saved register '" << info->name << "' is " << declared
             << " bits wide and `ms_x64` preserves all of it, but its prologue "
                "store accesses " << emitted << " bits";
+        // ★ AND THE RULE STATES WHAT THE STORE WROTE. The unwind writer for
+        // this convention's format has a save code that CLAIMS a width (the
+        // whole register), and holds the rule to it — so the rule has to carry
+        // the store's own byte count, not leave it for a reader to assume.
+        EXPECT_EQ(statedBytes(out.cc.perFuncCfi[0], inst), emitted / 8u)
+            << "the frame rule of saved register '" << info->name
+            << "' must state the " << emitted / 8u << " bytes its store wrote";
         if (info->regClass == TargetRegClass::FPR) {
             ++fprSaves;
             EXPECT_GT(emitted, 64u)
@@ -478,6 +499,12 @@ TEST(LirFrameAccessWidth, Aapcs64PrologueSavesExactlyTheDeclaredSixtyFourBits) {
             << info->name << "' is a 64-bit STUR Dt — DELETING that key makes "
                "it 128 and reddens this line, which is what proves the ms_x64 "
                "arm reads config rather than a constant";
+        // The rule says the same eight bytes: HALF of the sixteen-byte register,
+        // the one statement a format whose save code claims the whole register
+        // cannot make (its writer refuses such a rule by name).
+        EXPECT_EQ(statedBytes(out.cc.perFuncCfi[0], inst), 8u)
+            << "the frame rule of '" << info->name << "' must state the eight "
+               "bytes AAPCS64 preserves, not the register's sixteen";
     }
     ASSERT_GT(fprSaves, 0u)
         << "aapcs64 names v8..v15 in `calleeSaved` and this fixture keeps an "

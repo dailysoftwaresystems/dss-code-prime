@@ -19,6 +19,12 @@ add_library(core OBJECT
     types/scope_kind.cpp
     types/parse_diagnostic.cpp
     types/diagnostic_reporter.cpp
+    # The ONE home of a fresh SymbolId: its door types' emitters and the REPORTED
+    # door's settle check (P69 fold f26e, review-csf26d B1).
+    types/symbol_id_cursor.cpp
+    # The ONE rendering of source text inside a diagnostic — one line, cut past the
+    # configuration's limit (D-DIAG-A-DIAGNOSTIC-QUOTES-ITS-OPERAND-WHOLE).
+    types/diagnostic_quote.cpp
     types/unsuppressable_codes.cpp
     types/config_path_walk.cpp
     types/header_case_diagnostic.cpp
@@ -37,11 +43,23 @@ add_library(core OBJECT
     types/asm_template_text_forms.cpp
     types/grammar_schema.cpp
     types/grammar_schema_json.cpp
+    # The ONE vocabulary of a program's entry names on a format (a language's
+    # `entryFunctions` and a dialect's `entryLabels` alike): the driver's
+    # election and the semantic tier's entry gate both ask it (P69 fold 3e).
+    types/entry_names.cpp
+    # The ONE correspondence between an entry parameter SHAPE and a TYPE: the
+    # semantic tier classifies a definition with it and the startup's init
+    # builds a verb's signature with it (P69 fold 3f).
+    types/entry_param_types.cpp
     types/predefined_macro_json.cpp
     # The ONE resolver of a language type NAME (`"unsigned long"` -> its
     # typeSpecifiers row): the grammar loader at LOAD and the shipped-descriptor
     # reader at USE (a lattice-derived constant's `of`), P68 round 9.
     types/type_name_resolve.cpp
+    # The ONE renderer of a type as a source language spells it in a diagnostic,
+    # and the load of the language document's table it reads (P69 fold f26d).
+    types/type_spelling.cpp
+    types/type_spelling_json.cpp
     # The ONE `when` selector (decode + validate, and the match against a pair):
     # the shipped-descriptor reader at READ and the language document's builtin
     # `signature` variants at LOAD + INJECTION — P68 round 12, S2a-1 of
@@ -114,6 +132,37 @@ target_compile_definitions(core PRIVATE DSS_PROJECT_VERSION="${DSS_VERSION}")
 # `DSS_INSTALL_CONFIG_RELDIR` (cmake/DssInstall.cmake) use. A default would ship
 # a compiler that silently never reports a foreign tree, which is the defect.
 target_compile_definitions(core PRIVATE DSS_BUILD_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+
+# THE CONFIG DOCUMENTS' NESTING LIMIT (cycle P69 L2, lane `lm`). Every reader of a config
+# document takes it (`parseConfigDocument`, core/types/config_document_parse.hpp), so it
+# cannot live in a document the compiler reads at run time: it is the config tree's
+# configure-time document, read HERE by cmake/DssConfigNestingLimit.cmake — which refuses
+# the configure, by name, on a missing or malformed one — and compiled in. Undefined =>
+# config_document_parse.cpp's `#error`; no default stands in for it. The second define
+# names the document in the refusal's sentence. The document is never installed
+# (cmake/DssInstall.cmake), and the install smoke test proves nothing reads it at run time.
+include("${CMAKE_SOURCE_DIR}/cmake/DssConfigNestingLimit.cmake")
+dss_read_config_nesting_limit(
+    "${CMAKE_SOURCE_DIR}/src/dss-config/configure-time/config-documents.json"
+    DSS_CONFIG_MAX_NESTING)
+target_compile_definitions(core PRIVATE
+    DSS_CONFIG_MAX_NESTING=${DSS_CONFIG_MAX_NESTING}
+    DSS_CONFIG_MAX_NESTING_DOCUMENT="configure-time/config-documents.json")
+
+# THE DIAGNOSTICS' QUOTED-SOURCE-TEXT LIMIT (cycle P69 f26d, lane `cs`). Every diagnostic that
+# quotes source text renders it through `quotedSourceText` (core/types/diagnostic_quote.hpp), cut
+# past this many bytes. The limit is the diagnostics' own — no language, target or object format
+# states it — so it is the config tree's configure-time document, read HERE by
+# cmake/DssConfigureTimeCount.cmake, which refuses the configure by name on a missing or malformed
+# one, and compiled in. Undefined => diagnostic_quote.cpp's `#error`; no default stands in for it.
+include("${CMAKE_SOURCE_DIR}/cmake/DssConfigureTimeCount.cmake")
+dss_read_configure_time_count(
+    "${CMAKE_SOURCE_DIR}/src/dss-config/configure-time/diagnostics.json"
+    quotedSourceTextLimit
+    "the diagnostics' quoted-source-text limit"
+    "Every diagnostic that quotes source text takes its `quotedSourceTextLimit`, so the build cannot be configured without it."
+    bytes DSS_DIAGNOSTIC_QUOTE_LIMIT)
+target_compile_definitions(core PRIVATE DSS_DIAGNOSTIC_QUOTE_LIMIT=${DSS_DIAGNOSTIC_QUOTE_LIMIT})
 
 # nlohmann/json is PRIVATE: the include path is a build requirement of `core`'s
 # own sources, NOT a usage requirement re-exported to consumers.

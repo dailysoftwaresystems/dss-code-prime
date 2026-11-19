@@ -208,18 +208,31 @@ enum class MemberKind : std::uint8_t {
     return MemberKind::Object;
 }
 
-// Tokenize the GNU "//" long-name string table ONCE into an
-// offset -> name map. Each entry is "<name>/\n" (the trailing '/' is the
-// GNU terminator; '\n' ends the entry); the map key is the entry's START
-// offset -- exactly what a member's "/N" name field references. Building
-// this once (a single linear pass) replaces a per-member rescan: a
-// crafted "//" table with no terminator + many "/N" members drove that
-// rescan to O(members x table-bytes) -- a time-hang DoS on the untrusted
-// format-blind path (memory-safe, but unbounded work). An unterminated
-// final NON-empty entry (no closing '\n' before the table end) fails
-// loud CorruptedBinary -- a real GNU/SysV table always '\n'-terminates
-// every entry, so this never rejects a benign archive. Empty entries (a
-// trailing padding '\n', or "\n\n") are skipped, not mapped.
+// Tokenize the "//" long-name string table ONCE into an offset -> name map;
+// the map key is the entry's START offset -- exactly what a member's "/N"
+// name field references. Building this once (a single linear pass) replaces
+// a per-member rescan: a crafted "//" table with no terminator + many "/N"
+// members drove that rescan to O(members x table-bytes) -- a time-hang DoS
+// on the untrusted format-blind path (memory-safe, but unbounded work).
+//
+// ★ TWO PRODUCERS SPELL AN ENTRY TWO WAYS, AND THE TABLE'S OWN BYTES SAY
+//   WHICH (P69 fold 3c, D-FF1-AR-READER-REFUSES-THE-COFF-LONGNAMES-MEMBER):
+//     * GNU's, "<name>/\n" (ar, llvm-ar): the entry ends at its '\n', and one
+//       trailing '/' is GNU's terminator, not the name's;
+//     * the PE/COFF archive format's, "<name>\0" (lib.exe, llvm-lib): the
+//       entry ends at its NUL. ✔MEASURED 2026-10-07 and 2026-10-20: lib.exe
+//       14.44 archives `foreign_object_library_binding_x86_64_pe_cl_MD_O2.obj`
+//       with a longnames member whose bytes are that name and one NUL, and
+//       link.exe links the archive.
+//   An entry ends at whichever of the two comes FIRST, so a table that mixes
+//   them is read as its bytes say, entry by entry -- never by the host or the
+//   format the build targets. Until the fold this tokenizer read GNU's form
+//   alone, under a comment that "a real table always '\n'-terminates every
+//   entry", and every lib.exe archive with a member name past 15 characters
+//   was refused as corrupted.
+// A final NON-empty entry that ends in neither (the table's end reached
+// first) fails loud CorruptedBinary. Empty entries (a trailing padding '\n',
+// "\n\n", a run of NULs) are skipped, not mapped.
 [[nodiscard]] std::expected<std::unordered_map<std::uint64_t, std::string>,
                             BinaryReadError>
 parseLongNameTable(std::span<std::uint8_t const> tbl,
@@ -227,24 +240,24 @@ parseLongNameTable(std::span<std::uint8_t const> tbl,
     std::unordered_map<std::uint64_t, std::string> map;
     std::size_t start = 0;
     while (start < tbl.size()) {
-        std::size_t nl = start;
-        while (nl < tbl.size() && tbl[nl] != '\n') ++nl;
-        if (nl >= tbl.size()) {
+        std::size_t end = start;
+        while (end < tbl.size() && tbl[end] != '\n' && tbl[end] != '\0') ++end;
+        if (end >= tbl.size()) {
             return std::unexpected(emitAndReturn(
                 BinaryReadErrorKind::CorruptedBinary,
                 "ar reader: '//' long-name table has an unterminated final "
                 "entry at offset " + std::to_string(start)
-                + " (no '\\n' before the table end)", reporter));
+                + " (neither a NUL nor a '\\n' before the table end)", reporter));
         }
-        // Entry = [start, nl); strip one trailing '/' (GNU terminator).
-        std::size_t entryEnd = nl;
-        if (entryEnd > start && tbl[entryEnd - 1] == '/') --entryEnd;
+        // Entry = [start, end); a GNU entry sheds its one trailing '/'.
+        std::size_t entryEnd = end;
+        if (tbl[end] == '\n' && entryEnd > start && tbl[entryEnd - 1] == '/') --entryEnd;
         if (entryEnd > start) {
             map.emplace(static_cast<std::uint64_t>(start),
                 std::string{reinterpret_cast<char const*>(&tbl[start]),
                             static_cast<std::size_t>(entryEnd - start)});
         }
-        start = nl + 1;
+        start = end + 1;
     }
     return map;
 }

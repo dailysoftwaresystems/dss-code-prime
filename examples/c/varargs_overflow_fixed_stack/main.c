@@ -37,6 +37,8 @@
 // future target declares a different `argGprCount`, re-derive the param count from the
 // pool before adding its leg here — do not assume this shape overflows anywhere.
 
+#include <stdarg.h>
+
 int g_seed = 7;   // mutable global → opaque load (anti-fold)
 
 int pick(int a, int b, int c, int d, int e, int f, int g, ...) {

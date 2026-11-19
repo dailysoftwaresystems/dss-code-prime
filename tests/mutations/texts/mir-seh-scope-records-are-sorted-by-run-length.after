@@ -1,0 +1,1 @@
+        return (a.lastPos - a.firstPos) < (b.lastPos - b.firstPos);

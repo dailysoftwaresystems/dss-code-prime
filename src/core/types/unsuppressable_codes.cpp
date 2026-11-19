@@ -470,8 +470,8 @@ constexpr MembershipReason kWhyInlineAsmLabelSection{
     "which operand role becomes a guess"};
 constexpr MembershipReason kWhyVlaNonLeafFrame{
     MembershipProng::WrongArtifactShipsGreen,
-    "silenced, a non-leaf VLA frame places outgoing call arguments inside "
-    "the VLA region, an ABI break"};
+    "silenced, a frame whose stack pointer moved at run time addresses its "
+    "fixed slots off that stack pointer, a stack miscompile"};
 constexpr MembershipReason kWhyRegallocInvariant{
     MembershipProng::WrongArtifactShipsGreen,
     "a register-allocation calling-convention / class invariant; "
@@ -498,6 +498,15 @@ constexpr MembershipReason kWhySilentConstraint{
     MembershipProng::BuildFailsWithNothingSaid,
     "the build already fails on this constraint violation; silenced, it "
     "fails with ZERO diagnostics shown and no statement of why"};
+constexpr MembershipReason kWhyAttributeNotHonoured{
+    MembershipProng::BuildFailsWithNothingSaid,
+    "the build already fails on an attribute that changes a type or a call "
+    "sequence and cannot be applied; silenced, it fails with ZERO "
+    "diagnostics shown, and the attribute reads as accepted"};
+constexpr MembershipReason kWhySymbolAliasTargetInvalid{
+    MembershipProng::WrongArtifactShipsGreen,
+    "silenced, the alias is not made and its name stays a reference by name, "
+    "which the link binds to whatever another unit defines under it"};
 constexpr MembershipReason kWhyNullptrOperand{
     MembershipProng::WrongArtifactShipsGreen,
     "silenced, nullptr lowers through the integer-0 null constant and "
@@ -790,7 +799,32 @@ constexpr MembershipReason kWhyIncludeReentryRefused{
 // `S_EnumCompatibleTypeRuleUndeclared` joins under `kWhyEnumCompatibleTypeRule`, prong
 // (1) — a suppressed one would leave a guessed compatible type reaching codegen.
 // (Written from main's 198; a fold landing another member first reconciles the count.)
-constexpr std::array<UnsuppressableEntry, 199> kUnsuppressableCodes{{
+// ⓘ EXTENT 200 → 202 (2026-10-15, P69 round 1): lane `cs`'s `S_SymbolAliasTargetInvalid` and lane
+// `lm`'s `H_SehRegionInsideAFilter` join — the latter under `kWhyHirStructural`, a `__try` inside a
+// filter expression, which the filter's own function has no handler table for.
+// ⓘ EXTENT 202 → 203 (2026-10-20, P69 round 1, L2, lane `lm`): `I_PhiIncomingsNotOnePerPredecessor`
+// joins under `kWhyMirVerifier`, a member like every I_* verifier invariant (a Phi that does not
+// take its value from every way into its block). Written from main's 202; a fold landing another
+// member first reconciles the count.
+// ⓘ EXTENT 203 → 202 (2026-11-05, P69 fold 3e, lane `xa`, class C's N3): `S_EntryShapeNotDeclared`
+// LEAVES. It is a WARNING now -- a definition of an entry name whose signature is none of the rows its
+// format realizes is the program's entry all the same, called with the richest row, as gcc (-Wmain) and
+// MSVC link and run it -- so suppressing it hides advice while the build proceeds to the program every
+// reference makes: it fails both prongs, as gcc's -Wmain is suppressible. The program-entry block below
+// is rewritten in place. Written from main's 203; a fold landing another member first reconciles the count.
+// ⓘ EXTENT 202 → 206 (2026-11-14, P69 round 1, fold f26d, lane `cs`, review-csf26c2 N2):
+// `I_ArgOrdinalGap`, `I_ArgOrdinalRepeated`, `I_ArgCountingUnstated` and
+// `I_CallDisagreesWithItsDefinition` join under `kWhyMirVerifier`, members like every I_* verifier
+// invariant (a function whose `Arg`s skip or share a register, a module that cannot say how its
+// `Arg`s are counted, a stamped call its callee receives otherwise). Written from main's 203 and
+// reconciled on the refresh onto checkpoint 44 with 3e's departure of `S_EntryShapeNotDeclared`
+// (above); a fold landing another member first reconciles the count.
+// ⓘ EXTENT 206 → 208 (2026-11-17, P69 round 1, fold f26e, lane `cs`, review-csf26d B1/A1):
+// `K_SymbolIdSpaceExhausted` and the new `H_SymbolIdSpaceExhausted` join `L_SymbolIdSpaceExhausted`
+// under `kWhySymbolIdSpace`, prong (1): the K_/L_/H_ trio of the one home's refusal emitter
+// (core/types/symbol_id_cursor.hpp), each the ONLY statement that its tier's output was refused.
+// Written from main's 206; a fold landing another member first reconciles the count.
+constexpr std::array<UnsuppressableEntry, 209> kUnsuppressableCodes{{
     // D_* build-lifecycle band — a `.dss-project.json` pre/post-build hook
     // that could not be spawned, or that ran and failed. PRONG (2), and only
     // prong (2): both already abort the build with or without the diagnostic
@@ -1163,6 +1197,7 @@ constexpr std::array<UnsuppressableEntry, 199> kUnsuppressableCodes{{
     {DiagnosticCode::H_SehJumpIntoRegion, kWhyHirStructural},        // verifier, P68
     {DiagnosticCode::H_SehEarlyExit, kWhyHirStructural},             // verifier, P68
     {DiagnosticCode::H_SehLabelAddress, kWhyHirStructural},          // verifier, P68
+    {DiagnosticCode::H_SehRegionInsideAFilter, kWhyHirStructural},   // verifier, P69
     // H_WideCharSurrogateUnsupported (C11/C23 6.4.5, wide/UTF string literals):
     // a code point that cannot be represented in the requested element width
     // without truncation (astral under a 16-bit element, ill-formed UTF-8, or
@@ -1229,10 +1264,15 @@ constexpr std::array<UnsuppressableEntry, 199> kUnsuppressableCodes{{
     {DiagnosticCode::I_EntryBlockNotFirst, kWhyMirVerifier},
     {DiagnosticCode::I_BlockNotTerminated, kWhyMirVerifier},
     {DiagnosticCode::I_PhiPredNotInCfg, kWhyMirVerifier},
+    {DiagnosticCode::I_PhiIncomingsNotOnePerPredecessor, kWhyMirVerifier},
     {DiagnosticCode::I_NotDominated, kWhyMirVerifier},
     {DiagnosticCode::I_TerminatorTypeMismatch, kWhyMirVerifier},
     {DiagnosticCode::I_ArgIndexOutOfRange, kWhyMirVerifier},
     {DiagnosticCode::I_ArgPositionDuplicate, kWhyMirVerifier},
+    {DiagnosticCode::I_ArgOrdinalGap, kWhyMirVerifier},
+    {DiagnosticCode::I_ArgOrdinalRepeated, kWhyMirVerifier},
+    {DiagnosticCode::I_ArgCountingUnstated, kWhyMirVerifier},
+    {DiagnosticCode::I_CallDisagreesWithItsDefinition, kWhyMirVerifier},
     {DiagnosticCode::I_ExtensionTypeInMir, kWhyMirVerifier},
     {DiagnosticCode::I_NullptrTypeInMir, kWhyMirVerifier},
     {DiagnosticCode::I_StructCfMismatch, kWhyMirVerifier},
@@ -1419,7 +1459,8 @@ constexpr std::array<UnsuppressableEntry, 199> kUnsuppressableCodes{{
     {DiagnosticCode::K_FormatLacksProcessExit, kWhyEntryTrampoline},
     {DiagnosticCode::K_ExecEntryNotTrampolined, kWhyEntryTrampoline},
     // The PROGRAM-ENTRY RESOLUTION family (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE,
-    // 2026-08-10) — four codes, one rule, and the rule is that EVERY outcome of
+    // 2026-08-10) — three codes since P69 fold 3e (four before: see the shape
+    // check's bullet), one rule, and the rule is that EVERY outcome of
     // entry resolution other than "exactly one candidate" must be undroppable.
     // Suppression here restores a MEASURED fault rather than a hypothetical one:
     // before these codes existed, `int main(int, char**, char**)` compiled rc=0
@@ -1430,12 +1471,14 @@ constexpr std::array<UnsuppressableEntry, 199> kUnsuppressableCodes{{
     // allow, and suppression would hand exactly that binary back. A silently
     // miscompiled entry has NO other trace: the build reports success.
     //
-    // ★ WHY ALL FOUR AND NOT JUST THE SHAPE CHECK. Each is a distinct way to end
-    // up running the wrong code, or none, with a successful-looking build:
-    //   * S_EntryShapeNotDeclared — the definition has the wrong signature for its
-    //     name. (The measured 3-param-main fault above is closed by SUPPORT
-    //     now — the language declares that row — so what this code refuses
-    //     is every signature the language does NOT declare for an entry name.)
+    // ★ WHY THESE THREE. Each is a distinct way to end up running the wrong code,
+    // or none, with a successful-looking build:
+    //   * (S_EntryShapeNotDeclared LEFT this family in P69 fold 3e. It refused
+    //     every signature the language declares no row for an entry name; it now
+    //     WARNS where the definition is entered all the same, with the richest row
+    //     its format realizes, as gcc (-Wmain) and MSVC run `int main(int,
+    //     double)` and `int main(int, char**, int)` (✔MEASURED, lane `xa`). A
+    //     silenced warning leaves the program every reference makes: no prong.)
     //   * K_ProgramEntryUndefined — an exec build with NO candidate. Suppressed,
     //     the build proceeds to a link-tier "symbol not found" at best, and the
     //     explanation of WHY (the verb this format cannot realize) is lost.
@@ -1445,7 +1488,6 @@ constexpr std::array<UnsuppressableEntry, 199> kUnsuppressableCodes{{
     //   * K_EntryVerbUnmaterializable — the decided verb and the MIR signature
     //     disagree. Suppressed, the materializer reads past the end of the
     //     parameter list.
-    {DiagnosticCode::S_EntryShapeNotDeclared, kWhyProgramEntry},
     {DiagnosticCode::K_ProgramEntryUndefined, kWhyProgramEntry},
     {DiagnosticCode::K_ProgramEntryAmbiguous, kWhyProgramEntry},
     {DiagnosticCode::K_EntryVerbUnmaterializable, kWhyProgramEntry},
@@ -1505,10 +1547,11 @@ constexpr std::array<UnsuppressableEntry, 199> kUnsuppressableCodes{{
     // slot path and silently emit a `lea` of a 1-slot scalar for the whole VLA — a
     // stack miscompile (MINOR-3). Same load-bearing-boundary class as the L_ band.
     {DiagnosticCode::L_VlaDynamicAllocaUnsupported, kWhyVlaDynamicAlloca},
-    // L_VlaNonLeafFrameUnsupported (VLA C1b LEAF gate, D-CSUBSET-VLA-NONLEAF-CALL-FRAME):
-    // a VLA function that ALSO calls / uses va_start. A member: suppressed, a non-leaf
-    // VLA would place outgoing call args INSIDE the VLA region under the moved SP (an
-    // ABI break — a silent stack miscompile). Same load-bearing-boundary class.
+    // L_VlaNonLeafFrameUnsupported (born as the VLA C1b LEAF gate): a frame whose SP
+    // moves at run time with a fixed-frame reference left SP-relative (the frame-base
+    // verifier), or that is a SEH `__try` parent. A member: suppressed, the function
+    // addresses its frame off a stack pointer that moved — a silent stack miscompile.
+    // Same load-bearing-boundary class.
     {DiagnosticCode::L_VlaNonLeafFrameUnsupported, kWhyVlaNonLeafFrame},
     {DiagnosticCode::L_TerminatorSuccessorMismatch, kWhyTerminatorSuccessors},
 
@@ -1529,6 +1572,10 @@ constexpr std::array<UnsuppressableEntry, 199> kUnsuppressableCodes{{
     // of block / jump-table / sign-mask symbols refuses instead of wrapping.
     // Created a member, with the code — its own note says why.
     {DiagnosticCode::L_SymbolIdSpaceExhausted, kWhySymbolIdSpace},
+    // K_SymbolIdSpaceExhausted / H_SymbolIdSpaceExhausted (P69 fold f26e, B1): the
+    // link tier's and HIR→MIR's members of the same refusal, from the one emitter.
+    {DiagnosticCode::K_SymbolIdSpaceExhausted, kWhySymbolIdSpace},
+    {DiagnosticCode::H_SymbolIdSpaceExhausted, kWhySymbolIdSpace},
     // L_ArgClassHasNoRegisterPool / L_ArgClassPoolUndeclared
     // (D-LIR-ARG-PASSING-POOL-SELECTION-IS-TWO-WAY-AND-VR-FALLS-INTO-GPR): their own
     // note says "Both UNSUPPRESSABLE: suppressed, each is a wrong-register codegen
@@ -1687,6 +1734,17 @@ constexpr std::array<UnsuppressableEntry, 199> kUnsuppressableCodes{{
     {DiagnosticCode::S_AlignasWeakerThanNatural, kWhySilentConstraint},
     {DiagnosticCode::S_AlignasInvalidContext, kWhySilentConstraint},
     {DiagnosticCode::S_AlignasNonConstant, kWhySilentConstraint},
+    // P69 round 4 (lane `cs`): a KNOWN attribute the compiler cannot honour where it
+    // is written — `vector_size`, `mode`, a calling convention that is not the
+    // pair's. The refusal is an error, so the build fails; suppressed, it would
+    // fail with nothing said, and before the refusal existed each of these was a
+    // warning beside a wrong size or a wrong call sequence.
+    {DiagnosticCode::S_AttributeNotHonoured, kWhyAttributeNotHonoured},
+    // P69 (lane `cs`): an `alias("target")` whose target cannot be the definition the
+    // declared entity becomes a second name of. Silenced, the declared name stays a
+    // reference by name and the link binds it to whatever another unit defines under
+    // that name — a program no reference builds, shipped green.
+    {DiagnosticCode::S_SymbolAliasTargetInvalid, kWhySymbolAliasTargetInvalid},
     // S_PackedBitfieldUnsupported (0xE032) IS DELIBERATELY ABSENT, and its absence is
     // the point. It was a member from 2026-07-08 until
     // D-CSUBSET-PACKED-BITFIELD-INTERACTION
@@ -1992,6 +2050,11 @@ constexpr std::array<UnsuppressableEntry, 199> kUnsuppressableCodes{{
     // is exactly why both references make it an ordinary, silenceable warning
     // (clang's is even named: -Wimplicitly-unsigned-literal) rather than an
     // error. `--warnings-as-errors` is the lever for a project that wants it out.
+    // S_IntegerLiteralImplicitlyUnsigned (P69, its phase-7 twin) is NOT a member for
+    // the same two prongs: the literal is typed `decimalPastRange` whether or not the
+    // warning shows, so suppressing it changes no answer and hides no failure — and
+    // its dedup of the Pass-1.5 pre-stamp's second visit RELIES on it staying
+    // suppressible (the reporter's duplicate window applies only to such codes).
     // P_ClosedByEndOfInput (P68 round 8,
     // D-ASM-UNTERMINATED-BLOCK-COMMENT-AT-END-OF-FILE-REFUSED) is deliberately NOT
     // a member, by the same two prongs: the input is ACCEPTED and assembled
@@ -2033,6 +2096,10 @@ constexpr std::array<UnsuppressableEntry, 199> kUnsuppressableCodes{{
     // wrong symbol ships — the S_DeprecatedSymbolUsed posture.
     {DiagnosticCode::S_AsmLabelInvalid, kWhyAsmLabel},
     {DiagnosticCode::S_AsmLabelDuplicate, kWhyAsmLabel},
+    // P69 (lane `cs`, fold f26e): a label written where the language takes none -- the same
+    // rename, refused, so the C name would ship in its place. S_AsmLabelOnTypedef is NOT a
+    // member: a typedef has no symbol, so nothing wrong ships.
+    {DiagnosticCode::S_AsmLabelMisplaced, kWhyAsmLabel},
     // TF-C86 (D-CSUBSET-STDARG-F001A): a `#define`/`#undef` of a
     // conditional-inclusion OPERATOR name (`__has_include` and siblings).
     // Suppressing it does not make the shadowing harmless — it lets the

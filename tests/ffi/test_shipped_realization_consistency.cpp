@@ -212,14 +212,14 @@ using dss::ffi_test::FixtureRoleResolver;
     // stand-in works — the checker compares TypeIds and every descriptor is
     // handed the same binding.
     std::array<NamedTypeBinding, 1> const named{
-        NamedTypeBinding{"va_list",
+        NamedTypeBinding{dss::ffi::kVaListDescriptorTypeName,
                          interner.pointer(interner.primitive(TypeKind::Void))}};
     // (C) needs no language vocabulary: it compares realizations, not type
     // spellings. An empty vocabulary disables (B) only, which is pinned by the
     // sibling sweep.
     ShippedTypeConsistency checker{interner, std::span<VocabularyCore const>{},
                                    ax.format};
-    FixtureRoleResolver const roles{ax.format};
+    FixtureRoleResolver const roles{ax.format, arch};
     // The axis's long-double format reaches the reads, as in the type-consistency
     // sweep (P68 round 12, S2a-2a): the two sweeps read one corpus the same way.
     ShippedPairFacts const pairFacts{
@@ -583,6 +583,25 @@ TEST(ShippedRealizationConsistency, DivergentLinkNameIsRefused) {
                        "linkName": "dup_v2" } ]
     })");
     expectRefusedBothOrders(one, two, "linkName");
+}
+
+// P69 fold 3f (ledger 549 (b)): a row's stated route as a WRITTEN name is a realization fact the
+// first-wins read keeps from the winner alone -- two rows of one name, one stating the linker alias
+// and one stating nothing, would bind a foreign object's plain reference by which row won.
+TEST(ShippedRealizationConsistency, DivergentStatedRouteIsRefused) {
+    ScratchDir dir{Location::Temp, "shipped-realization-route"};
+    auto const one = writeDesc(dir, "one.json", R"({
+        "header": "one.h",
+        "library": { "pe": "alpha.dll" },
+        "symbols": [ { "name": "dup", "signature": "fn(i32) -> i32", "linkName": "_dup" } ]
+    })");
+    auto const two = writeDesc(dir, "two.json", R"({
+        "header": "two.h",
+        "library": { "pe": "alpha.dll" },
+        "symbols": [ { "name": "dup", "signature": "fn(i32) -> i32", "linkName": "_dup",
+                       "writtenNameRoute": { "pe": "linkerAlias" } } ]
+    })");
+    expectRefusedBothOrders(one, two, "stated route");
 }
 
 // One row says "this is data", the other "this is a function": different HIR

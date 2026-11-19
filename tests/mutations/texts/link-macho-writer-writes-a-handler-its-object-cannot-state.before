@@ -1,0 +1,2 @@
+    if (link::format::refuseAHandlerThisFlavourCannotState(
+            module.functions, "macho::encode (MH_OBJECT)",

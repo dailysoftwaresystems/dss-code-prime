@@ -1,0 +1,2 @@
+        request = CstFoldFrame{.kind = CstFoldFrame::Kind::PassThrough, .node = *arm};
+        return suspended(expr);

@@ -1,0 +1,3 @@
+                                good = verb.has_value()
+                                    && std::find(startup.verbs.begin(), startup.verbs.end(), *verb)
+                                           == startup.verbs.end();

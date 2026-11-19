@@ -1,0 +1,1 @@
+    wsl = dict((str(d["wsl"]), d) for d in (config.get("legs") or {}).values() if isinstance(d, dict) and d.get("wsl"))

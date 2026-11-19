@@ -1,0 +1,3 @@
+                                } else if (false && out.appliesTo.empty()) {
+                                    coll.emit(
+                                        DiagnosticCode::C_InvalidSemantics, keyPath,

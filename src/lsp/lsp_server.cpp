@@ -4,6 +4,7 @@
 #include "analysis/semantic/semantic_analyzer.hpp"
 #include "analysis/semantic/semantic_model.hpp"
 #include "analysis/semantic/target_format_analysis.hpp"   // analyzeForTargetFormat
+#include "core/substrate/key_order.hpp"   // entriesInKeyOrder -- the completion items' order
 #include "core/types/source_buffer.hpp"
 #include "core/types/tree.hpp"
 #include "core/types/tree_cursor.hpp"
@@ -677,25 +678,27 @@ LspServer::ParsePlan LspServer::planParse_(std::string const&      uri,
     };
 
     if (!workspaceBuild_.has_value()) {
-        auto const& err = workspaceBuild_.error();
+        auto const& refused = workspaceBuild_.error();
         // "There is no build" — no workspace folder, no manifest — is not a
         // refusal: there is nothing to agree with, and the document is analyzed
         // under its language alone, exactly as before.
-        if (err.kind != WorkspaceProjectErrorKind::NoWorkspaceRoot
-            && err.kind != WorkspaceProjectErrorKind::ProjectFileNotFound) {
-            // A manifest the BUILD refuses is published on the document under
-            // the build's own code, so the editor says why it cannot answer with
-            // the build's configuration instead of silently answering without it.
+        if (!refused.namesNoBuild()) {
+            // Every refusal of the workspace the BUILD refuses is published on
+            // the document, ONE diagnostic each, under the build's own code and
+            // in the list's order (P69 H6c2), so the editor says every reason it
+            // cannot answer with the build's configuration.
             DocumentAnalysis refusal;
-            dss::ParseDiagnostic d;
-            d.code     = err.code;
-            d.severity = dss::DiagnosticSeverity::Error;
-            d.actual   = "the workspace's build configuration could not be read ["
-                         + std::string{workspaceProjectErrorName(err.kind)}
-                         + "]: " + err.detail
-                         + " — this document is analyzed under its language "
-                           "alone until the manifest loads";
-            refusal.diagnostics.push_back(std::move(d));
+            for (auto const& err : refused.refusals) {
+                dss::ParseDiagnostic d;
+                d.code     = err.code;
+                d.severity = dss::DiagnosticSeverity::Error;
+                d.actual   = "the workspace's build configuration could not be read ["
+                             + std::string{workspaceProjectErrorName(err.kind)}
+                             + "]: " + err.detail
+                             + " — this document is analyzed under its language "
+                               "alone until the manifest loads";
+                refusal.diagnostics.push_back(std::move(d));
+            }
             plan.refusals.push_back(std::move(refusal));
         }
         languageOnly();
@@ -754,29 +757,22 @@ DocumentAnalysis LspServer::analyzeRun_(ParseRun const&    run,
     // ★★★ D-LSP-HAS-NO-SYSTEM-INCLUDE-DIRS-AND-DROPS-THE-CU-DRIVER-DIAGNOSTICS
     //
     // THE LANGUAGE'S SYSTEM INCLUDE PATH — the `/usr/include` analogue the
-    // angle form `#include <h>` resolves against. Without this call
-    // `systemDirs` was EMPTY, so no shipped descriptor resolved and the
-    // editor compiled every buffer against a corpus the compiler never uses.
-    // ✔MEASURED through a real `dsscp --lsp` child, same file both ways:
-    // `#include <stdbool.h>` -> CLI rc=0, editor `P_PreprocessorErrorDirective`.
-    // That is a FALSE ALARM on the line the user is looking at.
-    //
-    // ★ IT IS NOT GATED ON THE WORKSPACE TARGET: `semantics.shippedLibDirs` is a
-    // property of the LANGUAGE, and every run carries its language. The pair's
-    // settings are the next call's.
-    //
-    // ⚠ AND IT MUST LAND WITH THE `driverDiagnostics()` PUBLISH BELOW, in
-    // BOTH directions. ✔MEASURED (the red-on-disable arm that removes THIS
-    // line): publishing driver diagnostics with an EMPTY system path puts
-    // ELEVEN spurious `C_UnbackedPredefinedMacro` diagnostics on every open
-    // document — including a buffer with no `#include` at all —
-    // because `UnitBuilder::finish()` validates each predefined macro's
-    // `impliedSurface` claim against the corpus reached through
-    // `systemDirs_`, and with no dirs every claim is unbacked. Half of this
-    // fix alone is worse than neither half.
-    // ⓘ The COUNT is a property of `c.lang.json`'s predefine set and will
-    // move when that document does; the pin asserts ZERO, never a number.
-    dss::applySystemDirs(builder, *run.grammar);
+    // angle form `#include <h>` resolves against — comes with the builder
+    // itself: a `UnitBuilder` takes its language's system dirs at construction
+    // (P69 L2b2, ruling 570). This site used to have to ASK for them, and
+    // without that call `systemDirs` was EMPTY, so no shipped descriptor
+    // resolved and the editor compiled every buffer against a corpus the
+    // compiler never uses. ✔MEASURED through a real `dsscp --lsp` child, same
+    // file both ways: `#include <stdbool.h>` -> CLI rc=0, editor
+    // `P_PreprocessorErrorDirective` — a FALSE ALARM on the line the user is
+    // looking at. And the `driverDiagnostics()` publish below depends on it:
+    // with an EMPTY system path every open document carried ELEVEN spurious
+    // `C_UnbackedPredefinedMacro` diagnostics (`UnitBuilder::finish()` checks
+    // each predefined macro's `requires` claim against the corpus the unit can
+    // reach), which LspDriverAgreement.NoSpuriousUnbackedPredefinedMacro pins
+    // at ZERO. `semantics.shippedLibDirs` is a property of the LANGUAGE, so it
+    // is not gated on the workspace target; the pair's settings are the next
+    // call's.
     // ★★★ D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE — THE PAIR, THROUGH THE
     // BUILD'S OWN TWO CALLS. The editor used to state no target and no format
     // here, on purpose: with no workspace pair to read, guessing one would have
@@ -833,19 +829,18 @@ DocumentAnalysis LspServer::analyzeRun_(ParseRun const&    run,
     // in, so a header that could not be found is read before the cascade of
     // undeclared identifiers it caused.
     //
-    // ⚠ EVERY tree's diagnostics, not `trees()[0]`'s, is a DIFFERENT
-    // question and is deliberately NOT changed here: an auto-loaded include
-    // is a full member of `cu->trees()`, and publishing those is
-    // [[D-LSP-DIAGNOSTIC-RENDERED-AGAINST-THE-OPEN-DOCUMENT-IGNORING-ITS-BUFFER]]'s
-    // territory (which already made `publishDiagnostics_` group by ORIGIN
-    // uri, so the grouping is ready for it).
-    auto driverDiags = cu->driverDiagnostics().all();
-    out.diagnostics.assign(driverDiags.begin(), driverDiags.end());
-    if (!cu->trees().empty()) {
-        auto parseDiags = cu->trees()[0].diagnostics().all();
-        out.diagnostics.insert(out.diagnostics.end(), parseDiags.begin(),
-                               parseDiags.end());
-    }
+    // ★ EVERY tree's diagnostics, not `trees()[0]`'s: the unit's own streams come
+    // from their one home (`CompilationUnit::forEachOwnDiagnosticStream`, the
+    // driver's, then every tree's), as the build's drain and the FFI header reader
+    // read them. `publishDiagnostics_` already renders each diagnostic against the
+    // buffer it names and publishes per ORIGIN uri
+    // ([[D-LSP-DIAGNOSTIC-RENDERED-AGAINST-THE-OPEN-DOCUMENT-IGNORING-ITS-BUFFER]]),
+    // so a stream of another tree lands on that tree's file. The editor publishes
+    // whatever the verdict, so the verdict is not read here.
+    (void)cu->forEachOwnDiagnosticStream([&out](dss::DiagnosticReporter const& stream) {
+        auto const all = stream.all();
+        out.diagnostics.insert(out.diagnostics.end(), all.begin(), all.end());
+    });
     auto semDiags = out.model->diagnostics().all();
     out.diagnostics.insert(out.diagnostics.end(), semDiags.begin(), semDiags.end());
     return out;
@@ -1496,7 +1491,11 @@ std::optional<std::string> LspServer::handleCompletion_(Request const& req) {
             scope = scopes[scope.v].parent;
         }
 
-        for (auto const& [name, symId] : visible) {
+        // ★ IN NAME ORDER (P69 fold 3f, lane `xa`): the items ARE the reply, so they
+        // come in the names' own order (`substrate::entriesInKeyOrder`), never the
+        // order the unordered map happens to iterate in.
+        for (auto const* entry : substrate::entriesInKeyOrder(visible)) {
+            auto const& [name, symId] = *entry;
             if (offered.contains(name)) continue;
             auto const* rec = model->recordFor(symId);
             if (rec == nullptr) continue;

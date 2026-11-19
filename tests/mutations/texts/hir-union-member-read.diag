@@ -1,0 +1,1 @@
+static const union { int i; float f; } cu = { 42 };

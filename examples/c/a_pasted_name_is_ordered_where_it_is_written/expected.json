@@ -1,0 +1,16 @@
+{
+  "$comment": "A PASTED NAME IS ORDERED WHERE IT IS WRITTEN (P69 round 1, lane cs, fold f26c). The C front end answered 'is A written before B' by byte offset, which a token the preprocessor materializes (a paste's product, in the synth buffer's product tail) does not keep: a struct with a pasted tag was incomplete for every later function, a declaration with a pasted name was not seen by a later sizeof (a wrong value), and a const object with a pasted initializer was not visible to a later static initializer (probes fp3-fp6). Every order question now reads the token-stream order (semantic_analyzer.cpp streamRank). gcc, clang, mingw-w64 gcc and Apple clang run every form to 42. Each return before 42 names the first form that failed.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

@@ -1,0 +1,1 @@
+        || is(hirCfg.stmtExprRule) || is(cfg.genericRule)

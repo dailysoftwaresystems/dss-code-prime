@@ -1,0 +1,1 @@
+        return static_cast<int>(da.severity) > static_cast<int>(db.severity);

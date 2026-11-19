@@ -1,0 +1,2 @@
+                        if (!rec.asmName.empty()
+                            && effectiveKind == DeclarationKind::Type) {

@@ -40,7 +40,9 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -289,6 +291,16 @@ namespace {
     return model.lattice().interner().kind(res->hir.typeId(shift));
 }
 
+// The value a RETURN statement returns, read only once the node IS one with a value: nullopt for any other node
+// and for a `return;`. `Hir::returnValue` ASSERTS the node's kind and hands back an optional, so a test that took a
+// body's child on faith and read it there ABORTED the binary when a lowering put another node in its place — and
+// every test after it was never run (the arm `hir-a-body-that-terminates-is-completed-too`: exit 134 at
+// CallAndTypedef, no report). Each reader asserts what it got, by name.
+[[nodiscard]] std::optional<HirNodeId> returnedValue(Hir const& h, HirNodeId stmt) {
+    if (!stmt.valid() || h.kind(stmt) != HirKind::ReturnStmt) return std::nullopt;
+    return h.returnValue(stmt);
+}
+
 } // namespace
 
 TEST(HirLoweringC, EmptyVoidFunction) {
@@ -386,7 +398,9 @@ TEST(HirLoweringC, ArithmeticAndParams) {
     auto stmts = res->hir.children(body);
     ASSERT_EQ(stmts.size(), 1u);
     ASSERT_EQ(res->hir.kind(stmts[0]), HirKind::ReturnStmt);
-    HirNodeId ret = *res->hir.returnValue(stmts[0]);
+    auto const retValue = returnedValue(res->hir, stmts[0]);
+    ASSERT_TRUE(retValue.has_value()) << "the node read as a return statement is not one with a value";
+    HirNodeId ret = *retValue;
     EXPECT_EQ(res->hir.kind(ret), HirKind::BinaryOp);           // a + b
 }
 
@@ -719,6 +733,44 @@ TEST(HirLoweringC, AnArrayDecayingToAMoreQualifiedPointeeIsRealizedAsTheDecay) {
            "decay Cast typed `volatile int *`";
 }
 
+// P69 fold f26b (lane `cs`) — the REALIZE half of a function designator decaying to a pointer to a
+// COMPATIBLE function type that is not its own (C 6.3.2.1p4, 6.5.16.1p1, 6.7.6.3p15): `gu`, returning
+// `int (*)[]`, initializing, assigned to, passed as and returned as a pointer to a function returning
+// `int (*)[3]`. The semantic tier admits the pair on `decayedFunctionReachesPointee`; `coerce` must realize
+// it as the FnSig->Ptr decay Cast typed as the TARGET pointer, at all four sites — without it the operand
+// kept the designator's own signature where another is declared.
+// ✔MEASURED (lane `cs` probe ft): gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc 13.2.0 run each shape in silence.
+TEST(HirLoweringC, AFunctionDecayingToACompatibleSignatureIsRealizedAsTheDecay) {
+    SemanticModel model = analyzeC(
+        "int store[8];\n"
+        "int (*gu(void))[] { return (int (*)[])store; }\n"
+        "int apply3(int (*(*cb)(void))[3]) { return (*cb())[1]; }\n"
+        "int (*(*pick(void))(void))[3] { return gu; }\n"
+        "int g(void) { int (*(*fp)(void))[3] = gu; fp = gu; return apply3(gu) + (*fp())[1] + (*pick()())[1]; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    auto const& in = model.lattice().interner();
+    unsigned decays = 0;
+    // Arena slot 0 is the reserved sentinel; real ids run [1, nodeCount()).
+    for (std::uint32_t i = 1; i < res->hir.nodeCount(); ++i) {
+        HirNodeId const n{i};
+        if (res->hir.kind(n) != HirKind::Cast) continue;
+        auto const kids = res->hir.children(n);
+        if (kids.size() != 1u) continue;
+        TypeId const from = res->hir.typeId(kids[0]);
+        TypeId const to   = res->hir.typeId(n);
+        if (in.kind(from) != TypeKind::FnSig || in.kind(to) != TypeKind::Ptr) continue;
+        auto const pointee = in.operands(to);
+        if (pointee.size() == 1u && pointee[0] != from && in.kind(pointee[0]) == TypeKind::FnSig) ++decays;
+    }
+    EXPECT_EQ(decays, 4u)
+        << "the initialization, the assignment, the argument and the return must each be the FnSig->Ptr "
+           "decay Cast typed as the pointer to the declared, compatible, signature";
+}
+
 // (The positional-symmetry pin that explains WHY `aligned` left this test —
 // `AfterDeclaratorAlignedAppliesLikeTheLeadingPosition` — lives with the rest of
 // the TF-C73 battery further down, where the shared `globalAlignment` helper it
@@ -964,7 +1016,9 @@ TEST(HirLoweringC, CallAndTypedef) {
     // f's body returns a Call.
     HirNodeId fbody = res->hir.functionBody(decls[2]);
     HirNodeId ret = res->hir.children(fbody)[0];
-    EXPECT_EQ(res->hir.kind(*res->hir.returnValue(ret)), HirKind::Call);
+    auto const value = returnedValue(res->hir, ret);
+    ASSERT_TRUE(value.has_value()) << "the node read as a return statement is not one with a value";
+    EXPECT_EQ(res->hir.kind(*value), HirKind::Call);
 }
 
 // D-LANG-POINTER-VOID-CONVERT (audit-fold G4, step 13.2, 2026-06-02):
@@ -996,7 +1050,9 @@ TEST(HirLoweringC, CoerceEmitsCastForCharPtrToVoidPtrArg) {
     ASSERT_GE(stmts.size(), 1u);
     // Last statement is `return handler(s);` — find its Call.
     HirNodeId const ret = stmts.back();
-    HirNodeId const call = *res->hir.returnValue(ret);
+    auto const callValue = returnedValue(res->hir, ret);
+    ASSERT_TRUE(callValue.has_value()) << "the node read as a return statement is not one with a value";
+    HirNodeId const call = *callValue;
     ASSERT_EQ(res->hir.kind(call), HirKind::Call);
     // Call children: [callee, arg0, arg1, ...]
     auto const callKids = res->hir.children(call);
@@ -1037,7 +1093,9 @@ TEST(HirLoweringC, CoerceEmitsCastForVoidPtrToCharPtrArg) {
     HirNodeId const mainBody = res->hir.functionBody(decls.back());
     auto const stmts = res->hir.children(mainBody);
     HirNodeId const ret = stmts.back();
-    HirNodeId const outerCall = *res->hir.returnValue(ret);
+    auto const outerCallValue = returnedValue(res->hir, ret);
+    ASSERT_TRUE(outerCallValue.has_value()) << "the node read as a return statement is not one with a value";
+    HirNodeId const outerCall = *outerCallValue;
     ASSERT_EQ(res->hir.kind(outerCall), HirKind::Call);
     auto const outerKids = res->hir.children(outerCall);
     ASSERT_EQ(outerKids.size(), 2u);
@@ -1112,7 +1170,9 @@ TEST(HirLoweringC, ExplicitCastOfStringLiteralLowersViaDecay) {
     auto const stmts = res->hir.children(mainBody);
     ASSERT_GE(stmts.size(), 1u);
     HirNodeId const ret = stmts.back();
-    HirNodeId const outer = *res->hir.returnValue(ret);
+    auto const outerValue = returnedValue(res->hir, ret);
+    ASSERT_TRUE(outerValue.has_value()) << "the node read as a return statement is not one with a value";
+    HirNodeId const outer = *outerValue;
     // (int) ← (long) ← decay(Ptr<Char>) ← "xy"
     ASSERT_EQ(res->hir.kind(outer), HirKind::Cast);
     EXPECT_EQ(ti.kind(res->hir.typeId(outer)), TypeKind::I32);
@@ -1199,35 +1259,167 @@ TEST(HirLoweringC, ScalarEmptyAndSingleBraceInitLower) {
     EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
 }
 
-// FC17.5 (S_InvalidScalarInitializer 0xE03F): the three malformed scalar
-// brace shapes stay LOUD — excess elements (`{1,2}`), a designator on a
-// scalar (`{.x=1}`), and the audit-N2 nested brace list (`{{42}}` — C23
-// 6.7.10p12 requires a SINGLE expression). Each is a distinct arm of the
-// scalar lowering's reject path; a silent guess would ship wrong bytes.
-TEST(HirLoweringC, ScalarBraceInitMalformedShapesFailLoud) {
-    struct Arm { char const* src; char const* what; };
+// A `_Complex` AND A `_BitInt` ARE SCALAR BRACE-INIT TARGETS, EACH ITS OWN MEMBER
+// OF THE CLOSED ALLOWLIST. Both are scalar types (C23 6.2.5: the arithmetic types
+// and the pointer types), so `T v = { e };`, the empty `T v = {};`, a member inside
+// an aggregate's list and a compound literal initialize them as they do an `int`.
+// The runnable halves — the values read back through memory, debug and release —
+// are examples/c/complex_scalar_braced_initializer and
+// examples/c/bit_int_scalar_braced_initializer; these are the unit-tier claims, one
+// case per member, so that taking ONE member out of the allowlist is answered by its
+// own case.
+//
+// THE MUTATIONS are arms of `dssharness check-mutations` (tests/mutations/arms.registry),
+// WRITTEN, NOT READ — no sweep has read either `passed` yet:
+//   hir-braced-complex-refused   `TypeKind::Complex` out of the scalar brace-init allowlist
+//                                (the initializer then falls to the aggregate gate, which
+//                                refuses it); declared red: the first case
+//   hir-braced-bitint-refused    `TypeKind::BitInt` out of it; declared red: the second
+//                                case, with the first as the neighbour that stays green
+TEST(HirLoweringC, AComplexIsAScalarBraceInitTarget) {
+    SemanticModel model = analyzeC(
+        "int main(void) {\n"
+        "    double _Complex z = { 42.0 };\n"
+        "    double _Complex e = {};\n"
+        "    float _Complex f = { 2.0f };\n"
+        "    static double _Complex s = { 1.5 };\n"
+        "    struct { double _Complex m; int n; } t = { { 3.0 }, 7 };\n"
+        "    double _Complex c = (double _Complex){ 5.0 };\n"
+        "    (void)z; (void)e; (void)f; (void)s; (void)c;\n"
+        "    return t.n;\n"
+        "}\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok)
+        << "a `_Complex` is a scalar: its brace initializer must lower — "
+        << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::S_InvalidScalarInitializer), 0u);
+}
+
+TEST(HirLoweringC, ABitIntIsAScalarBraceInitTarget) {
+    SemanticModel model = analyzeC(
+        "int main(void) {\n"
+        "    _BitInt(8) b = { 42 };\n"
+        "    _BitInt(8) zb = {};\n"
+        "    unsigned _BitInt(100) w = { 42 };\n"
+        "    unsigned _BitInt(100) zw = {};\n"
+        "    static _BitInt(24) s = { 40 };\n"
+        "    struct { _BitInt(12) m; int n; } t = { { 2 }, 7 };\n"
+        "    (void)b; (void)zb; (void)w; (void)zw; (void)s;\n"
+        "    return t.n;\n"
+        "}\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok)
+        << "a `_BitInt` is a scalar: its brace initializer must lower — "
+        << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::S_InvalidScalarInitializer), 0u);
+}
+
+// CHECKED ARITHMETIC IS COMPUTED IN A TYPE WIDE ENOUGH TO HOLD THE EXACT RESULT.
+// `__builtin_add_overflow(a, b, &r)` answers "did the mathematical sum fit `r`", so
+// the sum is formed in a type W that cannot itself wrap: over two signed N-bit
+// operands, N + 1 bits. The lowering binds both operands and the exact result to
+// synthetic temporaries of type W — three of them — and W is the first of `long
+// long`'s 64 bits, the 128-bit type, and a bit-precise type of exactly the bits
+// needed. The run-time half is examples/c/gnu_overflow_predicates and
+// examples/c/gnu_builtins_overflow_alloca; this is the unit-tier claim: W, by type.
+//
+// THE MUTATION is the arm `hir-overflow-wide-type` of `dssharness check-mutations`
+// (WRITTEN, NOT READ — no sweep has read it `passed` yet): the signed W capped at 64
+// bits. The `long long` and `__int128` rows would then compute in a type the sum
+// wraps in; the `int` row, whose 33 bits fit 64 either way, is the control inside
+// the case.
+TEST(HirLoweringC, CheckedArithmeticOverSignedOperandsIsComputedWideEnoughForTheExactResult) {
+    struct Row {
+        char const*  type;
+        TypeKind     wide;
+        std::int64_t bitIntWidth;   // when `wide` is a bit-precise type
+    };
+    for (Row const& row : {Row{"int", TypeKind::I64, 0},
+                           Row{"long long", TypeKind::I128, 0},
+                           Row{"__int128", TypeKind::BitInt, 129}}) {
+        std::string src = "int f(";
+        src += row.type;
+        src += " a, ";
+        src += row.type;
+        src += " b) {\n    ";
+        src += row.type;
+        src += " r;\n    return __builtin_add_overflow(a, b, &r);\n}\n"
+               "int main(void) { return 0; }\n";
+        SemanticModel model = analyzeC(src);
+        ASSERT_FALSE(model.hasErrors())
+            << row.type << ": "
+            << (model.diagnostics().all().empty()
+                  ? "" : model.diagnostics().all()[0].actual);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << row.type << ": "
+                             << (r.all().empty() ? "" : r.all()[0].actual);
+        auto const& ti = model.lattice().interner();
+        Hir const& hir = res->hir;
+        std::size_t wideTemporaries = 0;
+        std::vector<HirNodeId> pending;
+        for (HirNodeId d : hir.moduleDecls(hir.root())) {
+            if (hir.kind(d) == HirKind::Function) pending.push_back(hir.functionBody(d));
+        }
+        while (!pending.empty()) {
+            HirNodeId const id = pending.back();
+            pending.pop_back();
+            if (hir.kind(id) == HirKind::VarDecl && has(hir.flags(id), HirFlags::Synthetic)) {
+                TypeId const t = hir.varDeclType(id);
+                bool const isWide =
+                    ti.kind(t) == row.wide
+                    && (row.wide != TypeKind::BitInt
+                        || (ti.bitIntWidth(t) == row.bitIntWidth && ti.bitIntIsSigned(t)));
+                if (isWide) ++wideTemporaries;
+            }
+            for (HirNodeId c : hir.children(id)) pending.push_back(c);
+        }
+        EXPECT_EQ(wideTemporaries, 3u)
+            << row.type << ": the two operands and the exact sum are each bound to a "
+                           "temporary of the type the sum cannot wrap in";
+    }
+}
+
+// FC17.5, turned around by P69 (lane `lm`, the scalar brace closure): the two scalar
+// brace shapes C does not allow are the LANGUAGE's statement — excess elements
+// (`{1,2}`, C 6.7.9p2) and the audit-N2 nested brace list (`{{42}}`, more braces than
+// C 6.7.9p11's one pair) lower to the first value with the warning c.lang.json
+// declares, as gcc 13.3.0 and clang 18.1.3 build both with a warning (✔MEASURED
+// 2026-10-16, every program RUN). A designator on a scalar stays refused — by the
+// semantic tier now, before any lowering (S_InvalidScalarInitializer 0xE03F), as both
+// references refuse it. Every shape, the values, and the document that declares no
+// warning are tests/hir/test_scalar_brace_initializer.cpp's.
+TEST(HirLoweringC, ScalarBraceInitShapesAreTheLanguagesDeclaration) {
+    struct Arm { char const* src; char const* what; DiagnosticCode warning; };
     Arm const arms[] = {
-        {"int main() { int v = {1, 2}; return v; }\n",   "excess elements"},
-        {"int main() { int v = {.x = 1}; return v; }\n", "designator on scalar"},
-        {"int main() { int v = {{42}}; return v; }\n",   "nested brace list (N2)"},
+        {"int main() { int v = {1, 2}; return v; }\n", "excess elements",
+         DiagnosticCode::S_ExcessElementsInScalarInitializer},
+        {"int main() { int v = {{42}}; return v; }\n", "nested brace list (N2)",
+         DiagnosticCode::S_BracesAroundScalarInitializer},
     };
     for (auto const& arm : arms) {
         SemanticModel model = analyzeC(arm.src);
-        ASSERT_FALSE(model.hasErrors())
-            << arm.what << ": the semantic tier admits the parse (the "
-                            "constraint is enforced at HIR lowering)";
+        ASSERT_FALSE(model.hasErrors()) << arm.what;
         DiagnosticReporter r;
         auto res = lowerToHir(model, r);
-        EXPECT_FALSE(res->ok)
-            << arm.what << " must fail loud at the scalar brace-init arm";
-        bool sawCode = false;
-        for (auto const& d : r.all()) {
-            if (d.code == DiagnosticCode::S_InvalidScalarInitializer)
-                sawCode = true;
-        }
-        EXPECT_TRUE(sawCode)
-            << arm.what << " must report S_InvalidScalarInitializer (0xE03F)";
+        EXPECT_TRUE(res->ok) << arm.what << " lowers to the first value";
+        EXPECT_EQ(countCode(r, arm.warning), 1u) << arm.what;
+        EXPECT_EQ(countCode(r, DiagnosticCode::S_InvalidScalarInitializer), 0u) << arm.what;
     }
+    SemanticModel designated = analyzeC("int main() { int v = {.x = 1}; return v; }\n");
+    std::size_t refused = 0;
+    for (auto const& d : designated.diagnostics().all()) {
+        if (d.code == DiagnosticCode::S_InvalidScalarInitializer) ++refused;
+    }
+    EXPECT_EQ(refused, 1u) << "a designator on a scalar is refused by the semantic tier";
 }
 
 // FC17.5 F4 (the CLOSED allowlist): `(void){}` stays LOUD — Void is not
@@ -1366,15 +1558,19 @@ TEST(HirLoweringC, StructDeclarationLowersToTypeDecl) {
 // C 6.7p2 — a top-level declaration with NEITHER a named declarator NOR a tag
 // (`int ;`) declares nothing. This became grammar-parseable when the init-
 // declarator-list was made OPTIONAL (to admit the bare `struct P {…};` form,
-// D-CSUBSET-STRUCT-BODY-VARDECL-POSITION). The HIR lowering must FAIL LOUD with
+// D-CSUBSET-STRUCT-BODY-VARDECL-POSITION). The HIR lowering reports it ONCE with
 // S_DeclarationDeclaresNothing — and must NOT crash: the prior code drove
 // `findCompositeSpecifierIn`'s `tree.rule()` over a leaf token (the `int`),
-// tripping the `Internal`-node assertion. RED-ON-DISABLE on BOTH halves: revert
-// the `findCompositeSpecifierIn` Internal guard → this test CRASHES; drop the
-// `emitH(S_DeclarationDeclaresNothing)` → `res->ok` stays true and the count is 0.
+// tripping the `Internal`-node assertion.
+// ★ P69 L2b2 (lane `lm`): RE-AIMED on the references' answer — a WARNING, and the
+// declaration lowers to nothing. ✔MEASURED 2026-11-05 (probe l2b2e): gcc 13.3.0 ("useless
+// type name in empty declaration"), clang 18.1.3 and Apple clang ("declaration does not
+// declare anything") warn and cl accepts in silence; this pin asked for a failing lowering.
+// RED-ON-DISABLE: revert the Internal guard → this test CRASHES; drop the report → the
+// count is 0.
 // (The sibling `StructDeclarationLowersToTypeDecl` above proves the diagnostic
 // does NOT false-fire on a real bare tag-declaring def.)
-TEST(HirLoweringC, TopLevelDeclaresNothingFailsLoudNoCrash) {
+TEST(HirLoweringC, TopLevelDeclaresNothingWarnsNoCrash) {
     SemanticModel model = analyzeC("int ;\nint main(void) { return 0; }\n");
     // The constraint violation is HIR-tier: parse + semantic accept `int ;`.
     ASSERT_FALSE(model.hasErrors())
@@ -1382,10 +1578,14 @@ TEST(HirLoweringC, TopLevelDeclaresNothingFailsLoudNoCrash) {
               ? "" : model.diagnostics().all()[0].actual);
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
-    EXPECT_FALSE(res->ok)
-        << "`int ;` declares nothing — lowering must fail loud, not accept";
+    EXPECT_TRUE(res->ok)
+        << "`int ;` declares nothing — a warning, and the lowering goes on";
     EXPECT_EQ(countCode(r, DiagnosticCode::S_DeclarationDeclaresNothing), 1u)
         << "exactly one S_DeclarationDeclaresNothing for the empty `int ;` decl";
+    for (auto const& d : r.all())
+        if (d.code == DiagnosticCode::S_DeclarationDeclaresNothing)
+            EXPECT_EQ(d.severity, DiagnosticSeverity::Warning)
+                << "C diagnoses an empty declaration as a warning (semantics.declarators.emptyDeclarationWarns)";
 }
 
 // C23 6.7.2.5 (D-CSUBSET-TYPEOF): a bare `typeof(x);` — a typeof type-specifier
@@ -1393,8 +1593,9 @@ TEST(HirLoweringC, TopLevelDeclaresNothingFailsLoudNoCrash) {
 // a type-specifier (not a struct/union/enum composite), so the "declares nothing"
 // path fires at HIR lowering (S_DeclarationDeclaresNothing) and must NOT crash on
 // the typeof subtree. Semantic + parse accept it (x is a declared global); the
-// constraint is HIR-tier.
-TEST(HirLoweringC, BareTypeofDeclaresNothingFailsLoud) {
+// constraint is HIR-tier. ★ P69 L2b2 (lane `lm`): RE-AIMED with the class, a WARNING
+// (`int;`'s answer, MEASURED; this typeof head's is INFERRED from the class, unmeasured).
+TEST(HirLoweringC, BareTypeofDeclaresNothingWarns) {
     SemanticModel model = analyzeC(
         "int x;\ntypeof(x);\nint main(void) { return 0; }\n");
     ASSERT_FALSE(model.hasErrors())
@@ -1402,10 +1603,14 @@ TEST(HirLoweringC, BareTypeofDeclaresNothingFailsLoud) {
               ? "" : model.diagnostics().all()[0].actual);
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
-    EXPECT_FALSE(res->ok)
-        << "`typeof(x);` declares nothing — lowering must fail loud, not accept";
+    EXPECT_TRUE(res->ok)
+        << "`typeof(x);` declares nothing — a warning, and the lowering goes on";
     EXPECT_EQ(countCode(r, DiagnosticCode::S_DeclarationDeclaresNothing), 1u)
         << "exactly one S_DeclarationDeclaresNothing for the bare `typeof(x);` decl";
+    for (auto const& d : r.all())
+        if (d.code == DiagnosticCode::S_DeclarationDeclaresNothing)
+            EXPECT_EQ(d.severity, DiagnosticSeverity::Warning)
+                << "C diagnoses an empty declaration as a warning (semantics.declarators.emptyDeclarationWarns)";
 }
 
 // c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: a body-PRESENT specifier WITH a
@@ -1435,7 +1640,7 @@ TEST(HirLoweringC, StructDefinitionWithObjectLowersClean) {
 // emit NOTHING and must NOT fail loud (it is NOT a declares-nothing constraint
 // violation). RED-on-disable: drop the `findForwardCompositeSpecifierIn` no-op arm
 // and the bare forward decl re-emits S_DeclarationDeclaresNothing (res->ok false).
-// Contrast TopLevelDeclaresNothingFailsLoudNoCrash (`int ;`, NO tag → still loud).
+// Contrast TopLevelDeclaresNothingWarnsNoCrash (`int ;`, NO tag → still loud).
 TEST(HirLoweringC, TopLevelForwardStructDeclLowersToNothing) {
     SemanticModel model = analyzeC(
         "struct S;\nint main(void) { return 0; }\n");
@@ -1451,7 +1656,7 @@ TEST(HirLoweringC, TopLevelForwardStructDeclLowersToNothing) {
 
 // c35: the LOCAL twin — a bare `struct S;` as a block STATEMENT is a (block-scoped)
 // forward declaration; lowers to nothing, no fail-loud. Contrast
-// LocalDeclaresNothingFailsLoud (`int;`, NO tag → still loud).
+// LocalDeclaresNothingWarns (`int;`, NO tag → still reported).
 TEST(HirLoweringC, LocalForwardStructDeclLowersToNothing) {
     SemanticModel model = analyzeC(
         "int main(void){ struct S; return 0; }\n");
@@ -1553,7 +1758,7 @@ TEST(HirLoweringC, MemberAccessLowersToHirMemberAccess) {
     ASSERT_EQ(stmts.size(), 1u);
     HirNodeId const ret = stmts[0];
     ASSERT_EQ(res->hir.kind(ret), HirKind::ReturnStmt);
-    auto const retVal = res->hir.returnValue(ret);
+    auto const retVal = returnedValue(res->hir, ret);
     ASSERT_TRUE(retVal.has_value());
     HirNodeId const access = *retVal;
     ASSERT_EQ(res->hir.kind(access), HirKind::MemberAccess);
@@ -1689,7 +1894,7 @@ TEST(HirLoweringC, DotMemberAccessLowersWithoutDeref) {
     auto stmts = res->hir.children(body);
     ASSERT_EQ(stmts.size(), 1u);
     HirNodeId const ret = stmts[0];
-    auto const retVal = res->hir.returnValue(ret);
+    auto const retVal = returnedValue(res->hir, ret);
     ASSERT_TRUE(retVal.has_value());
     HirNodeId const access = *retVal;
     ASSERT_EQ(res->hir.kind(access), HirKind::MemberAccess);
@@ -2135,7 +2340,9 @@ TEST(HirLoweringC, ValueYieldingIncrementLowersToSeqExpr) {
     EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
     HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
     HirNodeId ret  = res->hir.children(body)[0];
-    HirNodeId val  = *res->hir.returnValue(ret);
+    auto const valValue = returnedValue(res->hir, ret);
+    ASSERT_TRUE(valValue.has_value()) << "the node read as a return statement is not one with a value";
+    HirNodeId val  = *valValue;
     ASSERT_EQ(res->hir.kind(val), HirKind::SeqExpr);
     // stmts: [var tmp = x, assign x = x+1]; result: ref tmp.
     EXPECT_EQ(res->hir.seqExprStmts(val).size(), 2u);
@@ -2314,12 +2521,16 @@ TEST(HirLoweringC, AtomicIncrementYieldsTheReplacedOrRecomputedValueNeverAReRead
     ASSERT_EQ(bodies.size(), 2u);
 
     HirNodeId const postRet = res->hir.children(bodies[0])[0];
-    HirNodeId const postVal = peelCasts(res->hir, *res->hir.returnValue(postRet));
+    auto const postReturned = returnedValue(res->hir, postRet);
+    ASSERT_TRUE(postReturned.has_value()) << "the node read as a return statement is not one with a value";
+    HirNodeId const postVal = peelCasts(res->hir, *postReturned);
     EXPECT_EQ(res->hir.kind(postVal), HirKind::ReadModifyWrite)
         << "postfix's result IS the value the read-modify-write replaced";
 
     HirNodeId const preRet = res->hir.children(bodies[1])[0];
-    HirNodeId const preVal = peelCasts(res->hir, *res->hir.returnValue(preRet));
+    auto const preReturned = returnedValue(res->hir, preRet);
+    ASSERT_TRUE(preReturned.has_value()) << "the node read as a return statement is not one with a value";
+    HirNodeId const preVal = peelCasts(res->hir, *preReturned);
     ASSERT_EQ(res->hir.kind(preVal), HirKind::SeqExpr);
     auto const stmts = res->hir.seqExprStmts(preVal);
     ASSERT_EQ(stmts.size(), 1u);
@@ -2528,8 +2739,9 @@ TEST(HirLoweringC, NonTerminatingStraightLineMainNestsImplicitReturnZero) {
     HirNodeId const ret = outerKids[1];
     ASSERT_EQ(res->hir.kind(ret), HirKind::ReturnStmt);
     EXPECT_TRUE(has(res->hir.flags(ret), HirFlags::Synthetic));
-    ASSERT_TRUE(res->hir.returnValue(ret).has_value());
-    EXPECT_EQ(res->hir.kind(*res->hir.returnValue(ret)), HirKind::Literal);
+    auto const value = returnedValue(res->hir, ret);
+    ASSERT_TRUE(value.has_value()) << "the node read as a return statement is not one with a value";
+    EXPECT_EQ(res->hir.kind(*value), HirKind::Literal);
 }
 
 // ── D-HIR-INFINITE-LOOP-NOT-TERMINATING HIR-tier pins ───────────────────────
@@ -2588,6 +2800,11 @@ TEST(HirLoweringC, NonMainInfiniteLoopTailWrapsAndVerifies) {
     ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
     EXPECT_EQ(countCode(r, DiagnosticCode::H_VerifierFailure), 0u)
         << "the wrapped infinite-loop tail must satisfy non-void return completeness";
+    // P69: C no longer REFUSES a body whose end is open — it completes it and
+    // warns — so "not refused" alone would stay true with the wrap gone. The
+    // warning's absence is what says the tail was seen to terminate.
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_NonVoidFunctionEndReachable), 0u)
+        << "a provably-infinite loop tail must not read as reaching the end";
 
     HirNodeId const f = functionNamed(res->hir, model, "f");
     ASSERT_TRUE(f.valid());
@@ -2676,7 +2893,9 @@ TEST(HirLoweringC, BreakableInfiniteLoopIsNotWrapped) {
 // `Block{ ExprStmt(call), Synthetic Unreachable }` — the direct structural mirror
 // of the infinite-loop wrap above — so `f` structurally terminates and the
 // verifier is clean. RED-ON-DISABLE (revert detection / the wrap): `f`'s
-// fall-through no longer terminates → H_VerifierFailure count 1.
+// fall-through no longer terminates → the synthetic Unreachable is gone and
+// `f` is reported as reaching its end (H_NonVoidFunctionEndReachable count 1;
+// until P69 that was a refusal, H_VerifierFailure count 1).
 TEST(HirLoweringC, NoreturnCallTailWrapsAndVerifies) {
     SemanticModel model = analyzeC(
         "_Noreturn void die(int); "
@@ -2688,6 +2907,8 @@ TEST(HirLoweringC, NoreturnCallTailWrapsAndVerifies) {
     ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
     EXPECT_EQ(countCode(r, DiagnosticCode::H_VerifierFailure), 0u)
         << "the noreturn-call tail must satisfy non-void return completeness";
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_NonVoidFunctionEndReachable), 0u)
+        << "a tail that is a direct call to a noreturn function does not reach the end";
     HirNodeId const f = functionNamed(res->hir, model, "f");
     ASSERT_TRUE(f.valid());
     EXPECT_TRUE(subtreeHasSyntheticUnreachable(res->hir, res->hir.functionBody(f)))
@@ -2716,6 +2937,7 @@ TEST(HirLoweringC, NoreturnAllFourSpellingsCompileClean) {
         EXPECT_TRUE(res->ok) << proto << ": "
                              << (r.all().empty() ? "" : r.all()[0].actual);
         EXPECT_EQ(countCode(r, DiagnosticCode::H_VerifierFailure), 0u) << proto;
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_NonVoidFunctionEndReachable), 0u) << proto;
         EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u) << proto;
         HirNodeId const f = functionNamed(res->hir, model, "f");
         ASSERT_TRUE(f.valid()) << proto;
@@ -2729,10 +2951,17 @@ TEST(HirLoweringC, NoreturnAllFourSpellingsCompileClean) {
 // witnesses, both of which `firstNameToken` would have MIS-resolved to a noreturn
 // name: (1) a ternary callee `(c ? die : other)(1)` lowers to a NON-Ref node →
 // isDirectNoreturnCall false; `other` can return, so f's fall-through does NOT
-// terminate → H_VerifierFailure STILL fires (the miscompile witness). (2) a
+// terminate → f is STILL seen to reach its end (the miscompile witness). (2) a
 // function-POINTER object `fp(1)` lowers to Ref(fp) whose record has
-// isNoreturn==false → not wrapped. In BOTH the un-relaxed fall-through keeps the
-// loud verifier failure — proof we did not silently elide the return path.
+// isNoreturn==false → not wrapped. In BOTH the fall-through keeps its return
+// path — proof we did not silently elide it.
+//
+// P69: the witness is the WARNING and the completed body, not a refusal. Until
+// P69 C refused a function whose end is open (H_VerifierFailure count 1, which
+// is what these two arms asserted); it now completes the body with a return of
+// an unspecified value and reports the function once. Either way the fact
+// pinned is the same one: the call was NOT taken for a terminator, so no
+// synthetic Unreachable follows it and the path after it still returns.
 TEST(HirLoweringC, NoreturnIndirectCalleeIsNotWrapped) {
     {   // (1) ternary callee — the address-takeable miscompile vector.
         SemanticModel model = analyzeC(
@@ -2742,8 +2971,14 @@ TEST(HirLoweringC, NoreturnIndirectCalleeIsNotWrapped) {
         ASSERT_FALSE(model.hasErrors());
         DiagnosticReporter r;
         auto res = lowerToHir(model, r);
-        EXPECT_EQ(countCode(r, DiagnosticCode::H_VerifierFailure), 1u)
+        EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_NonVoidFunctionEndReachable), 1u)
             << "an address-takeable ternary callee must NOT be wrapped (F1)";
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_VerifierFailure), 0u);
+        HirNodeId const f = functionNamed(res->hir, model, "f");
+        ASSERT_TRUE(f.valid());
+        EXPECT_FALSE(subtreeHasSyntheticUnreachable(res->hir, res->hir.functionBody(f)))
+            << "no synthetic Unreachable may follow a call that can return";
     }
     {   // (2) function-pointer object callee — Ref, but not a noreturn record.
         SemanticModel model = analyzeC(
@@ -2753,8 +2988,14 @@ TEST(HirLoweringC, NoreturnIndirectCalleeIsNotWrapped) {
         ASSERT_FALSE(model.hasErrors());
         DiagnosticReporter r;
         auto res = lowerToHir(model, r);
-        EXPECT_EQ(countCode(r, DiagnosticCode::H_VerifierFailure), 1u)
+        EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_NonVoidFunctionEndReachable), 1u)
             << "a call through a function-pointer object must NOT be wrapped (F1)";
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_VerifierFailure), 0u);
+        HirNodeId const f = functionNamed(res->hir, model, "f");
+        ASSERT_TRUE(f.valid());
+        EXPECT_FALSE(subtreeHasSyntheticUnreachable(res->hir, res->hir.functionBody(f)))
+            << "no synthetic Unreachable may follow a call that can return";
     }
 }
 
@@ -2775,8 +3016,9 @@ TEST(HirLoweringC, NoreturnIndirectCalleeIsNotWrapped) {
 //
 // RED-ON-DISABLE: revert the Pass-1 apply gate from `isFnSig ||
 // isFnPointerType` back to `isFnSig` → `gp`'s record loses isNoreturn, the tail
-// stops terminating, H_VerifierFailure count goes 0 → 1 and the synthetic
-// Unreachable disappears.
+// stops terminating, the synthetic Unreachable disappears and `f` is reported
+// as reaching its end (H_NonVoidFunctionEndReachable 0 → 1; until P69 that was
+// the refusal, H_VerifierFailure 0 → 1).
 TEST(HirLoweringC, NoreturnFunctionPointerObjectCallWrapsAndVerifies) {
     SemanticModel model = analyzeC(
         "__attribute__((__noreturn__)) void (*gp)(int); "
@@ -2787,6 +3029,8 @@ TEST(HirLoweringC, NoreturnFunctionPointerObjectCallWrapsAndVerifies) {
     auto res = lowerToHir(model, r);
     ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
     EXPECT_EQ(countCode(r, DiagnosticCode::H_VerifierFailure), 0u)
+        << "a call through a pointer DECLARED noreturn must terminate the tail";
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_NonVoidFunctionEndReachable), 0u)
         << "a call through a pointer DECLARED noreturn must terminate the tail";
     EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u)
         << "the GNU spelling on a file-scope pointer must not trip the linkage scan";
@@ -3986,6 +4230,47 @@ declaredVisibility(CstToHirResult const& res, SemanticModel const& model,
 // specifier"; move `weak` into that row's ignored NAMES instead → the errors
 // vanish and `eaBinding` silently reads Global, which is the assertion below
 // that catches the wrong-way fix.
+// P69 fold f26b (lane `cs`, D-LK-OBJECT-STV-PROTECTED-DROPPED): `protected` and
+// `internal` are linkage specifiers of the language, on a function and on an object,
+// in front of the declaration and after its declarator. ✔MEASURED before the fold
+// (macos-arm64-debug, run 20261016-020009-896aa756): `visibility("protected")` was
+// warned as no linkage specifier and DROPPED. gcc 13.3.0 writes STV_PROTECTED and
+// STV_INTERNAL for them (lane `cs` probe pv); the ELF bytes are pinned at the object
+// tier (CompiledSymbolAliasObject).
+//
+// RED-ON-DISABLE: drop either word from c.lang.json's maps and its declarations
+// report H_UnknownLinkageSpecifier and record no visibility.
+TEST(HirLoweringC, ProtectedAndInternalVisibilityAreLinkageSpecifiers) {
+    struct Case {
+        char const*      src;
+        char const*      name;
+        SymbolVisibility want;
+    };
+    for (Case const c : {
+             Case{"__attribute__((visibility(\"protected\"))) int f(int v) { return v + 1; }\n", "f",
+                  SymbolVisibility::Protected},
+             Case{"int g __attribute__((visibility(\"protected\"))) = 3;\n", "g",
+                  SymbolVisibility::Protected},
+             Case{"__attribute__((visibility(\"internal\"))) int f(int v) { return v + 2; }\n", "f",
+                  SymbolVisibility::Internal},
+             Case{"int g __attribute__((visibility(\"internal\"))) = 4;\n", "g",
+                  SymbolVisibility::Internal},
+         }) {
+        SCOPED_TRACE(c.src);
+        SemanticModel model = analyzeC(std::string{c.src} + "int main(void){ return 0; }\n");
+        ASSERT_FALSE(model.hasErrors());
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u)
+            << "the word is a linkage specifier of the language";
+        auto const got = declaredLinkage(*res, model, c.name);
+        ASSERT_TRUE(got.has_value()) << "the visibility was dropped";
+        EXPECT_EQ(got->visibility, c.want);
+        EXPECT_EQ(got->binding, SymbolBinding::Global);
+    }
+}
+
 TEST(HirLoweringC, ExternDeclGlibcAttributeRunResolvesAndApplies) {
     SemanticModel model = analyzeC(
         "extern int gg(void) __attribute__((__nothrow__, __leaf__));\n"
@@ -4655,7 +4940,9 @@ namespace {
 // clean (pathTerminates treats `goto` as a terminator and a LabelStmt as
 // transparent — a labeled `return` terminates). Red-on-disable: if LabelStmt
 // transparency in `pathTerminates` were reverted, the body would look like it
-// falls through and `lowerToHir` would fail H_VerifierFailure.
+// falls through — and since P69 that reads as the WARNING
+// H_NonVoidFunctionEndReachable (C completes such a body instead of refusing
+// it), so the warning's absence is asserted beside the refusal's.
 TEST(HirLoweringC, GotoAndLabelLowerCleanAndTerminateViaLabel) {
     SemanticModel model = analyzeC(
         "int f(int c){ if(c) goto a; return 1; a: return 2; } "
@@ -4665,6 +4952,8 @@ TEST(HirLoweringC, GotoAndLabelLowerCleanAndTerminateViaLabel) {
     auto res = lowerToHir(model, r);
     ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
     EXPECT_EQ(countCode(r, DiagnosticCode::H_VerifierFailure), 0u)
+        << "a goto+labeled-return function must not look like it falls through";
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_NonVoidFunctionEndReachable), 0u)
         << "a goto+labeled-return function must not look like it falls through";
     EXPECT_EQ(countKind(res->hir, HirKind::GotoStmt), 1u);
     EXPECT_EQ(countKind(res->hir, HirKind::LabelStmt), 1u);
@@ -4677,6 +4966,7 @@ TEST(HirLoweringC, GotoAndLabelLowerCleanAndTerminateViaLabel) {
     auto res2 = lowerToHir(m2, r2);
     EXPECT_TRUE(res2->ok) << (r2.all().empty() ? "" : r2.all()[0].actual);
     EXPECT_EQ(countCode(r2, DiagnosticCode::H_VerifierFailure), 0u);
+    EXPECT_EQ(countCode(r2, DiagnosticCode::H_NonVoidFunctionEndReachable), 0u);
 }
 
 // ── D-CSUBSET-BLOCK-TERMINATION-LAST-REACHABLE ───────────────────────────────
@@ -4686,54 +4976,77 @@ TEST(HirLoweringC, GotoAndLabelLowerCleanAndTerminateViaLabel) {
 // (the `MACRO(...);` null-statement idiom that lowers `;` to an empty Block placed
 // AFTER the `return`) previously made the body read as fall-through → a spurious
 // H_VerifierFailure (H0003) that gcc/clang never emit. These pins assert the four
-// CLEAN shapes emit ZERO H_VerifierFailure. Red-on-disable: revert the Block case
-// to `return !kids.empty() && pathTerminates(src, kids.back())` and every case
-// here goes RED (the empty trailing Block reads as non-terminating).
-[[nodiscard]] std::size_t hirVerifierFailures(std::string src) {
+// CLEAN shapes are NOT seen to reach their end. Red-on-disable: revert the Block
+// case to `return !kids.empty() && pathTerminates(src, kids.back())` and every
+// case here goes RED (the empty trailing Block reads as non-terminating).
+//
+// ★ P69 — THE OBSERVABLE MOVED, AND THE HELPER MOVED WITH IT. "This body's end is
+// open" used to be read off ONE code, the verifier's refusal. C now COMPLETES
+// such a body and WARNS (`nonVoidFunctionEndReached: returnsUnspecifiedValue`),
+// so under the shipped C document the refusal count is 0 for an open body AND
+// for a closed one: a helper that still counted only H_VerifierFailure would
+// keep every "== 0" pin below green with the Block rule reverted. The verdict is
+// therefore BOTH codes — refused (a strict language, or a lowering defect) or
+// warned (C) — and each pin states which it expects.
+struct EndVerdict {
+    std::size_t refused = 0;   // H_VerifierFailure
+    std::size_t warned  = 0;   // H_NonVoidFunctionEndReachable
+    [[nodiscard]] std::size_t open() const { return refused + warned; }
+};
+[[nodiscard]] EndVerdict endVerdictOf(std::string src) {
     SemanticModel model = analyzeC(std::move(src));
     EXPECT_FALSE(model.hasErrors())
         << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
     (void)res;
-    return countCode(r, DiagnosticCode::H_VerifierFailure);
+    return EndVerdict{countCode(r, DiagnosticCode::H_VerifierFailure),
+                      countCode(r, DiagnosticCode::H_NonVoidFunctionEndReachable)};
 }
 
 TEST(HirLoweringC, DeadTailAfterTerminatorDoesNotReadAsFallThrough) {
     // The minimal trailing null statement — `int m(void){ return 0; ; }`.
-    EXPECT_EQ(hirVerifierFailures("int m(void){ return 0; ; }"), 0u)
+    EXPECT_EQ(endVerdictOf("int m(void){ return 0; ; }").open(), 0u)
         << "a `;` after `return 0;` (empty trailing Block) must NOT read as "
            "fall-through — the block terminates at its last REACHABLE statement";
     // The RECOVER_VFS_WRAPPER shape: every path returns via the if/else, then a
     // trailing `;` (the `MACRO(...);` null statement) follows the `return rc;`.
-    EXPECT_EQ(hirVerifierFailures(
-                  "int w(int x){ int rc=0; if(x){rc=1;}else{rc=2;} return rc; ; }"),
+    EXPECT_EQ(endVerdictOf(
+                  "int w(int x){ int rc=0; if(x){rc=1;}else{rc=2;} return rc; ; }").open(),
               0u)
         << "trailing `;` after the real terminator must not spuriously fall through";
     // General precision: a dead NON-label call after a return — `return 0; d2();`.
-    EXPECT_EQ(hirVerifierFailures("int d2(void); int d(void){ return 0; d2(); }"), 0u)
+    EXPECT_EQ(endVerdictOf("int d2(void); int d(void){ return 0; d2(); }").open(), 0u)
         << "dead non-label code after a terminator makes later positions "
            "unreachable — the block still terminates";
     // Both if/else arms return, then a dead trailing `;`.
-    EXPECT_EQ(hirVerifierFailures("int e(int x){ if(x){return 1;}else{return 2;} ; }"), 0u)
+    EXPECT_EQ(endVerdictOf("int e(int x){ if(x){return 1;}else{return 2;} ; }").open(), 0u)
         << "a both-arms-return if terminates; a trailing `;` does not undo that";
 }
 
-// The negative miscompile-pins: genuine fall-through MUST still fail loud
-// (H_VerifierFailure). These stay RED when the fix is present (they are the
-// behavior that must NOT change) — and are how a WRONG fix is caught.
-TEST(HirLoweringC, GenuineFallThroughStillFailsLoudIncludingNestedLabel) {
+// The negative miscompile-pins: a genuine fall-through MUST still be SEEN — in C
+// as exactly one warning per function and no refusal (P69; until then it was the
+// refusal). These hold when the fix is present (they are the behavior that must
+// NOT change) — and are how a WRONG fix is caught: a predicate that called one
+// of these bodies closed would complete nothing, and the function would fall
+// into whatever follows it.
+TEST(HirLoweringC, GenuineFallThroughIsStillSeenIncludingNestedLabel) {
+    auto const expectSeen = [](char const* src, char const* why) {
+        EndVerdict const v = endVerdictOf(src);
+        EXPECT_EQ(v.warned, 1u) << why;
+        EXPECT_EQ(v.refused, 0u) << why;
+    };
     // A non-void function that just calls a void fn and falls off the end.
-    EXPECT_GE(hirVerifierFailures("void foo(void); int g(int x){ foo(); }"), 1u)
-        << "a genuine fall-through must still emit H_VerifierFailure";
+    expectSeen("void foo(void); int g(int x){ foo(); }",
+               "a genuine fall-through must still be reported");
     // An `if` with no `else` — the then-arm may be skipped, so control falls off.
-    EXPECT_GE(hirVerifierFailures("int h(int x){ if(x) return 1; }"), 1u)
-        << "if-without-else does not terminate on the fall-through path";
+    expectSeen("int h(int x){ if(x) return 1; }",
+               "if-without-else does not terminate on the fall-through path");
     // A direct fall-through THROUGH a label: `goto L` may reach `L:` which then
     // falls off the end. The label re-establishes reachability at the dead tail.
-    EXPECT_GE(hirVerifierFailures("int lbl(int x){ if(x) goto L; return 0; L: ; }"), 1u)
-        << "a labeled statement after the terminator is a goto re-entry point — "
-           "the block can still fall through via the label";
+    expectSeen("int lbl(int x){ if(x) goto L; return 0; L: ; }",
+               "a labeled statement after the terminator is a goto re-entry point — "
+               "the block can still fall through via the label");
     // ★ THE NESTED-LABEL SOUNDNESS GUARD (the audit's mandatory addition). The
     // dead tail is an `if` whose BODY contains the label `L:`. `goto L` can re-
     // enter that nested label and then fall off the end — a GENUINE fall-through.
@@ -4741,11 +5054,9 @@ TEST(HirLoweringC, GenuineFallThroughStillFailsLoudIncludingNestedLabel) {
     // UNSOUND version (reset only at a DIRECT LabelStmt child) would see the `if`
     // as a plain dead child, keep `reachable=false`, and WRONGLY accept the body
     // (a silent miscompile). This pin goes RED against the unsound version.
-    EXPECT_GE(hirVerifierFailures(
-                  "int nested(int x){ if(x) goto L; return 0; if(x){ L: ; } }"),
-              1u)
-        << "a label nested inside a dead-tail statement is still a goto re-entry "
-           "point — the block genuinely falls through and must fail loud";
+    expectSeen("int nested(int x){ if(x) goto L; return 0; if(x){ L: ; } }",
+               "a label nested inside a dead-tail statement is still a goto re-entry "
+               "point — the block genuinely falls through and must be seen to");
 }
 
 // VLA C5 (D-CSUBSET-VLA, C99 6.8.6.1p1): a `goto` that jumps INTO the scope of a
@@ -5156,7 +5467,9 @@ TEST(HirLoweringC, ReturnOfBoolFromIntFunctionEmitsCast) {
     EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
     HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
     HirNodeId ret  = res->hir.children(body)[0];
-    HirNodeId val  = *res->hir.returnValue(ret);
+    auto const valValue = returnedValue(res->hir, ret);
+    ASSERT_TRUE(valValue.has_value()) << "the node read as a return statement is not one with a value";
+    HirNodeId val  = *valValue;
     // The returned expression is now `Cast(BinaryOp(Gt, ...), int)`.
     EXPECT_EQ(res->hir.kind(val), HirKind::Cast);
     auto castKids = res->hir.children(val);
@@ -5196,7 +5509,9 @@ TEST(HirLoweringC, TernaryLowersToTernaryNode) {
     EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
     HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
     HirNodeId ret  = res->hir.children(body)[0];
-    HirNodeId tern = *res->hir.returnValue(ret);
+    auto const ternValue = returnedValue(res->hir, ret);
+    ASSERT_TRUE(ternValue.has_value()) << "the node read as a return statement is not one with a value";
+    HirNodeId tern = *ternValue;
     ASSERT_EQ(res->hir.kind(tern), HirKind::Ternary);
     auto kids = res->hir.children(tern);
     ASSERT_EQ(kids.size(), 3u);
@@ -5238,7 +5553,9 @@ TEST(HirLoweringC, LogicalAndIntOperandsTakeTruthinessNe) {
     EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
     HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
     HirNodeId ret  = res->hir.children(body)[0];
-    HirNodeId tern = *res->hir.returnValue(ret);
+    auto const ternValue = returnedValue(res->hir, ret);
+    ASSERT_TRUE(ternValue.has_value()) << "the node read as a return statement is not one with a value";
+    HirNodeId tern = *ternValue;
     ASSERT_EQ(res->hir.kind(tern), HirKind::Ternary);
     // The ternary cond is the LogicalAnd itself — already Bool, so
     // coerceCondition adds NO extra node on top of it.
@@ -7010,8 +7327,12 @@ TEST(HirLoweringC, D5_3_CompoundLiteralInVarDeclInit) {
     HirNodeId fn = firstFunction(res->hir);
     HirNodeId init = firstVarInitOfFn(res->hir, fn);
     ASSERT_TRUE(init.valid());
-    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
-    EXPECT_EQ(res->hir.children(init).size(), 2u);
+    // P69 (D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT): the literal is
+    // an unnamed OBJECT whose value is the aggregate.
+    ASSERT_EQ(res->hir.kind(init), HirKind::UnnamedObject);
+    HirNodeId const value = res->hir.unnamedObjectValue(init);
+    EXPECT_EQ(res->hir.kind(value), HirKind::ConstructAggregate);
+    EXPECT_EQ(res->hir.children(value).size(), 2u);
 }
 
 // A NON-CONSTANT index designator (`[n] = 7`, `n` a mutable local) must be
@@ -7600,8 +7921,11 @@ TEST(HirLoweringC, D5_4_UnionCompoundLiteral) {
     HirNodeId fn = firstFunction(res->hir);
     HirNodeId init = firstVarInitOfFn(res->hir, fn);
     ASSERT_TRUE(init.valid());
-    EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
-    EXPECT_EQ(res->hir.children(init).size(), 1u);
+    // P69: an unnamed object whose value is the one-slot union aggregate.
+    ASSERT_EQ(res->hir.kind(init), HirKind::UnnamedObject);
+    HirNodeId const value = res->hir.unnamedObjectValue(init);
+    EXPECT_EQ(res->hir.kind(value), HirKind::ConstructAggregate);
+    EXPECT_EQ(res->hir.children(value).size(), 1u);
 }
 
 // Member access on a union: `u.c` must resolve via the existing
@@ -8230,7 +8554,9 @@ TEST(HirLoweringC, PrefixIncrementValueYieldsNewValue) {
     EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
     HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
     HirNodeId ret  = res->hir.children(body)[0];
-    HirNodeId val  = *res->hir.returnValue(ret);
+    auto const valValue = returnedValue(res->hir, ret);
+    ASSERT_TRUE(valValue.has_value()) << "the node read as a return statement is not one with a value";
+    HirNodeId val  = *valValue;
     ASSERT_EQ(res->hir.kind(val), HirKind::SeqExpr);
     // stmts: [assign x = x+1] ONLY (no tmp save).
     ASSERT_EQ(res->hir.seqExprStmts(val).size(), 1u)
@@ -8263,10 +8589,13 @@ TEST(HirLoweringC, PrefixVsPostfixDistinctReturn) {
     ASSERT_TRUE(pre->ok);
     auto seqOf = [](auto const& res) {
         HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
-        return *res->hir.returnValue(res->hir.children(body)[0]);
+        return returnedValue(res->hir, res->hir.children(body)[0]);
     };
-    HirNodeId postSeq = seqOf(post);
-    HirNodeId preSeq  = seqOf(pre);
+    auto const postReturned = seqOf(post);
+    auto const preReturned  = seqOf(pre);
+    ASSERT_TRUE(postReturned.has_value() && preReturned.has_value()) << "the node read as a return statement is not one with a value";
+    HirNodeId postSeq = *postReturned;
+    HirNodeId preSeq  = *preReturned;
     ASSERT_EQ(post->hir.kind(postSeq), HirKind::SeqExpr);
     ASSERT_EQ(pre->hir.kind(preSeq), HirKind::SeqExpr);
     // Distinct stmt counts: postfix saves the old value first (2), prefix does not (1).
@@ -8399,23 +8728,30 @@ TEST(HirLoweringC, LocalStructDefineAndDeclareAndRefLowerClean) {
 }
 
 // c28: a NON-defining no-declarator LOCAL (`int;`) declares nothing (C 6.7p2).
-// Mirroring the top-level `int ;` (TopLevelDeclaresNothingFailsLoudNoCrash), the
+// Mirroring the top-level `int ;` (TopLevelDeclaresNothingWarnsLoudNoCrash), the
 // front end (parse + semantic) ACCEPTS it, and the HIR lowering FAILS LOUD with
 // S_DeclarationDeclaresNothing — the local twin of the top-level no-object path
 // (lowerVarLikeInto: an empty list-mode declarator carrier with NO composite
 // specifier in the head). Must NOT crash and must NOT silently accept.
 // RED-on-disable: drop the lowerVarLikeInto declares-nothing guard → res->ok
 // stays true and the count is 0 (a silent accept).
-TEST(HirLoweringC, LocalDeclaresNothingFailsLoud) {
+// ★ P69 L2b2 (lane `lm`): RE-AIMED on the references' answer, a WARNING (probe l2b2e,
+// MEASURED 2026-11-05 — gcc, clang and Apple clang warn, cl accepts in silence).
+TEST(HirLoweringC, LocalDeclaresNothingWarns) {
     SemanticModel model = analyzeC("int main(void){ int; return 0; }\n");
     ASSERT_FALSE(model.hasErrors())
         << "parse + semantic accept `int;` — the constraint is HIR-tier";
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
-    EXPECT_FALSE(res->ok)
-        << "`int;` (no declarator, no tag) declares nothing — lowering must fail loud";
+    EXPECT_TRUE(res->ok)
+        << "`int;` (no declarator, no tag) declares nothing — a warning, and the lowering "
+           "goes on";
     EXPECT_EQ(countCode(r, DiagnosticCode::S_DeclarationDeclaresNothing), 1u)
         << "exactly one S_DeclarationDeclaresNothing for the empty local `int;`";
+    for (auto const& d : r.all())
+        if (d.code == DiagnosticCode::S_DeclarationDeclaresNothing)
+            EXPECT_EQ(d.severity, DiagnosticSeverity::Warning)
+                << "C diagnoses an empty declaration as a warning (semantics.declarators.emptyDeclarationWarns)";
 }
 
 // c89 (D-CSUBSET-SIZEOF-VALUE-OPERAND-TYPE): the VALUE-form sizeof operand is
@@ -8778,7 +9114,7 @@ TEST(HirLoweringC, DerefOfArrayOperandDecaysToPointer) {
     auto const stmts = res->hir.children(mainBody);
     ASSERT_GE(stmts.size(), 1u);
     HirNodeId const ret = stmts.back();
-    auto const rv = res->hir.returnValue(ret);
+    auto const rv = returnedValue(res->hir, ret);
     ASSERT_TRUE(rv.has_value()) << "the last statement is `return *(a);`";
     HirNodeId const deref = *rv;
     // `*(a)` is a Deref TYPED as the element (int → I32), NOT the pre-fix
@@ -9620,8 +9956,9 @@ TEST(HirLoweringC, TypedefMultiDeclaratorEmitsOneTypeDeclPerAlias) {
 // RED-ON-DISABLE (both tests): drop `&& !decl.paramAdjustments` from the
 // `isProto` derivation in semantic_analyzer.cpp's Pass-1 declarator mint. The
 // first test then reports 1 param instead of 2; the second fails its
-// `hasErrors()` assert with S0022 (the two parameters re-home onto the FILE
-// scope and collide as incompatible redeclarations).
+// `hasErrors()` assert with S0022 (as filed, before P69 fold f26b removed the
+// re-home: the two parameters were re-homed onto the FILE scope and collided as
+// incompatible redeclarations).
 namespace {
 // The pointee FnSig of a param slot that C 6.7.6.3p8 adjusted, or InvalidType.
 // Reading THROUGH this makes a bare-FnSig (un-adjusted) slot impossible to pass
@@ -9696,7 +10033,7 @@ TEST(HirLoweringC, InlineFunctionTypedParamEmitsItsOwnParamSlot) {
 // PIN 2 — C 6.2.1p4: a parameter name is scoped to its own declarator and has
 // NO linkage, so two functions may reuse one freely. Classifying the inline
 // spelling as a prototype ALSO re-homed the parameter symbol onto the FILE
-// scope (that is what the prototype path does, per D-CSUBSET-BLOCK-SCOPE-PROTOTYPE),
+// scope (what the prototype path did, per D-CSUBSET-BLOCK-SCOPE-PROTOTYPE, until P69 fold f26b),
 // where two same-named parameters met as one symbol. MEASURED
 // before the fix: S0022 S_IncompatibleRedeclaration on `g`, pointing at the
 // OTHER function's parameter — legal C rejected outright.
@@ -9844,18 +10181,28 @@ constexpr char const* kPrintfRedeclSrc =
     "int printf(const char *fmt, ...);\n"
     "int main(void) { return printf(\"hi\\n\"); }\n";
 
+// ★ P69: the same shape on a recipe of the one synthesized family left — the shim
+// claim's own reproducer since the pe printf family became DSS's runtime source.
+constexpr char const* kMtxLockRedeclSrc =
+    "#include <threads.h>\n"
+    "int mtx_lock(void *m);\n"
+    "int main(void) { return mtx_lock(0); }\n";
+
 } // namespace
 
-// THE PRIMARY PIN. Under pe the re-declared `printf` must reach the synth
+// THE PRIMARY PIN. Under pe the re-declared recipe symbol must reach the synth
 // recipe map — keyed by the USER prototype's symbol, since goal-2 deleted the
 // descriptor's — and must plant NO import row. Both halves are asserted: a
 // recipe entry alongside a surviving import would still fail the load, and no
 // import with no recipe would be an undefined symbol.
 //
 // RED BEFORE TF-C112 on BOTH assertions: the map was empty and the import row
-// was present.
+// was present. ★ P69: re-pointed from `printf` (DSS's runtime source since P69 —
+// its own pin follows) to `mtx_lock`, a recipe of the one synthesized family
+// left; the claim under test is the same helper, reached by the same bare
+// prototype over the same `#include`.
 TEST(HirLoweringC, TFC112RedeclaredPeShimSymbolLowersToARecipeNotAnImport) {
-    SemanticModel model = analyzeRealStdioAt(kPrintfRedeclSrc,
+    SemanticModel model = analyzeRealStdioAt(kMtxLockRedeclSrc,
                                              ObjectFormatKind::Pe,
                                              DataModel::Llp64);
     ASSERT_FALSE(model.hasErrors());
@@ -9863,25 +10210,77 @@ TEST(HirLoweringC, TFC112RedeclaredPeShimSymbolLowersToARecipeNotAnImport) {
     auto res = lowerToHir(model, r);
     EXPECT_TRUE(res->ok);
 
-    SymbolId const printfSym = symbolIdNamed(model, "printf");
-    ASSERT_TRUE(printfSym.valid());
-    auto const it = res->synthRecipeBySymbol.find(printfSym.v);
+    SymbolId const lockSym = symbolIdNamed(model, "mtx_lock");
+    ASSERT_TRUE(lockSym.valid());
+    auto const it = res->synthRecipeBySymbol.find(lockSym.v);
     ASSERT_NE(it, res->synthRecipeBySymbol.end())
         << "the user's prototype must inherit the suppressed row's REALIZATION: "
            "without a recipe entry HIR->MIR never seeds the symbol and no shim "
            "body is ever emitted";
-    EXPECT_EQ(it->second, "printf");
+    EXPECT_EQ(it->second, "mtx_lock");
 
-    EXPECT_EQ(externRowsNamed(*res, "printf"), 0u)
-        << "ucrtbase.dll exports no bare `printf` — an import row here is a "
-           "binary that fails to LOAD (0xC0000139) with no diagnostic anywhere";
+    EXPECT_EQ(externRowsNamed(*res, "mtx_lock"), 0u)
+        << "no pe image exports `mtx_lock` — an import row here is a binary that "
+           "fails to LOAD (0xC0000139) with no diagnostic anywhere";
 
-    // The four SIBLINGS this TU did not re-declare take the injected path and
-    // must be unaffected — the fix must not have moved the whole family.
-    for (char const* sibling : {"fprintf", "sprintf", "vfprintf", "sscanf"})
+    // The SIBLINGS this TU did not re-declare take the injected path and must be
+    // unaffected — the fix must not have moved the whole family. (P69: `cnd_wait`
+    // replaces `call_once`, which is DSS's runtime source on pe now — an extern row,
+    // bound to no image, by design.)
+    for (char const* sibling : {"mtx_init", "mtx_unlock", "thrd_yield", "cnd_wait"})
         EXPECT_EQ(externRowsNamed(*res, sibling), 0u) << sibling;
-    // ...while the UCRT cores the shims call ARE ordinary imports.
-    EXPECT_EQ(externRowsNamed(*res, "__stdio_common_vfprintf"), 1u);
+}
+
+// ★ P69 (D-C-C23-CONVERSIONS-MISSING-ON-THE-UCRT-AND-LIBSYSTEM): THE SHIPPED-SOURCE
+// ARM, on the very reproducer TF-C112 was measured on — and on its C99 6.7.4p7
+// inline-definition twin, the second site that displaces a shipped row. pe's
+// `printf` is DSS's runtime source now, so the re-declared name must bind THAT
+// realization: NO recipe entry (a shim would be a second body), exactly ONE extern
+// row, named by the row's LINK NAME `__dss_isoc23_printf` (what the runtime unit's
+// archive member defines) and bound to NO image. RED if the suppressed row lost
+// either property: the plain name is defined by nothing DSS links on pe, and a
+// `ucrtbase.dll` binding is the 0xC0000139 load failure TF-C112 measured, again.
+TEST(HirLoweringC, TFC112RedeclaredPeStdioSymbolBindsTheShippedSourceLinkName) {
+    for (char const* src :
+         {kPrintfRedeclSrc,
+          "#include <stdio.h>\n"
+          "inline int printf(const char *fmt, ...) { return -1; }\n"
+          "int main(void) { return printf(\"inl\\n\"); }\n"}) {
+        SCOPED_TRACE(src);
+        SemanticModel model = analyzeRealStdioAt(src, ObjectFormatKind::Pe,
+                                                 DataModel::Llp64);
+        ASSERT_FALSE(model.hasErrors());
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok);
+
+        SymbolId const printfSym = symbolIdNamed(model, "printf");
+        ASSERT_TRUE(printfSym.valid());
+        EXPECT_EQ(res->synthRecipeBySymbol.count(printfSym.v), 0u)
+            << "P69 retired the stdio recipes — a recipe here is a second owner of "
+               "the body runtime/platform/src/stdio.c provides";
+        ASSERT_EQ(externRowsNamed(*res, "printf"), 1u);
+        for (auto const& e : res->externDecls) {
+            if (e.canonicalName != "printf") continue;
+            EXPECT_EQ(e.linkName, "__dss_isoc23_printf")
+                << "the plain name is defined by nothing DSS links on pe";
+            auto const pe = e.libraryOverride.find("pe");
+            EXPECT_TRUE(e.noLibraryBinding
+                        || (pe != e.libraryOverride.end() && pe->second.empty()))
+                << "the extern must bind NO image — ucrtbase.dll exports no printf";
+            EXPECT_FALSE(e.isEagerImport);
+        }
+        // The siblings this TU did not re-declare take the injected path and
+        // bind the same way: each by its own link name, with no image.
+        for (std::string const sibling : {"fprintf", "sprintf", "vfprintf", "sscanf"}) {
+            ASSERT_EQ(externRowsNamed(*res, sibling), 1u) << sibling;
+            for (auto const& e : res->externDecls) {
+                if (e.canonicalName != sibling) continue;
+                EXPECT_EQ(e.linkName, "__dss_isoc23_" + sibling);
+                EXPECT_TRUE(e.noLibraryBinding) << sibling;
+            }
+        }
+    }
 }
 
 // THE AGNOSTICISM PIN. The SAME source under elf: glibc exports a real
@@ -9917,22 +10316,24 @@ TEST(HirLoweringC, TFC112RedeclaredElfStdioSymbolStaysAnOrdinaryImport) {
 // body per recipe id, built against the descriptor's signature, so binding a
 // divergent prototype to it would marshal the call under one ABI and answer it
 // under another — silently. Refusing is the only honest answer, and the refused
-// set is essentially clang's own "conflicting types for 'printf'".
+// set is essentially clang's own "conflicting types for 'mtx_lock'".
 //
 // Asserted THREE-SIDED: the diagnostic fires, the lowering is NOT ok, and
 // neither escape hatch is taken — no recipe entry (which would emit a wrong-ABI
-// shim) and no import row (which would not load).
+// shim) and no import row (which would not load). ★ P69: re-pointed from
+// `printf` to `mtx_lock` with the primary pin; the shipped-source `printf`'s own
+// refusal is the declaration-tier pin after the inline-definition arms below.
 TEST(HirLoweringC, TFC112IncompatibleRedeclarationOfAShimSymbolFailsLoud) {
     SemanticModel model = analyzeRealStdioAt(
-        "#include <stdio.h>\n"
-        "int printf(const char *fmt);\n"   // NOT variadic — cannot be the shim
-        "int main(void) { return printf(\"hi\\n\"); }\n",
+        "#include <threads.h>\n"
+        "int mtx_lock(int m);\n"   // an int, not a pointer — cannot be the shim
+        "int main(void) { return mtx_lock(0); }\n",
         ObjectFormatKind::Pe, DataModel::Llp64);
     // ★ P44 ([[D-CSUBSET-INCOMPATIBLE-REDECL-DIAGNOSED-AT-CALL-SITE-NOT-DECLARATION]]):
     // this used to `ASSERT_FALSE(model.hasErrors())` — the semantic tier said
     // NOTHING about a declaration that contradicts the platform's own, which is
     // the wrong-TIER half of that row and is why the identical source on an ELF
-    // target (where `printf` is an ordinary import, so this gate never runs)
+    // target (where the name is an ordinary import, so this gate never runs)
     // compiled completely clean. The declaration-site diagnostic now fires, and
     // this gate is the BACKSTOP rather than the only voice. Both must speak: a
     // shim gate that went quiet once the analyzer complained would leave the
@@ -9946,10 +10347,10 @@ TEST(HirLoweringC, TFC112IncompatibleRedeclarationOfAShimSymbolFailsLoud) {
     EXPECT_EQ(countCode(r, DiagnosticCode::H_ShippedShimSignatureMismatch), 1u)
         << "a silently wrong-ABI call is exactly the class this project refuses "
            "to ship; the mismatch must be named, not absorbed";
-    SymbolId const printfSym = symbolIdNamed(model, "printf");
-    ASSERT_TRUE(printfSym.valid());
-    EXPECT_EQ(res->synthRecipeBySymbol.count(printfSym.v), 0u);
-    EXPECT_EQ(externRowsNamed(*res, "printf"), 0u);
+    SymbolId const lockSym = symbolIdNamed(model, "mtx_lock");
+    ASSERT_TRUE(lockSym.valid());
+    EXPECT_EQ(res->synthRecipeBySymbol.count(lockSym.v), 0u);
+    EXPECT_EQ(externRowsNamed(*res, "mtx_lock"), 0u);
 }
 
 // THE ARITY ARM of the same refusal, on a DIFFERENT recipe — so the gate is
@@ -9957,9 +10358,9 @@ TEST(HirLoweringC, TFC112IncompatibleRedeclarationOfAShimSymbolFailsLoud) {
 // and so the "which axis diverged" reporting has a second witness.
 TEST(HirLoweringC, TFC112WrongArityRedeclarationOfAShimSymbolFailsLoud) {
     SemanticModel model = analyzeRealStdioAt(
-        "#include <stdio.h>\n"
-        "int sprintf(char *b, const char *f, int extra, ...);\n"
-        "int main(void) { char b[8]; return sprintf(b, \"%d\", 1, 2); }\n",
+        "#include <threads.h>\n"
+        "int mtx_init(void *m, int type, int extra);\n"
+        "int main(void) { return mtx_init(0, 0, 0); }\n",
         ObjectFormatKind::Pe, DataModel::Llp64);
     // P44: the declaration-site diagnostic now fires here too — see the
     // arity-arm's sibling above for why both tiers must speak.
@@ -9969,7 +10370,7 @@ TEST(HirLoweringC, TFC112WrongArityRedeclarationOfAShimSymbolFailsLoud) {
     auto res = lowerToHir(model, r);
     EXPECT_FALSE(res->ok);
     EXPECT_EQ(countCode(r, DiagnosticCode::H_ShippedShimSignatureMismatch), 1u);
-    EXPECT_EQ(externRowsNamed(*res, "sprintf"), 0u);
+    EXPECT_EQ(externRowsNamed(*res, "mtx_init"), 0u);
 }
 
 // THE NON-SHIM SUPPRESSED ROW IS UNTOUCHED (the selectivity guard). `puts` is a
@@ -10006,39 +10407,40 @@ TEST(HirLoweringC, TFC112RedeclaredNonRecipePeRowStillSynthesizesTheImport) {
 // displaces a shipped row and then synthesizes an extern for it. It carried the
 // identical defect, and it was found only by tracing every reader of
 // `suppressedShippedSymbolFor` instead of only the site the defect report
-// named. MEASURED before the refactor, on exactly this source: the same
-// `ExternImport{printf, ucrtbase.dll}`, rc=0, no diagnostic, and the same
-// 0xC0000139 at process start.
+// named. MEASURED before the refactor, on the `printf` spelling of this source:
+// the same `ExternImport{printf, ucrtbase.dll}`, rc=0, no diagnostic, and the
+// same 0xC0000139 at process start. (★ P69: re-pointed to `mtx_lock` with the
+// primary pin; the `printf` spelling is the shipped-source pin's second source.)
 //
 // Handing the shim over is not a workaround for the suppression — the external
 // definition 6.7.4p7 sends the call to IS the shim on such a target.
 TEST(HirLoweringC, TFC112InlineDefinitionOfAShimSymbolAlsoInheritsTheShim) {
     SemanticModel model = analyzeRealStdioAt(
-        "#include <stdio.h>\n"
-        "inline int printf(const char *fmt, ...) { return -1; }\n"
-        "int main(void) { return printf(\"inl\\n\"); }\n",
+        "#include <threads.h>\n"
+        "inline int mtx_lock(void *m) { return -1; }\n"
+        "int main(void) { return mtx_lock(0); }\n",
         ObjectFormatKind::Pe, DataModel::Llp64);
     ASSERT_FALSE(model.hasErrors());
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
     EXPECT_TRUE(res->ok);
-    SymbolId const printfSym = symbolIdNamed(model, "printf");
-    ASSERT_TRUE(printfSym.valid());
-    auto const it = res->synthRecipeBySymbol.find(printfSym.v);
+    SymbolId const lockSym = symbolIdNamed(model, "mtx_lock");
+    ASSERT_TRUE(lockSym.valid());
+    auto const it = res->synthRecipeBySymbol.find(lockSym.v);
     ASSERT_NE(it, res->synthRecipeBySymbol.end());
-    EXPECT_EQ(it->second, "printf");
-    EXPECT_EQ(externRowsNamed(*res, "printf"), 0u)
+    EXPECT_EQ(it->second, "mtx_lock");
+    EXPECT_EQ(externRowsNamed(*res, "mtx_lock"), 0u)
         << "the suppressed inline definition must inherit the shim, not plant a "
-           "ucrtbase import that cannot load";
+           "kernel32 import that cannot load";
 }
 
 // ...and its refusal arm, so the signature gate is pinned at BOTH sites rather
 // than only at the one the shared helper was written for.
 TEST(HirLoweringC, TFC112IncompatibleInlineDefinitionOfAShimSymbolFailsLoud) {
     SemanticModel model = analyzeRealStdioAt(
-        "#include <stdio.h>\n"
-        "inline int printf(const char *fmt) { return -1; }\n"   // not variadic
-        "int main(void) { return printf(\"inl\\n\"); }\n",
+        "#include <threads.h>\n"
+        "inline int mtx_unlock(int m) { return -1; }\n"   // an int, not a pointer
+        "int main(void) { return mtx_unlock(0); }\n",
         ObjectFormatKind::Pe, DataModel::Llp64);
     // P44: the declaration-site diagnostic now fires for the inline-definition
     // spelling as well — the C99 6.7.4p7 arm is a DECLARATION for compatibility
@@ -10049,7 +10451,30 @@ TEST(HirLoweringC, TFC112IncompatibleInlineDefinitionOfAShimSymbolFailsLoud) {
     auto res = lowerToHir(model, r);
     EXPECT_FALSE(res->ok);
     EXPECT_EQ(countCode(r, DiagnosticCode::H_ShippedShimSignatureMismatch), 1u);
-    EXPECT_EQ(externRowsNamed(*res, "printf"), 0u);
+    EXPECT_EQ(externRowsNamed(*res, "mtx_unlock"), 0u);
+}
+
+// ★ P69: THE SHIPPED-SOURCE ROW'S REFUSAL LIVES AT THE DECLARATION, as every
+// non-shim row's does (`puts`). A prototype contradicting pe's `printf` row is
+// refused by C23 6.7p4 at the semantic tier, so the driver never lowers it; the
+// HIR shim gate is NOT its backstop any more (there is no fixed synthesized body
+// to protect — the runtime unit is compiled C like any other definition), and
+// firing it would name a shim that does not exist. RED if the declaration-tier
+// diagnostic stops firing for a shipped-source row.
+TEST(HirLoweringC, TFC112IncompatibleRedeclarationOfAShippedSourceSymbolIsRefusedAtTheDeclaration) {
+    SemanticModel model = analyzeRealStdioAt(
+        "#include <stdio.h>\n"
+        "int printf(const char *fmt);\n"   // NOT variadic
+        "int main(void) { return printf(\"hi\\n\"); }\n",
+        ObjectFormatKind::Pe, DataModel::Llp64);
+    EXPECT_GE(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatibleRedeclaration), 1u)
+        << "C23 6.7p4 wants the diagnostic AT THE DECLARATION";
+    EXPECT_TRUE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_ShippedShimSignatureMismatch), 0u)
+        << "no shim realizes pe's printf since P69";
 }
 
 // ★★ D-CSUBSET-ENUM-FNSIG-NULLPTR-CONDITIONS-SKIP-THE-TRUTHINESS-CHOKEPOINT
@@ -11373,9 +11798,14 @@ TEST(HirLoweringC, SubscriptOfTwoPointersIsRefusedNotResolved) {
     SemanticModel model = analyzeC(
         "static int d[4];\n"
         "int main(void) { int *p = d; int *q = d; return p[q]; }\n");
-    ASSERT_FALSE(model.hasErrors())
-        << (model.diagnostics().all().empty()
-              ? "" : model.diagnostics().all()[0].actual);
+    // ★ P69 L2b2 (lane `lm`): THE SEMANTIC TIER REFUSES IT NOW, where every reference
+    // does. The constraint has one home (`subscriptConstraintOf`, type_rules.hpp), and the
+    // analyzer asks it at the subscript, so the model carries the one refusal; this pin
+    // asserted a CLEAN model while only the lowering asked. The lowering still asks the
+    // same home, and still refuses rather than aborting.
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_SubscriptOperandsNotPointerAndInteger), 1u)
+        << "the semantic tier refuses `p[q]` once, at the subscript";
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
     ASSERT_TRUE(res != nullptr);
@@ -11387,9 +11817,14 @@ TEST(HirLoweringC, SubscriptOfTwoPointersIsRefusedNotResolved) {
 TEST(HirLoweringC, SubscriptOfTwoIntegersIsRefusedNamingTheConstruct) {
     SemanticModel model = analyzeC(
         "int main(void) { int a = 1, b = 2; return a[b]; }\n");
-    ASSERT_FALSE(model.hasErrors())
-        << (model.diagnostics().all().empty()
-              ? "" : model.diagnostics().all()[0].actual);
+    // ★ P69 L2b2 (lane `lm`): THE SEMANTIC TIER REFUSES IT NOW, where every reference
+    // does. The constraint has one home (`subscriptConstraintOf`, type_rules.hpp), and the
+    // analyzer asks it at the subscript, so the model carries the one refusal; this pin
+    // asserted a CLEAN model while only the lowering asked. The lowering still asks the
+    // same home, and still refuses rather than aborting.
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_SubscriptOperandsNotPointerAndInteger), 1u)
+        << "the semantic tier refuses `a[b]` once, at the subscript";
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
     ASSERT_TRUE(res != nullptr);
@@ -12389,5 +12824,1660 @@ TEST(HirLoweringC, DeclaredLinkageAfterTheDefinitionIsIgnoredAndSaidSo) {
                "gcc applies it; DSS follows clang, and moving to gcc's answer is "
                "an architectural decision, not a bug fix";
         EXPECT_EQ(got->visibility, SymbolVisibility::Default) << src;
+    }
+}
+
+// ── P69 (lane `cs`): A COMPOUND LITERAL LOWERS TO ITS OWN OBJECT ──────────────────────────
+// D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT: every literal is an
+// `UnnamedObject` whose one child is its initializer value and whose payload is the storage
+// duration the semantic tier decided — automatic inside a function body, static outside
+// every one (C 6.5.2.5p5) or with C23 `static`, thread with `thread_local` — and a const
+// static one is recorded read-only on the SAME side table a const global's is.
+// RED-ON-DISABLE: `lowerCompoundLiteral` returning its brace list's value → no UnnamedObject.
+namespace {
+struct UnnamedFound { HirNodeId node; HirObjectStorage storage; };
+[[nodiscard]] std::vector<UnnamedFound> unnamedObjects(Hir const& hir) {
+    std::vector<UnnamedFound> out;
+    for (std::uint32_t i = 1; i < hir.nodeCount(); ++i) {
+        HirNodeId const n{i, hir.id().v};
+        if (hir.kind(n) == HirKind::UnnamedObject)
+            out.push_back({n, hir.unnamedObjectStorage(n)});
+    }
+    return out;
+}
+} // namespace
+
+TEST(HirLoweringC, EveryCompoundLiteralIsAnUnnamedObjectOfItsStorage) {
+    struct Case { char const* src; HirObjectStorage storage; bool readOnly; };
+    for (Case const& c : {
+             Case{"int main(int argc, char **argv) { (void)argv; int *p = &(int){ argc }; "
+                  "return *p; }\n", HirObjectStorage::Automatic, false},
+             Case{"int *p = &(int){ 42 };\nint main(void) { return *p; }\n",
+                  HirObjectStorage::Static, false},
+             Case{"const int *p = &(const int){ 42 };\nint main(void) { return *p; }\n",
+                  HirObjectStorage::Static, true},
+             Case{"int main(void) { int *p = &(static int){ 42 }; return *p; }\n",
+                  HirObjectStorage::Static, false},
+             Case{"int main(void) { int *p = &(static thread_local int){ 42 }; return *p; }\n",
+                  HirObjectStorage::Thread, false},
+         }) {
+        SemanticModel model = analyzeC(c.src);
+        ASSERT_FALSE(model.hasErrors())
+            << c.src << (model.diagnostics().all().empty()
+                             ? "" : model.diagnostics().all()[0].actual);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res != nullptr && res->ok)
+            << c.src << (r.all().empty() ? "" : r.all()[0].actual);
+        auto const found = unnamedObjects(res->hir);
+        ASSERT_EQ(found.size(), 1u) << c.src;
+        EXPECT_EQ(found[0].storage, c.storage) << c.src;
+        EXPECT_EQ(res->hir.children(found[0].node).size(), 1u) << c.src;
+        auto const* m = res->mutabilityMap.tryGet(found[0].node);
+        EXPECT_EQ(m != nullptr && m->isConst, c.readOnly) << c.src;
+    }
+}
+
+// C 6.5.3.2p1 / 6.3.2.1p3: no address of a `register` object — a C23 `(register T){ … }`
+// literal included — and no pointer from a `register` ARRAY, a subscript included
+// (D-C-A-REGISTER-ARRAY-DECAY-IS-NOT-REFUSED). gcc, clang and MSVC refuse each refused line
+// (runs 20260930-214035-a7fd710e, -214612-2a65f721; gcc -std=c2x for the literals,
+// 20260930-212759-cd6e2714 b04, -212829-175f46fc b19); an array MEMBER of a `register`
+// structure is built by clang and MSVC.
+// RED-ON-DISABLE: drop `refusedRegisterArrayDecay`'s calls → the array lines lower "ok";
+// drop the compound-literal half of `addressForbiddingObject` → the first line does.
+TEST(HirLoweringC, RegisterObjectsAddressAndArrayDecayAreRefused) {
+    for (char const* src : {
+             "int main(void) { int *p = &(register int){ 42 }; return *p; }\n",
+             "int main(int argc, char **argv) { (void)argv; register int a[2] = { 1, 41 }; "
+             "return a[argc] + 1; }\n",
+             "int main(int argc, char **argv) { (void)argv; register int a[2] = { 1, 41 }; "
+             "int *p = a; return p[argc] + 1; }\n",
+             "int main(int argc, char **argv) { (void)argv; "
+             "return (register int[]){ 1, 41 }[argc] + 1; }\n",
+         }) {
+        SemanticModel model = analyzeC(src);
+        ASSERT_FALSE(model.hasErrors())
+            << src << (model.diagnostics().all().empty()
+                           ? "" : model.diagnostics().all()[0].actual);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res != nullptr);
+        EXPECT_FALSE(res->ok) << src;
+        EXPECT_EQ(countCode(r, DiagnosticCode::S_AddressOfRegisterObject), 1u) << src;
+    }
+    SemanticModel model = analyzeC(
+        "struct S { int v[2]; };\n"
+        "int main(int argc, char **argv) { (void)argv; register struct S s = { { 1, 41 } }; "
+        "return s.v[argc] + 1; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res != nullptr);
+    EXPECT_TRUE(res->ok) << "an array member of a register structure decays (clang, MSVC) "
+                         << (r.all().empty() ? "" : r.all()[0].actual);
+}
+
+// P69 review n15: the designated-object walk is bounded by the HIR arena, never by a step
+// count — a member of a `register` structure reached through ANY depth of members is still
+// part of the register object, and taking its address is refused (C 6.5.3.2p1; gcc and clang
+// refuse `&s.m.x` of a `register` structure). The walk used to give up after 256 steps and
+// answer "no object", so a 300-member chain took the address in silence.
+// RED-ON-DISABLE: restore the 256-step limit in `designatedObjectRoot` → the register line
+// lowers "ok". CONTROL: the same chain on an ordinary object lowers.
+TEST(HirLoweringC, ARegisterObjectsAddressIsRefusedThroughAnyDepthOfMembers) {
+    constexpr int kDepth = 300;
+    std::string types = "struct S0 { int x; };\n";
+    for (int i = 1; i <= kDepth; ++i)
+        types += "struct S" + std::to_string(i) + " { struct S" + std::to_string(i - 1)
+               + " m; };\n";
+    std::string chain;
+    for (int i = 0; i < kDepth; ++i) chain += ".m";
+    auto const program = [&](char const* storage) {
+        return types + "int main(void) { " + storage + "struct S" + std::to_string(kDepth)
+             + " s; int *p = &s" + chain + ".x; (void)p; return 0; }\n";
+    };
+    {
+        SemanticModel model = analyzeC(program("register "));
+        ASSERT_FALSE(model.hasErrors())
+            << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res != nullptr);
+        EXPECT_FALSE(res->ok) << "the address of a register structure's member, 300 deep";
+        EXPECT_EQ(countCode(r, DiagnosticCode::S_AddressOfRegisterObject), 1u);
+    }
+    {
+        SemanticModel model = analyzeC(program(""));
+        ASSERT_FALSE(model.hasErrors());
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res != nullptr);
+        EXPECT_TRUE(res->ok) << "CONTROL: an ordinary object's member, 300 deep "
+                             << (r.all().empty() ? "" : r.all()[0].actual);
+    }
+}
+
+// ── P69 (lane `cs`): the weak-definition KIND and the TENTATIVE mark ──────────
+//
+// A weak binding is two different link rules under one word: a default any other
+// definition of the name replaces (`weak`), or one of several interchangeable
+// copies of which the link keeps one (`selectany`). The HIR linkage attribute
+// states which, beside the binding, and `HirVerifier` refuses a weak attribute
+// that states neither — so every cell below is also a cell of "the lowering
+// verified".
+//
+// ✔MEASURED, each reference alone (gcc 13.3.0 + clang 18.1.3 on Linux, Apple
+// clang, mingw-w64 gcc 13, cl 19.51), one cell per row of the table:
+//   * `selectany` on a datum is a weak definition on clang (`V` on ELF, a weak
+//     external on Mach-O) and a pick-any COMDAT on mingw-w64 gcc and cl; gcc on
+//     Linux implements no `selectany` and says so;
+//   * `weak` and `selectany` on ONE declaration are accepted by all four GNU
+//     drivers, and mingw-w64 gcc — the one whose object format writes the two
+//     kinds differently — emits the weak-external pair: the OVERRIDABLE kind;
+//   * `extern __declspec(selectany) int v; int v = 6;` builds and runs on cl and
+//     on mingw-w64 gcc: the kind reaches a definition that writes nothing;
+//   * `weak` on an inferred-type object (`auto v __attribute__((weak)) = 9;`,
+//     and leading) is a weak object on all four GNU drivers.
+//
+// RED-ON-DISABLE, one per mechanism: drop `weakKind` from a `linkageSpecifiers`
+// entry of the shipped C document and the LOAD fails (the loader's own pin);
+// make `settleWeakKind` return its `next` unconditionally and the three
+// both-names rows read select-any or overridable by ORDER; drop the kind block
+// of `mergeDeclaredLinkage` and the two cross-declaration rows lower a weak
+// attribute with no kind, which the verifier refuses; put `attrSpec` back in the
+// inferred-type row's `linkageSpecifierIgnoredRules` and its two rows read
+// `Global`.
+TEST(HirLoweringC, AWeakDefinitionStatesItsKindInEverySpellingAndPosition) {
+    struct Case {
+        char const*        what;
+        char const*        src;
+        WeakDefinitionKind kind;
+    };
+    for (Case const c : {
+             Case{"weak, leading, an object", "__attribute__((weak)) int v = 1;\n",
+                  WeakDefinitionKind::Overridable},
+             Case{"weak, after the declarator, an object",
+                  "int v __attribute__((weak)) = 1;\n",
+                  WeakDefinitionKind::Overridable},
+             Case{"weak, the reserved spelling", "__attribute__((__weak__)) int v = 1;\n",
+                  WeakDefinitionKind::Overridable},
+             Case{"weak, a function definition",
+                  "__attribute__((weak)) int v(void) { return 1; }\n",
+                  WeakDefinitionKind::Overridable},
+             Case{"weak on a prototype, the definition without",
+                  "int v(void) __attribute__((weak));\nint v(void) { return 3; }\n",
+                  WeakDefinitionKind::Overridable},
+             Case{"weak after an inferred-type declarator",
+                  "auto v __attribute__((weak)) = 9;\n",
+                  WeakDefinitionKind::Overridable},
+             Case{"weak before an inferred-type declaration",
+                  "__attribute__((weak)) auto v = 9;\n",
+                  WeakDefinitionKind::Overridable},
+             Case{"selectany, leading", "__attribute__((selectany)) int v = 1;\n",
+                  WeakDefinitionKind::SelectAny},
+             Case{"selectany, after the declarator",
+                  "int v __attribute__((selectany)) = 7;\n",
+                  WeakDefinitionKind::SelectAny},
+             Case{"selectany, the reserved spelling",
+                  "__attribute__((__selectany__)) int v = 1;\n",
+                  WeakDefinitionKind::SelectAny},
+             Case{"selectany on a const object",
+                  "__attribute__((selectany)) const int v = 14;\n",
+                  WeakDefinitionKind::SelectAny},
+             Case{"selectany on an uninitialized object",
+                  "__attribute__((selectany)) int v;\n",
+                  WeakDefinitionKind::SelectAny},
+             Case{"selectany on an inferred-type object",
+                  "__attribute__((selectany)) auto v = 9;\n",
+                  WeakDefinitionKind::SelectAny},
+             Case{"selectany on the declaration, the definition without",
+                  "extern __attribute__((selectany)) int v;\nint v = 6;\n",
+                  WeakDefinitionKind::SelectAny},
+             Case{"both names in one specifier, weak first",
+                  "__attribute__((weak, selectany)) int v = 5;\n",
+                  WeakDefinitionKind::Overridable},
+             Case{"both names in one specifier, selectany first",
+                  "__attribute__((selectany, weak)) int v = 5;\n",
+                  WeakDefinitionKind::Overridable},
+             Case{"both names, one leading and one after the declarator",
+                  "__attribute__((selectany)) int v __attribute__((weak)) = 5;\n",
+                  WeakDefinitionKind::Overridable},
+             Case{"the two names on two declarations of one object",
+                  "extern __attribute__((selectany)) int v;\n"
+                  "extern __attribute__((weak)) int v;\n"
+                  "int v = 6;\n",
+                  WeakDefinitionKind::Overridable},
+             Case{"selectany twice",
+                  "__attribute__((selectany)) int v __attribute__((selectany)) = 5;\n",
+                  WeakDefinitionKind::SelectAny}}) {
+        std::string const src = std::string(c.src) + "int ctl = 9;\n";
+        SemanticModel model = analyzeC(src);
+        ASSERT_FALSE(model.hasErrors())
+            << c.what << ": "
+            << (model.diagnostics().all().empty()
+                    ? std::string{}
+                    : model.diagnostics().all()[0].actual);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << c.what << ": "
+                             << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_TRUE(r.all().empty())
+            << c.what << " — the lowering must say nothing: "
+            << (r.all().empty() ? "" : r.all()[0].actual);
+        auto const got = declaredLinkage(*res, model, "v");
+        ASSERT_TRUE(got.has_value()) << c.what;
+        EXPECT_EQ(got->binding, SymbolBinding::Weak) << c.what;
+        EXPECT_EQ(weakDefinitionKindName(got->weakKind),
+                  weakDefinitionKindName(c.kind))
+            << c.what;
+        // CONTROL, in the same unit: an object that says nothing holds neither a
+        // weak binding nor a kind.
+        auto const ctl = declaredLinkage(*res, model, "ctl");
+        ASSERT_TRUE(ctl.has_value()) << c.what;
+        EXPECT_EQ(ctl->binding, SymbolBinding::Global) << c.what;
+        EXPECT_TRUE(weakDefinitionKindName(ctl->weakKind).empty()) << c.what;
+    }
+}
+
+// `selectany` on anything but a variable: the declaration-kind gate ignores it and
+// SAYS so, and the linkage fold — which reads the same tokens one tier down — must
+// not apply what the gate discarded.
+//
+// ✔MEASURED before this cycle's fold change (the gate's row alone): the warning
+// said "ignored … its effect was discarded" and the function was lowered WEAK.
+// The one reference that accepts the declaration (gcc 13.3.0 on Linux, which
+// ignores the word wherever it stands) makes it an ordinary function; clang,
+// mingw-w64 gcc and cl refuse it.
+//
+// RED-ON-DISABLE: drop the `attributeNameIgnoredForKind` line of `linkageFrom` and
+// every row but the control reads `Weak`; drop the gate's `set` in the analyzer
+// and the same; drop the `selectany` effects row and the warning count is zero.
+TEST(HirLoweringC, ALinkageAttributeTheKindGateIgnoredIsNotAppliedByTheFold) {
+    struct Case {
+        char const*   what;
+        char const*   src;
+        char const*   name;
+        SymbolBinding binding;
+        std::size_t   kindWarnings;
+    };
+    for (Case const c : {
+             Case{"selectany on a function definition",
+                  "__attribute__((selectany)) int f(void) { return 41; }\n", "f",
+                  SymbolBinding::Global, 1u},
+             Case{"selectany after a function declarator, the definition following",
+                  "int f(void) __attribute__((selectany));\n"
+                  "int f(void) { return 41; }\n",
+                  "f", SymbolBinding::Global, 1u},
+             Case{"selectany on a leading-position prototype",
+                  "__attribute__((selectany)) int f(void);\n"
+                  "int f(void) { return 41; }\n",
+                  "f", SymbolBinding::Global, 1u},
+             Case{"selectany beside another linkage name on a function: only it is "
+                  "ignored",
+                  "__attribute__((selectany, visibility(\"hidden\"))) int f(void) "
+                  "{ return 41; }\n",
+                  "f", SymbolBinding::Global, 1u},
+             Case{"one clause shared by an object and a function is ignored for "
+                  "both",
+                  "__attribute__((selectany)) int o = 1, f(void);\n"
+                  "int f(void) { return 41; }\n",
+                  "o", SymbolBinding::Global, 1u},
+             Case{"CONTROL: weak on a function is applied (its kind axis admits a "
+                  "function)",
+                  "__attribute__((weak)) int f(void) { return 41; }\n", "f",
+                  SymbolBinding::Weak, 0u},
+             Case{"CONTROL: selectany on an object is applied",
+                  "__attribute__((selectany)) int f = 41;\n", "f",
+                  SymbolBinding::Weak, 0u}}) {
+        std::string const src = std::string(c.src) + "int ctl = 9;\n";
+        SemanticModel model = analyzeC(src);
+        ASSERT_FALSE(model.hasErrors())
+            << c.what << ": "
+            << (model.diagnostics().all().empty()
+                    ? std::string{}
+                    : model.diagnostics().all()[0].actual);
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_AttributeIgnoredForDeclarationKind),
+                  c.kindWarnings)
+            << c.what;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << c.what << ": "
+                             << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_TRUE(r.all().empty())
+            << c.what << " — the lowering must say nothing more: "
+            << (r.all().empty() ? "" : r.all()[0].actual);
+        auto const got = declaredLinkage(*res, model, c.name);
+        ASSERT_TRUE(got.has_value()) << c.what;
+        EXPECT_EQ(got->binding, c.binding) << c.what;
+        EXPECT_EQ(weakDefinitionKindName(got->weakKind).empty(),
+                  c.binding != SymbolBinding::Weak)
+            << c.what << " — a kind beside the weak binding and only there";
+    }
+    // The ignored name's ARGUMENT is ignored with it, and the name beside it is
+    // still read: `visibility("hidden")` in the fourth row above.
+    {
+        SemanticModel model = analyzeC(
+            "__attribute__((selectany, visibility(\"hidden\"))) int f(void) "
+            "{ return 41; }\n");
+        ASSERT_FALSE(model.hasErrors());
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(declaredVisibility(*res, model, "f"),
+                  std::optional{SymbolVisibility::Hidden});
+    }
+}
+
+// C 6.9.2p2: a file-scope object declared without an initializer and without
+// `extern` is a TENTATIVE definition; when the unit holds no definition with an
+// initializer, it behaves as one with an initializer of zero. Below this tier a
+// tentative and `int t = 0;` were the same zero-filled global, so two units each
+// holding `int t;` could not be told from two definitions. The mark is the
+// semantic tier's own fact (`SymbolRecord::isTentativeDefinition`), read from the
+// surviving declaration.
+//
+// P69 (lane `cs`): the mark is "a tentative definition that MAY be a common", and
+// it is stated ONCE, here — a weak, a thread-local, a `nocommon` one and one an
+// `alias` names are definitions of their unit outright, and the mark is cleared on
+// each; `common` states the default and changes nothing.
+//
+// RED-ON-DISABLE: drop the tentative arm of `recordLinkage` and every `true` row
+// reads false; drop `|| attr.tentative` from its sparseness test and the same
+// (the attribute is never stored); drop the `== Global` test and the internal-
+// linkage rows and the weak one are refused by the verifier; drop the
+// thread-local or the `tentativeNeverCommon` conjunct and that row is.
+TEST(HirLoweringC, AnUncompletedTentativeDefinitionIsMarkedOnItsGlobal) {
+    struct Case {
+        char const* what;
+        char const* src;
+        bool        tentative;
+    };
+    for (Case const c : {
+             Case{"one tentative definition", "int t;\n", true},
+             Case{"two tentative definitions of one object", "int t;\nint t;\n", true},
+             Case{"a declaration, then a tentative definition",
+                  "extern int t;\nint t;\n", true},
+             Case{"a tentative definition of an array", "int t[4];\n", true},
+             Case{"a weak tentative definition is a WEAK definition, never a common",
+                  "__attribute__((weak)) int t;\n", false},
+             Case{"a thread-local tentative definition is a definition",
+                  "_Thread_local int t;\n", false},
+             Case{"`nocommon` makes a tentative definition a definition",
+                  "__attribute__((nocommon)) int t;\n", false},
+             // Of two tentative declarations the LAST one's `nocommon` is the definition's (gcc's reading of
+             // the split ✔MEASURED by lane `cs` probe rv cells 14 and 15; `settleNoCommon`).
+             Case{"`nocommon` on the later of two tentative declarations is the definition's",
+                  "int t;\n__attribute__((nocommon)) int t;\n", false},
+             Case{"a plain tentative declaration after a `nocommon` one makes it a common again",
+                  "__attribute__((nocommon)) int t;\nint t;\n", true},
+             Case{"`common` states the default", "__attribute__((common)) int t;\n",
+                  true},
+             Case{"a tentative definition an alias names is a definition",
+                  "int t;\nextern int t_alias __attribute__((alias(\"t\")));\n", false},
+             Case{"completed by a LATER definition", "int t;\nint t = 3;\n", false},
+             Case{"completed by an EARLIER definition", "int t = 3;\nint t;\n", false},
+             Case{"an initializer of zero is a definition", "int t = 0;\n", false},
+             Case{"an internal-linkage tentative definition", "static int t;\n",
+                  false},
+             Case{"two internal-linkage tentative definitions",
+                  "static int t;\nstatic int t;\n", false}}) {
+        std::string const src = std::string(c.src)
+                              + "int ctl = 9;\n"
+                                "int use(void) { return t ? 1 : ctl; }\n";
+        // An array object is read through its first element.
+        std::string const arraySrc = std::string(c.src)
+                                   + "int ctl = 9;\n"
+                                     "int use(void) { return t[0] ? 1 : ctl; }\n";
+        bool const isArray = std::string_view{c.src}.find('[') != std::string_view::npos;
+        SemanticModel model = analyzeC(isArray ? arraySrc : src);
+        ASSERT_FALSE(model.hasErrors())
+            << c.what << ": "
+            << (model.diagnostics().all().empty()
+                    ? std::string{}
+                    : model.diagnostics().all()[0].actual);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << c.what << ": "
+                             << (r.all().empty() ? "" : r.all()[0].actual);
+        auto const got = declaredLinkage(*res, model, "t");
+        ASSERT_TRUE(got.has_value()) << c.what;
+        EXPECT_EQ(got->tentative, c.tentative) << c.what;
+        // CONTROLS, in the same unit: a definition and a function are never marked.
+        auto const ctl = declaredLinkage(*res, model, "ctl");
+        ASSERT_TRUE(ctl.has_value()) << c.what;
+        EXPECT_FALSE(ctl->tentative) << c.what;
+        auto const fn = declaredLinkage(*res, model, "use");
+        ASSERT_TRUE(fn.has_value()) << c.what;
+        EXPECT_FALSE(fn->tentative) << c.what;
+    }
+    // A declaration that defines nothing emits an import, and an import is never a
+    // tentative definition.
+    {
+        SemanticModel model = analyzeC("extern int t;\nint use(void) { return t; }\n");
+        ASSERT_FALSE(model.hasErrors());
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        auto const got = declaredLinkage(*res, model, "t");
+        ASSERT_TRUE(got.has_value());
+        EXPECT_FALSE(got->tentative);
+    }
+}
+
+// WHERE a linkage attribute may be written and still be the declared entity's.
+// P69 round 4 gave an attribute specifier three more places in a declaration —
+// among the type's own specifiers, after a referred tag, and inside the declarator
+// beside the declared name — and an attribute read there by the semantic folds and
+// NOT by the linkage fold would be a `weak` the compiler accepted and dropped.
+//
+// ✔MEASURED by symbol binding, one cell per row (`nm`; gcc 13.3.0 and clang 18.1.3
+// on Linux, mingw-w64 gcc 13): every row below is a weak `v` beside an ordinary
+// `c` on all three.
+//
+// RED-ON-DISABLE: drop the head-run loop of `linkagePrefixRoots` and the first
+// three rows and the tag row read `Global`; drop the name-adjacent loop of
+// `declaratorAttrRoots` and the five declarator rows do.
+TEST(HirLoweringC, ALinkageAttributeIsTheDeclaredEntitysAtEveryPlaceTheReferencesReadItSo) {
+    struct Case {
+        char const* what;
+        char const* src;
+    };
+    for (Case const c : {
+             Case{"between two specifiers",
+                  "unsigned __attribute__((weak)) long v = 1;\nint c = 1;\n"},
+             Case{"after the type, before the declarator",
+                  "int __attribute__((weak)) v = 1;\nint c = 1;\n"},
+             Case{"after a typeof specifier",
+                  "__typeof__(int) __attribute__((weak)) v = 1;\nint c = 1;\n"},
+             Case{"after a referred tag",
+                  "struct S { int a; };\n"
+                  "struct S __attribute__((weak)) v = {1};\nint c = 1;\n"},
+             Case{"beside the name of a pointer",
+                  "int * __attribute__((weak)) v = 0;\nint c = 1;\n"},
+             Case{"beside the name of a function returning a pointer",
+                  "int * __attribute__((weak)) v(void) { return 0; }\nint c = 1;\n"},
+             Case{"beside the name: only the declarator that carries it",
+                  "int * __attribute__((weak)) v = 0, *c = 0;\n"},
+             Case{"inside the parentheses, beside the name",
+                  "int (__attribute__((weak)) v) = 0;\nint c = 1;\n"},
+             Case{"inside the parentheses of a function pointer",
+                  "int (* __attribute__((weak)) v)(void) = 0;\nint c = 1;\n"},
+             Case{"after the declarator: only that declarator",
+                  "int v __attribute__((weak)) = 1, c = 2;\n"}}) {
+        SemanticModel model = analyzeC(c.src);
+        ASSERT_FALSE(model.hasErrors())
+            << c.what << ": "
+            << (model.diagnostics().all().empty()
+                    ? std::string{}
+                    : model.diagnostics().all()[0].actual);
+        EXPECT_TRUE(model.diagnostics().all().empty())
+            << c.what << " — the analysis must say nothing: "
+            << (model.diagnostics().all().empty()
+                    ? std::string{}
+                    : model.diagnostics().all()[0].actual);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << c.what << ": "
+                             << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_TRUE(r.all().empty())
+            << c.what << ": " << (r.all().empty() ? "" : r.all()[0].actual);
+        auto const v = declaredLinkage(*res, model, "v");
+        ASSERT_TRUE(v.has_value()) << c.what;
+        EXPECT_EQ(v->binding, SymbolBinding::Weak) << c.what;
+        EXPECT_EQ(weakDefinitionKindName(v->weakKind),
+                  weakDefinitionKindName(WeakDefinitionKind::Overridable))
+            << c.what;
+        auto const ctl = declaredLinkage(*res, model, "c");
+        ASSERT_TRUE(ctl.has_value()) << c.what;
+        EXPECT_EQ(ctl->binding, SymbolBinding::Global)
+            << c.what << " — the object that says nothing stays ordinary";
+    }
+    // A specifier written before the declaration is every declarator's.
+    {
+        SemanticModel model = analyzeC("__attribute__((weak)) int v = 1, w = 2;\n");
+        ASSERT_FALSE(model.hasErrors());
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(declaredBinding(*res, model, "v"), std::optional{SymbolBinding::Weak});
+        EXPECT_EQ(declaredBinding(*res, model, "w"), std::optional{SymbolBinding::Weak});
+    }
+    // BEFORE ANOTHER STAR the specifier decorates the POINTER TYPE that level
+    // forms, not the declared object: gcc 13.3.0 (Linux and mingw-w64) emits `v`
+    // ordinary and warns "'weak' attribute does not apply to types"; clang 18.1.3
+    // makes `v` weak in silence. A MEANING split — the reading taken is gcc's,
+    // which is also what every other attribute in that position gets here, and
+    // it is SAID (the cost: a clang-built program relying on that spelling gets
+    // an ordinary symbol and one warning).
+    {
+        SemanticModel model = analyzeC("int * __attribute__((weak)) * v = 0;\nint c = 1;\n");
+        ASSERT_FALSE(model.hasErrors());
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_AttributeIgnoredForDeclarationKind),
+                  1u);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(declaredBinding(*res, model, "v"), std::optional{SymbolBinding::Global});
+    }
+}
+
+// GNU C lets an attribute specifier list stand immediately BEFORE a declarator
+// other than the first (GCC manual, "Attribute Syntax"), and it is that
+// declarator's alone. ✔MEASURED (`nm`; gcc 13.3.0 and clang 18.1.3 on Linux,
+// mingw-w64 gcc 13): in `int c = 1, __attribute__((weak)) v = 2;` `v` is weak and
+// `c` is not.
+TEST(HirLoweringC, AnAttributeBeforeALaterDeclaratorIsThatDeclaratorsAlone) {
+    SemanticModel model = analyzeC("int c = 1, __attribute__((weak)) v = 2;\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? std::string{}
+                : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(declaredBinding(*res, model, "v"), std::optional{SymbolBinding::Weak});
+    EXPECT_EQ(declaredBinding(*res, model, "c"), std::optional{SymbolBinding::Global});
+}
+
+// ── P69 (lane `cs`): THE SECOND SPELLING OF THE ATTRIBUTE SPECIFIER AT THE LINKAGE
+//    FOLD ──────────────────────────────────────────────────────────────────────
+//
+// `__declspec(...)` was erased by a predefined macro before this cycle, so this
+// fold never saw a modifier written in it. It reads them now, each under its
+// QUALIFIED name first (`__declspec(thread)`, `__declspec(align)`) and then under
+// its plain one — and a fold that looked a qualified word up under the plain name
+// alone would either warn about a name the language models or, worse, give
+// `thread` no row at all.
+
+// `selectany` inside the frame is the weak definition of kind select-any that it
+// is under the plain spelling, at every place cl and mingw-w64 gcc take the
+// specifier. ✔MEASURED (cl 19.51 and mingw-w64 gcc 13): two units that each define
+// `__declspec(selectany) int v = …;` link and run; `extern __declspec(selectany)
+// int v; int v = 6;` builds and runs on both.
+//
+// RED-ON-DISABLE: read an attribute-position token of the frame as a clause name
+// only under its qualified key in `linkageFrom` (drop the plain-key fallback) and
+// every row reads `Global` beside one warning about an unrecognized specifier.
+TEST(HirLoweringC, SelectanyInsideTheSecondSpellingIsASelectAnyWeakDefinition) {
+    struct Case {
+        char const* what;
+        char const* src;
+    };
+    for (Case const c : {
+             Case{"leading", "__declspec(selectany) int v = 1;\n"},
+             Case{"after the type", "int __declspec(selectany) v = 1;\n"},
+             Case{"on a const object", "__declspec(selectany) const int v = 14;\n"},
+             Case{"on the declaration, the definition without",
+                  "extern __declspec(selectany) int v;\nint v = 6;\n"},
+             Case{"beside the plain spelling of the same word",
+                  "__declspec(selectany) int v __attribute__((selectany)) = 5;\n"}}) {
+        SemanticModel model = analyzeCPe(std::string(c.src) + "int ctl = 9;\n");
+        ASSERT_FALSE(model.hasErrors())
+            << c.what << ": "
+            << (model.diagnostics().all().empty()
+                    ? std::string{}
+                    : model.diagnostics().all()[0].actual);
+        EXPECT_TRUE(model.diagnostics().all().empty())
+            << c.what << " — the analysis must say nothing: "
+            << (model.diagnostics().all().empty()
+                    ? std::string{}
+                    : model.diagnostics().all()[0].actual);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << c.what << ": "
+                             << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_TRUE(r.all().empty())
+            << c.what << " — the lowering must say nothing: "
+            << (r.all().empty() ? "" : r.all()[0].actual);
+        auto const got = declaredLinkage(*res, model, "v");
+        ASSERT_TRUE(got.has_value()) << c.what;
+        EXPECT_EQ(got->binding, SymbolBinding::Weak) << c.what;
+        EXPECT_EQ(weakDefinitionKindName(got->weakKind),
+                  weakDefinitionKindName(WeakDefinitionKind::SelectAny))
+            << c.what;
+        auto const ctl = declaredLinkage(*res, model, "ctl");
+        ASSERT_TRUE(ctl.has_value()) << c.what;
+        EXPECT_EQ(ctl->binding, SymbolBinding::Global) << c.what;
+    }
+}
+
+// A MODIFIER THE LANGUAGE MODELS IS NOT AN UNKNOWN LINKAGE SPECIFIER — whether its
+// row is a qualified one (`align`, `thread`), a plain one read through the frame
+// (`deprecated`, `dllexport`), or there is no modifier at all — and it leaves the
+// binding alone. A modifier the language does NOT model gets exactly the
+// diagnostic the plain spelling of an unknown name gets, no more and no fewer.
+//
+// RED-ON-DISABLE: drop the qualified half of the by-name ignore test of
+// `linkageFrom` and the `align` rows are reported; drop the qualified lookup and
+// the `thread` rows are.
+TEST(HirLoweringC, AModelledModifierOfTheSecondSpellingIsNotAnUnknownLinkageSpecifier) {
+    for (char const* decl :
+         {"__declspec(align(32)) int gv = 7;", "int __declspec(align(32)) gv = 7;",
+          "struct S { int a; } __declspec(align(32)) gv = { 7 };",
+          "__declspec(thread) int gv = 7;", "static __declspec(thread) int gv = 7;",
+          "__declspec(deprecated) int gv = 7;", "__declspec(dllexport) int gv = 7;",
+          "__declspec() int gv = 7;", "__declspec(align(16) dllexport) int gv = 7;",
+          "__declspec(dllimport) int imported(void);",
+          "__declspec(dllexport) int exported(void) { return 1; }",
+          "__declspec(restrict) void *fresh(void) { return 0; }",
+          "__declspec(noalias) int pure(int v) { return v; }",
+          "__declspec(noinline) int one(void) { return 1; }",
+          "__declspec(noreturn) void leave(void);"}) {
+        SemanticModel model =
+            analyzeCPe(std::string(decl) + "\nint main(void) { return 0; }\n");
+        ASSERT_FALSE(model.hasErrors())
+            << decl << ": "
+            << (model.diagnostics().all().empty()
+                    ? std::string{}
+                    : model.diagnostics().all()[0].actual);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << decl << ": "
+                             << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u) << decl;
+        EXPECT_TRUE(r.all().empty())
+            << decl << ": " << (r.all().empty() ? "" : r.all()[0].actual);
+    }
+    // THE NEGATIVE, AND ITS TWIN: an unknown word, in each spelling.
+    std::size_t reported[2] = {0, 0};
+    std::size_t at = 0;
+    for (char const* decl : {"__declspec(frobnicate_xyz) int uz = 1;",
+                             "__attribute__((frobnicate_xyz)) int uz = 1;"}) {
+        SemanticModel model =
+            analyzeCPe(std::string(decl) + "\nint main(void) { return uz; }\n");
+        ASSERT_FALSE(model.hasErrors()) << decl;
+        EXPECT_TRUE(model.diagnostics().all().empty())
+            << decl << " — the analysis leaves the word to this tier";
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        // WARNED, not refused: mingw-w64 gcc warns about the unknown modifier and
+        // runs the program (cl refuses it — acceptance by one reference).
+        EXPECT_TRUE(res->ok) << decl << ": "
+                             << (r.all().empty() ? "" : r.all()[0].actual);
+        for (auto const& d : r.all())
+            EXPECT_EQ(d.severity, DiagnosticSeverity::Warning) << decl << ": " << d.actual;
+        reported[at++] = countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier);
+    }
+    EXPECT_EQ(reported[1], 1u) << "the plain spelling's unknown word is reported once";
+    EXPECT_EQ(reported[0], reported[1])
+        << "…and the same word inside the frame is reported exactly as often";
+
+    // `dllexport` is a word of the SECOND spelling. Written as a GNU attribute for a
+    // non-Windows target it is warned and ignored by every reference (✔MEASURED: gcc
+    // 13.3.0 "attribute directive ignored"; clang 18.1.3 and Apple clang "unknown
+    // attribute 'dllexport' ignored"; all three run the program) — and by this
+    // compiler, which had answered so before the second spelling existed and must not
+    // have stopped when its rows were written.
+    {
+        char const* const decl = "__attribute__((dllexport)) int gv = 7;";
+        SemanticModel model =
+            analyzeC(std::string(decl) + "\nint main(void) { return 0; }\n");
+        ASSERT_FALSE(model.hasErrors()) << decl;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok) << decl;
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 1u) << decl;
+        for (auto const& d : r.all())
+            EXPECT_NE(d.severity, DiagnosticSeverity::Error) << decl << ": " << d.actual;
+    }
+    // ★ P69 (lane `cs`, fold f26b): `dllimport` is the GNU spelling's word too, ON pe —
+    // mingw-w64 gcc 13.2.0 imports `__attribute__((dllimport))` (✔MEASURED, lane `cs`
+    // probe di5) — so its effects row names it, gated to pe. Off pe it is warned and
+    // ignored as every other reference does, still exactly ONCE: by the analysis, which
+    // judges a gated-off name, while this tier skips every name of the effects table.
+    //
+    // RED-ON-DISABLE: drop the analysis's gated-off arm and the analysis says nothing;
+    // drop the row's name from this tier's skip list and the word is reported twice.
+    {
+        char const* const decl = "__attribute__((dllimport)) extern int gv;";
+        SemanticModel model =
+            analyzeC(std::string(decl) + "\nint main(void) { return 0; }\n");
+        ASSERT_FALSE(model.hasErrors()) << decl;
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownAttribute), 1u)
+            << decl;
+        EXPECT_EQ(model.diagnostics().all().size(), 1u) << decl;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok) << decl;
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u) << decl;
+        for (auto const& d : r.all())
+            EXPECT_NE(d.severity, DiagnosticSeverity::Error) << decl << ": " << d.actual;
+    }
+}
+
+// THREAD STORAGE REQUESTED INSIDE THE FRAME REACHES THE LOWERED DECLARATION — and
+// does NOT when another declaration of the object made no such request (the request
+// yields; cl and mingw-w64 gcc both run that program with one shared object).
+//
+// RED-ON-DISABLE: drop the record-time scan of the analyzer and the first two rows
+// lower with no thread-storage mark; drop the yield in the redeclaration merge and
+// the third is refused before it is lowered.
+TEST(HirLoweringC, ThreadStorageRequestedInTheSecondSpellingReachesTheLoweredObject) {
+    struct Case {
+        char const* what;
+        char const* src;
+        bool        threadStorage;
+    };
+    for (Case const c : {
+             Case{"a definition", "__declspec(thread) int tv = 1;\n", true},
+             Case{"an internal one", "static __declspec(thread) int tv = 1;\n"
+                                     "int use(void) { return tv; }\n", true},
+             Case{"a declaration that the definition does not repeat",
+                  "extern __declspec(thread) int tv;\nint tv = 1;\n", false},
+             Case{"no request at all", "int tv = 1;\n", false}}) {
+        SemanticModel model = analyzeCPe(c.src);
+        ASSERT_FALSE(model.hasErrors())
+            << c.what << ": "
+            << (model.diagnostics().all().empty()
+                    ? std::string{}
+                    : model.diagnostics().all()[0].actual);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << c.what << ": "
+                             << (r.all().empty() ? "" : r.all()[0].actual);
+        bool found = false;
+        for (HirNodeId d : res->hir.moduleDecls(res->hir.root())) {
+            if (res->hir.kind(d) != HirKind::Global) continue;
+            auto const* rec = model.recordFor(res->hir.globalSymbol(d));
+            if (rec == nullptr || rec->name != "tv") continue;
+            found = true;
+            bool const marked = res->threadLocalMap.has(d)
+                             && res->threadLocalMap.get(d).isThreadLocal;
+            EXPECT_EQ(marked, c.threadStorage) << c.what;
+        }
+        EXPECT_TRUE(found) << c.what << " — no lowered definition of 'tv'";
+    }
+}
+
+// ★ P69 (lane `cs`, fold f26b): A `dllimport` DECLARATION LOWERS TO AN IMPORT, NEVER TO
+// STORAGE — at file scope (where without the modifier it is a tentative definition: a
+// zero-filled Global of this unit) and inside a body (where without it it is a local:
+// a stack VarDecl), in both spellings, per declarator. ✔MEASURED (lane `cs` probes di,
+// di3, di4, di5; cl 19.51 and mingw-w64 gcc 13.2.0): each writes a reference to
+// `__imp_<name>` and no definition. Before fold f26b the file-scope ones lowered to a
+// common Global and the block ones to a stack local.
+//
+// RED-ON-DISABLE: drop the import arm of the declarator loop and every cell lowers to a
+// Global (file scope) or a VarDecl (block scope) again.
+TEST(HirLoweringC, ADllimportDeclarationLowersToAnImportNotToStorage) {
+    struct Case {
+        char const* what;
+        char const* src;
+        char const* imported;   // the name lowered to the one ExternGlobal
+        char const* defined;    // a name lowered to a Global beside it, or empty
+    };
+    for (Case const c : {
+             Case{"a file-scope datum", "__declspec(dllimport) int x;\n"
+                                        "int use(void) { return x; }\n", "x", ""},
+             Case{"after the declarator", "int x __declspec(dllimport);\n"
+                                          "int use(void) { return x; }\n", "x", ""},
+             Case{"the GNU spelling", "__attribute__((dllimport)) int x;\n"
+                                      "int use(void) { return x; }\n", "x", ""},
+             Case{"one declarator of a list", "int a, * __declspec(dllimport) p;\n"
+                                              "int use(void) { return a + *p; }\n", "p", "a"},
+             Case{"inside a body", "int use(void) { __declspec(dllimport) int x; return x; }\n",
+                  "x", ""},
+             Case{"inside a body, with `extern`",
+                  "int use(void) { __declspec(dllimport) extern int x; return x; }\n", "x", ""},
+             Case{"inside a body, the GNU spelling",
+                  "int use(void) { __attribute__((dllimport)) int x; return x; }\n", "x", ""},
+         }) {
+        SemanticModel model = analyzeCPe(c.src);
+        ASSERT_FALSE(model.hasErrors())
+            << c.what << ": "
+            << (model.diagnostics().all().empty() ? std::string{}
+                                                  : model.diagnostics().all()[0].actual);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << c.what << ": " << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_TRUE(r.all().empty()) << c.what << ": " << r.all()[0].actual;
+        std::size_t imports = 0, globals = 0;
+        for (HirNodeId d : res->hir.moduleDecls(res->hir.root())) {
+            if (res->hir.kind(d) == HirKind::ExternGlobal) {
+                auto const* rec = model.recordFor(res->hir.externGlobalSymbol(d));
+                ASSERT_NE(rec, nullptr) << c.what;
+                EXPECT_EQ(rec->name, c.imported) << c.what;
+                ++imports;
+            }
+            if (res->hir.kind(d) == HirKind::Global) {
+                auto const* rec = model.recordFor(res->hir.globalSymbol(d));
+                ASSERT_NE(rec, nullptr) << c.what;
+                EXPECT_EQ(rec->name, c.defined) << c.what << ": storage for an import";
+                ++globals;
+            }
+        }
+        EXPECT_EQ(imports, 1u) << c.what;
+        EXPECT_EQ(globals, *c.defined == '\0' ? 0u : 1u) << c.what;
+        HirNodeId const fn = firstFunction(res->hir);
+        for (HirNodeId s : res->hir.children(res->hir.functionBody(fn)))
+            EXPECT_NE(res->hir.kind(s), HirKind::VarDecl)
+                << c.what << ": an import inside a body is no local";
+    }
+}
+
+// ── F1': AN UNRESOLVED TYPE IN EVERY POSITION f05 HOLDS IT ───────────────────────
+// The sibling of AnUnresolvedDeclaredTypeFailsLoudInsteadOfAbortingTheCompiler,
+// one TEST per position so the `[ RUN ]` line names a position that aborts.
+// `va_list` with no header in scope is the program's own unknown name: the
+// semantic tier reports S_UnknownType and leaves the type InvalidType — a state
+// no later fix can make valid, so these fixtures cannot rot. The pipeline never
+// lowers such a model (`lowerModelToHir` stops at the model's error); what this
+// tier owes a caller that does is a RETURN from `lowerToHir`, never an abort.
+// ✔MEASURED 2026-11-13 (macos-arm64-debug, host run 20261113-211922-9a805016):
+// every position returns. The abort MirLoweringC.ArrayRvalueValueReadDecaysNeverLoads's
+// old source hit (`dss::substrate fatal: TypeInterner::get: TypeId out of range`,
+// host run 20261105-194136-d2e3e46a) was MIR's, entered on such a model by a
+// fixture past the pipeline's gate.
+namespace {
+void expectLoweringReturns(char const* src) {
+    SemanticModel model = analyzeC(src);
+    ASSERT_GE(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 1u)
+        << "the fixture's precondition: `va_list` with no header is unknown";
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);   // must RETURN, not abort
+    ASSERT_TRUE(res != nullptr);
+}
+}  // namespace
+
+TEST(HirLoweringCUnresolvedType, AParameterOfAnUnresolvedTypeIsLoweredWithoutAborting) {
+    expectLoweringReturns("void take(va_list ap) { }\n");
+}
+
+TEST(HirLoweringCUnresolvedType, AMemberOfAnUnresolvedTypeIsLoweredWithoutAborting) {
+    expectLoweringReturns("struct S { int pad; va_list ap; };\n"
+                          "int f(struct S *s) { return s->pad; }\n");
+}
+
+TEST(HirLoweringCUnresolvedType, AGlobalOfAnUnresolvedTypeIsLoweredWithoutAborting) {
+    expectLoweringReturns("va_list gv;\n");
+}
+
+TEST(HirLoweringCUnresolvedType, AnUnresolvedGlobalAsAnArgumentIsLoweredWithoutAborting) {
+    expectLoweringReturns("void take(va_list ap);\n"
+                          "va_list gv;\n"
+                          "void f(void) { take(gv); }\n");
+}
+
+TEST(HirLoweringCUnresolvedType, AnUnresolvedMemberAsAnArgumentIsLoweredWithoutAborting) {
+    expectLoweringReturns("void take(va_list ap);\n"
+                          "struct S { int pad; va_list ap; };\n"
+                          "void f(struct S *s) { take(s->ap); }\n");
+}
+
+TEST(HirLoweringCUnresolvedType, AnUnresolvedPointeeAsAnArgumentIsLoweredWithoutAborting) {
+    expectLoweringReturns("void take(va_list ap);\n"
+                          "void f(va_list *pp) { take(*pp); }\n");
+}
+
+// ★ P69 (lane `cs`, fold f26b): AN ATTRIBUTE MAY LEAD A BLOCK-SCOPE `extern`
+// DECLARATION — before `extern`, after a qualifier and before `extern`, in either
+// spelling — as it may lead every other declaration. ✔MEASURED (lane `cs` probe di3):
+// gcc 13.3.0 and mingw-w64 gcc 13.2.0 take `const __attribute__((unused)) extern int y;`
+// inside a body; this compiler refused it as a syntax error (P_NoAlternativeMatched) —
+// a LOUD defect — before the fold.
+//
+// RED-ON-DISABLE: drop the attribute-led branch of `externSpecifiers` and the first two
+// cells do not parse; drop the attribute from the qualifier branch's repeat and the third
+// does not.
+TEST(HirLoweringC, AnAttributeMayLeadABlockScopeExternDeclaration) {
+    for (char const* body :
+         {"__attribute__((unused)) extern int y;", "[[maybe_unused]] extern int y;",
+          "const __attribute__((unused)) extern int y;"}) {
+        SemanticModel model =
+            analyzeC(std::string("int use(void) { ") + body + " return y; }\n");
+        ASSERT_FALSE(model.hasErrors())
+            << body << ": "
+            << (model.diagnostics().all().empty() ? std::string{}
+                                                  : model.diagnostics().all()[0].actual);
+        EXPECT_TRUE(model.diagnostics().all().empty())
+            << body << ": " << model.diagnostics().all()[0].actual;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << body << ": " << (r.all().empty() ? "" : r.all()[0].actual);
+        std::size_t imports = 0;
+        for (HirNodeId d : res->hir.moduleDecls(res->hir.root()))
+            if (res->hir.kind(d) == HirKind::ExternGlobal) ++imports;
+        EXPECT_EQ(imports, 1u) << body << ": the block-scope `extern` re-homes to one import";
+    }
+}
+
+// ★★ P69 (lane `cs`, fold f26c — D-C-A-POINTER-TO-AN-ARRAY-OF-UNKNOWN-SIZE-IS-WARNED-INCOMPATIBLE, item (3)):
+// A CONDITIONAL OF POINTERS TO COMPATIBLE TYPES HAS A POINTER TO THEIR COMPOSITE (C 6.5.15p6, 6.2.7p3), and
+// BOTH ARMS ARE CONVERTED TO IT. ✔MEASURED (lane `cs` probe ft cells 23, 24 and 15, each RUN): gcc 13.3.0,
+// clang 18.1.3 and mingw-w64 gcc 13.2.0 read `sizeof *(one ? pu : p3)` over `int (*)[]` / `int (*)[3]` as 12,
+// the same through two function pointers, and take `one ? g3 : gu` into an `int (*(*)(void))[3]` in silence;
+// cl 19.51 reads the first arm's incomplete type (C4034) — a meaning split, decided for C 6.5.15p6 and the three.
+// Each cell: the semantic tier folds the size of the composite (no "sizeof of an incomplete array" warning), and
+// the HIR's ONE ternary is typed the composite — a pointer whose pointee chain ends in `int[3]` — with each arm
+// typed it too. The example examples/c/a_conditional_of_compatible_pointers_has_their_composite_type RUNS the
+// same three cells on the four exec targets.
+//
+// RED-ON-DISABLE: drop the HIR `combineTernary`'s read of the type the analyzer records for the conditional
+// (`conditionalTypeFor`; since fold f26c2 the lowering decides no pointer type of its own) and the ternary takes its
+// then arm's type over arms of their own types -- ✔MEASURED red (run f26c2-a, where the read asked the node-type
+// door, which holds no conditional's type); drop the semantic arm and the size reads the first arm's incomplete
+// array (warned) and the ternary is typed it.
+TEST(HirLoweringC, AConditionalOfPointersToCompatibleTypesHasTheirCompositeType) {
+    struct Cell {
+        char const* what;
+        char const* src;
+        bool        throughAFunction;
+    };
+    for (Cell const c : {
+             Cell{"pointers to int[] and int[3] (cell 23)",
+                  // The `sizeof` operand folds and is never lowered, so the cell also
+                  // EVALUATES the conditional (store is zero-initialized): the HIR holds
+                  // that one ternary.
+                  "static int store[3];\n"
+                  "int f(int one) { int (*pu)[] = (int (*)[])store; int (*p3)[3] = &store;\n"
+                  "  return (int)sizeof *(one ? pu : p3) + (*(one ? pu : p3))[0] + 30; }\n",
+                  false},
+             Cell{"two function pointers (cell 24)",
+                  "int (*g3(void))[3];\nint (*gu(void))[];\n"
+                  "int f(int one) { int (*(*fu)(void))[] = gu; int (*(*f3)(void))[3] = g3;\n"
+                  "  return (int)sizeof *(one ? fu : f3)() + (*(one ? fu : f3)())[0] + 30; }\n",
+                  true},
+             Cell{"two function designators (cell 15)",
+                  "int (*g3(void))[3];\nint (*gu(void))[];\n"
+                  "int f(int one) { int (*(*fp)(void))[3] = one ? g3 : gu; return fp != 0; }\n",
+                  true},
+         }) {
+        SCOPED_TRACE(c.what);
+        SemanticModel model = analyzeC(c.src);
+        ASSERT_FALSE(model.hasErrors())
+            << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_SizeofIncompleteArrayIsZero), 0u)
+            << "the size read is the composite's, not the first arm's incomplete array";
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_IncompatiblePointerConversion), 0u);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        auto const& in = model.lattice().interner();
+        // The composite's pointee chain: a pointer to int[3], or a pointer to a function returning one.
+        auto const endsInIntOfThree = [&](TypeId t) {
+            if (!t.valid() || in.kind(t) != TypeKind::Ptr || in.operands(t).empty()) return false;
+            TypeId p = in.operands(t)[0];
+            if (c.throughAFunction) {
+                if (in.kind(p) != TypeKind::FnSig) return false;
+                TypeId const res2 = in.fnResult(p);
+                if (!res2.valid() || in.kind(res2) != TypeKind::Ptr || in.operands(res2).empty()) return false;
+                p = in.operands(res2)[0];
+            }
+            return in.kind(p) == TypeKind::Array && !in.isIncompleteArray(p) && !in.scalars(p).empty()
+                && in.scalars(p)[0] == 3;
+        };
+        std::size_t ternaries = 0;
+        std::uint32_t const tag = res->hir.id().v;
+        for (std::uint32_t i = 1; i < res->hir.nodeCount(); ++i) {
+            HirNodeId const n{i, tag};
+            if (res->hir.kind(n) != HirKind::Ternary) continue;
+            ++ternaries;
+            TypeId const t = res->hir.typeId(n);
+            EXPECT_TRUE(endsInIntOfThree(t)) << "the conditional is typed the composite";
+            auto const kids = res->hir.children(n);
+            ASSERT_EQ(kids.size(), 3u);
+            EXPECT_EQ(res->hir.typeId(kids[1]).v, t.v) << "the then arm is converted to the composite";
+            EXPECT_EQ(res->hir.typeId(kids[2]).v, t.v) << "the else arm is converted to the composite";
+        }
+        EXPECT_EQ(ternaries, 1u);
+    }
+}
+
+// ★★ P69 (lane `cs`, fold f26c2 — review-csf26c F2): EVERY CONDITIONAL OF POINTERS IS LOWERED AT THE TYPE THE
+// ANALYZER GAVE IT, both arms converted to it. C 6.5.15p6 has ONE home, the semantic `combineTernary`, whose answer
+// Pass 2 records for the conditional (`conditionalTypeFor`); the lowering decides none of it (it held a mirror of six
+// of the analyzer's arms, which could only fall behind the original). THE UNIVERSE: every pointer result the analyzer decides -- a pointer beside a null
+// pointer constant (both orders), a function designator and a string literal beside one, two string literals of
+// different lengths, `void *` beside an object pointer, two compatible pointees' composite, an incompatible pair's
+// `void *`, `nullptr` beside a pointer, and two function pointers whose pointees differ in a qualifier only the
+// analyzer sees -- each with the pointee the analyzer's answer has.
+//
+// RED-ON-DISABLE: drop the record's read in the HIR `combineTernary` and the arms keep their own types (the arm
+// assertions red) or the conditional takes its then arm's type -- ✔MEASURED red on every cell but the qualifier
+// one (run f26c2-a, where the read asked the node-type door, which held only that cell's `void *`).
+TEST(HirLoweringC, EveryConditionalOfPointersIsLoweredAtTheTypeTheAnalyzerGaveIt) {
+    enum class Pointee { Int, Char, Void, Function, IntArrayOfThree };
+    struct Cell {
+        char const* what;
+        char const* src;
+        Pointee     pointee;
+    };
+    for (Cell const c : {
+             Cell{"a pointer, then a null pointer constant",
+                  "int g(int c, int *p) { int *q = c ? p : 0; return q != 0; }\n", Pointee::Int},
+             Cell{"a null pointer constant, then a pointer",
+                  "int g(int c, int *p) { int *q = c ? 0 : p; return q != 0; }\n", Pointee::Int},
+             Cell{"a function designator beside a null pointer constant",
+                  "int h(void);\nint g(int c) { int (*f)(void) = c ? h : 0; return f != 0; }\n", Pointee::Function},
+             Cell{"a string literal beside a null pointer constant",
+                  "int g(int c) { char const *s = c ? \"%s\" : 0; return s != 0; }\n", Pointee::Char},
+             Cell{"two string literals of different lengths",
+                  "int g(int c) { char const *s = c ? \"a\" : \"bb\"; return s[0]; }\n", Pointee::Char},
+             Cell{"`void *` beside an object pointer",
+                  "int g(int c, int *p, void *v) { void *r = c ? p : v; return r != 0; }\n", Pointee::Void},
+             Cell{"two compatible pointees' composite",
+                  "static int store[3];\n"
+                  "int g(int c) { int (*pu)[] = (int (*)[])store; int (*p3)[3] = &store;\n"
+                  "  return (*(c ? pu : p3))[0]; }\n",
+                  Pointee::IntArrayOfThree},
+             Cell{"an incompatible pair",
+                  "int g(int c, int *p, double *d) { void *r = c ? p : d; return r != 0; }\n", Pointee::Void},
+             Cell{"`nullptr` beside a pointer",
+                  "int g(int c, int *p) { int *q = c ? p : nullptr; return q != 0; }\n", Pointee::Int},
+             Cell{"two function pointers whose pointees differ in a qualifier",
+                  "int fp(char *s);\nint fc(const char *s);\n"
+                  "int g(int c) { return (c ? &fp : &fc) != 0; }\n",
+                  Pointee::Void},
+         }) {
+        SCOPED_TRACE(c.what);
+        SemanticModel model = analyzeC(c.src);
+        ASSERT_FALSE(model.hasErrors())
+            << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        auto const& in = model.lattice().interner();
+        auto const pointeeIs = [&](TypeId t) {
+            if (!t.valid() || in.kind(t) != TypeKind::Ptr || in.operands(t).empty()) return false;
+            TypeId const p = in.operands(t)[0];
+            TypeKind const k = in.kind(p);
+            switch (c.pointee) {
+                case Pointee::Int: return k == TypeKind::I32;
+                case Pointee::Char: return k == TypeKind::Char;   // C's plain `char` is the lattice's own core
+                case Pointee::Void: return k == TypeKind::Void;
+                case Pointee::Function: return k == TypeKind::FnSig;
+                case Pointee::IntArrayOfThree:
+                    return k == TypeKind::Array && !in.isIncompleteArray(p) && !in.scalars(p).empty()
+                        && in.scalars(p)[0] == 3;
+            }
+            return false;
+        };
+        std::size_t pointerTernaries = 0;
+        std::uint32_t const tag = res->hir.id().v;
+        for (std::uint32_t i = 1; i < res->hir.nodeCount(); ++i) {
+            HirNodeId const n{i, tag};
+            if (res->hir.kind(n) != HirKind::Ternary) continue;
+            TypeId const t = res->hir.typeId(n);
+            if (!t.valid() || in.kind(t) != TypeKind::Ptr) continue;
+            ++pointerTernaries;
+            EXPECT_TRUE(pointeeIs(t)) << "the conditional is typed the analyzer's answer";
+            auto const kids = res->hir.children(n);
+            ASSERT_EQ(kids.size(), 3u);
+            EXPECT_EQ(res->hir.typeId(kids[1]).v, t.v) << "the then arm is converted to it";
+            EXPECT_EQ(res->hir.typeId(kids[2]).v, t.v) << "the else arm is converted to it";
+        }
+        EXPECT_GE(pointerTernaries, 1u) << "the cell's conditional is a pointer";
+    }
+}
+
+// ★★ P69 (lane `cs`, fold f26c — D-C-A-CALL-BEFORE-ANY-DECLARATION-MAKES-NO-IMPLICIT-DECLARATION): A FUNCTION A
+// CALL DECLARED IMPLICITLY — the unit declares it nowhere — LOWERS TO ONE ExternFunction BOUND TO NO LIBRARY, not
+// eager, as an unabsorbed bare prototype does (c86), so the link binds it to the unit that defines it; its
+// signature is the analyzer's (the first call's promoted arguments, the implicit `int` result, not variadic).
+// Two calls of the name are one import. CONTROL: a later definition in the unit is the function called, so no
+// import is emitted for the name. The example examples/c/two_units_implicit_function_declaration RUNS it.
+//
+// RED-ON-DISABLE: drop `lowerToHir`'s implicit-declaration loop and the call names a function no declaration of
+// the module holds (no ExternFunction, no import row).
+TEST(HirLoweringC, AFunctionACallDeclaredImplicitlyIsAnExternNoLibraryBinds) {
+    SemanticModel model = analyzeC("int b(void) { return g(40) + g(2); }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+    ASSERT_EQ(model.implicitDeclarations().size(), 1u);
+    SymbolId const g = model.implicitDeclarations()[0];
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    auto const& in = model.lattice().interner();
+    std::size_t externs = 0;
+    for (HirNodeId d : res->hir.moduleDecls(res->hir.root())) {
+        if (res->hir.kind(d) != HirKind::ExternFunction) continue;
+        if (res->hir.payload(d) != g.v) continue;
+        ++externs;
+        TypeId const t = res->hir.typeId(d);
+        ASSERT_EQ(in.kind(t), TypeKind::FnSig);
+        EXPECT_EQ(in.kind(in.fnResult(t)), TypeKind::I32);
+        ASSERT_EQ(in.fnParams(t).size(), 1u);
+        EXPECT_EQ(in.kind(in.fnParams(t)[0]), TypeKind::I32);
+        EXPECT_FALSE(in.fnIsVariadic(t));
+    }
+    EXPECT_EQ(externs, 1u) << "one ExternFunction for the implicitly declared `g`";
+    std::size_t rows = 0;
+    for (auto const& e : res->externDecls) {
+        if (e.canonicalName != "g") continue;
+        ++rows;
+        EXPECT_TRUE(e.noLibraryBinding) << "another unit defines it: no library binds it";
+        EXPECT_FALSE(e.isEagerImport);
+        EXPECT_TRUE(e.libraryOverride.empty());
+    }
+    EXPECT_EQ(rows, 1u) << "two calls, one import";
+
+    SemanticModel later = analyzeC("int b(void) { return f(40) + 2; }\nint f(int v) { return v; }\n");
+    ASSERT_FALSE(later.hasErrors());
+    EXPECT_TRUE(later.implicitDeclarations().empty()) << "the later definition is the function called";
+    DiagnosticReporter r2;
+    auto res2 = lowerToHir(later, r2);
+    ASSERT_TRUE(res2->ok) << (r2.all().empty() ? "" : r2.all()[0].actual);
+    for (auto const& e : res2->externDecls) EXPECT_NE(e.canonicalName, "f") << "f is the unit's own";
+}
+
+// ★★ P69 (lane `cs`, fold f26c2 — review-csf26c F6; main's ledger 554): EACH CALL OF A FUNCTION DECLARED WITHOUT A
+// PROTOTYPE IS LOWERED AT ITS OWN TYPE — its arguments after the default argument promotions, not variadic — and the
+// function is ONE import of the module, whichever declaration gave it no prototype: the implicit declaration of a
+// call (C90 6.3.2.2), or `int f();`. ✔MEASURED (lane `cs` probes ic2 and np2, each built and RUN, the mismatched
+// calls guarded): gcc 13.3.0, mingw-w64 gcc 13.2.0 and cl 19.51 pass each call its own promoted arguments. The
+// example examples/c/two_units_implicit_function_declaration RUNS both declarations' calls.
+//
+// RED-ON-DISABLE: type every call of such a function by its declaration (drop `typeOfACallWithoutAPrototype`'s own
+// type) and the later calls are refused, or lowered at the first call's parameters.
+TEST(HirLoweringC, EachCallOfAFunctionDeclaredWithoutAPrototypeIsLoweredAtItsOwnType) {
+    for (char const* src : {"int b(void) { return g(40) + g(1.0) + g(1, 2); }\n",
+                            "int g();\nint b(void) { return g(40) + g(1.0) + g(1, 2); }\n"}) {
+        SCOPED_TRACE(src);
+        SemanticModel model = analyzeC(src);
+        ASSERT_FALSE(model.hasErrors())
+            << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        auto const& in = model.lattice().interner();
+        std::vector<std::vector<TypeKind>> calls;
+        std::uint32_t const tag = res->hir.id().v;
+        for (std::uint32_t i = 1; i < res->hir.nodeCount(); ++i) {
+            HirNodeId const n{i, tag};
+            if (res->hir.kind(n) != HirKind::Call) continue;
+            auto const kids = res->hir.children(n);
+            ASSERT_GE(kids.size(), 1u);
+            TypeId sig = res->hir.typeId(kids[0]);
+            if (sig.valid() && in.kind(sig) == TypeKind::Ptr && !in.operands(sig).empty()) sig = in.operands(sig)[0];
+            ASSERT_TRUE(sig.valid() && in.kind(sig) == TypeKind::FnSig) << "a call's callee is typed a function";
+            EXPECT_FALSE(in.fnIsVariadic(sig)) << "a call without a prototype is no variadic call";
+            EXPECT_EQ(in.kind(in.fnResult(sig)), TypeKind::I32);
+            std::vector<TypeKind> params;
+            for (TypeId const p : in.fnParams(sig)) params.push_back(in.kind(p));
+            ASSERT_EQ(params.size() + 1, kids.size()) << "one argument per parameter of the call's own type";
+            for (std::size_t a = 0; a < params.size(); ++a)
+                EXPECT_EQ(in.kind(res->hir.typeId(kids[a + 1])), params[a]) << "the argument is converted to it";
+            calls.push_back(std::move(params));
+        }
+        std::sort(calls.begin(), calls.end());
+        std::vector<std::vector<TypeKind>> want{{TypeKind::I32}, {TypeKind::I32, TypeKind::I32}, {TypeKind::F64}};
+        std::sort(want.begin(), want.end());
+        EXPECT_EQ(calls, want) << "each call at its own promoted arguments";
+        std::size_t imports = 0;
+        for (auto const& e : res->externDecls)
+            if (e.canonicalName == "g") ++imports;
+        EXPECT_EQ(imports, 1u) << "three calls, one import";
+    }
+}
+
+// ★ P69 (lane `cs`, fold f26c2 — review-csf26c F6; main's ledger 554): A CALL SEES ONLY A PROTOTYPE WRITTEN BEFORE IT
+// (C 6.2.1p7: a declaration's scope begins after its declarator). `int f();` declares `f` without one, so a call
+// written before the prototype `int f(int x);` passes its own promoted argument -- a `double` for `f(2.5)` -- and a
+// call written after it is converted to the prototype's `int`. ✔MEASURED (lane `cs` probe np2: `int f();`, guarded
+// calls whose arguments mismatch, then `int f(int)`): gcc 13.3.0 and clang 18.1.3 at their default standard,
+// mingw-w64 gcc 13.2.0, cl 19.51 and Apple clang build and RUN it. CONTROL: the prototype written first, both calls
+// convert to `int`.
+//
+// RED-ON-DISABLE: take every prototype of the function as visible at every call (drop the rank test of
+// `callHasNoPrototypeAt`) and the first call converts 2.5 to `int`.
+TEST(HirLoweringC, ACallSeesOnlyAPrototypeWrittenBeforeIt) {
+    struct Cell {
+        char const*           what;
+        char const*           src;
+        std::vector<TypeKind> firstCall;   // the argument kinds of the call in `a`
+    };
+    std::vector<Cell> const cells{
+        {"the prototype after the first call",
+         "int f();\nint a(void) { return f(2.5); }\nint f(int x);\nint b(void) { return f(3); }\n",
+         {TypeKind::F64}},
+        {"CONTROL: the prototype before both calls",
+         "int f();\nint f(int x);\nint a(void) { return f(2.5); }\nint b(void) { return f(3); }\n",
+         {TypeKind::I32}},
+    };
+    for (Cell const& c : cells) {
+        SCOPED_TRACE(c.what);
+        SemanticModel model = analyzeC(c.src);
+        ASSERT_FALSE(model.hasErrors())
+            << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        auto const& in = model.lattice().interner();
+        std::vector<std::vector<TypeKind>> calls;   // in source order: the call in `a`, then the call in `b`
+        std::uint32_t const tag = res->hir.id().v;
+        for (std::uint32_t i = 1; i < res->hir.nodeCount(); ++i) {
+            HirNodeId const n{i, tag};
+            if (res->hir.kind(n) != HirKind::Call) continue;
+            auto const kids = res->hir.children(n);
+            ASSERT_EQ(kids.size(), 2u) << "one argument";
+            calls.push_back({in.kind(res->hir.typeId(kids[1]))});
+        }
+        ASSERT_EQ(calls.size(), 2u);
+        EXPECT_EQ(calls[0], c.firstCall) << "the call before the prototype passes its own promoted argument";
+        EXPECT_EQ(calls[1], std::vector<TypeKind>{TypeKind::I32}) << "a call after the prototype is converted to it";
+    }
+}
+
+// ★★ P69 (lane `cs`, fold f26c2 — review-csf26c F9, the class's universe): A LINKAGE ATTRIBUTE ON A BLOCK-SCOPE
+// DECLARATION IS READ BY THE DECLARATOR'S LINKAGE, NOT BY ITS ROW. A function declared in a block has linkage (C
+// 6.2.2p5: it is the `extern` declaration) through every row that can declare one -- a plain head (`varDecl`) and a
+// typedef-named head (`identVarDecl`) -- so its `weak` and `visibility` are its import's (and, with a definition later,
+// the definition's); and a typedef-headed one makes the import a plain one makes. An object declared in a block
+// without `extern` has none (C 6.2.2p6) through every row that declares one -- a plain head, a typedef-named head, a
+// for-init declaration, a C23 inferred object, `static` or not -- so `weak` there is refused. ✔MEASURED (lane `cs`
+// probes wb, wb3, wb4; gcc 13.3.0 and clang 18.1.3 on Linux, mingw-w64 gcc 13.2.0, Apple clang): the block prototype
+// cells run (a null weak reference without a definition, the definition with one), `.hidden` on gcc and clang; every
+// no-linkage `weak` cell is refused ("weak declaration of 'x' must be public"). CONTROLS: a parameter's `weak` is
+// passed over (gcc warns it ignored, runs), a visibility on a local changes nothing (clang silent), an unknown
+// attribute name on a block prototype is said ONCE (the semantic tier's S_UnknownAttribute, never also the linkage
+// tier's), and a block prototype without attributes keeps the default linkage.
+// ★ P69 (fold f26d — review-csf26c2 N5): the no-linkage verdict is the semantic tier's no-linkage gate's, read from
+// the attribute's row (`refusedWithoutLinkage`): the refused cells are refused THERE, by name, once
+// (S_AttributeNotHonoured), and the controls are ignored and SAID (S_AttributeIgnoredForDeclarationKind) -- gcc and
+// mingw-w64 gcc warn both ignored (probe n5p) -- where fold f26c2 refused a binding in the lowering and passed the
+// controls in silence.
+//
+// RED-ON-DISABLE: drop the block prototype's attribute reading and its import is strong; drop the no-linkage gate's
+// refusal and every no-linkage cell builds; drop `identVarDecl`'s `prototypeSynthesizesExtern` and the typedef-headed
+// cells make no import.
+TEST(HirLoweringC, ALinkageAttributeOnABlockDeclarationIsReadByItsDeclaratorsLinkage) {
+    auto const importOf = [](CstToHirResult const& res, std::string_view name) -> HirNodeId {
+        for (auto const& e : res.externDecls)
+            if (e.canonicalName == name) return e.node;
+        return HirNodeId{};
+    };
+    struct Linked {
+        char const*                     what;
+        char const*                     src;
+        std::optional<SymbolBinding>    binding;      // of `hook`'s import (or definition, when `defined`)
+        std::optional<SymbolVisibility> visibility;
+        bool                            defined;
+    };
+    std::vector<Linked> const linked{
+        {"a trailing `weak` on a block prototype, no definition",
+         "int main(void) { int hook(void) __attribute__((weak)); return hook ? hook() : 42; }\n",
+         SymbolBinding::Weak, std::nullopt, false},
+        {"a leading `weak` on a block prototype, no definition",
+         "int main(void) { __attribute__((weak)) int hook(void); return hook ? hook() : 42; }\n",
+         SymbolBinding::Weak, std::nullopt, false},
+        {"`visibility(\"hidden\")` on a block prototype, no definition",
+         "int use(void) { int hook(void) __attribute__((visibility(\"hidden\"))); return hook(); }\n",
+         std::nullopt, SymbolVisibility::Hidden, false},
+        {"a typedef-headed block prototype with `weak`, no definition",
+         "typedef int T;\nint main(void) { T hook(void) __attribute__((weak)); return hook ? hook() : 42; }\n",
+         SymbolBinding::Weak, std::nullopt, false},
+        {"a typedef-headed block prototype, no attribute, no definition (it makes an import at all)",
+         "typedef int T;\nint main(void) { T hook(void); return hook(); }\n",
+         std::nullopt, std::nullopt, false},
+        {"`weak` on a block prototype, the definition later: the definition is weak",
+         "int main(void) { int hook(void) __attribute__((weak)); return hook ? hook() : 42; }\n"
+         "int hook(void) { return 7; }\n",
+         SymbolBinding::Weak, std::nullopt, true},
+        {"CONTROL: a block prototype with no attribute keeps the default linkage",
+         "int main(void) { int hook(void); return hook(); }\n",
+         std::nullopt, std::nullopt, false},
+    };
+    for (Linked const& c : linked) {
+        SCOPED_TRACE(c.what);
+        SemanticModel model = analyzeC(c.src);
+        ASSERT_FALSE(model.hasErrors())
+            << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u);
+        HirNodeId const n = c.defined ? functionNamed(res->hir, model, "hook") : importOf(*res, "hook");
+        ASSERT_TRUE(n.valid()) << (c.defined ? "the definition" : "the block prototype's import") << " of hook";
+        std::optional<SymbolBinding> const binding =
+            res->linkageMap.has(n) ? std::optional{res->linkageMap.get(n).binding} : std::nullopt;
+        std::optional<SymbolVisibility> const visibility =
+            res->linkageMap.has(n) ? std::optional{res->linkageMap.get(n).visibility} : std::nullopt;
+        if (c.binding.has_value()) {
+            EXPECT_EQ(binding, c.binding) << "the block declaration's attribute is its linkage";
+        } else {
+            EXPECT_TRUE(!binding.has_value() || *binding == SymbolBinding::Global) << "no binding was written";
+        }
+        if (c.visibility.has_value()) {
+            EXPECT_EQ(visibility, c.visibility) << "the block declaration's visibility is its import's";
+        }
+    }
+
+    struct Refused {
+        char const* what;
+        char const* src;
+    };
+    std::vector<Refused> const refused{
+        {"`weak` on an automatic object", "int main(void) { __attribute__((weak)) int x = 41; return x + 1; }\n"},
+        {"`weak` on a static local", "int main(void) { static __attribute__((weak)) int x = 41; return x + 1; }\n"},
+        {"`weak` on an automatic object through a typedef head",
+         "typedef int T;\nint main(void) { T x __attribute__((weak)) = 41; return x + 1; }\n"},
+        {"`weak` on a for-init object",
+         "int main(void) { int s = 0; for (int i __attribute__((weak)) = 0; i < 42; ++i) s++; return s; }\n"},
+        {"`weak` on an inferred automatic object", "int main(void) { auto x __attribute__((weak)) = 41; return x + 1; }\n"},
+        {"`weak` on an inferred static object",
+         "int main(void) { static auto x __attribute__((weak)) = 41; return x + 1; }\n"},
+    };
+    for (Refused const& c : refused) {
+        SCOPED_TRACE(c.what);
+        SemanticModel model = analyzeC(c.src);
+        EXPECT_TRUE(model.hasErrors()) << "`weak` on an object with no linkage is refused";
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_AttributeNotHonoured), 1u)
+            << "said once, by name, by the semantic tier's no-linkage gate";
+    }
+
+    struct Passed {
+        char const* what;
+        char const* src;
+        std::size_t ignoredSaid;   // S_AttributeIgnoredForDeclarationKind
+    };
+    std::vector<Passed> const passed{
+        {"CONTROL: `weak` on a parameter is ignored and said",
+         "static int f(int x __attribute__((weak))) { return x + 1; }\nint main(void) { return f(41); }\n", 1},
+        {"CONTROL: a visibility on a local is ignored and said",
+         "int main(void) { __attribute__((visibility(\"hidden\"))) int x = 41; return x + 1; }\n", 1},
+        {"CONTROL: an alignment on a local is no linkage",
+         "int main(void) { __attribute__((aligned(16))) int x = 41; return x + 1; }\n", 0},
+    };
+    for (Passed const& c : passed) {
+        SCOPED_TRACE(c.what);
+        SemanticModel model = analyzeC(c.src);
+        ASSERT_FALSE(model.hasErrors())
+            << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_AttributeIgnoredForDeclarationKind),
+                  c.ignoredSaid);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u);
+    }
+    // CONTROL: an unknown attribute name on a block prototype is the semantic tier's, said once.
+    {
+        SemanticModel model =
+            analyzeC("int main(void) { int hook(void) __attribute__((frobnicate_xyz)); return hook(); }\n");
+        ASSERT_FALSE(model.hasErrors());
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownAttribute), 1u);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u) << "never also the linkage tier's";
+    }
+}
+
+// ★★★ P69 (lane `cs`, fold f26d — review-csf26c2 N5, the class's universe): EVERY DECLARATION ROW'S ATTRIBUTE
+// SPECIFIERS ARE READ BY THE ONE TABLE ITS ROW NAMES (`attributeTableOf`), IN BOTH TIERS. The row axis is the shipped
+// document's, walked: every row of `semantics.declarations` must have a C spelling in `kSpelledBy` below, keyed by
+// rule name, so a row added later FAILS this pin until its cell is written. Per row, `__attribute__((weak))` is
+// written on one of its declarators and the verdict asserted is the one its accessor answer gives:
+//   * `Own` (the row's fold reads it): the symbol is WEAK;
+//   * `Borrowed` (a block row): the object has no linkage, `weak` is refused by name, once (S_AttributeNotHonoured);
+//   * `NoLinkage` (a member, a parameter, an enumerator, a tag, a typedef name): ignored and said, the build goes on;
+//     on an EMPTY declaration (`declaresNothing`: the four typedef-named rows) nothing is declared, so no attribute
+//     is said and the declaration is said to declare nothing, once (✔MEASURED, lane `cs` probe tn5: gcc 13.3.0 and
+//     clang 18.1.3 accept each with their one empty-declaration warning and name no attribute).
+// ✔MEASURED (lane `cs` probes n5p, wb3, wb4; gcc 13.3.0, clang 18.1.3, Apple clang 21, clang-cl, mingw-w64 gcc
+// 13.2.0): weak on every file-scope and block `extern` declaration; refused on every block object, through a keyword,
+// a typedef-named head, a for-init and a C23 inferred one; warned ignored on a member, a parameter and a typedef
+// name. DSS built the typedef-headed for-init cell (`forIdentDecl`, no table) and the member and parameter cells in
+// silence before this fold.
+// The TIER, SPELLING and FORMAT axes, beside the row walk:
+//   * the semantic record's facets through a BORROWED table: `typedef int T; { T __declspec(dllimport) tx; }` on pe
+//     is an import (cl, mingw-w64 gcc and clang-cl import it, as its keyword-head twin; DSS made an automatic object);
+//     `{ __declspec(thread) int x; }` on pe is ignored and said (mingw-w64 gcc builds it, cl and clang-cl refuse it),
+//     and a block `static` one keeps its thread storage;
+//   * the C23 vendor spelling (probe n5q): `[[gnu::weak]]` and `[[__gnu__::weak]]` at the leading sequence and after
+//     the declarator are WEAK, `[[gnu::visibility("hidden")]]` HIDDEN, `[[gnu::dllimport]]` on pe an import; `[[weak]]`
+//     and `[[clang::weak]]` (no namespace, another vendor's) and `int * [[gnu::weak]] p` (the pointer type's) confer
+//     nothing;
+//   * the per-format verdict (`refusedWithoutLinkageOn`): `selectany` on a block object is refused on pe and ignored
+//     and said on ELF, where gcc 13.3.0 builds it.
+// RED-ON-DISABLE: the accessor answering the row's OWN table for the semantic tier leaves the typedef-headed import an
+// automatic object; dropping forIdentDecl's borrowed table builds its cell; dropping the token's reader builds the
+// member and parameter cells in silence; dropping the standard form's reading leaves the `[[gnu::]]` cells strong.
+namespace {
+struct RowSpelling {
+    char const*          src;       // `weak` on a declarator of the row
+    AttributeTableAnswer answer;    // what the row's accessor must answer
+    bool declaresNothing = false;   // an EMPTY declaration: `weak` on the row, which declares no entity
+};
+std::map<std::string, RowSpelling, std::less<>> const kSpelledBy{
+    {"topLevelDecl", {"int hook __attribute__((weak));\nint main(void) { return hook; }\n", AttributeTableAnswer::Own}},
+    {"autoInferredTopLevelDecl",
+     {"auto hook __attribute__((weak)) = 1;\nint main(void) { return hook; }\n", AttributeTableAnswer::Own}},
+    {"externDecl",
+     {"extern int hook __attribute__((weak));\nint main(void) { return &hook ? hook : 0; }\n", AttributeTableAnswer::Own}},
+    {"varDecl", {"int main(void) { int x __attribute__((weak)) = 1; return x; }\n", AttributeTableAnswer::Borrowed}},
+    {"identVarDecl",
+     {"typedef int T;\nint main(void) { T x __attribute__((weak)) = 1; return x; }\n", AttributeTableAnswer::Borrowed}},
+    {"forDecl",
+     {"int main(void) { int s = 0; for (int i __attribute__((weak)) = 0; i < 2; ++i) s += i; return s; }\n",
+      AttributeTableAnswer::Borrowed}},
+    {"forIdentDecl",
+     {"typedef int T;\nint main(void) { int s = 0; for (T i __attribute__((weak)) = 0; i < 2; ++i) s += i; return s; }\n",
+      AttributeTableAnswer::Borrowed}},
+    {"autoInferredVarDecl",
+     {"int main(void) { auto x __attribute__((weak)) = 1; return x; }\n", AttributeTableAnswer::Borrowed}},
+    {"autoInferredForDecl",
+     {"int main(void) { int s = 0; for (auto i __attribute__((weak)) = 0; i < 2; ++i) s += i; return s; }\n",
+      AttributeTableAnswer::Borrowed}},
+    {"param", {"static int f(int x __attribute__((weak))) { return x; }\nint main(void) { return f(1); }\n",
+               AttributeTableAnswer::NoLinkage}},
+    {"structField", {"struct S { int x __attribute__((weak)); };\nint main(void) { struct S s = {1}; return s.x; }\n",
+                     AttributeTableAnswer::NoLinkage}},
+    {"unionField", {"union U { int x __attribute__((weak)); };\nint main(void) { union U u = {1}; return u.x; }\n",
+                    AttributeTableAnswer::NoLinkage}},
+    {"typedefDecl", {"typedef int U __attribute__((weak));\nU u;\nint main(void) { return u; }\n",
+                     AttributeTableAnswer::NoLinkage}},
+    {"structSpec", {"struct __attribute__((weak)) S { int x; };\nint main(void) { struct S s = {1}; return s.x; }\n",
+                    AttributeTableAnswer::NoLinkage}},
+    {"unionSpec", {"union __attribute__((weak)) U { int x; };\nint main(void) { union U u = {1}; return u.x; }\n",
+                   AttributeTableAnswer::NoLinkage}},
+    {"enumSpec", {"enum __attribute__((weak)) E { A = 1 };\nint main(void) { return A; }\n",
+                  AttributeTableAnswer::NoLinkage}},
+    {"enumerator", {"enum E { A __attribute__((weak)) = 1 };\nint main(void) { return A; }\n",
+                    AttributeTableAnswer::NoLinkage}},
+    // the typedef-named EMPTY declarations: a bare row's only attribute position follows the typedef name
+    {"typeNameEmptyDecl", {"typedef int T;\nint main(void) { const __attribute__((weak)) T; return 0; }\n",
+                           AttributeTableAnswer::NoLinkage, true}},
+    {"typeNameEmptyForDecl",
+     {"typedef int T;\nint main(void) { for (const __attribute__((weak)) T; 0; ) { } return 0; }\n",
+      AttributeTableAnswer::NoLinkage, true}},
+    {"typeNameBareEmptyDecl", {"typedef int T;\nint main(void) { T __attribute__((weak)); return 0; }\n",
+                               AttributeTableAnswer::NoLinkage, true}},
+    {"typeNameBareEmptyForDecl",
+     {"typedef int T;\nint main(void) { for (T __attribute__((weak)); 0; ) { } return 0; }\n",
+      AttributeTableAnswer::NoLinkage, true}},
+};
+
+[[nodiscard]] HirNodeId globalOrImportNamed(CstToHirResult const& res, SemanticModel const& m, std::string_view name) {
+    for (HirNodeId d : res.hir.moduleDecls(res.hir.root())) {
+        HirKind const k = res.hir.kind(d);
+        if (k != HirKind::Global && k != HirKind::Function) continue;
+        SymbolId const sym = k == HirKind::Function ? res.hir.functionSymbol(d) : res.hir.globalSymbol(d);
+        auto const* rec = m.recordFor(sym);
+        if (rec != nullptr && rec->name == name) return d;
+    }
+    for (auto const& e : res.externDecls)
+        if (e.canonicalName == name) return e.node;
+    return HirNodeId{};
+}
+
+[[nodiscard]] std::optional<SymbolBinding> bindingOf(CstToHirResult const& res, HirNodeId n) {
+    if (!n.valid() || !res.linkageMap.has(n)) return std::nullopt;
+    return res.linkageMap.get(n).binding;
+}
+} // namespace
+
+TEST(HirLoweringC, EveryDeclarationRowsAttributeSpecifiersAreReadByTheTableItsRowNames) {
+    auto const loaded = dss::test_support::shippedSchemaOrThrow("c");
+    SemanticConfig const& cfg = loaded->semantics();
+    ASSERT_FALSE(cfg.declarations.empty());
+    for (DeclarationRule const& row : cfg.declarations) {
+        SCOPED_TRACE(row.ruleName);
+        auto const it = kSpelledBy.find(row.ruleName);
+        ASSERT_NE(it, kSpelledBy.end()) << "a declaration row with no C spelling in this pin: write its cell";
+        AttributeTableOfRow const reading = attributeTableOf(cfg, row);
+        EXPECT_EQ(reading.answer, it->second.answer) << "the row's accessor answer";
+        ASSERT_NE(reading.answer, AttributeTableAnswer::Unread) << "no shipped row's specifiers are read by nobody";
+        SemanticModel model = analyzeC(it->second.src);
+        switch (reading.answer) {
+            case AttributeTableAnswer::Own: {
+                ASSERT_FALSE(model.hasErrors())
+                    << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+                DiagnosticReporter r;
+                auto res = lowerToHir(model, r);
+                ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+                EXPECT_EQ(bindingOf(*res, globalOrImportNamed(*res, model, "hook")), SymbolBinding::Weak)
+                    << "the row's own table reads the attribute: the symbol is weak";
+                break;
+            }
+            case AttributeTableAnswer::Borrowed:
+                EXPECT_TRUE(model.hasErrors()) << "a block object has no linkage: `weak` is refused";
+                EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_AttributeNotHonoured), 1u)
+                    << "by name, once, by the no-linkage gate";
+                break;
+            case AttributeTableAnswer::NoLinkage: {
+                ASSERT_FALSE(model.hasErrors())
+                    << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+                bool const empty = it->second.declaresNothing;
+                EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_AttributeIgnoredForDeclarationKind),
+                          empty ? 0u : 1u)
+                    << (empty ? "an empty declaration names no attribute" : "ignored and said, once");
+                DiagnosticReporter r;
+                auto res = lowerToHir(model, r);
+                EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+                if (empty)
+                    EXPECT_EQ(countCode(r, DiagnosticCode::S_DeclarationDeclaresNothing), 1u)
+                        << "the declaration declares nothing, said once";
+                break;
+            }
+            case AttributeTableAnswer::Unread:
+                break;
+        }
+    }
+
+    // THE TIER AXIS through a borrowed table, on pe: the semantic record's `imported` and thread facets.
+    {
+        SCOPED_TRACE("a typedef-headed block `__declspec(dllimport)` object is an import");
+        SemanticModel model = analyzeCPe("typedef int T;\nint main(void) { T __declspec(dllimport) tx; return tx; }\n");
+        ASSERT_FALSE(model.hasErrors())
+            << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+        SymbolId const tx = symbolIdNamed(model, "tx");
+        ASSERT_TRUE(tx.valid());
+        EXPECT_TRUE(model.symbols()[tx.v].isImportedDeclaration) << "read with the borrowed table";
+    }
+    {
+        SCOPED_TRACE("CONTROL: its keyword-head twin is an import too");
+        SemanticModel model = analyzeCPe("int main(void) { int __declspec(dllimport) ax; return ax; }\n");
+        ASSERT_FALSE(model.hasErrors());
+        SymbolId const ax = symbolIdNamed(model, "ax");
+        ASSERT_TRUE(ax.valid());
+        EXPECT_TRUE(model.symbols()[ax.v].isImportedDeclaration);
+    }
+    {
+        SCOPED_TRACE("`__declspec(thread)` on an automatic object is ignored and said");
+        SemanticModel model = analyzeCPe("typedef int T;\nint main(void) { T __declspec(thread) x; x = 1; return x; }\n");
+        ASSERT_FALSE(model.hasErrors())
+            << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_AttributeIgnoredForDeclarationKind), 1u);
+        SymbolId const x = symbolIdNamed(model, "x");
+        ASSERT_TRUE(x.valid());
+        EXPECT_FALSE(model.symbols()[x.v].isThreadLocal) << "the object keeps its automatic storage";
+    }
+    {
+        SCOPED_TRACE("CONTROL: `__declspec(thread)` on a block `static` object keeps its thread storage");
+        SemanticModel model = analyzeCPe("int main(void) { static __declspec(thread) int x; return x; }\n");
+        ASSERT_FALSE(model.hasErrors())
+            << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+        SymbolId const x = symbolIdNamed(model, "x");
+        ASSERT_TRUE(x.valid());
+        EXPECT_TRUE(model.symbols()[x.v].isThreadLocal);
+    }
+
+    // THE SPELLING AXIS: the C23 vendor form, read for the items the GNU spelling claims.
+    struct Spelled {
+        char const*                     what;
+        char const*                     src;
+        std::optional<SymbolBinding>    binding;      // of `hook`
+        std::optional<SymbolVisibility> visibility;
+    };
+    std::vector<Spelled> const spelled{
+        {"`[[gnu::weak]]` leading", "[[gnu::weak]] int hook;\nint main(void) { return hook; }\n",
+         SymbolBinding::Weak, std::nullopt},
+        {"`[[gnu::weak]]` after the declarator", "int hook [[gnu::weak]];\nint main(void) { return hook; }\n",
+         SymbolBinding::Weak, std::nullopt},
+        {"`[[__gnu__::weak]]` leading", "[[__gnu__::weak]] int hook;\nint main(void) { return hook; }\n",
+         SymbolBinding::Weak, std::nullopt},
+        {"`[[gnu::weak]]` on a block `extern`",
+         "int main(void) { [[gnu::weak]] extern int hook; return &hook ? hook : 0; }\n", SymbolBinding::Weak,
+         std::nullopt},
+        {"`[[gnu::weak]]` on a block prototype",
+         "int main(void) { [[gnu::weak]] int hook(void); return hook ? hook() : 42; }\n", SymbolBinding::Weak,
+         std::nullopt},
+        {"`[[gnu::visibility(\"hidden\")]]` leading",
+         "[[gnu::visibility(\"hidden\")]] int hook;\nint main(void) { return hook; }\n", std::nullopt,
+         SymbolVisibility::Hidden},
+        {"CONTROL: `[[weak]]` (no namespace) confers nothing", "[[weak]] int hook;\nint main(void) { return hook; }\n",
+         std::nullopt, std::nullopt},
+        {"CONTROL: `[[clang::weak]]` (another vendor's) confers nothing",
+         "[[clang::weak]] int hook;\nint main(void) { return hook; }\n", std::nullopt, std::nullopt},
+        {"CONTROL: `[[gnu::weak]]` beside the name in a pointer is the pointer type's",
+         "int * [[gnu::weak]] hook;\nint main(void) { return hook != 0; }\n", std::nullopt, std::nullopt},
+    };
+    for (Spelled const& c : spelled) {
+        SCOPED_TRACE(c.what);
+        SemanticModel model = analyzeC(c.src);
+        ASSERT_FALSE(model.hasErrors())
+            << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u);
+        HirNodeId const n = globalOrImportNamed(*res, model, "hook");
+        ASSERT_TRUE(n.valid()) << "hook";
+        std::optional<SymbolBinding> const binding = bindingOf(*res, n);
+        if (c.binding.has_value()) {
+            EXPECT_EQ(binding, c.binding) << "the claimed item is the GNU spelling's attribute";
+        } else {
+            EXPECT_TRUE(!binding.has_value() || *binding == SymbolBinding::Global) << "no binding was written";
+        }
+        std::optional<SymbolVisibility> const visibility =
+            res->linkageMap.has(n) ? std::optional{res->linkageMap.get(n).visibility} : std::nullopt;
+        if (c.visibility.has_value()) {
+            EXPECT_EQ(visibility, c.visibility);
+        } else {
+            EXPECT_TRUE(!visibility.has_value() || *visibility == SymbolVisibility::Default)
+                << "no visibility was written";
+        }
+    }
+    {
+        SCOPED_TRACE("`[[gnu::dllimport]]` on pe is an import");
+        SemanticModel model = analyzeCPe("[[gnu::dllimport]] extern int hook;\nint main(void) { return hook; }\n");
+        ASSERT_FALSE(model.hasErrors())
+            << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+        SymbolId const hook = symbolIdNamed(model, "hook");
+        ASSERT_TRUE(hook.valid());
+        EXPECT_TRUE(model.symbols()[hook.v].isImportedDeclaration);
+    }
+
+    // THE FORMAT AXIS: `selectany` on a block object, refused where every reference of the format refuses it.
+    {
+        SCOPED_TRACE("`selectany` on a block object on pe is refused");
+        SemanticModel model = analyzeCPe("int main(void) { __attribute__((selectany)) int x = 1; return x; }\n");
+        EXPECT_TRUE(model.hasErrors());
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_AttributeNotHonoured), 1u);
+    }
+    {
+        SCOPED_TRACE("`selectany` on a block object on ELF is ignored and said (gcc 13.3.0 builds it)");
+        SemanticModel model = analyzeC("int main(void) { __attribute__((selectany)) int x = 1; return x; }\n");
+        ASSERT_FALSE(model.hasErrors())
+            << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+        EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_AttributeIgnoredForDeclarationKind), 1u);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
     }
 }

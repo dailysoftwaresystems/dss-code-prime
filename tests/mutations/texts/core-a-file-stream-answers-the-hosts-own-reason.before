@@ -1,0 +1,1 @@
+    if (file == nullptr) return std::unexpected(runtimeReason());   // read AT the failing call

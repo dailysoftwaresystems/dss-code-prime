@@ -1,0 +1,1 @@
+                            SectionGroupRule{keep.value_or(SectionGroupKeep::FirstInLinkOrder), ordinal});

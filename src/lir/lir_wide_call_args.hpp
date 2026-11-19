@@ -6,6 +6,7 @@
 #include "lir/lir.hpp"
 
 #include <cstdint>
+#include <vector>
 
 // D-AS-REGALLOC-WIDE-CALL-OPERAND-COUNT (option E) — PROTOTYPE.
 //
@@ -30,11 +31,26 @@
 // So the pass emits, for one call:
 //   * each stacked SCALAR as a `store_outgoing_arg` whose PAYLOAD is its byte
 //     offset and whose `flags` are the access width the cursor chose, and
-//   * each stacked by-value AGGREGATE left on the Call (its byte-copy needs
-//     post-regalloc physical registers) with its byte offset STATED as a
-//     trailing `MemOffset` operand on the carrier triple,
+//   * each stacked by-value AGGREGATE as ITS BYTES, copied here: one GPR-wide
+//     `load` from [temp + k] into a fresh virtual register and one
+//     `store_outgoing_arg` at placement + k per chunk, emitted before the Call,
+//     and the `(Reg, ByValueStackAgg)` carrier REMOVED from the Call,
 // and it stamps `kLirInstFlagOutgoingArgsPlaced` on the shrunken Call, which is
-// how `lir_callconv` KNOWS to read those placements rather than compute any.
+// how `lir_callconv` KNOWS the placements are made and that it must compute none.
+//
+// ★ THE CARRIER'S STAGE RULE. Every Call goes through this pass, so after it NO
+// instruction carries the `(Reg, ByValueStackAgg[, MemOffset])` form: the
+// aggregate's address is read by single-operand loads the allocator places
+// like any other, not kept live into the Call. The LIR verifier states it —
+// `verifyLirStackedAggregatesLowered`, which this pass runs on the module it
+// produced (so a terminator Call, whose operands are carried verbatim, that
+// held one is refused here rather than passed on) and which
+// `verifyLirPostRegalloc` runs at every later checkpoint — so liveness, the
+// allocator, the rewrite and `lir_callconv` keep no arm for the form. An input
+// that already states a placement (the trailing `MemOffset` this pass used to
+// leave on the Call for `lir_callconv` to copy after allocation) is REFUSED: it
+// has been through here before. The form's only readers are this pass and the
+// text codec (a pre-pass module written out and read back).
 //
 // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: the byte placement rule
 // itself lives in `StackArgCursor` (lir_callconv.hpp) — the same object the
@@ -54,6 +70,13 @@ namespace dss {
 struct LirWideCallResult {
     Lir  lir{};
     bool ok = false;
+    // D-LIR-DESCRIPTOR-BLOCK-IDS-SHIFTED-BY-A-BLOCK-INSERTING-PASS: every rebuild publishes its block entry
+    // image, and this pass rebuilds block for block, so what it publishes is the identity IT PERFORMED —
+    // written down where each source block is begun, from the map the rebuild goes through. Indexed by the
+    // SOURCE module's block arena (`LirBlockId.v`; slot 0 holds 0): the `.v` of the block of `lir` where
+    // that block's instructions begin. `lir/lir_descriptor_blocks.hpp` follows the blocks data names
+    // through it, and refuses a rebuild that publishes none.
+    std::vector<std::uint32_t> blockEntryImage;
 };
 
 // callingConventionIndex selects the active cc from the schema (same index

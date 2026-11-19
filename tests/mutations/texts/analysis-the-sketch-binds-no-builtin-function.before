@@ -1,0 +1,1 @@
+        pushBinding_(entryFor_(bf.name), 0, /*isType=*/false);

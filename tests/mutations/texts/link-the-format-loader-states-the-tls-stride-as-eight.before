@@ -1,0 +1,2 @@
+                info.blockPointerBytes = static_cast<std::uint8_t>(
+                    scalarByteSize(TypeKind::Ptr, data.dataModel).value_or(0));

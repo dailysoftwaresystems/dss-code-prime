@@ -1,0 +1,2 @@
+            if (!al.contains("bitPreciseChunk")
+                || !al.at("bitPreciseChunk").is_number_integer()) {

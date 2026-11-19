@@ -1,0 +1,4 @@
+                lir_pass_util::carryInstSideData(src, inst, b, descent);
+                outProbeTouches.insert(
+                    emitProbeTouch(b, h.orMem, sp, 0, probeTouch).v);
+                continue;

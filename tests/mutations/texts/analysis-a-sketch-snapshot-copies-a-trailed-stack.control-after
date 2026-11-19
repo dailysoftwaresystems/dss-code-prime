@@ -1,0 +1,1 @@
+    TrailedStack<LiveScope> const copied{}; (void)copied; auto const live = liveScopes_.mark();

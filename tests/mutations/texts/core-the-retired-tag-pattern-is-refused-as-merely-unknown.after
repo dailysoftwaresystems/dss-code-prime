@@ -1,0 +1,4 @@
+    if (false && obj.contains("tagPattern")) {
+        c.emit(DiagnosticCode::C_InvalidStringStyle,
+               std::format("{}/tagPattern", path),
+               "'tagPattern' is retired: a delimiter tag is stated as "

@@ -17,24 +17,31 @@
 //     (the deferral the deleted table had for a target it had no row for);
 //   * a brand-new arch is JSON-ONLY — no C++ row, and the wrong pairing still
 //     fails loud;
-//   * the shipped corpus is self-consistent about arch ↔ machine number.
+//   * the shipped corpus is self-consistent about arch ↔ machine number;
+//   * a format that declares a handler routine refuses a target that states not
+//     the two opcodes a guarded region is sealed with, by the opcode's name —
+//     and every shipped pair of that kind is swept.
 
 #include "core/types/config_path_walk.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
 #include "link/object_format_schema.hpp"
+#include "lir/lowering/mir_to_lir.hpp"   // guardedRegionSealMnemonics
 #include "program/cross_validate_target_format.hpp"
 
 #include <gtest/gtest.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 using namespace dss;
 
@@ -564,4 +571,195 @@ TEST(CrossValidateTargetFormat, ShippedX86_64DylibMatches) {
     DiagnosticReporter rep;
     EXPECT_TRUE(crossValidateTargetFormat(**target, **format, rep));
     EXPECT_EQ(rep.errorCount(), 0u);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// A DECLARED HANDLER ROUTINE, AND THE TWO OPCODES A GUARDED REGION IS SEALED WITH
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// A format that declares a handler routine is one whose programs may guard a
+// region (`__try`). A guarded region adds two terminators of its own to its
+// function — the opener's jump into the guarded body, and the terminator of the
+// block left where the filter stood, which control never leaves — and the
+// lowering asks the target for both by name. A target that states one of them
+// not is refused HERE, where the pair is read, and not at the first `__try`
+// somebody compiles.
+//
+// ★ NO NAME IS TYPED IN THESE CASES. The two mnemonics are the lowering's own
+// (`guardedRegionSealMnemonics`); the formats are whichever shipped documents
+// declare a handler routine and the targets whichever shipped documents the
+// pairing accepts for them — read off the shipped directories, so a document
+// added later is read by the sweep without anyone editing a list.
+namespace {
+
+// Every name `<name><suffix>` of the shipped directory `dir`.
+[[nodiscard]] std::vector<std::string> shippedNames(std::string_view dir,
+                                                    std::string_view suffix) {
+    std::vector<std::string> out;
+    auto const dirR = findShippedConfigDir(dir);
+    if (!dirR.has_value()) {
+        ADD_FAILURE() << "cannot locate the shipped directory " << dir;
+        return out;
+    }
+    for (auto const& e : std::filesystem::directory_iterator{*dirR}) {
+        std::string const fn = e.path().filename().string();
+        if (fn.size() > suffix.size()
+            && fn.compare(fn.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            out.push_back(fn.substr(0, fn.size() - suffix.size()));
+        }
+    }
+    return out;
+}
+
+// The shipped formats that declare a handler routine, loaded.
+[[nodiscard]] std::vector<std::shared_ptr<ObjectFormatSchema const>>
+shippedFormatsWithAHandlerRoutine() {
+    std::vector<std::shared_ptr<ObjectFormatSchema const>> out;
+    for (std::string const& name : shippedNames("object-formats", ".format.json")) {
+        auto format = ObjectFormatSchema::loadShipped(name);
+        if (!format.has_value()) {
+            ADD_FAILURE() << name << " failed to load";
+            continue;
+        }
+        if ((*format)->sehPersonality().has_value()) out.push_back(*format);
+    }
+    return out;
+}
+
+// A target named `name` whose document states `invalid` and, as asked, each of
+// the two sealing opcodes — under the lowering's own names for them.
+[[nodiscard]] std::shared_ptr<TargetSchema const>
+makeTargetStating(std::string_view name, bool theJump, bool theBlockWithNoWayOut) {
+    auto const seals = guardedRegionSealMnemonics();
+    std::string json = std::string{R"({
+      "dssTargetVersion": 1,
+      "target": {"name": ")"} + std::string{name} + R"("},
+      "opcodes": [ {"mnemonic":"invalid","result":"none"})";
+    if (theJump) {
+        json += R"(, {"mnemonic":")" + std::string{seals[0]}
+              + R"(","result":"none","terminatorKind":"br","minOperands":1,)"
+                R"("maxOperands":1,"minSuccessors":1,"maxSuccessors":1})";
+    }
+    if (theBlockWithNoWayOut) {
+        json += R"(, {"mnemonic":")" + std::string{seals[1]}
+              + R"(","result":"none","terminatorKind":"unreachable",)"
+                R"("minOperands":0,"maxOperands":0})";
+    }
+    json += " ] }";
+    auto r = TargetSchema::loadFromText(json);
+    if (!r.has_value()) {
+        ADD_FAILURE() << "target load failed: " << json;
+        return nullptr;
+    }
+    return *r;
+}
+
+[[nodiscard]] std::string allActual(DiagnosticReporter const& rep) {
+    std::string out;
+    for (auto const& d : rep.all()) { out += '['; out += d.actual; out += ']'; }
+    return out;
+}
+
+} // namespace
+
+// The refusal, once for each opcode: the target is named as the format wants its
+// target named, so the two older rules accept the pair and this rule alone
+// speaks. The message names the opcode and both documents.
+TEST(CrossValidateTargetFormat, AFormatWithAHandlerRoutineRefusesATargetThatCannotSealAGuardedRegion) {
+    auto const formats = shippedFormatsWithAHandlerRoutine();
+    ASSERT_FALSE(formats.empty())
+        << "the premise: a shipped format declares a handler routine";
+    auto const seals = guardedRegionSealMnemonics();
+    for (auto const& format : formats) {
+        SCOPED_TRACE(format->name());
+        std::string const arch{format->targetArch()};
+        ASSERT_FALSE(arch.empty());
+        struct Case { bool jump; bool noWayOut; std::string_view missing; };
+        for (Case const k : {Case{true, false, seals[1]}, Case{false, true, seals[0]}}) {
+            SCOPED_TRACE(std::string{k.missing});
+            auto const target = makeTargetStating(arch, k.jump, k.noWayOut);
+            ASSERT_TRUE(target);
+            DiagnosticReporter rep;
+            EXPECT_FALSE(crossValidateTargetFormat(*target, *format, rep));
+            EXPECT_TRUE(sawCode(rep, DiagnosticCode::L_RequiredLirOpcodeMissing))
+                << allActual(rep);
+            std::string const text = allActual(rep);
+            EXPECT_NE(text.find("declares no '" + std::string{k.missing} + "' opcode"),
+                      std::string::npos) << text;
+            EXPECT_NE(text.find("declares a handler routine"), std::string::npos) << text;
+            EXPECT_NE(text.find("'" + arch + "'"), std::string::npos) << text;
+            EXPECT_NE(text.find("'" + std::string{format->name()} + "'"),
+                      std::string::npos) << text;
+        }
+        // The same target stating BOTH is accepted, in silence.
+        auto const whole = makeTargetStating(arch, true, true);
+        ASSERT_TRUE(whole);
+        DiagnosticReporter rep;
+        EXPECT_TRUE(crossValidateTargetFormat(*whole, *format, rep)) << allActual(rep);
+        EXPECT_EQ(rep.errorCount(), 0u) << allActual(rep);
+    }
+}
+
+// THE CONTROL, differing by the handler routine alone: a format that declares
+// none does not ask — the same target that was refused above, stating NEITHER
+// opcode, pairs with every shipped format of its name that declares no handler
+// routine.
+TEST(CrossValidateTargetFormat, AFormatWithNoHandlerRoutineDoesNotAskForTheSealingOpcodes) {
+    auto const withARoutine = shippedFormatsWithAHandlerRoutine();
+    ASSERT_FALSE(withARoutine.empty());
+    std::string const arch{withARoutine.front()->targetArch()};
+    auto const bare = makeTargetStating(arch, false, false);
+    ASSERT_TRUE(bare);
+    std::size_t asked = 0;
+    for (std::string const& name : shippedNames("object-formats", ".format.json")) {
+        auto format = ObjectFormatSchema::loadShipped(name);
+        ASSERT_TRUE(format.has_value()) << name;
+        if ((*format)->sehPersonality().has_value()) continue;
+        if ((*format)->targetArch() != arch) continue;
+        if ((*format)->cCallingConvention().declaresNoConvention()) continue;
+        ++asked;
+        DiagnosticReporter rep;
+        EXPECT_TRUE(crossValidateTargetFormat(*bare, **format, rep))
+            << name << ": " << allActual(rep);
+        EXPECT_FALSE(sawCode(rep, DiagnosticCode::L_RequiredLirOpcodeMissing)) << name;
+    }
+    EXPECT_GE(asked, 1u)
+        << "the premise: a shipped format for the same target declares no handler "
+           "routine";
+}
+
+// THE SWEEP. Every shipped format that declares a handler routine, against every
+// shipped target: where the pairing is accepted the target states both opcodes,
+// and no pair is refused by THIS rule — so "each target a `__try` can be lowered
+// for states them" is read off the shipped documents. Each such format pairs
+// with at least one shipped target, or the sweep read nothing.
+TEST(CrossValidateTargetFormat, EveryShippedFormatWithAHandlerRoutinePairsWithATargetThatStatesBothOpcodes) {
+    auto const formats = shippedFormatsWithAHandlerRoutine();
+    ASSERT_FALSE(formats.empty());
+    auto const targetNames = shippedNames("targets", ".target.json");
+    ASSERT_GE(targetNames.size(), 2u)
+        << "the shipped targets directory yielded " << targetNames.size()
+        << " document(s) — a sweep over a truncated set proves nothing";
+    auto const seals = guardedRegionSealMnemonics();
+    for (auto const& format : formats) {
+        std::size_t accepted = 0;
+        for (std::string const& targetName : targetNames) {
+            SCOPED_TRACE(std::string{format->name()} + " x " + targetName);
+            auto target = TargetSchema::loadShipped(targetName);
+            ASSERT_TRUE(target.has_value());
+            DiagnosticReporter rep;
+            bool const ok = crossValidateTargetFormat(**target, *format, rep);
+            EXPECT_FALSE(sawCode(rep, DiagnosticCode::L_RequiredLirOpcodeMissing))
+                << "a shipped target paired with a shipped format that declares a "
+                   "handler routine cannot seal a guarded region: " << allActual(rep);
+            if (!ok) continue;
+            ++accepted;
+            for (std::string_view const mnemonic : seals) {
+                EXPECT_TRUE((*target)->opcodeByMnemonic(mnemonic).has_value()) << mnemonic;
+            }
+        }
+        EXPECT_GE(accepted, 1u)
+            << format->name() << " declares a handler routine and pairs with no "
+               "shipped target";
+    }
 }

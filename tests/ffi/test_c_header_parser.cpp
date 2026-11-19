@@ -13,6 +13,7 @@
 #include "link/object_format_schema.hpp"
 #include "program/program.hpp"   // the BUILD's verdict on the same text, under the same pair
 #include "diagnostic_count.hpp"
+#include "driver_diagnostics_listener.hpp"   // AskedDriverCodes
 #include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
@@ -186,10 +187,13 @@ TEST(FfiCHeaderParser, EmptyHeaderProducesEmptySurfaceAndNoDiagnostic) {
         "", "<test>", "libc.so.6", elfPair(), rep);
     ASSERT_TRUE(rowsOrErr.has_value()) << headerReadErrorKindName(rowsOrErr.error().kind);
     EXPECT_EQ(rowsOrErr->size(), 0u);
-    // No-input must produce no diagnostic — pins the "informational
-    // chatter on empty input" silent-failure surface (pr-test-analyzer
-    // P5 fold).
-    EXPECT_EQ(rep.all().size(), 0u);
+    // No input is no error, and the caller hears exactly what a build of an empty source
+    // hears: the unit's own one note that its input was empty (the unit's streams reach
+    // whoever finished it, `CompilationUnit::forEachOwnDiagnosticStream`) — nothing else.
+    ASSERT_EQ(rep.all().size(), 1u);
+    EXPECT_EQ(rep.all()[0].code, DiagnosticCode::D_EmptyInput);
+    EXPECT_EQ(rep.all()[0].severity, DiagnosticSeverity::Info);
+    EXPECT_FALSE(rep.hasErrors());
 }
 
 TEST(FfiCHeaderParser, TypedefAcceptedProducesNoRow) {
@@ -742,4 +746,63 @@ TEST(CHeaderParserPair, ATypeWidthIsThePairsWidthForTheReaderAndTheBuild) {
     auto const belf = buildTranslationUnit("ffi-pair-width-elf", tu, kElfSpec);
     EXPECT_GT(countCode(belf.rep, DiagnosticCode::S_StaticAssertFailed), 0u)
         << "the elf build refuses the width the elf reader refuses";
+}
+
+// ── A HEADER'S FRONT HALF DECIDES ITS READ, AS IT DECIDES THE BUILD'S ────────
+//
+// ★★★ A unit's verdict is the union of THREE streams — the driver's
+// (`CompilationUnit::driverDiagnostics()`: an `#include` no directory resolves,
+// a missing file), each tree's (the lexer's and the parser's, recovered or not)
+// and the analysis's. The build reads all three (`runCusToTargets` fails a unit
+// on any of them). This reader read only the third: a header whose `#include`
+// resolved nowhere, or whose parser recovered past a syntax error, was read as
+// the declarations that happened to survive, with no diagnostic and no error —
+// the import surface silently smaller than the header. Each row below is a
+// header the build refuses; the read must refuse it too, by the code the build
+// names, with that code on the caller's reporter.
+TEST(FfiCHeaderParser, AnIncludeNoDirectoryResolvesFailsTheReadByItsDriverCode) {
+    dss::test_support::AskedDriverCodes const asked{
+        DiagnosticCode::F_ShippedHeaderNotFound};
+    DiagnosticReporter rep;
+    auto rowsOrErr = readCHeaderFromText(
+        "#include <zz_no_such_shipped_header.h>\n"
+        "extern int f(void);\n",
+        "<test>", "libc.so.6", elfPair(), rep);
+    ASSERT_FALSE(rowsOrErr.has_value())
+        << "a header whose include resolved nowhere was read as "
+        << rowsOrErr->size() << " row(s)";
+    EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::HeaderParseFailed);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::F_ShippedHeaderNotFound), 1u);
+}
+
+TEST(FfiCHeaderParser, ASyntaxErrorTheParserRecoveredFromFailsTheRead) {
+    struct Row {
+        char const* what;
+        char const* text;
+    };
+    Row const rows[] = {
+        {"a stray ')' inside a declaration",
+         "extern int f(void);\nextern int ) g;\nextern int h(void);\n"},
+        {"a declaration missing its ';'",
+         "extern int f(void)\nextern int g(void);\n"},
+    };
+    for (Row const& r : rows) {
+        SCOPED_TRACE(r.what);
+        DiagnosticReporter rep;
+        auto rowsOrErr = readCHeaderFromText(r.text, "<test>", "libc.so.6",
+                                             elfPair(), rep);
+        ASSERT_FALSE(rowsOrErr.has_value())
+            << "a header the parser refused was read as " << rowsOrErr->size()
+            << " row(s)";
+        EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::HeaderParseFailed);
+        std::size_t parseErrors = 0;
+        for (auto const& d : rep.all()) {
+            if (d.severity == DiagnosticSeverity::Error
+                && diagnosticCodeName(d.code).starts_with("P_")) {
+                ++parseErrors;
+            }
+        }
+        EXPECT_GE(parseErrors, 1u) << "the parser's own error never reached the "
+                                      "caller's reporter";
+    }
 }

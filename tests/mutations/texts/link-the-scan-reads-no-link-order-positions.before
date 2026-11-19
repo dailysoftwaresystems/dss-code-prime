@@ -1,0 +1,4 @@
+         for (auto const& [definition, at] : m.linkPositionOfDefinition) {
+             (void)at;
+             seeHeldSymbolId(h, definition);
+         }

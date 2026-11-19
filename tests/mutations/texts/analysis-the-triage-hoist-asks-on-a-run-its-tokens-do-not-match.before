@@ -1,0 +1,3 @@
+        for (std::size_t i = 0; i < *run; ++i) {
+            if (!schema->typeChildLeadRunAdmits(branch, i, peekSignificantKind(i))) return false;
+        }

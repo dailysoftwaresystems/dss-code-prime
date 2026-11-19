@@ -1,0 +1,4 @@
+    if (!::dss::link::format::requireTheWritersAddressWidth(objectFormatSchema, kPe32PlusAddressBytes,
+                                                           "pe::encode", reporter)) {
+        return {};
+    }

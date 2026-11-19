@@ -1,0 +1,1 @@
+        && false && !link::format::fillEhFrameHandlerFields(*ehFrameOpt, ehFrameVa, module, symbolVa,

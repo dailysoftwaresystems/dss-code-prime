@@ -6,15 +6,16 @@
 // that bodyless shadow -> H0009 (a Ref to an unbound symbol) at HIR->MIR.
 //
 // Here `even` block-declares the prototype `int odd(int);` and forward-calls
-// `odd` (defined LATER at file scope). The fix re-homes the block proto onto the
-// file scope so it MERGES with the file-scope definition — the call resolves to
-// the real `odd`. Value-divergent so a shadow/merge bug yields the wrong exit:
+// `odd` (defined LATER at file scope). The block proto binds in its block and the
+// block-extern sweep MERGES it with the file-scope definition (P69 fold f26b; it was
+// re-homed onto the file scope before) — the call resolves to the real `odd`. Value-divergent so a shadow/merge bug yields the wrong exit:
 //   even(10) = 1, odd(7) = 1  =>  (1 && 1) => 42 ; any miscompile => 7.
 //
-// RED-ON-DISABLE: revert the Pass-1 re-home (bind the block proto in `current`
-// instead of the file scope) -> the block proto shadows, the forward call hits
-// the bodyless shadow -> H0009, the program no longer COMPILES (the runner reports
-// a compile failure instead of exit 42).
+// RED-ON-DISABLE, as filed: revert the Pass-1 re-home -> the block proto shadows,
+// the forward call hits the bodyless shadow -> H0009, the program no longer
+// COMPILES. Since P69 fold f26b there is no re-home: the merge is the block-extern
+// sweep's, and its red is SemanticAnalyzerC.BlockScopePrototypeMergesWithFileDefinition
+// (two surviving functions named `odd`).
 //
 // Front-end (semantic + HIR) feature, target-agnostic — the emitted code is two
 // ordinary mutually-recursive functions. Runs on x86_64 (PE+ELF) and arm64 (ELF

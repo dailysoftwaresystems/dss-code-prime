@@ -1,0 +1,1 @@
+    if (core::reachedKind(destination, core::Use::Leaf, ec) != core::EntryKind::Absent && !ec)

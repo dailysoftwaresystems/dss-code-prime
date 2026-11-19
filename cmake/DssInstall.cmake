@@ -148,9 +148,16 @@ endif()
 # were shipping. When the cache lands, add `dist/release/` here AND answer the
 # question the install set cannot answer on its own: a cache under `share/` is
 # READ-ONLY for an ordinary user, so the miss path needs a writable cache root.
+#
+# ⚠ A SECOND EXCLUSION, ANCHORED THE SAME WAY (cycle P69 L2, lane `lm`):
+# `configure-time/` holds what the BUILD reads when it is configured — the config
+# documents' nesting limit, compiled in by src/core/CMakeLists.txt — and nothing the
+# compiler reads at run time. The install smoke test checks it is absent from the
+# installed tree, and its hello-world compile is the proof nothing needs it there.
 install(DIRECTORY "${CMAKE_SOURCE_DIR}/src/dss-config/"
         DESTINATION "${DSS_INSTALL_CONFIGDIR}"
-        REGEX "/runtime/platform/dist(/|$)" EXCLUDE)
+        REGEX "/runtime/platform/dist(/|$)" EXCLUDE
+        REGEX "/configure-time(/|$)" EXCLUDE)
 
 # ── The closing test: does an INSTALLED compiler actually compile? ─────────────
 #

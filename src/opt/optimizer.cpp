@@ -51,7 +51,9 @@ struct PassRunResult {
                                     passes::InlineGrowthLedger& inlineLedger,
                                     std::optional<bool> charIsUnsigned,
                                     std::span<SymbolBinding const>
-                                        preemptibleDefinitionBindings) {
+                                        preemptibleDefinitionBindings,
+                                    ModuleExtent extent,
+                                    std::span<SymbolId const> entryRoots) {
     switch (id) {
         case PassId::Identity:
             return {true, false};  // no-op; exercises the engine wiring.
@@ -61,7 +63,8 @@ struct PassRunResult {
             return {r.ok, r.instructionsFolded > 0};
         }
         case PassId::Dce: {
-            auto const r = passes::runDce(mir, interner, reporter);
+            auto const r =
+                passes::runDce(mir, interner, reporter, extent, entryRoots);
             return {r.ok,
                     r.instructionsEliminated + r.blocksEliminated
                   + r.functionsEliminated   + r.globalsEliminated > 0};
@@ -266,6 +269,10 @@ struct ScheduleInterpreter {
     // D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: threaded to the Inlining
     // leaf, for the reason stated one line up about `charIsUnsigned`.
     std::span<SymbolBinding const> preemptibleDefinitionBindings;
+    // D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS: threaded to the
+    // Dce leaf — what the module is to its link, and the image entry's roots.
+    ModuleExtent              extent;
+    std::span<SymbolId const> entryRoots;
 
     // Failure latch — once a pass or a verify fails, unwind without
     // running anything further (the pre-tree early `return result`).
@@ -421,7 +428,7 @@ struct ScheduleInterpreter {
         auto const passResult =
             runPass(p, mir, target, interner, pipeline, reporter,
                     inlineLedger, charIsUnsigned,
-                    preemptibleDefinitionBindings);
+                    preemptibleDefinitionBindings, extent, entryRoots);
         if (optTrace) {
             auto const ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - t0).count();
@@ -541,7 +548,10 @@ OptResult optimize(Mir& mir,
                    std::span<ExternImport const> externImports,
                    std::optional<bool> charIsUnsigned,
                    std::span<SymbolBinding const>
-                       preemptibleDefinitionBindings) {
+                       preemptibleDefinitionBindings,
+                   ModuleExtent extent,
+                   std::span<SymbolId const> entryRoots,
+                   bool laterStageResumes) {
     // D-OPT1-RETURN-FALSE-DIAGNOSTIC-CONTRACT: a false return MUST
     // be paired with a new error. Snapshot + belt-and-suspenders
     // emit below covers any future failure path that forgets to.
@@ -582,7 +592,8 @@ OptResult optimize(Mir& mir,
                                result, entryErrorCount,
                                std::getenv("DSS_OPT_TRACE") != nullptr,
                                inlineLedger, charIsUnsigned,
-                               preemptibleDefinitionBindings};
+                               preemptibleDefinitionBindings, extent,
+                               entryRoots};
     interp.run(pipeline.schedule, std::string{});
     if (interp.stopped) {
         // A failed pass / failed verify unwinds WITHOUT the epilogues —
@@ -614,7 +625,31 @@ OptResult optimize(Mir& mir,
     // programs that compile fine today. `Warning` is the honest register:
     // the compiler did not finish the job it was asked to do, and the user
     // is entitled to know before they measure the result.
-    if (!result.fixedPointReached) {
+    //
+    // ★★ ONLY THE LAST STAGE A MODULE RECEIVES SAYS IT
+    // (D-OPT-RELEASE-UNIT-FIXPOINT-CAP-WARNS-THOUGH-THE-PROGRAM-STAGE-RESUMES).
+    // A stage a later stage resumes did not leave the program incomplete:
+    // the later stage runs its schedule over this one's output and reports
+    // its own truncation, if any. ✔MEASURED 2026-10-20 (the orchestrator, four
+    // single-file examples, `release`): the unit stage's `release-unit`
+    // fixpoint, capped at 2 by design, "hit its cap" on 4 of 12 compiles and
+    // told the user to raise a cap the two-stage topology fixes on purpose --
+    // a warning that cries wolf trains its reader to ignore the real one.
+    // Which run is resumed is the DRIVER's knowledge (`laterStageResumes`,
+    // decided where the stage sequence is fixed), never a list of pipeline
+    // names here; under DSS_OPT_TRACE the truncation is still printed.
+    if (!result.fixedPointReached && laterStageResumes) {
+        if (std::getenv("DSS_OPT_TRACE") != nullptr) {
+            for (auto const& t : interp.truncated) {
+                std::fprintf(stderr,
+                             "opt: pipeline=%s fixpoint=%s hit its cap of %u with %zu "
+                             "pass(es) still mutating; a later stage resumes this module\n",
+                             pipeline.name.c_str(), t.path.empty() ? "<root>" : t.path.c_str(),
+                             static_cast<unsigned>(t.cap), static_cast<std::size_t>(t.lastDelta));
+            }
+            std::fflush(stderr);
+        }
+    } else if (!result.fixedPointReached) {
         for (auto const& t : interp.truncated) {
             ParseDiagnostic d;
             d.code     = DiagnosticCode::X_OptFixpointTruncated;

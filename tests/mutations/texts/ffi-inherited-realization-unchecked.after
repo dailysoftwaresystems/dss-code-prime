@@ -1,0 +1,2 @@
+                if (std::string const declared = std::string{};   // R3c
+                    !declared.empty()) {

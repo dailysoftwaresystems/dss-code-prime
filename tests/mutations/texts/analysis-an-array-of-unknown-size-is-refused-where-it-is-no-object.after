@@ -1,0 +1,5 @@
+            //     (`sizeof.incompleteArraySize`), else refused by name.
+            emit(DiagnosticCode::S_NonConstantArrayLength,
+                 "an array declarator in this position needs a length, and it "
+                 "must be an integer constant expression (C 6.7.6.2)");
+            return InvalidType;

@@ -1,0 +1,4 @@
+    if (auto const it = scope.keyOfSpelling.find(spelling); it != scope.keyOfSpelling.end()) {
+        return it->second;
+    }
+    auto key = resolvedDescriptorPathKey(path);

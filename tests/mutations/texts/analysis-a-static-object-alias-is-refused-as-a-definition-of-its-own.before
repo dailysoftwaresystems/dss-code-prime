@@ -1,0 +1,1 @@
+            || (dRec.isInternalLinkage && !p.wroteInitializer);

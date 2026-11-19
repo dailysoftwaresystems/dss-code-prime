@@ -1,0 +1,1 @@
+    return SELF_TEST_LABEL in labels_of(entry)

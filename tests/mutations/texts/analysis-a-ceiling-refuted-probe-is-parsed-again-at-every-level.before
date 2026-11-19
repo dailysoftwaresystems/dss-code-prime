@@ -1,0 +1,2 @@
+                return RecordedFailure{it->second.refusal, it->second.hit, keyedBySketch,
+                                       /*committedTypeReading=*/false};

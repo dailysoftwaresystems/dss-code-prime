@@ -1,0 +1,2 @@
+            head = machineModeType(s, cfg, tree, facts.machineModeClause,
+                                   *facts.machineModeRow, head, say);

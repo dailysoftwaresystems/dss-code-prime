@@ -1,0 +1,1 @@
+        named(a.alias, MirSymbolMention::Alias, MirInstId{});

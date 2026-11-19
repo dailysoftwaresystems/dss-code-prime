@@ -1,0 +1,1 @@
+the aarch64 relocatable build of a global whose struct holds a zero-width bit-field must succeed

@@ -1,0 +1,1 @@
+    bool const hasRelaRodata = false && !isExec && hasRodata && layoutRelocates(rodataLayout);

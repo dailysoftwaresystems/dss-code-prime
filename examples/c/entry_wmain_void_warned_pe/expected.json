@@ -1,0 +1,15 @@
+{
+  "$comment": "D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE (P69 fold 3e, lane `xa`, class C's N3): `int wmain(void)` alone is a pe64 program's entry, called with the richest row pe64 realizes for `wmain` (`argc-wargv-wenvp`) and WARNED at its declarator (S_EntryShapeNotDeclared): it is none of the language's `wmain` rows. MEASURED 2026-11-05 (lane `xa`, d136): cl 19.44, clang-cl 19.1.5 and MinGW-w64 gcc 13.2 -municode run it (22); every Linux reference refuses the program (no `main`), as DSS does on ELF and Mach-O, where the format realizes no `wmain` row. No `none` row for `wmain` exists, by design: every format realizes `none`, so such a row would make `wmain` an entry everywhere. RED-ON-DISABLE: drop the semantic tier's richest-row stamp -> K_ProgramEntryUndefined; make the warning an error -> refused; move it off the declarator -> the position reds.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 22,
+  "expectWarnings": [
+    { "code": "S_EntryShapeNotDeclared", "line": 20, "col": 5 }
+  ],
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": false }
+  ]
+}

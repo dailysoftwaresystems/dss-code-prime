@@ -1,0 +1,2 @@
+    static_cast<void>(child);
+    return HostPath{parentText / fs::path{name}};

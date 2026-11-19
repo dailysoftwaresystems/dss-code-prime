@@ -1,0 +1,2 @@
+        listEntries(dir, storeText, relative, depth, listed.entries, ec);
+        if (ec && depth != 0) {

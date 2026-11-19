@@ -1,0 +1,1 @@
+countCode(m.diagnostics(), DiagnosticCode::S_AlignasNotPowerOfTwo)

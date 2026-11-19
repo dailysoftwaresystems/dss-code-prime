@@ -1,6 +1,9 @@
 #include "ffi/ingest.hpp"
 
+#include "core/substrate/every_unit.hpp"   // runEveryUnit: every source, member, input and header
+#include "core/substrate/input_named_diagnostics.hpp"  // readNamingTheInput: a refusal of one input names it
 #include "core/substrate/path_identity.hpp"  // genericSpelling
+#include "core/substrate/silent_unit.hpp"  // namingSilentUnits: a unit that fails having said nothing is named
 #include "core/types/parse_diagnostic.hpp"
 #include "ffi/abi/abi_catalog.hpp"
 #include "ffi/binary_reader.hpp"
@@ -254,8 +257,9 @@ struct PeekedLibraryIdentity {
 [[nodiscard]] static PeekedLibraryIdentity
 peekLibraryIdentity(std::filesystem::path const& libraryPath) {
     PeekedLibraryIdentity out;
-    std::ifstream in(libraryPath, std::ios::binary);
-    if (!in) return out;
+    auto opened = core::openInputStream(libraryPath, std::ios::binary);   // at any length (the home)
+    if (!opened) return out;   // deferred: readImports opens it again and names the OS's reason
+    std::ifstream& in = *opened;
     std::uint8_t buf[kArchitectureLeadBytes] = {};
     in.read(reinterpret_cast<char*>(buf), static_cast<std::streamsize>(sizeof(buf)));
     auto const got = static_cast<std::size_t>(in.gcount());
@@ -452,8 +456,9 @@ checkArchiveMembersMatchTargetFormat(std::filesystem::path const& archivePath,
     // the same bytes with the same reader and reports structural faults in
     // full. Reporting here as well would double-report one broken archive; the
     // contract is `peekLibraryIdentity`'s, one tier up.
-    std::ifstream in(archivePath, std::ios::binary);
-    if (!in) return std::nullopt;
+    auto opened = core::openInputStream(archivePath, std::ios::binary);   // at any length (the home)
+    if (!opened) return std::nullopt;   // deferred: the merge opens it again and names the OS's reason
+    std::ifstream& in = *opened;
     std::vector<std::uint8_t> const bytes{
         std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
     if (bytes.empty()) return std::nullopt;
@@ -464,11 +469,26 @@ checkArchiveMembersMatchTargetFormat(std::filesystem::path const& archivePath,
         quiet);
     if (!archive.has_value()) return std::nullopt;
 
+    // ★ EVERY MEMBER IS COMPARED, AND EACH WRONG ONE NAMED, BEFORE THE CHECK
+    // ANSWERS (`substrate::runEveryUnit`, the several-unit class's one home,
+    // P69 H6c2): the FIRST rejection is still the answer, and every one is
+    // reported. Netted: a refusal names its member in `archive(member)`
+    // notation.
     bool anyMemberIsOurs = false;
-    for (auto const& member : archive->members) {
+    std::optional<BinaryReadError> firstRejection;
+    static_cast<void>(substrate::runEveryUnit(
+        archive->members.size(),
+        substrate::namingSilentUnits(
+            reporter, "the archive member format check",
+            [&](std::size_t m) {
+                return std::format("{0}({1}), member {2}", core::genericSpelling(archivePath),
+                                   archive->members[m].name, m);
+            },
+            [&](std::size_t m) {
+        auto const& member = archive->members[m];
         if (member.dataOffset > bytes.size()
             || bytes.size() - member.dataOffset < member.size) {
-            continue;   // structurally impossible; the merge tier reports it
+            return true;   // structurally impossible; the merge tier reports it
         }
         auto const payload = std::span<std::uint8_t const>{bytes}.subspan(
             static_cast<std::size_t>(member.dataOffset),
@@ -478,8 +498,11 @@ checkArchiveMembersMatchTargetFormat(std::filesystem::path const& archivePath,
             std::format("{0}({1})", core::genericSpelling(archivePath),
                         member.name),
             "archive member", identityOfBytes(payload), format, reporter);
-        if (rejected.has_value()) return rejected;
-    }
+        if (!rejected.has_value()) return true;
+        if (!firstRejection.has_value()) firstRejection = std::move(rejected);
+        return false;
+    })));
+    if (firstRejection.has_value()) return firstRejection;
 
     // ── THE MEMBER WHOSE MAGIC NAMES NOTHING ───────────────────────────────
     //
@@ -553,18 +576,22 @@ bool checkMergedLibraryInputsMatchTargetFormat(
         std::span<std::filesystem::path const> objects,
         ObjectFormatSchema const&              format,
         DiagnosticReporter&                    reporter) {
-    bool ok = true;
     // ⚠ NO EARLY RETURN. An operator who named three wrong-architecture inputs
     // is told about three of them, not shown one and left to re-run twice; the
     // sibling probe in `compile_pipeline`'s step 2.5-pre takes the same posture
-    // over the dynamic partition for the same reason.
-    for (auto const& path : archives) {
-        if (checkLibraryMatchesTargetFormat(path, format, reporter)) ok = false;
-    }
-    for (auto const& path : objects) {
-        if (checkLibraryMatchesTargetFormat(path, format, reporter)) ok = false;
-    }
-    return ok;
+    // over the dynamic partition for the same reason. Both partitions are
+    // walked on the one home (`substrate::runEveryUnit`, P69 H6c2), netted: a
+    // refusal names its input.
+    auto const checkEvery = [&](std::span<std::filesystem::path const> inputs, char const* step) {
+        return substrate::runEveryUnit(
+            inputs.size(),
+            substrate::namingSilentUnits(
+                reporter, step, [&](std::size_t i) { return "input '" + core::genericSpelling(inputs[i]) + "'"; },
+                [&](std::size_t i) { return !checkLibraryMatchesTargetFormat(inputs[i], format, reporter); }));
+    };
+    bool const archivesOk = checkEvery(archives, "the merged archives' format check");
+    bool const objectsOk  = checkEvery(objects, "the merged objects' format check");
+    return archivesOk && objectsOk;
 }
 
 // The target-aware read. Doc + rationale live on the declaration in
@@ -572,15 +599,29 @@ bool checkMergedLibraryInputsMatchTargetFormat(
 // `bindAsmExternImports` in `program/compile_pipeline.cpp` (the encode tier) --
 // the same two-binder shape, and the same one-function remedy, as
 // `recordedImportIdentity` above.
+//
+// ★ A REFUSAL OF ONE LIBRARY NAMES THE LIBRARY (P69 fold 3e, the orchestrator's
+// ledger 583): the FF1 readers report what is wrong with the bytes, and a PE
+// reader's "export-directory RVA ... does not lie in any section's raw data"
+// names no file -- two unreadable libraries read as ONE refusal, the second
+// dropped as a recent duplicate (✔MEASURED, the every-unit pin of the encode
+// tier's binder on the Mac leg). Every diagnostic of this read goes through the
+// class's one home with the library's path in front, here, so neither binder
+// that calls this chokepoint wraps the call itself.
 std::expected<std::vector<ImportSurface>, BinaryReadError>
 readImportsForTargetFormat(std::filesystem::path const& libraryPath,
                            ObjectFormatSchema const&    format,
                            DiagnosticReporter&          reporter) {
-    if (auto rejected =
-            checkLibraryMatchesTargetFormat(libraryPath, format, reporter)) {
-        return std::unexpected(std::move(*rejected));
-    }
-    return readImports(libraryPath, reporter);
+    return substrate::readNamingTheInput(
+        core::genericSpelling(libraryPath), reporter,
+        [&](DiagnosticReporter& libraryReporter)
+            -> std::expected<std::vector<ImportSurface>, BinaryReadError> {
+            if (auto rejected = checkLibraryMatchesTargetFormat(
+                    libraryPath, format, libraryReporter)) {
+                return std::unexpected(std::move(*rejected));
+            }
+            return readImports(libraryPath, libraryReporter);
+        });
 }
 
 namespace {
@@ -697,26 +738,54 @@ readCHeaderDirectory(std::filesystem::path const& headerDir,
                      DiagnosticReporter&          reporter) {
     namespace fs = std::filesystem;
     std::error_code ec;
-    if (!fs::is_directory(headerDir, ec)) {
-        return std::unexpected(HeaderReadError{
-            HeaderReadErrorKind::FileOpenFailed,
-            std::string{"readCHeaderDirectory: not a directory: "}
-                + core::genericSpelling(headerDir)
-        });
+    // ★ A REFUSAL OF THE READ IS REPORTED BY THE READ (P69 H6c2), as `readCHeader`
+    // reports its own (`emitAndReturn`): the caller hands the error on and says
+    // nothing, so a refusal returned unreported failed the ingest in silence.
+    auto const refuse = [&](HeaderReadErrorKind kind, DiagnosticCode code, std::string detail) {
+        dss::report(reporter, code, DiagnosticSeverity::Error, detail);
+        return std::unexpected(HeaderReadError{kind, std::move(detail)});
+    };
+    // A CONTAINER (H6c, A2): the directory the headers are listed from.
+    if (core::reachedKind(headerDir, core::Use::Container, ec) != core::EntryKind::Directory || ec) {
+        return refuse(HeaderReadErrorKind::FileOpenFailed, DiagnosticCode::F_FileOpenFailed,
+                      std::string{"readCHeaderDirectory: not a directory: "}
+                          + core::genericSpelling(headerDir)
+                          + (ec ? " (it cannot be examined: " + core::reasonText(ec) + ")" : std::string{}));
     }
     if (importLibrary.empty()) {
-        return std::unexpected(HeaderReadError{
-            HeaderReadErrorKind::EmptyImportLibrary,
-            "readCHeaderDirectory requires a non-empty importLibrary"
-        });
+        return refuse(HeaderReadErrorKind::EmptyImportLibrary, DiagnosticCode::F_HeaderEmptyImportLibrary,
+                      "readCHeaderDirectory requires a non-empty importLibrary");
     }
+    // The directory's own entries (a sub-directory is never descended), by the
+    // substrate's walk. A header is an entry NAMED `.h` by what it REACHES (the
+    // substrate's answer, never the library's: libstdc++ on Windows calls a
+    // dangling link a regular file). What the read cannot read FAILS it, naming
+    // it -- a listing that fails, and an entry named as a header whose reach
+    // cannot be examined (a looping link) -- because a header library read short
+    // would hand a partial surface on as the whole one. An entry NOT named as a
+    // header is none whatever it reaches, so its reach is never asked.
     std::vector<fs::path> headers;
-    for (auto const& entry : fs::directory_iterator{headerDir, ec}) {
-        if (ec) break;
-        if (!entry.is_regular_file()) continue;
-        if (entry.path().extension() == ".h") {
-            headers.push_back(entry.path());
-        }
+    std::string           unreadable;
+    auto const walk = core::walkTree(
+        headerDir,
+        [&](core::TreeEntry const& entry) {
+            if (entry.at.extension() != ".h") return core::WalkStep::Prune;
+            if (entry.reachError) {
+                unreadable = "'" + entry.at.spelling().generic() + "' is named as a header but what it "
+                             "reaches cannot be examined (" + core::reasonText(entry.reachError) + ")";
+                return core::WalkStep::Stop;
+            }
+            if (entry.reaches == core::EntryKind::File) headers.push_back(entry.storeRoutePath);
+            return core::WalkStep::Prune;
+        },
+        core::TreeWalkOptions{.handOutUnreadableLinks = true});
+    if (!unreadable.empty() || walk.error) {
+        return refuse(HeaderReadErrorKind::FileOpenFailed, DiagnosticCode::F_FileOpenFailed,
+                      std::string{"readCHeaderDirectory: '"} + core::genericSpelling(headerDir)
+                          + "' could not be read whole: "
+                          + (!unreadable.empty() ? unreadable
+                                                 : "the walk stopped at '" + walk.where.spelling().generic()
+                                                       + "' (" + core::reasonText(walk.error) + ")"));
     }
     // Deterministic order: alphabetical by filename — makes test
     // assertions stable across platforms when a directory-based
@@ -725,28 +794,32 @@ readCHeaderDirectory(std::filesystem::path const& headerDir,
     std::sort(headers.begin(), headers.end());
 
     std::vector<ImportSurface> aggregated;
-    std::size_t failedFiles = 0;
-    // post-fold #5 silent-failure H1: collect per-file failures
-    // instead of halting on the first. A typo in `stdlib.h` should
-    // NOT silently amputate `stdio.h`, `string.h`, etc. — the
-    // operator needs to see every parse failure AND get the
-    // partial surface for the files that did parse. Only fail
-    // the whole directory read if EVERY file failed.
+    // ★ EVERY HEADER IS READ, AND REPORTS ITS OWN FAILURE, BEFORE THE READ FAILS
+    // (`substrate::runEveryUnit`, the several-unit class's one home, P69 H6c2):
+    // a typo in `stdlib.h` never stops `stdio.h` from being read and reported.
+    // The read FAILS when ANY header failed -- the first failure its answer --
+    // and no longer answers a partial surface: a surface short of a broken
+    // header's declarations let `ingest` refuse an extern the header declared
+    // for a cause two steps from the parse error. Netted: `readCHeader` names
+    // its header.
     std::optional<HeaderReadError> firstError;
-    for (auto const& path : headers) {
-        auto r = readCHeader(path, importLibrary, pair, reporter);
+    bool const everyHeaderRead = substrate::runEveryUnit(
+        headers.size(),
+        substrate::namingSilentUnits(
+            reporter, "the header directory read",
+            [&](std::size_t h) { return "header '" + core::genericSpelling(headers[h]) + "'"; },
+            [&](std::size_t h) {
+        auto r = readCHeader(headers[h], importLibrary, pair, reporter);
         if (!r) {
-            ++failedFiles;
             if (!firstError) firstError = std::move(r.error());
-            continue;
+            return false;
         }
         aggregated.insert(aggregated.end(),
                           std::make_move_iterator(r->begin()),
                           std::make_move_iterator(r->end()));
-    }
-    if (!headers.empty() && failedFiles == headers.size()) {
-        return std::unexpected(std::move(*firstError));
-    }
+        return true;
+    }));
+    if (!everyHeaderRead) return std::unexpected(std::move(*firstError));
     return aggregated;
 }
 
@@ -823,10 +896,29 @@ ingest(std::span<IngestionSource const> sources,
     std::vector<TaggedRow> aggregated;
 
     HeaderReadPair const pair{target, format, resolvedCc};
-    for (auto const& src : sources) {
+    // ★ EVERY SOURCE IS READ, AND REPORTS ITS OWN FAILURE, BEFORE THE INGEST
+    // FAILS (`substrate::runEveryUnit`, the several-unit class's one home, P69
+    // H6c2): an unreadable library or header never stops the sources after it;
+    // the ingest fails after the last source. Netted: every reader names its
+    // input (`readNamingTheInput` for a library, `readCHeader` its header).
+    auto const sourceName = [&](std::size_t s) {
+        return std::visit(
+            [](auto const& src) -> std::string {
+                using T = std::decay_t<decltype(src)>;
+                if constexpr (std::is_same_v<T, CHeaderDirSource>) {
+                    return "header directory '" + core::genericSpelling(src.dir) + "'";
+                } else {
+                    return "source '" + core::genericSpelling(src.path) + "'";
+                }
+            },
+            sources[s]);
+    };
+    bool const everySourceRead = substrate::runEveryUnit(
+        sources.size(), substrate::namingSilentUnits(reporter, "the FFI ingest", sourceName, [&](std::size_t s) {
+        IngestionSource const& src = sources[s];
         bool failed = false;
         auto rows = readSource(src, pair, reporter, failed);
-        if (failed) return returnWithSnapshot();
+        if (failed) return false;
         bool const fromBinary =
             std::holds_alternative<BinaryLibrarySource>(src);
         // c162 (D-FF1-READER-CONSUMER): a BinaryLibrarySource carrying a
@@ -850,7 +942,9 @@ ingest(std::span<IngestionSource const> sources,
             aggregated.push_back({std::move(r), fromBinary, declaredImportName});
         }
         ++result.sourcesProcessed;
-    }
+        return true;
+    }));
+    if (!everySourceRead) return returnWithSnapshot();
     result.rowsAggregated = aggregated.size();
 
     // (3) Build a canonical-name → TaggedRow index for O(1) match.

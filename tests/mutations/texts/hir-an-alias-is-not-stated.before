@@ -1,0 +1,1 @@
+        symbolAliasAcc.push_back(HirSymbolAlias{sym, rec->aliasTarget, attr});

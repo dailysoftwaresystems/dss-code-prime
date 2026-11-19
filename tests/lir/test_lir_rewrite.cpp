@@ -23,11 +23,16 @@
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
 #include "synthetic_fn.hpp"
+#include "first_convention.hpp"   // dss::test::kFirstConventionOfTheTarget -- the convention a test states
+#include "scoped_env.hpp"
+#include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
 
 #include <array>
 #include <cstdint>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -75,6 +80,32 @@ TEST(LirRewrite, RoundTripStraightLineFunctionProducesNoVirtuals) {
     EXPECT_TRUE(rewritten.ok);
     DiagnosticReporter verifyRep;
     EXPECT_TRUE(verifyLirPostRegalloc(rewritten.lir, *bundle.lowered.target, verifyRep));
+}
+
+// ★ THE LIR DUMP IS THE SAME BYTES WHICHEVER HOST'S DSS WRITES IT (P69, lane `cs`, fold f26d; the host-toolchain class,
+// its site in the LIR dump). Opened in text mode, a Windows-built DSS wrote every line ending as CR LF, so one module's
+// dump differed by the host that built DSS. It is opened in binary now. THE CELL: the dump of one rewritten function
+// holds its line endings as LF alone. RED-ON-DISABLE on Windows (text mode, the arm): its lines end CR LF. On a POSIX
+// host text and binary are one mode, so there the cell reads the same bytes either way.
+TEST(LirRewrite, TheLirDumpWritesItsLineEndingsAsTheBytesDssWrites) {
+    auto bundle = lowerAndAllocate("int f(int x) { return x + x; }");
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.alloc.ok());
+    DiagnosticReporter rewriteRep;
+    auto rewritten = rewriteWithAllocation(bundle.lowered.lir.lir, *bundle.lowered.target, bundle.alloc, rewriteRep);
+    ASSERT_TRUE(rewritten.ok);
+    test_support::ScratchDir scratch{test_support::Location::InsideRepo, "lir-dump-bytes"};
+    auto const file = scratch.path() / "dump.txt";
+    {
+        test_support::ScopedEnv const minInsts{"DSS_DUMP_LIR_MIN_INSTS", "0"};
+        test_support::ScopedEnv const where{"DSS_DUMP_LIR_FILE", file.string()};
+        dumpLirFuncs(rewritten.lir, *bundle.lowered.target, "dump-bytes");
+    }
+    std::ifstream in{file, std::ios::binary};
+    std::string const bytes{std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
+    ASSERT_NE(bytes.find("STAGE dump-bytes"), std::string::npos) << "the dump was written";
+    ASSERT_NE(bytes.find('\n'), std::string::npos) << "the dump wrote lines";
+    EXPECT_EQ(bytes.find('\r'), std::string::npos) << "no CR: each line ends as DSS writes it, with LF alone";
 }
 
 TEST(LirRewrite, VerifyLirPostRegallocFiresOnPreRewriteModule) {
@@ -194,7 +225,7 @@ TEST(LirRewrite, ExhaustedClassEmitsLoudFailureNotSilentClobber) {
             mb.addReturn(callResult);
         });
     DiagnosticReporter lirRep;
-    auto const lirResult = lowerToLir(syn.mir, **target, syn.interner, lirRep);
+    auto const lirResult = lowerToLir(syn.mir, **target, syn.interner, lirRep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(lirResult.ok);
     LirLiveness const lv = analyzeLiveness(lirResult.lir);
     DiagnosticReporter regallocRep;
@@ -236,10 +267,10 @@ TEST(LirRewrite, Arm64HighFprSpillScratchPoolHandlesOrdinalsBeyond64) {
     // allocates an FPR up into d31 (global ordinal 64). The named `n` is an int (x0).
     auto out = AllocatedLir{lowerCToLir(
         "double sum_d(int n, ...) {\n"
-        "    va_list ap; va_start(ap, n);\n"
+        "    __builtin_va_list ap; __builtin_va_start(ap, n);\n"
         "    double t = 0.0;\n"
-        "    for (int i = 0; i < n; i = i + 1) { t = t + va_arg(ap, double); }\n"
-        "    va_end(ap);\n"
+        "    for (int i = 0; i < n; i = i + 1) { t = t + __builtin_va_arg(ap, double); }\n"
+        "    __builtin_va_end(ap);\n"
         "    return t;\n"
         "}\n"
         "int main(void) {\n"

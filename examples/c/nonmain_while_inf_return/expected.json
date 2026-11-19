@@ -2,6 +2,8 @@
   "language": "c",
   "source": "main.c",
   "exitCode": 5,
+  "$commentForbidDiagnostics": "THE RED OF THIS EXAMPLE, SINCE P69. If the lowering stops wrapping the provably-infinite `while (1)`, `f`'s end is called REACHED. That refused the compile until P69; under C it is now accepted (C23 6.9.2p13) with the warning H_NonVoidFunctionEndReachable, and the program still exits 5 — so the exit code cannot see the regression and this key does: the arm is red on the diagnostic, in both runners.",
+  "forbidDiagnostics": ["H_NonVoidFunctionEndReachable"],
   "targets": [
     {
       "spec": "x86_64:pe64-x86_64-windows-exec",

@@ -1,0 +1,3 @@
+    std::optional<std::vector<SymbolId>> const taken = ModuleSymbolIds{module}.take(
+        ids, reporter, std::format("entry-trampoline: the {} id(s) of the trampoline and its exit", ids));
+    if (!taken.has_value()) return false;

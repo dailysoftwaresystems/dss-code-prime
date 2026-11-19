@@ -1,0 +1,1 @@
+    appendUnitLinkerRequests(assembled->linkerRequests, cuMir.linkerRequests);

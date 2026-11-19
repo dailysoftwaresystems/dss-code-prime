@@ -1,0 +1,2 @@
+                        bool const nestedStrip = false &&
+                            cfg.typeofStripQualifiersToken.has_value()

@@ -1,6 +1,7 @@
 #include "core/types/tree_builder.hpp"
 
 #include "core/substrate/mint_monotonic_id.hpp"
+#include "core/types/diagnostic_quote.hpp"  // quotedSourceText: the ONE rendering of source text in a diagnostic
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/trivia_token.hpp"
@@ -236,6 +237,7 @@ void TreeBuilder::discardTrailsIfIdle_() noexcept {
     pendingChildren_.discardJournal();
     open_.discardJournal();
     scopes_.discardJournal();
+    scopeKindCounts_.discardJournal();
     closedCookies_.discardJournal();
     nodeWrites_.discardJournal();
     childIndex_.discardJournal();
@@ -244,13 +246,31 @@ void TreeBuilder::discardTrailsIfIdle_() noexcept {
 void TreeBuilder::emitDiagnostic_(ParseDiagnostic d) {
     // Snapshot the scope stack at error-time. Done here (rather than at
     // call sites) so every diagnostic gets it for free.
-    d.scopeStack.assign(scopes_.begin(), scopes_.end());
+    // P69 L2b2 (lane `lm`): as a HANDLE, O(1) — it was a copy of the whole stack, and a probe
+    // nest's refuted alternatives raise diagnostics at every level (scope_trail.hpp).
+    d.scopeStack = captureOwnTrail_();
     reporter_->report(std::move(d));
 }
 
 void TreeBuilder::forceReport_(ParseDiagnostic d) {
-    d.scopeStack.assign(scopes_.begin(), scopes_.end());
+    d.scopeStack = captureOwnTrail_();
     reporter_->forceReport(std::move(d));
+}
+
+ScopeTrail TreeBuilder::scopeTrail_() const noexcept {
+    if (scopes_.empty()) return ScopeTrail{};
+    return ScopeTrail::at(scopeChain_, scopes_.back().node,
+                          static_cast<std::uint32_t>(scopes_.size()));
+}
+
+// P69 L2b2 (lane `lm`): the nodes the trail reads are every node up to its top, so marking the
+// top marks them all (node ids climb up the stack).
+ScopeTrail TreeBuilder::captureOwnTrail_() noexcept {
+    if (!scopes_.empty()) {
+        capturedTrailEnd_ =
+            std::max<std::size_t>(capturedTrailEnd_, std::size_t{scopes_.back().node} + 1u);
+    }
+    return scopeTrail_();
 }
 
 void TreeBuilder::reportDiagnostic(ParseDiagnostic d) {
@@ -262,7 +282,7 @@ void TreeBuilder::reportDiagnostic(ParseDiagnostic d) {
     emitDiagnostic_(std::move(d));
 }
 
-void TreeBuilder::ingestDiagnostics(std::span<ParseDiagnostic const> diags) {
+void TreeBuilder::ingestDiagnostics(DiagnosticReporter const& from) {
     if (finished_) {
         addBuilderInvariant_("ingestDiagnostics() after finish()",
                              SourceSpan::empty(0));
@@ -271,10 +291,9 @@ void TreeBuilder::ingestDiagnostics(std::span<ParseDiagnostic const> diags) {
     // Report verbatim: external diagnostics already carry their own buffer,
     // span, and scope. Do NOT route through emitDiagnostic_ — that would
     // overwrite scopeStack with the builder's (empty/irrelevant for lexer
-    // diags). Goes through report() so the cap/dedup window still applies.
-    for (auto const& d : diags) {
-        reporter_->report(d);
-    }
+    // diags). Goes through report() so the cap/dedup window still applies --
+    // the one relay, which also counts what `from`'s gates dropped (D9(c)).
+    reporter_->relayFrom(from);
 }
 
 void TreeBuilder::addBuilderInvariant_(std::string actual, SourceSpan span) {
@@ -565,7 +584,7 @@ void TreeBuilder::closeFrame_(std::uint32_t cookie, bool /*synthetic*/) noexcept
         //     grammar that splits an opener from its closer across two rules,
         //     or a builder bug — never user input, so it stays an internal
         //     invariant (repaired where it can be, so it is reported once).
-        // `scopes_.pop()`, not `popScope()`: `finish()` closes frames after
+        // `popScopeEntry_()`, not `popScope()`: `finish()` closes frames after
         // `finished_` is set, and `popScope` refuses to run then.
         {
             auto const depth = static_cast<std::size_t>(fr.scopeDepth);
@@ -580,7 +599,7 @@ void TreeBuilder::closeFrame_(std::uint32_t cookie, bool /*synthetic*/) noexcept
                                 depth),
                     frameSpan);
             }
-            while (scopes_.size() > depth) scopes_.pop();
+            while (scopes_.size() > depth) popScopeEntry_();
         }
 
         const bool isTarget = (fr.cookie == cookie);
@@ -630,32 +649,49 @@ struct ResolvedMeaning {
 // Distinct from `schema.isTokenValidInScope` which enforces the schema's
 // top-level `scopes.validity[].forbid` rules (per-scope, not per-token).
 // Both checks are AND'd in `resolveMeaning`.
+// P69 L2a2 (lane `lm`): what a token's resolution knows of the scope stack — its two ENDS (for
+// `topMustBe` / `outermost`) and a PRESENCE oracle (`open`) for every other question, so no
+// check reads the stack's depth: it did, once per token, and a parse cost Θ(tokens × nesting).
+// `work` counts the resolution and every presence question (`TreeBuilder::scopeWork`).
+// P69 L2b1 (lane `lm`, the L2a2 review's A4): the view holds the two ends as VALUES, not the
+// stack — a resolution has no stack to walk — and the stack's own reads count into the same
+// `scopeWork` (`TrailedStack::reads`), so a walk written anywhere in the builder is seen.
+struct ScopeView {
+    ScopeKind                  top     = ScopeKind::None;
+    ScopeKind                  bottom  = ScopeKind::None;
+    bool                       empty   = true;
+    GrammarSchema::ScopeOpenFn open    = nullptr;
+    void const*                builder = nullptr;
+    std::uint64_t*             work    = nullptr;
+};
+
+bool askScopeOpen(void const* view, ScopeKind kind) noexcept {
+    auto const& sv = *static_cast<ScopeView const*>(view);
+    ++*sv.work;   // a presence question
+    return sv.open(sv.builder, kind);
+}
+
 [[nodiscard]] bool meaningAllowedByScopeRequire(
     LexemeMeaning const& m,
-    std::span<ScopeKind const> scopes) noexcept {
+    ScopeView const& sv) noexcept {
     auto const& sr = m.scopeRequire;
     // forbid
     for (ScopeKind f : sr.forbid) {
-        for (ScopeKind active : scopes) {
-            if (f == active) return false;
-        }
+        if (askScopeOpen(&sv, f)) return false;
     }
     // topMustBe — innermost is the last element (stack grows back).
     if (sr.topMustBe.has_value()) {
-        if (scopes.empty() || scopes.back() != *sr.topMustBe) return false;
+        if (sv.empty || sv.top != *sr.topMustBe) return false;
     }
     // outermost — bottom-of-stack is the first element.
     if (sr.outermost.has_value()) {
-        if (scopes.empty() || scopes.front() != *sr.outermost) return false;
+        if (sv.empty || sv.bottom != *sr.outermost) return false;
     }
     // anyOf — at least one of the listed must be active.
     if (!sr.anyOf.empty()) {
         bool any = false;
         for (ScopeKind required : sr.anyOf) {
-            for (ScopeKind active : scopes) {
-                if (required == active) { any = true; break; }
-            }
-            if (any) break;
+            if (askScopeOpen(&sv, required)) { any = true; break; }
         }
         if (!any) return false;
     }
@@ -721,7 +757,7 @@ struct ResolvedMeaning {
     GrammarSchema const& schema,
     SchemaTokenId preResolved,
     std::unordered_set<SchemaTokenId> const& bodyKinds,
-    std::span<ScopeKind const> scopes) noexcept {
+    ScopeView const& sv) noexcept {
     if (!(bodyKinds.contains(preResolved)
           || isBuiltinLiteralKind(schema, preResolved)
           || isBuiltinTriviaKind(schema, preResolved)
@@ -730,7 +766,7 @@ struct ResolvedMeaning {
                 "a body-mode defaultToken, a built-in literal, nor a "
                 "mode-introduced kind — likely a tokenizer/schema drift bug");
     }
-    if (!schema.isTokenValidInScope(preResolved, scopes)) {
+    if (!schema.isTokenValidInScope(preResolved, &askScopeOpen, &sv)) {
         return ResolvedMeaning{};
     }
     ResolvedMeaning out;
@@ -743,10 +779,11 @@ struct ResolvedMeaning {
 
 ResolvedMeaning resolveMeaning(GrammarSchema const& schema,
                                std::string_view lexeme,
-                               std::span<ScopeKind const> scopes,
+                               ScopeView const& sv,
                                std::unordered_set<SchemaTokenId> const& bodyKinds,
                                SchemaTokenId errorKind,
                                SchemaTokenId preResolved = InvalidSchemaToken) {
+    ++*sv.work;   // a resolution
     ResolvedMeaning out;
     const auto candidates = schema.lookupLexeme(lexeme);
 
@@ -757,7 +794,7 @@ ResolvedMeaning resolveMeaning(GrammarSchema const& schema,
     // recovery flows through P_UnknownToken.
     if (candidates.empty() && preResolved.valid()) {
         if (preResolved != errorKind) {
-            return makeSyntheticMeaning(schema, preResolved, bodyKinds, scopes);
+            return makeSyntheticMeaning(schema, preResolved, bodyKinds, sv);
         }
         return out;
     }
@@ -766,8 +803,8 @@ ResolvedMeaning resolveMeaning(GrammarSchema const& schema,
     // A candidate survives iff BOTH the schema's per-scope forbid rules
     // AND the candidate's per-meaning scopeRequire allow it.
     auto candidateAllowed = [&](LexemeMeaning const& m) {
-        return schema.isTokenValidInScope(m.id, scopes)
-            && meaningAllowedByScopeRequire(m, scopes);
+        return schema.isTokenValidInScope(m.id, &askScopeOpen, &sv)
+            && meaningAllowedByScopeRequire(m, sv);
     };
 
     // Fast path: tokenizer pre-resolved a `schemaKind`. Find the named
@@ -809,7 +846,7 @@ ResolvedMeaning resolveMeaning(GrammarSchema const& schema,
             if (m.id == preResolved) { preResolvedInCandidates = true; break; }
         }
         if (!preResolvedInCandidates && preResolved != errorKind) {
-            return makeSyntheticMeaning(schema, preResolved, bodyKinds, scopes);
+            return makeSyntheticMeaning(schema, preResolved, bodyKinds, sv);
         }
     }
 
@@ -882,8 +919,15 @@ void TreeBuilder::pushToken(Token const& tok) {
     //     resolveMeaning fast-path short-circuits the priority scan.
     //  2. Word fallback to Identifier when the lexeme isn't a keyword.
     //  3. No match at all → Error leaf + P_UnknownToken.
+    bool const noScope = scopes_.empty();
+    ScopeView const scopeView{.top     = noScope ? ScopeKind::None : scopes_.back().kind,
+                              .bottom  = noScope ? ScopeKind::None : scopes_[0].kind,
+                              .empty   = noScope,
+                              .open    = &TreeBuilder::scopeKindOpenThunk_,
+                              .builder = this,
+                              .work    = &scopeWork_};
     ResolvedMeaning resolved = resolveMeaning(
-        *schema_, lexeme, std::span<ScopeKind const>{scopes_},
+        *schema_, lexeme, scopeView,
         *bodyDefaultTokenKinds_, errorKind_, tok.schemaKind);
 
     if (resolved.matchCount == 0 && tok.coreKind == CoreTokenKind::Word) {
@@ -905,7 +949,7 @@ void TreeBuilder::pushToken(Token const& tok) {
         d.severity    = DiagnosticSeverity::Error;
         d.buffer      = source_->id();
         d.span        = tok.span;
-        d.actual      = std::format("'{}'", lexeme);
+        d.actual      = std::format("'{}'", quotedSourceText(lexeme));
         d.ruleContext = open_.back().rule;
         emitDiagnostic_(std::move(d));
 
@@ -928,7 +972,7 @@ void TreeBuilder::pushToken(Token const& tok) {
         d.severity    = DiagnosticSeverity::Warning;
         d.buffer      = source_->id();
         d.span        = tok.span;
-        d.actual      = std::format("'{}'", lexeme);
+        d.actual      = std::format("'{}'", quotedSourceText(lexeme));
         d.ruleContext = open_.back().rule;
         emitDiagnostic_(std::move(d));
     }
@@ -976,7 +1020,7 @@ void TreeBuilder::pushToken(Token const& tok) {
             d.buffer      = source_->id();
             d.span        = tok.span;
             d.actual      = std::format("'{}' as Identifier (demoted from {})",
-                                        lexeme,
+                                        quotedSourceText(lexeme),
                                         schema_->schemaTokens().name(demotedFrom));
             d.ruleContext = open_.back().rule;
             emitDiagnostic_(std::move(d));
@@ -1112,7 +1156,58 @@ void TreeBuilder::pushScope(ScopeKind kind) {
         addBuilderInvariant_("pushScope after finish()", SourceSpan::empty(0));
         return;
     }
-    scopes_.push(kind);
+    pushScopeEntry_(kind);
+}
+
+// P69 L2a2 (lane `lm`): the per-kind counts move with `scopes_` — every push and pop goes
+// through these two (see `scopeKindCounts_`).
+std::uint32_t TreeBuilder::scopeKindSlot_(ScopeKind kind) {
+    auto const key = static_cast<std::uint16_t>(kind);
+    auto it = scopeKindSlots_.find(key);
+    if (it == scopeKindSlots_.end()) {
+        it = scopeKindSlots_.emplace(key, static_cast<std::uint32_t>(scopeKindSlots_.size())).first;
+    }
+    while (scopeKindCounts_.size() <= it->second) scopeKindCounts_.push(0);
+    return it->second;
+}
+
+// P69 L2b2 (lane `lm`): a push also grows the chain a diagnostic's trail is read from — a node
+// above the top's — and records it beside the kind, in the one entry a rollback rewinds.
+void TreeBuilder::pushScopeEntry_(ScopeKind kind) {
+    std::uint32_t const slot = scopeKindSlot_(kind);
+    scopeKindCounts_.assign(slot, scopeKindCounts_[slot] + 1);
+    std::uint32_t const below = scopes_.empty() ? ScopeChain::kNoNode : scopes_.back().node;
+    scopes_.push(ScopeEntry{.kind = kind, .node = scopeChain_->push(kind, below)});
+}
+
+void TreeBuilder::popScopeEntry_() {
+    std::uint32_t const slot = scopeKindSlot_(scopes_.back().kind);
+    if (scopeKindCounts_[slot] == 0) {
+        tbFatal("a scope's kind count is 0 while the stack holds it — the counts and the "
+                "scope stack disagree");
+    }
+    scopeKindCounts_.assign(slot, scopeKindCounts_[slot] - 1);
+    std::uint32_t const node = scopes_.back().node;
+    scopes_.pop();
+    // P69 L2b2 (lane `lm`): the popped scope's node goes with it when nothing can read it again
+    // (`scopeChain_` states the rule and the bound): the chain's newest, read by no trail handed
+    // out, and pushed after the innermost live checkpoint, so no rollback restores an entry
+    // naming it.
+    std::size_t const n = node;
+    if (n + 1u == scopeChain_->size() && n >= capturedTrailEnd_ && n >= heldTrailEnd_
+        && (checkpointStack_.empty() || n >= checkpointStack_.back().second.scopeChainSize)) {
+        scopeChain_->dropNewest();
+    }
+}
+
+bool TreeBuilder::scopeKindOpen_(ScopeKind kind) const noexcept {
+    auto const it = scopeKindSlots_.find(static_cast<std::uint16_t>(kind));
+    return it != scopeKindSlots_.end() && it->second < scopeKindCounts_.size()
+        && scopeKindCounts_[it->second] > 0;
+}
+
+bool TreeBuilder::scopeKindOpenThunk_(void const* builder, ScopeKind kind) noexcept {
+    return static_cast<TreeBuilder const*>(builder)->scopeKindOpen_(kind);
 }
 
 void TreeBuilder::popScope() {
@@ -1134,15 +1229,22 @@ void TreeBuilder::popScope() {
         addBuilderInvariant_("popScope on empty scope stack", at);
         return;
     }
-    scopes_.pop();
+    popScopeEntry_();
 }
 
 ScopeKind TreeBuilder::currentScope() const noexcept {
-    return scopes_.empty() ? ScopeKind::None : scopes_.back();
+    return scopes_.empty() ? ScopeKind::None : scopes_.back().kind;
 }
 
-std::span<ScopeKind const> TreeBuilder::scopeStack() const noexcept {
-    return scopes_.span();
+ScopeTrail TreeBuilder::scopeStack() const noexcept {
+    if (!scopes_.empty()) {
+        heldTrailEnd_ = std::max<std::size_t>(heldTrailEnd_, std::size_t{scopes_.back().node} + 1u);
+    }
+    return scopeTrail_();
+}
+
+std::size_t TreeBuilder::scopeChainSize() const noexcept {
+    return scopeChain_->size();
 }
 
 RuleId TreeBuilder::currentRule() const noexcept {
@@ -1291,6 +1393,14 @@ Tree TreeBuilder::finish() && {
     // rules() identical to schema().rules() — same namespace, same memory.
     td.rules      = std::shared_ptr<RuleInterner const>(schema_, &schema_->rules());
     td.schema     = schema_;
+    // P69 L2b2 (lane `lm`): the kept diagnostics' trails are re-homed into a chain of only the
+    // nodes they read, so the finished tree does not keep a node alive for every scope its parse
+    // ever pushed; an ingested diagnostic's own trail passes unchanged.
+    {
+        ScopeChainCompaction compaction{scopeChain_};
+        reporter_->remapBuffers(
+            [&](ParseDiagnostic& d) { d.scopeStack = compaction.rehome(d.scopeStack); });
+    }
     td.diagnostics = std::move(reporter_);
 
     using NodeArena = substrate::ArenaContainer<detail::Node, NodeId, TreeId>;
@@ -1341,12 +1451,15 @@ TreeBuilder::Checkpoint TreeBuilder::checkpoint() {
     snap.pendingChildren            = pendingChildren_.mark();
     snap.openFrames                 = open_.mark();
     snap.scopes                     = scopes_.mark();
+    snap.scopeKindCounts            = scopeKindCounts_.mark();
     snap.closedCookies              = closedCookies_.mark();
     snap.nodeWrites                 = nodeWrites_.mark();
     snap.walker                     = walker_.snapshot();
     snap.nextCookie                 = nextCookie_;
     snap.maxSpeculationDepthReached = maxSpeculationDepthReached_;
     snap.reporterSnap               = reporter_->snapshotForRollback();
+    snap.scopeChainSize             = scopeChain_->size();   // P69 L2b2
+    snap.capturedTrailEnd           = capturedTrailEnd_;     // P69 L2b2
 
     const auto id = nextCheckpointId_++;
     checkpointStack_.emplace_back(id, std::move(snap));
@@ -1453,11 +1566,18 @@ void TreeBuilder::rollbackToId_(std::uint32_t id) noexcept {
     pendingChildren_.rewindTo(snap.pendingChildren);
     open_.rewindTo(snap.openFrames);
     scopes_.rewindTo(snap.scopes);
+    scopeKindCounts_.rewindTo(snap.scopeKindCounts);
     walker_.restore(std::move(*snap.walker));
     nextCookie_                 = snap.nextCookie;
     closedCookies_.rewindTo(snap.closedCookies);
     maxSpeculationDepthReached_ = snap.maxSpeculationDepthReached;
     reporter_->truncateTo(snap.reporterSnap);
+    // P69 L2b2 (lane `lm`): the nodes pushed since the checkpoint go (`scopeChain_`): every live
+    // entry now names one below them, and the diagnostics raised since are gone with the
+    // truncation above, so the mark of the trails they carried comes back with them. A trail
+    // `scopeStack()` handed a caller is never recalled: the nodes up to it stay.
+    capturedTrailEnd_ = snap.capturedTrailEnd;
+    scopeChain_->truncateTo(std::max(snap.scopeChainSize, heldTrailEnd_));
     discardTrailsIfIdle_();
 }
 

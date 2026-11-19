@@ -1,0 +1,1 @@
+        return !discardedFold.value.has_value();

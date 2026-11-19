@@ -1,0 +1,1 @@
+--lto=thin with a cap-1 override must warn ONCE

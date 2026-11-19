@@ -1,0 +1,2 @@
+            } else if (*yields && s.binding == SymbolBinding::Global) {
+                yieldedTo.insert(s.name);

@@ -1,0 +1,1 @@
+int main(void) { char *p = __builtin_strndup("abc", 2);

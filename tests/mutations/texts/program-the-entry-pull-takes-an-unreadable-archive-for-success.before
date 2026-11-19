@@ -1,0 +1,1 @@
+    if (!everyArchiveRead) return std::nullopt;   // each reported

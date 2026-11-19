@@ -1,0 +1,1 @@
+    return stage == PipelineStage::Unit;

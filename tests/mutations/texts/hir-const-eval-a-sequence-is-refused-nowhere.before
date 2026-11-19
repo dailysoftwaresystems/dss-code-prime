@@ -1,0 +1,1 @@
+        return discards() && !admitted.admits(ConstantForm::CommaOperator);

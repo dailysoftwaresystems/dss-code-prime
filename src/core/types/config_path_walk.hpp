@@ -231,8 +231,8 @@ shippedConfigDocuments(std::filesystem::path const& directory, std::string_view 
 // beside the `findShippedConfigDir` it wraps, is the same move
 // `D-LSP-PROJECT-CONFIG-LIVES-ABOVE-ITS-CONSUMERS` made for the project-manifest
 // reader: down to the tier every reader already depends on, so the dependency
-// runs one way. Binding the result to a builder is `applySystemDirs`, declared
-// one tier up beside `UnitBuilder::addSystemDir` — where the `UnitBuilder` is.
+// runs one way. A unit takes the result at construction — `UnitBuilder`, one tier
+// up, through `LanguageSystemDirs` — where the `UnitBuilder` is.
 //
 // A dir that resolves NOWHERE is SKIPPED rather than reported. An unresolvable
 // entry only matters if something actually asks for a header, and that miss

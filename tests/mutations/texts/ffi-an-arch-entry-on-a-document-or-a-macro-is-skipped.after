@@ -1,0 +1,3 @@
+    for (auto const& v : node) {
+        if (v.is_object()) continue;
+        if (!v.is_string()) {

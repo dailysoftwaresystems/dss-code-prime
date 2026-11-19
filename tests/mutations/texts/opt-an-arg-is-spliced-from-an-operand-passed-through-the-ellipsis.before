@@ -1,0 +1,4 @@
+                    if (pos >= irr
+                        && ::dss::call_payload::passesThroughEllipsis(callPayload, pos - irr)) {
+                        return std::nullopt;
+                    }

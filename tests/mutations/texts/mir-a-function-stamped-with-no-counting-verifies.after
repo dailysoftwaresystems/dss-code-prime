@@ -1,0 +1,2 @@
+        if (false && counting == MirArgCounting::Unstated) {
+            reportInst(reporter, DiagnosticCode::I_ArgCountingUnstated, args.front().id,

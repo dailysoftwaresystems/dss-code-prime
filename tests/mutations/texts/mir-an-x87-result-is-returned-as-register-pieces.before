@@ -1,0 +1,2 @@
+        if (abi->kind == AbiPassing::Kind::X87) {
+            if (abi->pieces.empty()) {

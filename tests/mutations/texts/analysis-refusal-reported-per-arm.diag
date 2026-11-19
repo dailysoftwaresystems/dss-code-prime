@@ -1,0 +1,1 @@
+double f(double x) { return __builtin_cbrt(x) + __builtin_cbrt(x); }

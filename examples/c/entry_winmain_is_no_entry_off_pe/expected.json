@@ -1,0 +1,13 @@
+{
+  "$comment": "P69 fold 3f (lane `xa`; D-LK-PE-IMAGE-CANNOT-HONOUR-EVERY-LINKER-DIRECTIVE item (6)): a `WinMain`-only program targeting ELF or Mach-O has NO program entry and is REFUSED, as every reference refuses it (MEASURED 2026-11-17: gcc 13.3.0 and clang 18.1.3 'undefined reference to `main''; Apple clang 21 'Undefined symbols ... _main'). `WinMain`'s verb `instance-prev-cmdline-show` is realized by pe64-x86_64-windows-exec alone, so the name is a program entry on Windows only (entry_winmain_pe) and an ordinary function here; the refusal names that near miss. `positioned: false`: a WHOLE-PROGRAM fact with no single declaration at fault. RED-ON-DISABLE: add \"instance-prev-cmdline-show\" to the ELF exec document's `entryVerbs` and the document is refused at load (its stack-vector mechanism produces no module instance, command line or show-window value), so no target of it builds.",
+  "language": "c",
+  "source": "main.c",
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec" },
+    { "spec": "arm64:elf64-aarch64-linux-exec" },
+    { "spec": "arm64:macho64-arm64-darwin-exec" }
+  ],
+  "expectDiagnostics": [
+    { "code": "K_ProgramEntryUndefined", "line": 1, "col": 1, "positioned": false }
+  ]
+}

@@ -377,6 +377,72 @@ public:
     [[nodiscard]] virtual bool
     realizesCoalescingScopeReferences() const noexcept { return false; }
 
+    // ── D-LK-WEAK-UNDEFINED-SYMBOL-NAMED-DIRECTLY-IS-NOT-ADDRESS-ZERO (P69) ─
+    //
+    // Does THIS backend's WRITER resolve a PC-relative or branch field naming a
+    // symbol whose ADDRESS is 0 (`AssembledModule::nullAddressSymbols`: a weak
+    // symbol the link resolved to nothing) in an image of this schema — that is,
+    // does it place the image at its link address, so `0 - P` is a constant the
+    // field can hold?
+    //
+    // ★ A WALKER CAPABILITY, like the one above: a document DECLARES `zero` for
+    // such a field (`weakResolvedToNothing`), and whether the bytes can then be
+    // written is a property of the code that writes them, so the loader refuses
+    // a document that declares `zero` for a PC-relative class on a backend that
+    // answers false here.
+    // ★ DEFAULT FALSE. A writer that never gives the symbol an address would fail
+    // the reference loud ("not defined") — the refusal at load says why.
+    [[nodiscard]] virtual bool
+    writesNullAddressReferences(detail::ObjectFormatData const& /*d*/) const noexcept {
+        return false;
+    }
+
+    // ── P69 fold 3d (D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL) ───────────
+    //
+    // Does THIS backend's WRITER give each name the document states in
+    // `imageDefinedSymbols` the address it denotes
+    // (`AssembledModule::imageDefinedSymbols`) in an image of this schema?
+    // ★ A WALKER CAPABILITY, like the one above: the document states the names,
+    // and whether an address is then written is a property of the code that
+    // writes the image, so the loader refuses an IMAGE document that states one
+    // on a backend that answers false here. (A relocatable or archive document
+    // states them for its compile alone: the image it ends in defines them.)
+    // ★ DEFAULT FALSE: a writer that gives the symbol no address would refuse
+    // every reference to it loud, and the refusal at load says why.
+    [[nodiscard]] virtual bool
+    writesImageDefinedSymbols(detail::ObjectFormatData const& /*d*/) const noexcept {
+        return false;
+    }
+
+    // ── D-LK-COFF-READER-SKIPPED-EVERY-LINKER-DIRECTIVE (P69 round 4) ──
+    //
+    // Does THIS backend's image writer realize the image requests a link's units
+    // state (`DirectiveImageSettings`: a stack or heap size, a subsystem, a
+    // version, a base, a section alignment, a checksum, section attributes, the
+    // exports)? A WALKER CAPABILITY, for the reason the ones above are: only the
+    // code that writes the header can answer it. DEFAULT FALSE: a link whose
+    // units ask any of them of a backend that does not realize them is refused
+    // by name (`decideUnitLinkerRequests`) rather than written without them.
+    [[nodiscard]] virtual bool
+    realizesDirectiveImageSettings() const noexcept { return false; }
+
+    // ── A COMPILED UNIT'S OWN LINKER OPTIONS (P69 fold 3f, `#pragma comment(linker, ...)`) ──
+    //
+    // Apply the options a COMPILED unit states (`UnitLinkerRequests::linkerOptions`) to its module EXACTLY as this
+    // backend's object reader applies the ones an object it reads states -- so a unit compiled to an object and the
+    // same unit compiled straight into a link carry one module: the object read back. `objectFormatSchema` is the
+    // family's OBJECT document, the one that states the options' vocabulary (an image document states none: its
+    // objects are read through their archive-writing sibling). true: applied; false: refused, the refusal reported
+    // here by name and the module as it was. ★ DEFAULT nullopt: this backend's objects state no option, and the
+    // caller refuses the module by name -- the compile pipeline keeps a unit's option only where the object
+    // document states a vocabulary, so a format whose backend answers nullopt never reaches here with one.
+    [[nodiscard]] virtual std::optional<bool>
+    applyUnitLinkerOptions(AssembledModule&          /*module*/,
+                           ObjectFormatSchema const& /*objectFormatSchema*/,
+                           DiagnosticReporter&       /*reporter*/) const {
+        return std::nullopt;
+    }
+
     // ── [[D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH]] ──
     //
     // Where THIS backend's writer will put the call stub of each import that
@@ -417,7 +483,14 @@ public:
     // RUNPATHS do reach every backend (D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH):
     // a backend whose walker records none was reported by the gate's warning,
     // and one that records them does so from the format's declaration.
-    [[nodiscard]] virtual std::vector<std::uint8_t>
+    //
+    // ★ P69 (lane `cs`, fold f26e -- B1, D-MIR-SYNTHESIZED-SYMBOL-MINTED-INSIDE-THE-NAME-TABLE): THE ANSWER
+    // IS THE REFUSAL. `nullopt` = this walker refused the image, every reason already reported; an engaged
+    // value is its bytes. A walker that takes fresh symbol ids (PE: the import-slot residue runner's three)
+    // hands a refused take to the link as that nullopt, never as an empty vector beside an error count. A
+    // walker whose free function still answers bytes (ELF, Mach-O, SPIR-V, wasm: they take no fresh id) is
+    // answered ENGAGED, and its refusals are read by the link's post-walker count, which stays for them.
+    [[nodiscard]] virtual std::optional<std::vector<std::uint8_t>>
     encode(AssembledModule const&    module,
            TargetSchema const&       targetSchema,
            ObjectFormatSchema const& objectFormatSchema,

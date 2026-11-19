@@ -12,3 +12,40 @@ steps:
       python3 ./check-retyped-closed-sets.py
     successPattern: '# self-test: (\d+)/\1 checks passed'
     requireInputsUnmoved: true
+
+  # The CENSUS with its settings -- a listing, never an assertion; the self-test still runs after it.
+  - name: census
+    manual: true
+    workingDirectoryRoot: action
+    inputs:
+      minTokens:
+        description: "how many vocabulary tokens a literal must carry to count; 2 HIDES every one-element set -- run 1 before calling a file clean"
+        default: '2'
+      bare:
+        description: "true also matches UNQUOTED vocabulary runs (noisy; finds the (a / b / c) shape)"
+        default: 'false'
+      paths:
+        description: "path substrings under src/, space-separated; empty censuses every file"
+        default: ''
+    run: |
+      python3 ./check-retyped-closed-sets.py --min-tokens="{minTokens}" --bare="{bare}" {paths}
+    successPattern: '# self-test: (\d+)/\1 checks passed'
+    requireInputsUnmoved: true
+
+  # The harvested vocabularies, and nothing else.
+  - name: vocab
+    manual: true
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-retyped-closed-sets.py --vocab
+    successPattern: '^# vocabularies harvested: \d+'
+    requireInputsUnmoved: true
+
+  # The self-test ALONE -- `dssharness run check-retyped-closed-sets --manual-step self-test`.
+  - name: self-test
+    manual: true
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-retyped-closed-sets.py --self-test
+    successPattern: '# self-test: (\d+)/\1 checks passed'
+    requireInputsUnmoved: true

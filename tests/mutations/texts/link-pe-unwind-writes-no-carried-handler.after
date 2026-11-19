@@ -1,0 +1,2 @@
+    if (false && languageHandler != nullptr) {
+        // ★ A FOREIGN OBJECT'S HANDLER, CARRIED AND NEVER RE-TYPED: the handler

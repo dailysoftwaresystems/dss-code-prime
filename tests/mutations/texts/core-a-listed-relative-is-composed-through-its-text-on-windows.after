@@ -1,0 +1,2 @@
+    if (listed.names_.empty() || illFormed_ || !listed.names_.empty())
+        return listed.names_.empty() || illFormed_ ? *this : *this / fs::path{listed.generic()};

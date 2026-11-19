@@ -1,17 +1,24 @@
 #include "link/format/macho_object_reader.hpp"
 #include "link/format/dwarf_cfi_decode.hpp"
 #include "link/format/foreign_section_alignment.hpp"
+#include "link/format/input_section_names.hpp"   // inputSectionRow: the row an input section reads as
+#include "link/format/macho_linker_options.hpp"   // readMachOLinkerOption -- LC_LINKER_OPTION, as ld64 reads it
+#include "link/format/macho_relocation_info.hpp"
 #include "link/format/object_atom_coverage.hpp"
+#include "link/format/record_symbol_ids.hpp"
 #include "link/format/object_format_backends.hpp"
 #include "link/format/relocation_addend.hpp"
 #include "link/format/section_relative_target.hpp"
 
+#include "core/substrate/key_order.hpp"   // entriesInKeyOrder -- the slicing walk's order
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/section_kind.hpp"
 #include "core/types/symbol_attrs.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <format>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -43,6 +50,7 @@ constexpr std::size_t kLcPreambleSz   = 8;
 constexpr std::size_t kSegCmd64HdrSz  = 72;  // segment_command_64 header
 constexpr std::size_t kSection64Sz    = 80;  // one section_64 record
 constexpr std::size_t kSymtabCmdSz    = 24;  // LC_SYMTAB command
+constexpr std::size_t kLinkerOptionHdrSz = 12;  // LC_LINKER_OPTION's cmd, cmdsize, count
 constexpr std::size_t kNlist64Sz      = 16;  // one nlist_64 record
 constexpr std::size_t kRelocInfoSz    = 8;   // one relocation_info record
 constexpr std::size_t kName16Sz       = 16;  // section_64 / segname field
@@ -50,8 +58,11 @@ constexpr std::size_t kName16Sz       = 16;  // section_64 / segname field
 constexpr std::uint32_t kMachOMagic64 = 0xFEEDFACFu;  // 64-bit LE
 constexpr std::uint32_t kMhObject     = 1;            // filetype MH_OBJECT
 
-constexpr std::uint32_t kLcSegment64 = 0x19u;
-constexpr std::uint32_t kLcSymtab    = 0x02u;
+// The load commands' numbers: the reader's header (`kLoadCommandsTheReaderReads`), the one home the loader of
+// `macho.skippedLoadCommands` reads too.
+constexpr std::size_t kDysymtabCmdSz     = 80;  // LC_DYSYMTAB command
+constexpr std::size_t kBuildVersionCmdSz = 24;  // LC_BUILD_VERSION command, before its tool entries
+constexpr std::size_t kVersionMinCmdSz   = 16;  // LC_VERSION_MIN_* command
 
 // mach_header_64 field offsets.
 constexpr std::size_t kHdrMagicOff    = 0;
@@ -134,14 +145,10 @@ static_assert(kNDescAltEntry != kNDescNoDeadStrip,
 constexpr std::uint32_t kSectTypeMask = 0x000000FFu;
 constexpr std::uint32_t kSZerofill    = 1;
 
-// relocation_info.r_info bit layout (LSB): r_symbolnum bits 0..23,
-// r_pcrel bit 24, r_length bits 25..26, r_extern bit 27, r_type bits
-// 28..31. The PACKED nativeId the format schema stores is
-// (r_type<<28)|(r_length<<25)|(r_pcrel<<24) -- everything EXCEPT the
-// walker-owned r_extern (bit 27) and r_symbolnum (bits 0..23).
-constexpr std::uint32_t kRInfoSymbolnumMask = 0x00FFFFFFu;
-constexpr std::uint32_t kRInfoExternBit     = 1u << 27;
-constexpr std::uint32_t kRInfoNativeIdMask  = 0xF7000000u;
+// relocation_info.r_info: its bit layout, and the PACKED nativeId a format
+// document stores, are `macho_relocation_info.hpp`'s (`kRInfo*`,
+// `relocationFieldBytes`) -- one home, shared with the backend's load-time
+// rules for the ids a document declares.
 
 // ── THE "EXTERN IS A FUNCTION" SIGNAL IS DECLARED, NOT DERIVED ──────────
 //
@@ -211,8 +218,9 @@ rdName(std::span<std::uint8_t const> b, std::uint64_t tabStart, std::uint64_t ta
 // POLICY that turns a declared section alignment into an `Alignment` is shared
 // with the ELF and COFF readers and lives in
 // `link/format/foreign_section_alignment.hpp` -- this reader supplies only the
-// fact that Mach-O spells the field as a LOG2 EXPONENT.
-[[nodiscard]] Alignment alignFromLog2(std::uint32_t log2) noexcept {
+// fact that Mach-O spells the field as a LOG2 EXPONENT. nullopt: past what an
+// `Alignment` holds (the header walk refuses the object by name).
+[[nodiscard]] std::optional<Alignment> alignFromLog2(std::uint32_t log2) noexcept {
     return link::format::foreignSectionAlignmentFromLog2(log2);
 }
 
@@ -232,6 +240,7 @@ struct Section {
     std::uint64_t size     = 0;
     std::uint64_t offset   = 0;   // file offset of the section body
     std::uint32_t align    = 0;   // log2
+    Alignment     alignment{};    // `align`, carried by the header walk (or the object refused)
     std::uint64_t reloff   = 0;   // file offset of this section's reloc table
     std::uint32_t nreloc   = 0;
     std::uint32_t flags    = 0;
@@ -416,6 +425,13 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     std::uint64_t strsize = 0;
     bool          sawSymtab = false;
 
+    // P69 fold 3f: what the object states to the link that takes it -- its final linker's options (LC_LINKER_OPTION,
+    // the command the document's `macho.linkerOptions` names, read as ld64 reads it: `readMachOLinkerOption`) and the
+    // minimum OS it was built for (LC_BUILD_VERSION / LC_VERSION_MIN_MACOSX) -- the module's once it exists.
+    UnitLinkerRequests objectRequests;
+    MachOLinkerOptions const* const optionsBlock =
+        objectFormatSchema.macho().linkerOptions.has_value() ? &*objectFormatSchema.macho().linkerOptions : nullptr;
+
     std::size_t       lcOff = kMachHeader64Sz;
     std::size_t const lcEnd = kMachHeader64Sz + static_cast<std::size_t>(sizeofcmds);
     for (std::uint32_t i = 0; i < ncmds; ++i) {
@@ -475,6 +491,20 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 sec.nreloc   = rdU32(bytes, secOff + 60);
                 sec.flags    = rdU32(bytes, secOff + 64);
                 sec.zeroFill = (sec.flags & kSectTypeMask) == kSZerofill;
+                // The declared alignment is a CORRECTNESS input (the policy's
+                // note): carried as declared, or -- an exponent past what an
+                // `Alignment` holds, where a shift would pass the width of the
+                // type -- the object refused here, by name, before any atom is
+                // cut. This value comes off a foreign wire.
+                std::optional<Alignment> const declared = alignFromLog2(sec.align);
+                if (!declared.has_value()) {
+                    return fail(DiagnosticCode::F_CorruptedBinary,
+                        "macho::readRelocatableObject: section '" + sec.segName
+                        + "," + sec.sectName + "' declares alignment 2^"
+                        + std::to_string(sec.align)
+                        + ", which is not an alignment any atom can have.");
+                }
+                sec.alignment = *declared;
                 // A file-backed section's body must lie within the file. A
                 // zero-fill section carries no file bytes (its offset may be 0
                 // / past EOF legitimately), so it is exempt -- exactly like the
@@ -509,6 +539,104 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             stroff    = rdU32(bytes, lcOff + 16);
             strsize   = rdU32(bytes, lcOff + 20);
             sawSymtab = true;
+        } else if (optionsBlock != nullptr && cmd == optionsBlock->command) {
+            // LC_LINKER_OPTION: its count, then that many NUL-terminated strings, all inside the command.
+            if (cmdsize < kLinkerOptionHdrSz) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "macho::readRelocatableObject: LC_LINKER_OPTION #" + std::to_string(i)
+                    + " cmdsize=" + std::to_string(cmdsize) + " is smaller than its 12-byte header.");
+            }
+            std::uint32_t const count = rdU32(bytes, lcOff + 8);
+            std::vector<std::string> words;
+            std::size_t       at  = lcOff + kLinkerOptionHdrSz;
+            std::size_t const end = lcOff + cmdsize;
+            for (std::uint32_t k = 0; k < count; ++k) {
+                std::size_t nul = at;
+                while (nul < end && bytes[nul] != 0) ++nul;
+                if (nul >= end) {
+                    return fail(DiagnosticCode::F_CorruptedBinary,
+                        "macho::readRelocatableObject: LC_LINKER_OPTION #" + std::to_string(i) + " states "
+                        + std::to_string(count) + " strings, and string " + std::to_string(k)
+                        + " runs past the command's end.");
+                }
+                words.emplace_back(reinterpret_cast<char const*>(bytes.data() + at), nul - at);
+                at = nul + 1;
+            }
+            readMachOLinkerOption(std::move(words), *optionsBlock, objectRequests,
+                                  "a linked object's LC_LINKER_OPTION");
+        } else if (cmd == kLcDysymtab) {
+            // LC_DYSYMTAB. In a relocatable object, a partition of the symbol table (locals, defined externals,
+            // undefined) that each symbol's own `n_type` states again, which the symbol walk reads -- and tables only a
+            // linked image, or a section of pointers or stubs, fills: the contents and module tables, the referenced
+            // symbols, the indirect symbols, the external and local relocations (✔MEASURED P69 fold 3f, run 20261117-192243-260e95c2: every
+            // one empty in each of 12 Apple clang objects, and ld64's `-r` writes no LC_DYSYMTAB at all). One that
+            // fills a table states what this reader does not read: refused by name, never stepped over.
+            if (cmdsize < kDysymtabCmdSz) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "macho::readRelocatableObject: LC_DYSYMTAB #" + std::to_string(i) + " cmdsize="
+                    + std::to_string(cmdsize) + " is smaller than the 80-byte command.");
+            }
+            struct DysymtabTable {
+                std::size_t countAt;   // the count's offset in the command
+                char const* what;
+            };
+            static constexpr std::array<DysymtabTable, 6> kTables{{{36, "contents table (ntoc)"},
+                                                                   {44, "module table (nmodtab)"},
+                                                                   {52, "referenced symbols (nextrefsyms)"},
+                                                                   {60, "indirect symbols (nindirectsyms)"},
+                                                                   {68, "external relocations (nextrel)"},
+                                                                   {76, "local relocations (nlocrel)"}}};
+            for (auto const& table : kTables) {
+                if (std::uint32_t const n = rdU32(bytes, lcOff + table.countAt); n != 0u) {
+                    return fail(DiagnosticCode::F_UnsupportedBinaryFormat,
+                        std::format("macho::readRelocatableObject: LC_DYSYMTAB #{} states {} entries of its {}, "
+                                    "which no relocatable object this reader reads fills -- refusing rather than "
+                                    "reading the object without them.",
+                                    i, n, table.what));
+                }
+            }
+        } else if (cmd == kLcBuildVersion || cmd == kLcVersionMinMacosx) {
+            // The PLATFORM the object was built for, and its minimum OS version. ld64 REFUSES an object of another
+            // platform -- "building for 'macOS', but linking in object file (...) built for 'iOS'" (✔MEASURED P69
+            // fold 3f, run 20261117-192243-260e95c2) -- and so does the reader, against the platform its document states
+            // (`image.buildVersion`; a document that states none judges none). LC_VERSION_MIN_MACOSX states macOS by
+            // its command. A minimum OS NEWER than the image's is the image link's to warn about, as ld64 warns
+            // ("object file was built for newer 'macOS' version (26.0) than being linked (11.0)", the same probe):
+            // carried to it (`UnitLinkerRequests::minimumOs`).
+            bool const build = cmd == kLcBuildVersion;
+            if (cmdsize < (build ? kBuildVersionCmdSz : kVersionMinCmdSz)) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    std::format("macho::readRelocatableObject: {} #{} cmdsize={} is smaller than its {}-byte command.",
+                                build ? "LC_BUILD_VERSION" : "LC_VERSION_MIN_MACOSX", i, cmdsize,
+                                build ? kBuildVersionCmdSz : kVersionMinCmdSz));
+            }
+            std::uint32_t const platform =
+                build ? rdU32(bytes, lcOff + 8) : static_cast<std::uint32_t>(MachOBuildVersion::Platform::MacOs);
+            std::uint32_t const minOs = rdU32(bytes, lcOff + (build ? 12 : 8));
+            if (auto const& stated = objectFormatSchema.machoImage().buildVersion;
+                stated.has_value() && platform != static_cast<std::uint32_t>(stated->platform)) {
+                // The platform's name, from the one table of them; a number no row names is said as a number.
+                auto const spelled =
+                    kMachOBuildVersionPlatformTable.findName(static_cast<MachOBuildVersion::Platform>(platform));
+                return fail(DiagnosticCode::K_NoMatchingObjectFormat,
+                    std::format("macho::readRelocatableObject: the object was built for {} (load command #{}), and "
+                                "format '{}' links for '{}' -- ld64 refuses an object of another platform, and so "
+                                "does DSS.",
+                                spelled.has_value() ? std::format("'{}'", *spelled)
+                                                    : std::format("platform {}", platform),
+                                i, objectFormatSchema.name(), machoBuildVersionPlatformName(stated->platform)));
+            }
+            objectRequests.minimumOs.push_back(UnitMinimumOs{minOs});
+        } else if (std::none_of(objectFormatSchema.macho().skippedLoadCommands.begin(),
+                                objectFormatSchema.macho().skippedLoadCommands.end(),
+                                [&](MachOSkippedLoadCommand const& s) { return s.command == cmd; })) {
+            // A command its document states a reason for (`macho.skippedLoadCommands`) is stepped over: nothing a
+            // link makes reads it. Every other is refused by name -- never stepped over in silence.
+            return fail(DiagnosticCode::F_UnsupportedBinaryFormat,
+                std::format("macho::readRelocatableObject: load command #{} (cmd 0x{:X}) is none this reader reads, "
+                            "and format '{}' states no reason to step over it ('macho.skippedLoadCommands') -- "
+                            "refusing rather than skipping a command whose meaning it does not know.",
+                            i, cmd, objectFormatSchema.name()));
         }
         lcOff += cmdsize;
     }
@@ -541,22 +669,19 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     //
     // The two `__const` rows differ ONLY by segment (rodata = `__TEXT,
     // __const`, relro = `__DATA,__const`), so the pair -- never the section
-    // name alone -- is the key. An unmapped section leaves kind = nullopt.
-    auto pairKey = [](std::string_view seg, std::string_view name) -> std::string {
-        std::string k{seg};
-        k.push_back('\0');   // a NUL cannot appear inside a Mach-O 16-byte name
-        k.append(name);
-        return k;
-    };
-    std::unordered_map<std::string, ObjectFormatSectionInfo const*> pairToRow;
-    for (auto const& row : objectFormatSchema.sections()) {
-        pairToRow.emplace(pairKey(row.segment, row.name), &row);
-    }
+    // name alone -- is the key. The row a pair reads as is `inputSectionRow`'s
+    // answer (P69 fold 3e, the orchestrator's ledger 577), the one function
+    // every reader asks: the exact row, else the row the document's `readAs`
+    // names for a section a reference toolchain emits and no writer of the
+    // format writes -- Apple clang's `__TEXT,__cstring` and
+    // `__TEXT,__literal{4,8,16}`, read as `__TEXT,__const`, which until the fold
+    // refused every Apple clang object holding a string literal. An unmapped
+    // section leaves kind = nullopt.
     for (auto& sec : sections) {
-        if (auto it = pairToRow.find(pairKey(sec.segName, sec.sectName));
-            it != pairToRow.end()) {
-            sec.schemaRow = it->second;
-            sec.kind      = it->second->kind;
+        if (auto const row = link::format::inputSectionRow(objectFormatSchema, sec.segName, sec.sectName);
+            row.has_value()) {
+            sec.schemaRow = &objectFormatSchema.sections()[*row];
+            sec.kind      = sec.schemaRow->kind;
         }
     }
 
@@ -595,9 +720,9 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // capability was simply unavailable here. Also gone with the copy: the
     // omitted `pltNativeId` leg. Mach-O declares no PLT-variant id (an extern
     // call is BRANCH26/BRANCH against the same id whether or not ld64
-    // synthesizes a stub), so the shared builder's leg costs nothing on every
-    // shipped document -- but it is now read from the SCHEMA rather than
-    // assumed absent by this reader.
+    // synthesizes a stub), and since P69 no format can: the key is retired
+    // and refused by the loader, and a call is a ROW of its own marked
+    // `isCall`, read from the SCHEMA like every other row.
     auto decode = objectFormatSchema.relocationDecodeTable();
     if (!decode) {
         return fail(DiagnosticCode::F_CorruptedBinary,
@@ -605,7 +730,16 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     }
     auto const& callSignalNativeIds = decode->callSignalNativeIds;
 
-    // -- (5) Decode every nlist_64; assign SymbolId = symtab index ---
+    // -- (5) Decode every nlist_64 ---------------------------------------
+    // A record's id is `symbolIds.of(its index)` — THE ONE RULE
+    // (`record_symbol_ids.hpp`): the index, and for record 0, whose index is the
+    // invalid id, the first id past the table. Everything this reader keys by a
+    // symbol below is keyed by the record INDEX; an id is made where a value
+    // enters the module.
+    std::optional<link::format::RecordSymbolIds> openedIds =
+        link::format::RecordSymbolIds::open(nsyms, reporter, "macho::readRelocatableObject");
+    if (!openedIds) return std::nullopt;   // the table reaches a reserved id: refused by name
+    link::format::RecordSymbolIds& symbolIds = *openedIds;
     std::vector<Nlist> syms(nsyms);
     for (std::uint32_t i = 0; i < nsyms; ++i) {
         std::size_t const so = static_cast<std::size_t>(*symoff)
@@ -622,6 +756,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // -- (6) Reconstruct externs, then stage defined symbols per section --
     AssembledModule mod;
     mod.cuId = cuId;
+    mod.linkerRequests = std::move(objectRequests);   // (2)'s: its libraries, options and minimum OS
 
     // symtab index -> the extern's position in mod.externImports (for the
     // isData inference in step 7).
@@ -650,17 +785,67 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         std::uint8_t const typeBits = s.type & kNTypeMask;
         bool const isExt = (s.type & kNExtBit) != 0u;
 
+        if (typeBits == kNTypeUndf && isExt && s.value != 0u) {
+            // A COMMON symbol: an EXTERNAL `N_UNDF` with a non-zero `n_value`
+            // is a tentative DEFINITION of `n_value` bytes, its alignment's
+            // log2 in bits 8-11 of `n_desc` (<mach-o/nlist.h> GET_COMM_ALIGN),
+            // 0 meaning "the size rounded up to a power of two, at most 2^15"
+            // (ld64's reading). Read as the row that says so
+            // (`ExternImport::commonSize`, P69,
+            // D-LK-OBJECT-READERS-MISREAD-COMMON-SYMBOLS): this arm used to
+            // fall through to the import below, so an object DEFINING storage
+            // was read as one demanding it. clang writes one for every
+            // tentative definition under -fcommon. A weak reference bit on a
+            // common names no shape ld64 defines and is refused.
+            if (s.name.empty() || (s.desc & kNDescWeakRef) != 0u) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "macho::readRelocatableObject: COMMON symbol #" + std::to_string(i)
+                    + " ('" + s.name + "', n_desc " + std::to_string(s.desc)
+                    + ") is nameless or marked a weak reference -- neither describes "
+                      "storage a link could allocate.");
+            }
+            std::uint8_t const alignLog2 = static_cast<std::uint8_t>((s.desc >> 8) & 0x0Fu);
+            std::uint64_t alignment = std::uint64_t{1} << alignLog2;
+            if (alignLog2 == 0u) {
+                alignment = 1;
+                while (alignment < s.value && alignment < (std::uint64_t{1} << 15)) alignment <<= 1;
+            }
+            ExternImport common;
+            common.symbol           = symbolIds.of(i);
+            common.mangledName      = s.name;
+            common.isData           = true;
+            common.binding          = SymbolBinding::Global;
+            common.commonSize       = s.value;
+            common.commonAlignment  = alignment;
+            // An `n_desc` alignment of 0 is ld64's derivation from the size, not
+            // one the object states.
+            common.commonAlignmentStated = alignLog2 == 0u ? 0u : alignment;
+            common.commonVisibility = machoVisibility(s.type);
+            externBySym.emplace(i, mod.externImports.size());
+            mod.externImports.push_back(std::move(common));
+            continue;
+        }
         if (typeBits == kNTypeUndf) {
             // N_UNDF -> an undefined reference -> an extern import. A nameless
             // UND slot (index 0 / padding) carries no import identity.
             if (s.name.empty()) continue;
             ExternImport ext;
-            ext.symbol      = SymbolId{i};
+            ext.symbol      = symbolIds.of(i);
             ext.mangledName = s.name;
-            // Mach-O nlist carries NO type hint (no STT_FUNC), so seed DATA
-            // and force to false (function) ONLY when a CALL/BRANCH-class
-            // reloc targets it (step 7) -- the agnostic function signal.
-            ext.isData      = true;
+            // Mach-O nlist carries NO type hint (no STT_FUNC), so the object
+            // states the kind only by a CALL: a BRANCH-class reloc makes the
+            // row a stated function (step 7), the agnostic function signal.
+            // Any other reference -- a GOT load, a SIGNED or UNSIGNED field --
+            // names a function and a datum alike and states nothing, so the
+            // row starts `Pending` and its DEFINITION decides, as ld64 takes it
+            // (D-LK-MEMBER-UNTYPED-EXTERN-TAKEN-AS-DATA, P69; the ELF reader's
+            // undefined-symbol arm has the rule in full). It was seeded DATA
+            // until P69, so a DSS member that took `&puts` without calling it
+            // minted a DATA import that conflicted with the program's own
+            // declaration (✔MEASURED 2026-10-01, run 20261002-000334-c812a53b:
+            // the arm64 Mach-O arm of staticlib_reads_a_library_datum).
+            ext.kindOrigin  = ExternKindOrigin::Pending;
+            ext.isData      = false;   // meaningless while Pending
             // D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE: the REFERENCE
             // binding, lifted from the one n_desc bit that carries it. Reading
             // it as Global -- which is what this arm did until the import row
@@ -679,7 +864,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // ModuleSymbol so a reloc target still resolves by identity (the
             // reserved-index analog of the ELF reader's SHN_ABS handling).
             if (!s.name.empty()) {
-                mod.symbols.push_back(ModuleSymbol{SymbolId{i}, s.name,
+                mod.symbols.push_back(ModuleSymbol{symbolIds.of(i), s.name,
                     isExt ? SymbolBinding::Global : SymbolBinding::Local,
                     machoVisibility(s.type)});
             }
@@ -829,7 +1014,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // a silent wrong address. Kept module-private, a sibling reference
             // instead fails loud (`K_SymbolUndefined`, nothing declares it),
             // which is the correct posture until the interior-VA follow-up lands.
-            mod.symbols.push_back(ModuleSymbol{SymbolId{i}, s.name,
+            mod.symbols.push_back(ModuleSymbol{symbolIds.of(i), s.name,
                 SymbolBinding::Local, machoVisibility(s.type)});
             // ...and STAGE it for the coverage guard
             // (D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM).
@@ -885,7 +1070,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         // A geometry-promoted symbol already has its ModuleSymbol from the
         // classification loop (see `DefSym::moduleSymbolAlreadyPushed`).
         if (!d.name.empty() && !d.moduleSymbolAlreadyPushed) {
-            mod.symbols.push_back(ModuleSymbol{SymbolId{d.symIdx}, d.name,
+            mod.symbols.push_back(ModuleSymbol{symbolIds.of(d.symIdx), d.name,
                                                d.binding, d.visibility});
         }
     };
@@ -1004,6 +1189,10 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // (`atomEndFor`), so equal-offset candidates get equal extents by
     // construction and the conflicting-extent refusal cannot fire here.
     std::unordered_map<std::uint32_t, std::uint32_t> atomOwnerBySym;
+    // The names a relocation KEEPS instead of the atom this pass gives it: THE
+    // WEAK-NAME RULE (`object_atom_coverage.hpp`), decided on the alias sets
+    // here and read by the relocation pass.
+    link::format::WeakNameReferences weakNames;
     {
         std::vector<link::format::AtomStartCandidate> candidates;
         for (auto const& [ordinal, defs] : defsBySection) {
@@ -1027,6 +1216,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 atomOwnerBySym.emplace(candidates[i].symbolId, owner[i]);
             }
         }
+        weakNames.decideFrom(candidates, owner, symbolIds);
     }
     // The atom identity a symbol resolves to: itself unless it aliases another.
     // Consulted at BOTH sites that need it -- the slicing loop (does this
@@ -1041,11 +1231,25 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // id -> row lookup over `AssembledModule::symbols` keeps the FIRST row for
     // an id, so the canonical name must be recorded before any alias of it.
     std::vector<ModuleSymbol> aliasRows;
+    // The records that OWN a reconstructed body, by record index — filled where
+    // each atom is cut. The relocation pass asks it of a target (step 7).
+    std::unordered_set<std::uint32_t> atomSymIdx;
 
     // Slice each section's atoms by SORTED n_value. What reached
     // `defsBySection` is every defined symbol that STARTS A BODY: the wire's
     // own boundary set, plus whatever (6.4) recovered.
-    for (auto& [ordinal, defs] : defsBySection) {
+    //
+    // ★ IN ASCENDING SECTION ORDINAL. `defsBySection` is an unordered_map, and
+    // this loop APPENDS every atom it cuts to `mod.functions` / `mod.dataItems`.
+    // Walking the map directly made the order of a several-section object's
+    // atoms, and so the layout the link keeps from them, the host library's
+    // hash-table layout: one object read into two orders by a compiler built
+    // with MSVC's library and one built with libstdc++. The ordinal is the
+    // object's own data, and the walk takes its entries from that order's one
+    // home (as the COFF reader's does).
+    for (auto const* section : substrate::entriesInKeyOrder(defsBySection)) {
+        std::uint8_t const ordinal = section->first;
+        std::vector<DefSym> const& defs = section->second;
         Section const& sec = sections[ordinal - 1u];
         std::optional<SectionKind> const rk = sec.kind;
         std::optional<DataSectionKind> const dk =
@@ -1079,13 +1283,13 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                     // already pushed carries the WRONG id and retargeting it is
                     // the correct repair, not skipping it.
                     for (auto& ms : mod.symbols) {
-                        if (ms.symbol == SymbolId{defs[k].symIdx}) {
-                            ms.symbol = SymbolId{owner};
+                        if (ms.symbol == symbolIds.of(defs[k].symIdx)) {
+                            ms.symbol = symbolIds.of(owner);
                             break;
                         }
                     }
                 } else if (!defs[k].name.empty()) {
-                    aliasRows.push_back(ModuleSymbol{SymbolId{owner}, defs[k].name,
+                    aliasRows.push_back(ModuleSymbol{symbolIds.of(owner), defs[k].name,
                                                      defs[k].binding,
                                                      defs[k].visibility});
                 }
@@ -1108,12 +1312,13 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 std::size_t const bodyOff =
                     static_cast<std::size_t>(sec.offset + off);
                 AssembledFunction fn;
-                fn.symbol = SymbolId{defs[k].symIdx};
+                fn.symbol = symbolIds.of(defs[k].symIdx);
                 fn.bytes.assign(bytes.begin() + bodyOff,
                                 bytes.begin() + bodyOff + static_cast<std::size_t>(len));
                 fn.inputSection = sliceOf(ordinal, off);
                 funcIntervalsBySec[ordinal].push_back(
                     Interval{off, len, mod.functions.size()});
+                atomSymIdx.insert(defs[k].symIdx);
                 mod.functions.push_back(std::move(fn));
                 pushModuleSym(defs[k]);
                 continue;
@@ -1124,22 +1329,27 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 // data kind must NEVER be silently dropped to a bodiless
                 // ModuleSymbol (the "never a silent partial reconstruction"
                 // contract) -- fail loud so the shape is recovered (a new
-                // schema row) rather than mis-linked to an empty def.
-                return fail(DiagnosticCode::F_CorruptedBinary,
+                // schema row) rather than mis-linked to an empty def. Under a
+                // code of its own (P69): the object is not corrupt, DSS does
+                // not model the section.
+                return fail(DiagnosticCode::K_ObjectSectionNotModelled,
                     "macho::readRelocatableObject: defined symbol '"
                     + defs[k].name + "' lives in section '" + sec.segName + ","
                     + sec.sectName + "' which resolves to no known code/data "
-                    "section kind -- refusing to silently drop a body (add the "
-                    "section's kind to the format schema).");
+                    "section kind: no row of format '"
+                    + std::string{objectFormatSchema.name()} + "' names that "
+                    "section. The object is well-formed; DSS does not carry a "
+                    "section its format document has no row for, and refuses "
+                    "rather than drop the body.");
             }
 
             // A data object -> an AssembledData item. File-backed sections
             // slice their bytes; zero-fill (bss) reserves the size with empty
             // bytes (the reservedSize invariant).
             AssembledData di;
-            di.symbol    = SymbolId{defs[k].symIdx};
+            di.symbol    = symbolIds.of(defs[k].symIdx);
             di.section   = *dk;
-            di.alignment = alignFromLog2(sec.align);
+            di.alignment = sec.alignment;
             di.inputSection = sliceOf(ordinal, off);
             if (isZeroFill(*dk)) {
                 di.reservedSize = len;
@@ -1161,6 +1371,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             }
             dataIntervalsBySec[ordinal].push_back(
                 Interval{off, len, mod.dataItems.size()});
+            atomSymIdx.insert(defs[k].symIdx);
             mod.dataItems.push_back(std::move(di));
             pushModuleSym(defs[k]);
         }
@@ -1169,6 +1380,60 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // Every canonical row is now recorded, so the aliases can follow: several
     // names, one SymbolId, the owning name first (see (6.44)).
     for (auto& ms : aliasRows) mod.symbols.push_back(std::move(ms));
+    // THE WEAK-NAME RULE, stated on the rows: each weak name this object's
+    // relocations are kept on says so (`ModuleSymbol::referencedByName`), which
+    // is what makes a relocation left on its atom a reference to the BYTES.
+    weakNames.stateOn(mod.symbols);
+
+    // -- (6.46) Anonymous data-section content becomes atoms -------------
+    //
+    // P69 fold 3e (the orchestrator's ledger 577). x86_64 Apple clang keeps a
+    // string literal (`__TEXT,__cstring`) and a constant literal
+    // (`__TEXT,__literal{4,8,16}`) under an assembler-local `L` label that the
+    // object does not carry: no symbol owns those bytes, and the code reaches
+    // them by a SECTION-INDEX relocation (r_extern=0, step (7)). ✔MEASURED
+    // (Apple clang 21.0.0, `-arch x86_64 -O2`, probe run 20261113-223609-b9727adc,
+    // 7 units): `leaq L_.str(%rip)` and every literal load are
+    // X86_64_RELOC_SIGNED r_extern=0 to their section, a pointer to a literal in
+    // `__DATA` X86_64_RELOC_UNSIGNED r_extern=0; arm64 keeps its `l_.str` /
+    // `lCPI` labels, whose atoms the symbol walk above makes (run
+    // 20261113-223526-701281de). Every maximal byte range of a file-backed
+    // section of a DECLARED data kind -- its row by name (`inputSectionRow`),
+    // never a guess from flags -- that no atom owns becomes an anonymous atom: a
+    // fresh SymbolId past the symbol table and no ModuleSymbol (module-private,
+    // never folded across units), as the ELF and COFF readers make theirs. WHICH
+    // bytes are unowned is the shared question (`unownedByteRangesOfSection`).
+    // Inert on DSS's own objects, whose sections every data item names.
+    for (std::size_t i = 0; i < sections.size(); ++i) {
+        Section const&     sec     = sections[i];
+        std::uint8_t const ordinal = static_cast<std::uint8_t>(i + 1u);
+        if (!sec.kind.has_value() || sec.zeroFill || sec.size == 0u) continue;
+        std::optional<DataSectionKind> const dk = dataSectionKindOf(*sec.kind);
+        if (!dk.has_value() || isZeroFill(*dk)) continue;
+        if (rangeExceedsBuffer(sec.offset, sec.size, bytes.size())) continue;   // belt: the header walk refused it
+        // Covered = the atoms already made for this section (a fresh COPY: the
+        // loop below appends to the live vector).
+        std::vector<link::format::ReconstructedAtomExtent> covered;
+        if (auto it = dataIntervalsBySec.find(ordinal); it != dataIntervalsBySec.end()) {
+            for (auto const& iv : it->second) {
+                covered.push_back(link::format::ReconstructedAtomExtent{ordinal, iv.start, iv.len});
+            }
+        }
+        for (auto const& gap : link::format::unownedByteRangesOfSection(ordinal, sec.size, covered)) {
+            std::optional<SymbolId> const gapId = symbolIds.fresh();
+            if (!gapId) return std::nullopt;   // refused by name at the door
+            AssembledData di;
+            di.symbol       = *gapId;
+            di.section      = *dk;
+            di.alignment    = sec.alignment;
+            di.inputSection = sliceOf(ordinal, gap.start);
+            std::size_t const b0 = static_cast<std::size_t>(sec.offset + gap.start);
+            di.bytes.assign(bytes.begin() + static_cast<std::ptrdiff_t>(b0),
+                            bytes.begin() + static_cast<std::ptrdiff_t>(b0 + gap.len));
+            dataIntervalsBySec[ordinal].push_back(Interval{gap.start, gap.len, mod.dataItems.size()});
+            mod.dataItems.push_back(std::move(di));
+        }
+    }
 
     // -- (6.5) Coverage guard: no defined symbol's body was dropped -------
     //
@@ -1203,10 +1468,16 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // r_address is section-relative (the writer emits `fnStart+rel.offset`
     // for __text, `itemOff+rel.offset` for data). We route it to the
     // reconstructed atom whose byte range contains it (offset made item
-    // -relative). A section with relocs but NO reconstructed atom (anonymous
-    // content reached via a section symbol -- the gap-atom / foreign-clang
-    // follow-up) is skipped; DSS output has none. A per-entry miss WITHIN a
-    // reconstructed section still fails loud (never silently drop a reloc).
+    // -relative). A section of a declared data kind always has an atom for
+    // every byte (its anonymous content became atoms at step (6.46)); a
+    // reloc-bearing section that reconstructed none is refused below. A
+    // per-entry miss WITHIN a reconstructed section still fails loud (never
+    // silently drop a reloc).
+    //
+    // A relocation target defined in a section that is NOT one of the records
+    // that own a reconstructed body (`atomSymIdx`, filled by the slicing loop)
+    // names an OFFSET in that section rather than an identity the merge can
+    // bind -- the rebind in the loop below.
     auto findInterval = [](std::vector<Interval> const& ivs, std::uint64_t off)
         -> Interval const* {
         for (auto const& iv : ivs) {
@@ -1235,10 +1506,13 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         // and whatever a COMPACT-encoded section still fails to carry is stated
         // once, at full volume, by step (8) below; repeating it per relocation
         // would bury it. ⚠ A DWARF-ENCODED unwind section is a DIFFERENT
-        // case and step (8) REFUSES it here rather than reaching this arm: its
-        // FDE binding reads the pcrel value STORED in the field, so a relocation
-        // this reader skipped would mean the stored value is only half the
-        // reference and every bound function could be the wrong one. ⚠ THE TEST IS THE KIND, NEVER THE NAME, and never `nreloc == 0`:
+        // case: its FDE binding reads the pcrel value STORED in the field, so a
+        // relocation this reader skipped would mean the stored value is only
+        // half the reference and every bound function could be the wrong one.
+        // Its relocations are therefore not skipped but APPLIED, by step (8)
+        // itself on a copy of the section before the decoder runs (the
+        // difference pairs a relocatable link leaves there), and any other
+        // relocation there is refused by name. ⚠ THE TEST IS THE KIND, NEVER THE NAME, and never `nreloc == 0`:
         // an UNCLASSIFIED reloc-bearing section still falls through to the
         // refusal below, which is what keeps an unknown foreign section loud.
         if (sec.kind.has_value()
@@ -1254,10 +1528,11 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // section-relative relocs would vanish undiagnosed. ⓘ THE SECTION
             // THIS SENTENCE USED TO NAME IS NO LONGER ONE OF THEM: a
             // `__LD,__compact_unwind` now resolves to `SectionKind::Unwind` and
-            // exits at the arm above, so what still reaches here is a section
-            // whose kind NO format row describes -- anonymous `__cstring` /
-            // jump-table content reached through a section symbol, which is the
-            // gap-atom half of D-LK-MACHO-STATIC-SECTION-RELATIVE-RELOC.
+            // exits at the arm above, and a section the document reads as a
+            // data row (`__cstring` and the literal sections included, through
+            // `readAs`) has every byte in an atom since step (6.46) -- so what
+            // still reaches here is a section whose kind NO format row
+            // describes, and refusing it by name is the answer.
             return fail(DiagnosticCode::F_CorruptedBinary,
                 "macho::readRelocatableObject: section '" + sec.segName + ","
                 + sec.sectName + "' carries " + std::to_string(sec.nreloc)
@@ -1266,6 +1541,18 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         }
         std::vector<Interval> const& ivs = patchesText ? fIt->second : dIt->second;
 
+        // ★ AN ADDEND RECORD (P69 fold 3e, `macho.addendRelocation`): an entry
+        // that names no symbol and patches no field -- its r_symbolnum holds a
+        // signed addend for the NEXT entry, at its own address, whose field holds
+        // instruction bits and so cannot hold one. ✔MEASURED 2026-11-13, Apple
+        // clang 21.0.0 `-arch arm64 -O2`: `l_.str.1 + 2` (a merged string
+        // literal's tail) is ARM64_RELOC_ADDEND (addend 2) before its PAGE21 and
+        // again before its PAGEOFF12. The record is consumed here and its addend
+        // added to the next entry's; a record that is r_extern, follows another,
+        // ends the table, or precedes an entry at another address or one whose
+        // own field holds an addend is refused by name.
+        auto const& addendRecord = objectFormatSchema.macho().addendRelocation;
+        std::optional<std::int64_t> carriedAddend;
         for (std::uint32_t e = 0; e < sec.nreloc; ++e) {
             std::size_t const ro = static_cast<std::size_t>(sec.reloff)
                                  + static_cast<std::size_t>(e) * kRelocInfoSz;
@@ -1275,21 +1562,65 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             std::uint32_t const rSymNum  = rInfo & kRInfoSymbolnumMask;
             std::uint32_t const nativeId = rInfo & kRInfoNativeIdMask;
 
+            if (addendRecord.has_value() && nativeId == addendRecord->nativeId) {
+                auto const refuseRecord = [&](std::string const& why) {
+                    return fail(DiagnosticCode::F_CorruptedBinary,
+                        "macho::readRelocatableObject: the addend record at section "
+                        "offset " + std::to_string(rAddress) + " in '" + sec.segName
+                        + "," + sec.sectName + "' " + why + ".");
+                };
+                if (rExtern) {
+                    return refuseRecord("is r_extern, and an addend record names no symbol");
+                }
+                if (carriedAddend.has_value()) {
+                    return refuseRecord("follows another addend record, which carries no relocation");
+                }
+                if (e + 1u >= sec.nreloc) {
+                    return refuseRecord("ends the relocation table, so it carries no relocation's addend");
+                }
+                if (rdU32(bytes, ro + kRelocInfoSz) != rAddress) {
+                    return refuseRecord("is followed by a relocation at another address, and it carries "
+                                        "the addend of the relocation at its own");
+                }
+                // ★ ONLY BEFORE AN ENTRY THE DOCUMENT LISTS (P69 fold 3f, `carriesAddendOf`): the
+                // assembler writes a record before PAGE21, PAGEOFF12 and BRANCH26 alone, and refuses
+                // an addend on a GOT page reference (✔MEASURED, Apple clang 21.0.0); an addend for any
+                // other entry is a shape no reference writes, refused rather than added.
+                {
+                    std::uint32_t const nextId =
+                        rdU32(bytes, ro + kRelocInfoSz + 4) & kRInfoNativeIdMask;
+                    auto const& carried = addendRecord->carriesAddendOf;
+                    if (std::find(carried.begin(), carried.end(), nextId) == carried.end()) {
+                        return refuseRecord(std::format(
+                            "is followed by a relocation of wire id {}, which the document's "
+                            "`carriesAddendOf` does not list, so no addend of it travels in a record",
+                            nextId));
+                    }
+                }
+                std::uint32_t const bits = addendRecord->addendBits;
+                if (bits == 0u || bits > 24u) {   // validate()'s rule, for a table built in memory
+                    return refuseRecord("is declared with an addend width outside r_symbolnum's [1, 24] bits");
+                }
+                std::int64_t value = static_cast<std::int64_t>(rSymNum & ((1u << bits) - 1u));
+                if ((value & (std::int64_t{1} << (bits - 1u))) != 0) value -= std::int64_t{1} << bits;
+                carriedAddend = value;
+                continue;
+            }
+
             // DSS ALWAYS writes r_extern=1 (every reloc points at a symbol).
             // An r_extern=0 SECTION-INDEX relocation is a foreign-clang shape
-            // (r_symbolnum is a 1-based section number, not a symtab index) --
-            // the section-relative-redirect analog is a named follow-up; fail
-            // loud rather than mis-bind it as a symbol.
+            // (r_symbolnum is a 1-based section number, not a symtab index): it
+            // is bound below, after its field is read, to the atom that owns the
+            // byte it names (P69 fold 3e) -- never as a symbol.
             if (!rExtern) {
-                return fail(DiagnosticCode::F_UnsupportedBinaryFormat,
-                    "macho::readRelocatableObject: relocation in section '"
-                    + sec.segName + "," + sec.sectName
-                    + "' has r_extern=0 (a SECTION-INDEX relocation) -- DSS "
-                      "output is always symbol-relative (r_extern=1); the "
-                      "section-relative-redirect shape is the named follow-up "
-                      "D-LK-MACHO-STATIC-SECTION-RELATIVE-RELOC.");
-            }
-            if (rSymNum >= nsyms) {
+                if (rSymNum == 0u || rSymNum > sections.size()) {
+                    return fail(DiagnosticCode::F_CorruptedBinary,
+                        "macho::readRelocatableObject: relocation in section '"
+                        + sec.segName + "," + sec.sectName + "' names section #"
+                        + std::to_string(rSymNum) + " (r_extern=0), and the object "
+                        "has " + std::to_string(sections.size()) + ".");
+                }
+            } else if (rSymNum >= nsyms) {
                 return fail(DiagnosticCode::F_CorruptedBinary,
                     "macho::readRelocatableObject: relocation in section '"
                     + sec.segName + "," + sec.sectName + "' names symbol #"
@@ -1382,41 +1713,189 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 *storage, *tri, std::nullopt,
                 std::span<std::uint8_t const>{
                     bytes.data() + static_cast<std::size_t>(sec.offset + rAddress),
-                    fieldWidth});
+                    fieldWidth},
+                decode->addendLoweringOf(nativeId));
             if (!recovered.has_value()) {
                 return fail(DiagnosticCode::F_CorruptedBinary,
                     "macho::readRelocatableObject: relocation at section offset "
                     + std::to_string(rAddress) + " in '" + sec.segName + ","
                     + sec.sectName + "': " + recovered.error());
             }
-            std::int64_t const addend = *recovered;
+            // The addend an addend record carried (above) is this entry's, whose
+            // field holds instruction bits; a field that holds its own addend
+            // beside one would name the reference twice.
+            if (carriedAddend.has_value() && fieldWidth != 0u) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "macho::readRelocatableObject: relocation at section offset "
+                    + std::to_string(rAddress) + " in '" + sec.segName + ","
+                    + sec.sectName + "' follows an addend record, and its own "
+                    "field holds an addend: the two would state one reference's "
+                    "addend twice.");
+            }
+            std::int64_t const addend = *recovered + carriedAddend.value_or(0);
+            carriedAddend.reset();
 
-            Relocation rel;
-            rel.offset = static_cast<std::uint32_t>(rAddress - iv->start);
             // (6.44): a target naming an ALIAS binds to the atom that owns the
             // body, because only the owner is a declared definition -- an id
             // that owns no body is `K_SymbolUndefined` at the linker's compound
             // index. The addend needs no adjustment: an alias shares its owner's
             // offset exactly, so the same S makes the same address.
-            rel.target = SymbolId{ownerOf(rSymNum)};
+            // ★ A SECTION-INDEX RELOCATION (r_extern=0) -- P69 fold 3e, the
+            // orchestrator's ledger 577. x86_64 Apple clang reaches every
+            // anonymous literal this way (✔MEASURED, probe run
+            // 20261113-223609-b9727adc: `__TEXT,__cstring` and
+            // `__TEXT,__literal{4,8,16}` from code, X86_64_RELOC_SIGNED; a
+            // literal's address in `__DATA`, X86_64_RELOC_UNSIGNED). The field
+            // holds the reference RESOLVED in the object's own addresses -- the
+            // format's formula `value = S + A + (pcRel ? -P : 0) + addendBias`
+            // evaluated with the target's address -- so the target's offset in
+            // its section is read back from it, and the reference binds to the
+            // atom that owns that byte (step (6.46)'s anonymous atoms included),
+            // with the residual, by the rule every reader shares
+            // (`section_relative_target.hpp`). A wire type whose field holds
+            // instruction bits names no offset, so it is refused.
+            if (!rExtern) {
+                Section const& tsec = sections[rSymNum - 1u];
+                if (fieldWidth == 0u) {
+                    return fail(DiagnosticCode::F_UnsupportedBinaryFormat,
+                        "macho::readRelocatableObject: relocation at section offset "
+                        + std::to_string(rAddress) + " in '" + sec.segName + ","
+                        + sec.sectName + "' names section '" + tsec.segName + ","
+                        + tsec.sectName + "' (r_extern=0) through a field that holds "
+                        "instruction bits, which name no offset in it.");
+                }
+                std::int64_t const lowered =
+                    static_cast<std::int64_t>(decode->addendLoweringOf(nativeId));
+                std::int64_t const inField = addend + lowered;
+                std::int64_t const placeVm = static_cast<std::int64_t>(sec.addr + rAddress);
+                // The addend this reference carries once it names the section's
+                // start (S = the section's address), in the reader's convention
+                // (the type's lowering taken off, as for a symbol-relative one).
+                std::int64_t const bindBase = inField - static_cast<std::int64_t>(tri->addendBias)
+                                            + (tri->pcRelative ? placeVm : 0)
+                                            - static_cast<std::int64_t>(tsec.addr) - lowered;
+                std::int64_t const searchOff = link::format::sectionRelativeSearchOffset(
+                    bindBase + lowered, tri->pcRelative, /*referenceIsInData=*/!patchesText,
+                    static_cast<std::int64_t>(tri->addendBias),
+                    static_cast<std::int64_t>(rAddress) - static_cast<std::int64_t>(iv->start));
+                std::uint8_t const tOrdinal = static_cast<std::uint8_t>(rSymNum);
+                auto const bound = link::format::bindSectionRelativeReference(
+                    link::format::sectionAtomSpans(funcIntervalsBySec, tOrdinal),
+                    link::format::sectionAtomSpans(dataIntervalsBySec, tOrdinal),
+                    bindBase, searchOff, sectionsAreUnits);
+                if (!bound.has_value()) {
+                    return fail(DiagnosticCode::F_CorruptedBinary,
+                        "macho::readRelocatableObject: relocation at section offset "
+                        + std::to_string(rAddress) + " in '" + sec.segName + ","
+                        + sec.sectName + "' names section '" + tsec.segName + ","
+                        + tsec.sectName + "' (r_extern=0) + offset "
+                        + std::to_string(searchOff) + ", which " + bound.error() + ".");
+                }
+                Relocation rel;
+                rel.offset = static_cast<std::uint32_t>(rAddress - iv->start);
+                rel.target = bound->isFunction ? mod.functions[bound->outIdx].symbol
+                                               : mod.dataItems[bound->outIdx].symbol;
+                rel.kind   = kind;
+                rel.addend = bound->residual;
+                if (patchesText) mod.functions[iv->outIdx].relocations.push_back(rel);
+                else             mod.dataItems[iv->outIdx].relocations.push_back(rel);
+                continue;   // names no symbol: no extern, no weak name
+            }
+
+            std::uint32_t const targetIdx = ownerOf(rSymNum);
+            SymbolId     relTarget = symbolIds.of(targetIdx);
+            std::int64_t relAddend = addend;
+
+            // SECTION-RELATIVE: a target DEFINED in a section that owns no body
+            // -- an INTERIOR LABEL. DSS's own writer names every jump-table slot
+            // and every `&&label` through one (`macho.cpp`'s synthetic per-block
+            // labels, N_ALT_ENTRY in `__text`), and the classification above
+            // keeps such a label off the atom boundaries. It used to stay the
+            // target, which no atom owns and the linker's compound index never
+            // declares, so a DSS static library holding a dense switch could not
+            // be linked into a Mach-O image: `K_SymbolUndefined` once per table
+            // slot (D-LINK-OBJECT-READERS-DROP-INTERIOR-SYMBOL-OFFSET; ✔MEASURED
+            // P69 on both Mach-O arches, where the same library links on ELF). It
+            // is rebound to the atom that holds the offset, with the residual, by
+            // the rule every reader shares (`section_relative_target.hpp`). With
+            // MH_SUBSECTIONS_VIA_SYMBOLS the atoms are NOT a unit, so only the
+            // atom that CONTAINS the offset may stand in for it -- which for an
+            // interior label is always its own function.
+            Nlist const& tsym = syms[targetIdx];
+            bool const definedInASection =
+                (tsym.type & kNStabMask) == 0u
+                && (tsym.type & kNTypeMask) == kNTypeSect
+                && tsym.sect >= 1u
+                && static_cast<std::size_t>(tsym.sect) <= sections.size();
+            if (definedInASection && !atomSymIdx.contains(targetIdx)) {
+                Section const& tsec = sections[tsym.sect - 1u];
+                std::int64_t const bindBase =
+                    static_cast<std::int64_t>(tsym.value - tsec.addr) + addend;
+                std::int64_t const searchOff = link::format::sectionRelativeSearchOffset(
+                    bindBase, tri->pcRelative, /*referenceIsInData=*/!patchesText,
+                    static_cast<std::int64_t>(tri->addendBias),
+                    static_cast<std::int64_t>(rAddress)
+                        - static_cast<std::int64_t>(iv->start));
+                auto const bound = link::format::bindSectionRelativeReference(
+                    link::format::sectionAtomSpans(funcIntervalsBySec, tsym.sect),
+                    link::format::sectionAtomSpans(dataIntervalsBySec, tsym.sect),
+                    bindBase, searchOff, sectionsAreUnits);
+                if (!bound.has_value()) {
+                    return fail(DiagnosticCode::F_CorruptedBinary,
+                        "macho::readRelocatableObject: relocation at section offset "
+                        + std::to_string(rAddress) + " in '" + sec.segName + ","
+                        + sec.sectName + "' targets '" + tsym.name
+                        + "' (defined in '" + tsec.segName + "," + tsec.sectName
+                        + "' with no body of its own) + offset "
+                        + std::to_string(searchOff) + ", which " + bound.error()
+                        + ".");
+                }
+                relTarget = bound->isFunction
+                                ? mod.functions[bound->outIdx].symbol
+                                : mod.dataItems[bound->outIdx].symbol;
+                relAddend = bound->residual;
+            }
+
+            // THE WEAK-NAME RULE (`object_atom_coverage.hpp`): a relocation
+            // written through a WEAK name keeps the NAME, whatever else names
+            // the body -- a plain reference row the link resolves by name, to an
+            // override where one is linked and to this very body otherwise --
+            // instead of the atom (6.44) chose for it. What this pass leaves on
+            // an atom is then a reference to its BYTES: one written through a
+            // static name of the body, or through its section. The addend is
+            // the name's own: the name sits at the atom's start.
+            auto const weakNameOrRefused = weakNames.referenceFor(rSymNum, symbolIds);
+            if (!weakNameOrRefused) return std::nullopt;   // a fresh id refused by name at the door
+            if (auto const& weakName = *weakNameOrRefused) {
+                if (weakName->fresh) {
+                    mod.externImports.push_back(
+                        link::format::referenceRowOfAWeakName(*weakName, mod.dataItems));
+                }
+                relTarget = weakName->id;
+            }
+            Relocation rel;
+            rel.offset = static_cast<std::uint32_t>(rAddress - iv->start);
+            rel.target = relTarget;
             rel.kind   = kind;
-            rel.addend = addend;
+            rel.addend = relAddend;
             if (patchesText) mod.functions[iv->outIdx].relocations.push_back(rel);
             else             mod.dataItems[iv->outIdx].relocations.push_back(rel);
 
-            // isData inference: an extern reached through a relocation the
-            // FORMAT declares `"isCall": true` on -- ARM64_RELOC_BRANCH26,
-            // X86_64_RELOC_BRANCH -- is a FUNCTION, so force isData=false. A
-            // plain address reloc (PAGE21/PAGEOFF12/UNSIGNED) leaves the DATA
-            // seed intact. Mirrors the ELF reader's reloc-typed extern rule.
-            // Mach-O's nlist_64 carries no STT_FUNC-style type hint, so this
-            // relocation is the ONLY class signal a name-only reference offers.
+            // The kind a CALL states: an extern reached through a relocation
+            // the FORMAT declares `"isCall": true` on -- ARM64_RELOC_BRANCH26,
+            // X86_64_RELOC_BRANCH -- is a FUNCTION, stated by the object. A
+            // plain address reloc (PAGE21/PAGEOFF12/UNSIGNED/GOT_LOAD) states
+            // nothing and leaves the row `Pending` for its definition. Mirrors
+            // the ELF reader's reloc-typed extern rule. Mach-O's nlist_64
+            // carries no STT_FUNC-style type hint, so this relocation is the
+            // ONLY class signal a name-only reference offers.
             //
             // ── THE EMPTY-SET REFUSAL (D-LK-MACHO-ISDATA-NO-CALL-SIGNAL) ──
-            // A Mach-O format that declares NO `isCall` row at all cannot
-            // classify an extern it meets through a relocation, and the DATA
-            // seed would then be a SILENT GUESS -- not a diagnostic, a wrong
-            // answer. Refuse instead, naming the extern and the format.
+            // A Mach-O format that declares NO `isCall` row at all cannot read
+            // the statement every call makes, so a CALLED extern would reach
+            // its definition as though it stated nothing -- a misreading of the
+            // object, not a diagnostic. Refuse instead, naming the extern and
+            // the format.
             //
             // ⚠ THIS ARM IS NOT DEAD CODE AND IS NOT A HYPOTHETICAL. It is
             // what every macho64-x86_64 archive member that called a library
@@ -1437,12 +1916,13 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                         + "' is reached by a relocation, but Mach-O format '"
                         + std::string{objectFormatSchema.name()}
                         + "' declares no relocation row with \"isCall\": true "
-                        "-- a function-vs-data classification cannot be made, "
-                        "and guessing DATA would silently mis-type the import "
-                        "(D-LK-MACHO-ISDATA-NO-CALL-SIGNAL).");
+                        "-- a call cannot be told from an address, so the "
+                        "function a call states could not be read off the "
+                        "object (D-LK-MACHO-ISDATA-NO-CALL-SIGNAL).");
                 }
                 if (callSignalNativeIds.contains(nativeId)) {
-                    mod.externImports[ex->second].isData = false;
+                    mod.externImports[ex->second].isData     = false;
+                    mod.externImports[ex->second].kindOrigin = ExternKindOrigin::Stated;
                 }
             }
         }
@@ -1486,6 +1966,195 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         auto isCarryingUnwindSection = [](Section const& sec) {
             return sec.kind.has_value() && *sec.kind == SectionKind::Unwind
                 && sec.size != 0u;   // nothing described, nothing to say
+        };
+
+        // ── THE RELOCATIONS OF A DWARF CALL-FRAME SECTION ARE DIFFERENCE PAIRS ──
+        //
+        // P69, D-LK-MACHO-LD-R-EH-FRAME-RELOCATIONS-REFUSED-AT-READ. Applies
+        // every relocation of `sec` to `frame`, a COPY of the section's bytes,
+        // so the decoder below reads what a compiler's object holds. The one
+        // shape applied is the pair the format document declares
+        // (`MachODifferenceRelocation`): a SUBTRAHEND entry, then at the same
+        // address the MINUEND entry, both naming symbols this object DEFINES —
+        //     field = minuend's address - subtrahend's address + the addend the field stores
+        // computed in the object's own flat address space, the space the FDE
+        // binding works in. The arithmetic is the linker's own, so nothing here
+        // assumes what the two labels mark (✔MEASURED: in a relocatable link's
+        // product `func.eh - EH_Frame1 + 4` is the FDE's CIE pointer and
+        // `<function> - func.eh - 8` its pc-begin; in an arm64 compiler's own
+        // object `<function> - <the section's start label> - <field offset>` is
+        // the pc-begin). Nor does it assume the table's ORDER beyond a pair's
+        // own two entries: the arm64 compiler writes the later record first.
+        // Everything else is REFUSED BY NAME: an entry that starts no declared
+        // pair, a pair split across addresses, a section-number entry
+        // (r_extern=0), a symbol this object does not define — the difference
+        // of addresses in two objects is no constant of this one — two pairs on
+        // one field, a value the field cannot hold. False = already reported.
+        auto applyUnwindDifferencePairs =
+            [&](Section const& sec, std::string const& where,
+                std::vector<std::uint8_t>& frame) -> bool {
+            auto refuse = [&](DiagnosticCode code, std::string detail) -> bool {
+                report(reporter, code, DiagnosticSeverity::Error,
+                       "macho::readRelocatableObject: unwind section '" + where
+                       + "' " + std::move(detail));
+                return false;
+            };
+            auto const& declared = objectFormatSchema.macho().differenceRelocations;
+            // (The relocation table lies within the file: checked where the
+            // section's header was read.)
+            struct Entry {
+                std::uint64_t address  = 0;
+                std::uint32_t nativeId = 0;
+                std::uint32_t symNum   = 0;
+                bool          isExtern = false;
+            };
+            auto entryAt = [&](std::uint32_t e) -> Entry {
+                std::size_t const ro = static_cast<std::size_t>(sec.reloff)
+                                     + static_cast<std::size_t>(e) * kRelocInfoSz;
+                std::uint32_t const rInfo = rdU32(bytes, ro + 4);
+                return Entry{rdU32(bytes, ro + 0), rInfo & kRInfoNativeIdMask,
+                             rInfo & kRInfoSymbolnumMask,
+                             (rInfo & kRInfoExternBit) != 0u};
+            };
+            // The flat address of a symbol this object DEFINES in a section.
+            auto definedAddress =
+                [&](std::uint32_t symNum) -> std::optional<std::uint64_t> {
+                if (symNum >= nsyms) return std::nullopt;
+                Nlist const& s = syms[symNum];
+                bool const inASection =
+                    (s.type & kNStabMask) == 0u
+                    && (s.type & kNTypeMask) == kNTypeSect && s.sect >= 1u
+                    && static_cast<std::size_t>(s.sect) <= sections.size();
+                if (!inASection) return std::nullopt;
+                return s.value;
+            };
+            auto symbolText = [&](std::uint32_t symNum) -> std::string {
+                if (symNum >= nsyms) {
+                    return "symbol #" + std::to_string(symNum)
+                         + ", which is past the symbol table";
+                }
+                return "'" + syms[symNum].name + "' (symbol #"
+                     + std::to_string(symNum) + ")";
+            };
+            std::unordered_set<std::uint64_t> patched;
+            for (std::uint32_t e = 0; e < sec.nreloc; e += 2u) {
+                Entry const sub = entryAt(e);
+                auto const pair = std::find_if(
+                    declared.begin(), declared.end(),
+                    [&](MachODifferenceRelocation const& d) {
+                        return d.subtrahendNativeId == sub.nativeId;
+                    });
+                if (pair == declared.end()) {
+                    return refuse(DiagnosticCode::F_UnsupportedBinaryFormat,
+                        "carries relocation #" + std::to_string(e) + " (wire type "
+                        + std::to_string(sub.nativeId) + " at section offset "
+                        + std::to_string(sub.address)
+                        + "), which is not the subtrahend of a difference pair "
+                          "Mach-O format '" + std::string{objectFormatSchema.name()}
+                        + "' declares (`macho.differenceRelocations`). The one "
+                          "relocation shape this reader applies to DWARF "
+                          "call-frame information is that pair -- a symbol to "
+                          "subtract, then at the same address the symbol it is "
+                          "subtracted from -- which is what a relocatable link "
+                          "(`ld -r`) and an arm64 compiler leave there; a "
+                          "reference of any other shape (a personality routine "
+                          "or a language-specific data area reached through "
+                          "another object) is not carried.");
+                }
+                if (e + 1u >= sec.nreloc) {
+                    return refuse(DiagnosticCode::F_CorruptedBinary,
+                        "ends on the subtrahend of a difference pair (relocation #"
+                        + std::to_string(e) + " at section offset "
+                        + std::to_string(sub.address)
+                        + "): the minuend that must follow it is missing.");
+                }
+                Entry const min = entryAt(e + 1u);
+                if (min.nativeId != pair->minuendNativeId
+                    || min.address != sub.address) {
+                    return refuse(DiagnosticCode::F_CorruptedBinary,
+                        "carries the subtrahend of a difference pair at section "
+                        "offset " + std::to_string(sub.address) + " (relocation #"
+                        + std::to_string(e) + ") followed by wire type "
+                        + std::to_string(min.nativeId) + " at section offset "
+                        + std::to_string(min.address)
+                        + ", where the format declares its minuend as wire type "
+                        + std::to_string(pair->minuendNativeId)
+                        + " at the same offset.");
+                }
+                if (!sub.isExtern || !min.isExtern) {
+                    return refuse(DiagnosticCode::F_UnsupportedBinaryFormat,
+                        "carries a difference pair at section offset "
+                        + std::to_string(sub.address) + " whose "
+                        + std::string{!sub.isExtern ? "subtrahend" : "minuend"}
+                        + " names a SECTION rather than a symbol (r_extern=0); "
+                          "this reader applies the pair only between two "
+                          "symbols.");
+                }
+                auto const subAddr = definedAddress(sub.symNum);
+                auto const minAddr = definedAddress(min.symNum);
+                if (!subAddr.has_value() || !minAddr.has_value()) {
+                    return refuse(DiagnosticCode::F_UnsupportedBinaryFormat,
+                        "carries a difference pair at section offset "
+                        + std::to_string(sub.address) + " that names "
+                        + symbolText(!subAddr.has_value() ? sub.symNum : min.symNum)
+                        + ", which this object does not define in one of its "
+                          "sections; the difference of two addresses is a "
+                          "constant this reader can state only when both are "
+                          "this object's own.");
+                }
+                // The field's width is the entries' own (`r_length`), which the
+                // matched wire id carries; the loader holds a pair's two ids
+                // to one width.
+                std::uint64_t const width =
+                    relocationFieldBytes(pair->subtrahendNativeId);
+                if (rangeExceedsBuffer(sub.address, width, frame.size())) {
+                    return refuse(DiagnosticCode::F_CorruptedBinary,
+                        "carries a difference pair whose " + std::to_string(width)
+                        + "-byte field at section offset "
+                        + std::to_string(sub.address) + " runs past the section.");
+                }
+                if (!patched.insert(sub.address).second) {
+                    return refuse(DiagnosticCode::F_CorruptedBinary,
+                        "carries two difference pairs on the field at section "
+                        "offset " + std::to_string(sub.address) + ".");
+                }
+                // The addend the field stores, sign-extended; then the pair,
+                // modulo 2^64 as the linker computes it.
+                std::uint64_t stored = 0;
+                for (std::uint64_t b = 0; b < width; ++b) {
+                    stored |= static_cast<std::uint64_t>(
+                                  frame[static_cast<std::size_t>(sub.address + b)])
+                              << (8u * b);
+                }
+                if (width < 8u
+                    && (stored & (std::uint64_t{1} << (8u * width - 1u))) != 0u) {
+                    stored |= ~std::uint64_t{0} << (8u * width);
+                }
+                std::uint64_t const value = *minAddr - *subAddr + stored;
+                if (width < 8u) {
+                    // A field narrower than the address is read by the decoder
+                    // as a signed OR an unsigned quantity (a pc-relative
+                    // displacement, a distance back to the CIE): it must hold
+                    // the value under one of the two readings.
+                    std::int64_t const asSigned = static_cast<std::int64_t>(value);
+                    std::int64_t const lowest =
+                        -(std::int64_t{1} << (8u * width - 1u));
+                    std::int64_t const highest =
+                        (std::int64_t{1} << (8u * width)) - 1;
+                    if (asSigned < lowest || asSigned > highest) {
+                        return refuse(DiagnosticCode::F_CorruptedBinary,
+                            "carries a difference pair at section offset "
+                            + std::to_string(sub.address) + " that resolves to "
+                            + std::to_string(asSigned) + ", which its "
+                            + std::to_string(width) + "-byte field cannot hold.");
+                    }
+                }
+                for (std::uint64_t b = 0; b < width; ++b) {
+                    frame[static_cast<std::size_t>(sub.address + b)] =
+                        static_cast<std::uint8_t>(value >> (8u * b));
+                }
+            }
+            return true;
         };
 
         // ── PASS ONE: EVERY ENCODING THIS READER CAN CARRY ────────────────
@@ -1542,38 +2211,85 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                     + "', which this reader has no decoder for. Refusing rather "
                       "than reading it as DWARF.");
             }
-            // ⚠ NO RELOCATIONS, AND THAT IS CHECKED RATHER THAN ASSUMED.
-            // ✔MEASURED (Apple clang, both the fixture and a fresh `cc -arch
-            // x86_64 -c`): `__TEXT,__eh_frame` has nreloc 0 -- the FDE's
-            // `initial_location` is a pcrel DELTA resolved inside the object's
-            // own flat address space, which is the OPPOSITE of the ELF
-            // relocatable convention where that field is zero and a relocation
-            // carries the whole reference. So the binding below reads the
-            // STORED value, and a relocation nobody applied would make that
-            // value half of a reference -- binding every FDE to a wrong
-            // function while reporting success.
-            if (sec.nreloc != 0u) {
-                return fail(DiagnosticCode::F_CorruptedBinary,
-                    "macho::readRelocatableObject: unwind section '" + where
-                    + "' carries " + std::to_string(sec.nreloc)
-                    + " relocation(s). A DWARF call-frame section in a Mach-O "
-                      "relocatable resolves each FDE's `initial_location` as a "
-                      "pc-relative delta within the object's own address space "
-                      "and carries none; a relocation here means the stored "
-                      "delta is only part of the reference, and binding on it "
-                      "would attach unwind rules to the wrong functions.");
-            }
+            // ⚠ THE STORED VALUE IS THE WHOLE REFERENCE ONLY WHERE NO
+            // RELOCATION COMPLETES IT, and which of the two an object is is
+            // READ from it, never assumed. ✔MEASURED on a COMPILER's object
+            // (Apple clang, both the fixture and a fresh `cc -arch x86_64 -c`):
+            // `__TEXT,__eh_frame` has nreloc 0 -- the FDE's `initial_location`
+            // is a pcrel DELTA resolved inside the object's own flat address
+            // space, which is the OPPOSITE of the ELF relocatable convention
+            // where that field is zero and a relocation carries the whole
+            // reference. So the binding below reads the STORED value.
+            //
+            // ⚠ A LINKER's relocatable product is NOT that shape (P69,
+            // D-LK-MACHO-LD-R-EH-FRAME-RELOCATIONS-REFUSED-AT-READ: until it
+            // this arm refused every relocation-bearing call-frame section,
+            // and with it an object Apple's ld links into a program that
+            // runs). ✔MEASURED 2026-10-08 (Apple clang 21.0.0 with ld-1267,
+            // and the same with `-ld_classic`; one- and two-function units;
+            // with and without `-x`): `ld -r` of an x86_64 unit writes FOUR
+            // relocations per FDE here -- two (SUBTRACTOR, UNSIGNED) pairs, all
+            // extern: `func.eh - EH_Frame1` on the FDE's CIE-pointer field and
+            // `<function> - func.eh` on its pc-begin field -- and stores only
+            // the ADDENDS (4 and -8), beside local symbols `EH_Frame1` and one
+            // `func.eh` per FDE, which the symbol loop never publishes (they
+            // are defined in a section that carries no linkable body). The
+            // stored value really is half of a reference there: Apple's own
+            // `dwarfdump --eh-frame` cannot read that section either, because
+            // it applies no relocation. So the pairs are APPLIED -- on a COPY
+            // of the section, in the object's own address space -- which hands
+            // the decoder exactly the bytes a compiler's object holds; which
+            // entries form a pair is the format document's
+            // (`macho.differenceRelocations`), and any other relocation in the
+            // section is refused by name (`applyUnwindDifferencePairs`).
+            //
+            // ⚠ AND AN arm64 COMPILER's OWN OBJECT IS NOT THE x86_64 SHAPE
+            // EITHER (P69, D-LK-MACHO-ARM64-EH-FRAME-SECTION-REFUSED-AT-READ).
+            // ✔MEASURED 2026-10-08, Apple clang 21.0.0: where an arm64 object
+            // carries the section at all -- for a function whose frame the
+            // compact encoding cannot describe, which
+            // `-fasynchronous-unwind-tables` makes of any function with an
+            // epilogue -- each FDE's pc-begin is ALREADY one such pair
+            // (`<function>` minus the section's start label) and only the
+            // CIE pointer is stored resolved. The same arm completes it.
             if (rangeExceedsBuffer(sec.offset, sec.size, bytes.size())) {
                 return fail(DiagnosticCode::F_CorruptedBinary,
                     "macho::readRelocatableObject: unwind section '" + where
                     + "' body runs past the end of the file.");
             }
+            std::span<std::uint8_t const> frameBytes = bytes.subspan(
+                static_cast<std::size_t>(sec.offset),
+                static_cast<std::size_t>(sec.size));
+            std::vector<std::uint8_t> resolvedFrameBytes;
+            if (sec.nreloc != 0u) {
+                resolvedFrameBytes.assign(frameBytes.begin(), frameBytes.end());
+                if (!applyUnwindDifferencePairs(sec, where, resolvedFrameBytes)) {
+                    return std::nullopt;   // already reported
+                }
+                frameBytes = resolvedFrameBytes;
+            }
             auto const decoded = link::format::decodeEhFrame(
-                bytes.subspan(static_cast<std::size_t>(sec.offset),
-                              static_cast<std::size_t>(sec.size)),
+                frameBytes,
                 link::format::dwarfRegisterMappingOf(targetSchema),
+                objectFormatSchema.dataModel(),   // an absptr field is one of its addresses
                 "macho::readRelocatableObject", reporter);
             if (!decoded.has_value()) return std::nullopt;  // already reported
+
+            // P69 fold 3d: the decoder READS a CIE's personality and an FDE's
+            // language-specific data area, and the ELF reader binds both into
+            // the function's `LanguageHandler`. This reader does not bind them
+            // yet, so a record naming either is refused by name here: carried
+            // without them, an exception dispatched to the frame would find
+            // no handler, and the image would look complete.
+            for (auto const& fde : decoded->fdes) {
+                if (!fde.personality.has_value() && !fde.dataArea.has_value()) continue;
+                return fail(DiagnosticCode::K_UnwindRuleUnrepresentable,
+                    "macho::readRelocatableObject: an FDE of '" + where
+                    + "' names a personality routine or a language-specific data "
+                      "area, which this reader does not bind to its function yet; "
+                      "carried without them, an exception dispatched to the frame "
+                      "would find no handler.");
+            }
 
             for (auto const& fde : decoded->fdes) {
                 // ★ THE REFERENCE IS RESOLVED THROUGH THE ENCODING THE CIE
@@ -1667,18 +2383,10 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 //   up to 16 is 16 and the atom ends at 100. The bound is the
                 //   document's declared alignment, not a constant.
                 std::uint64_t const atomEnd = hit->start + hit->len;
-                // `section_64.align` is a LOG2 exponent. Read from the OWNING
-                // section rather than from a constant, and refused rather than
-                // shifted when it is absurd -- a shift past the width of the
-                // type is undefined, and this value comes off a foreign wire.
-                if (owner->align > 31u) {
-                    return fail(DiagnosticCode::F_CorruptedBinary,
-                        "macho::readRelocatableObject: section '"
-                        + owner->segName + "," + owner->sectName
-                        + "' declares alignment 2^" + std::to_string(owner->align)
-                        + ", which is not an alignment any atom can have.");
-                }
-                std::uint64_t const alignBytes = std::uint64_t{1} << owner->align;
+                // The OWNING section's declared alignment, rather than a
+                // constant -- carried by the header walk, which refused an
+                // exponent no `Alignment` holds before this point.
+                std::uint64_t const alignBytes = owner->alignment.bytes();
                 std::uint64_t const describedEnd = hit->start + fde.cfi.codeLength;
                 std::uint64_t const paddedEnd =
                     ((describedEnd + alignBytes - 1u) / alignBytes) * alignBytes;
@@ -1774,6 +2482,8 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         }
     }
 
+    // A fresh id the table could not hand out refused the read AT its take (P69 f26e, B1): nothing reaches here.
+    mod.symbolIdEnd.keepClearOf(symbolIds.end());   // the module carries its table's end
     mod.expectedFuncCount = mod.functions.size();
     return mod;
 }

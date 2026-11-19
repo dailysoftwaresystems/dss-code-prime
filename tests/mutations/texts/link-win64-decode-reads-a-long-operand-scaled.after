@@ -1,0 +1,2 @@
+            c.bytes = unit * (static_cast<std::int64_t>(node(k + 1))
+                    | (static_cast<std::int64_t>(node(k + 2)) << 16));

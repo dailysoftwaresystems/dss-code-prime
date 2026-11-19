@@ -8,14 +8,20 @@
 
 #include "core/types/parse_diagnostic.hpp"
 #include "program/input_resolver.hpp"
+#include "os_link.hpp"   // links made by the OS: MinGW's library makes none
 #include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <string>
 #include <vector>
+
+#if !defined(_WIN32)
+#include <sys/stat.h>   // mkfifo: the special file a POSIX host can make
+#endif
 
 namespace fs = std::filesystem;
 using namespace dss;
@@ -93,6 +99,106 @@ TEST(InputResolver, RecursiveScanPicksUpAllMatchingFiles) {
     EXPECT_EQ(out.size(), 3u);
 }
 
+// A LINK IS AN INPUT BY WHAT IT REACHES, AND A DIRECTORY LINK IS NEVER WALKED
+// THROUGH, on every build. ✔MEASURED 2026-10-20 (src/core/substrate/path_identity.hpp):
+// libstdc++ on Windows cannot tell a link from what it reaches, so the MinGW
+// build's recursive scan DESCENDED a directory link the MSVC build's did not (one
+// directory, two input lists) and took a dangling `.c` link for a source. The
+// links are made by the OS (`os_link.hpp`): that build's library makes none.
+TEST(InputResolver, RecursiveScanNeverDescendsALinkAndTakesALinkByWhatItReaches) {
+    ScratchDir scratch{Location::InsideRepo, "input-resolver"};
+    ScratchDir elsewhere{Location::Temp, "input-resolver-elsewhere"};
+    writeFile(scratch.path() / "a.c");
+    writeFile(elsewhere.path() / "beyond.c");
+    writeFile(elsewhere.path() / "named.c");
+    using dss::test_support::LinkTo;
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(elsewhere.path(), scratch.path() / "linked-dir",
+                                                             LinkTo::Directory));
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(elsewhere.path() / "named.c", scratch.path() / "via-link.c",
+                                                             LinkTo::File));
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(scratch.path() / "gone.c", scratch.path() / "dangling.c",
+                                                             LinkTo::File));
+
+    std::vector<std::string> exts{".c"};
+    std::vector<std::string> out;
+    DiagnosticReporter rep;
+    bool const ok = InputResolver::resolveDirectory(
+        scratch.path(), exts, InputResolver::Mode::Recursive, out, rep);
+    EXPECT_TRUE(ok);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    std::vector<std::string> names;
+    std::string              took;
+    for (auto const& s : out) names.push_back(fs::path{s}.lexically_relative(scratch.path()).generic_string());
+    std::sort(names.begin(), names.end());
+    for (auto const& n : names) took += " " + n;
+    EXPECT_EQ(names, (std::vector<std::string>{"a.c", "via-link.c"}))
+        << "the scan took " << names.size() << " inputs:" << took
+        << " -- a directory link was walked through, or a dangling link was taken for a source";
+}
+
+// A LINK WHOSE REACH CANNOT BE EXAMINED IS ASKED ABOUT ONLY WHEN ITS NAME IS AN INPUT'S: an unrelated looping link
+// beside the sources (`docs/self`, no `.c`) leaves the scan whole, as bash, Python's glob and CMake's GLOB_RECURSE
+// list such a tree; a looping link NAMED like a source is an input nobody can read, refused naming it (what gcc and
+// clang answer for a looping include candidate, ✔MEASURED 2026-10-28). The links are made by the OS and name
+// themselves, which loops on every host.
+TEST(InputResolver, AnUnrelatedLoopingLinkLeavesTheScanWholeAndOneNamedLikeASourceIsRefusedNamingIt) {
+    ScratchDir scratch{Location::InsideRepo, "input-resolver"};
+    writeFile(scratch.path() / "a.c");
+    writeFile(scratch.path() / "docs" / "readme.txt");
+    using dss::test_support::LinkTo;
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(scratch.path() / "docs" / "self",
+                                                             scratch.path() / "docs" / "self", LinkTo::File));
+    std::vector<std::string> exts{".c"};
+    {
+        std::vector<std::string> out;
+        DiagnosticReporter       rep;
+        bool const ok = InputResolver::resolveDirectory(scratch.path(), exts, InputResolver::Mode::Recursive, out, rep);
+        std::string said;
+        for (auto const& d : rep.all()) said += "\n  " + d.actual;
+        EXPECT_TRUE(ok) << "an unrelated looping link failed the scan:" << said;
+        EXPECT_EQ(out.size(), 1u) << "the scan took " << out.size() << " inputs";
+    }
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(scratch.path() / "b.c", scratch.path() / "b.c",
+                                                             LinkTo::File));
+    {
+        std::vector<std::string> out;
+        DiagnosticReporter       rep;
+        bool const ok = InputResolver::resolveDirectory(scratch.path(), exts, InputResolver::Mode::Recursive, out, rep);
+        std::string said;
+        for (auto const& d : rep.all()) said += "\n  " + d.actual;
+        EXPECT_FALSE(ok) << "a looping link named like a source was passed over in silence; took " << out.size();
+        EXPECT_NE(said.find("b.c"), std::string::npos) << "the refusal does not name the link:" << said;
+    }
+}
+
+// A SPECIAL FILE IS NO INPUT, whatever it is named: the scan takes an entry that reaches a regular file and
+// nothing else, as it did when it asked the library for `regular`. POSIX only: Windows makes no FIFO in its
+// filesystem.
+TEST(InputResolver, AFifoNamedLikeASourceIsNoInput) {
+#if defined(_WIN32)
+    GTEST_SKIP() << "Windows makes no FIFO in its filesystem; the POSIX legs read it";
+#else
+    ScratchDir scratch{Location::InsideRepo, "input-resolver"};
+    writeFile(scratch.path() / "a.c");
+    ASSERT_EQ(::mkfifo((scratch.path() / "pipe.c").c_str(), 0600), 0) << "this host made no FIFO";
+
+    std::vector<std::string> exts{".c"};
+    std::vector<std::string> out;
+    DiagnosticReporter rep;
+    bool const ok = InputResolver::resolveDirectory(
+        scratch.path(), exts, InputResolver::Mode::Recursive, out, rep);
+    EXPECT_TRUE(ok);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    std::vector<std::string> names;
+    std::string              took;
+    for (auto const& s : out) names.push_back(fs::path{s}.lexically_relative(scratch.path()).generic_string());
+    std::sort(names.begin(), names.end());
+    for (auto const& n : names) took += " " + n;
+    EXPECT_EQ(names, (std::vector<std::string>{"a.c"}))
+        << "the scan took " << names.size() << " inputs:" << took << " -- a FIFO was taken for a source";
+#endif
+}
+
 TEST(InputResolver, FlatScanIgnoresSubdirectories) {
     ScratchDir scratch{Location::InsideRepo, "input-resolver"};
     writeFile(scratch.path() / "a.c");
@@ -153,6 +259,26 @@ TEST(InputResolver, MissingDirectoryFiresFileNotFound) {
     EXPECT_FALSE(InputResolver::resolveDirectory(
         ghost, exts, InputResolver::Mode::Recursive, out, rep));
     EXPECT_GT(countCode(rep, DiagnosticCode::D_FileNotFound), 0u);
+}
+
+// THE DIRECTORY NAMED AS AN INPUT, WHEN WHAT IT REACHES CANNOT BE EXAMINED, IS NO ABSENCE: a looping link named as
+// the directory is refused with D_DirectoryScanFailed naming it and the OS's reason -- never D_FileNotFound's "does
+// not exist", which would send the reader after the wrong cause. The link names itself, which loops on every host.
+// The checkpoint-34 bytes said it did not exist.
+TEST(InputResolver, ADirectoryWhoseReachCannotBeExaminedIsRefusedAsSuchNotAsAbsent) {
+    ScratchDir scratch{Location::InsideRepo, "input-resolver"};
+    using dss::test_support::LinkTo;
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(scratch.path() / "self", scratch.path() / "self",
+                                                             LinkTo::Directory));
+    std::vector<std::string> exts{".c"};
+    std::vector<std::string> out;
+    DiagnosticReporter       rep;
+    EXPECT_FALSE(InputResolver::resolveDirectory(scratch.path() / "self", exts, InputResolver::Mode::Recursive, out, rep));
+    std::string said;
+    for (auto const& d : rep.all()) said += "\n  " + d.actual;
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_FileNotFound), 0u) << "the directory was called absent:" << said;
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_DirectoryScanFailed), 1u) << said;
+    EXPECT_NE(said.find("reaches cannot be examined"), std::string::npos) << said;
 }
 
 TEST(InputResolver, EmptyMatchSetFiresEmptyInput) {

@@ -224,6 +224,67 @@ static_assert(stricterDuplicateMatch(DuplicateMatch::ExactContent,
 static_assert(stricterDuplicateMatch(DuplicateMatch::Any, DuplicateMatch::Any)
               == DuplicateMatch::Any);
 
+// ── WHICH KIND OF WEAK DEFINITION ─────────────────────────────────────────
+//
+// `SymbolBinding::Weak` says "a strong definition of this name replaces this
+// one". It does not say what the definition IS beside the other definitions
+// that are not strong, and the toolchains write two different things:
+//
+//   * OVERRIDABLE — a DEFAULT: the body stands only while nothing else defines
+//     the name. The GNU `weak` attribute. COFF spells it as a weak external
+//     whose default is the body (PE/COFF 5.5.3: the default is used "if sym1
+//     is not present at link time").
+//   * SELECT-ANY — ONE OF SEVERAL EQUAL COPIES: every unit that needs the
+//     definition carries it and the link keeps one. Microsoft's `selectany`,
+//     and a body DSS synthesizes into every unit that needs it. COFF spells it
+//     as a COMDAT section.
+//
+// Where a format spells the two differently its linkers RANK them, and a
+// common (tentative) definition of the name sits BETWEEN them. ✔MEASURED
+// 2026-10-08 on PE — GNU ld 2.42 on MinGW gcc 13.2's objects, link.exe 14.44
+// and lld-link 19.1.5 on clang 19.1.5's weak external beside cl 19.44's and
+// clang's select-any: one name defined both ways LINKS, the select-any body
+// wins in both object orders, and beside a common of the name in all six —
+// strong > select-any > common > overridable. Where a format has ONE spelling
+// for a weak definition (ELF's `STB_WEAK`, Mach-O's `N_WEAK_DEF`) both kinds
+// are written in it, and its linkers cannot rank what they cannot tell apart.
+//
+// ★ A SEPARATE AXIS FROM THE BINDING, for `DuplicateMatch`'s reason: a third
+// and a fourth `SymbolBinding` would make every `== SymbolBinding::Weak` test
+// in the tree enumerate a widening set. Read ONLY when the binding is Weak.
+//
+// ★ TWO VALUES AND NO DEFAULT. A producer that makes a weak definition KNOWS
+// which it is making, so it says. Zero is deliberately NOT an enumerator:
+// storage a producer never wrote names neither kind, and a verifier can refuse
+// it. A symbol READ from an object whose format has one spelling for both
+// carries no kind at all — that is a `std::optional<WeakDefinitionKind>` at
+// the tier that reads objects, never a third enumerator here.
+enum class WeakDefinitionKind : std::uint8_t {
+    Overridable = 1,  // a default: any other definition of the name replaces it
+    SelectAny   = 2,  // one of several equal copies: the link keeps one
+};
+
+inline constexpr EnumNameTable<WeakDefinitionKind, 2> kWeakDefinitionKindTable{{{
+    { WeakDefinitionKind::Overridable, "overridable" },
+    { WeakDefinitionKind::SelectAny,   "select-any"  },
+}}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kWeakDefinitionKindTable);
+
+// EMPTY for a value that is neither enumerator (storage nobody wrote): it has
+// no spelling, and the table's first name would read as a statement nobody made.
+[[nodiscard]] constexpr std::string_view
+weakDefinitionKindName(WeakDefinitionKind k) noexcept {
+    return kWeakDefinitionKindTable.nameOrEmpty(k);
+}
+[[nodiscard]] constexpr std::optional<WeakDefinitionKind>
+weakDefinitionKindFromName(std::string_view s) noexcept {
+    return kWeakDefinitionKindTable.fromName(s);
+}
+
 // ── WHEN TWO TRANSLATION UNITS REFERENCE ONE NAME AND DISAGREE ────────────
 //    D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE
 //

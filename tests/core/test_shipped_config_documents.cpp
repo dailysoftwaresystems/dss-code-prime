@@ -11,6 +11,7 @@
 // HERMETIC: every tree is planted under a scratch directory, so the arms answer the same in-tree and out.
 
 #include "core/types/config_path_walk.hpp"
+#include "os_link.hpp"   // links made by the OS: MinGW's library makes none
 #include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
@@ -115,4 +116,49 @@ TEST(ShippedConfigDocuments, ADirectoryThatCannotBeListedIsRefusedByName) {
     auto const notDir = shippedConfigDocuments(file, ".lang.json");
     ASSERT_FALSE(notDir.has_value()) << "a FILE where the directory should be must not read as a corpus";
     EXPECT_NE(notDir.error().find(file.generic_string()), std::string::npos) << notDir.error();
+}
+
+// A LINK IS A DOCUMENT BY WHAT IT REACHES, on every build: a link to a regular file is that document, and a
+// DANGLING link is none -- what the MSVC and POSIX builds always answered. libstdc++ on Windows reads a dangling
+// link's own attributes and calls it a regular file, so the MinGW build took it for a document and then failed to
+// read it ([[D-CORE-MINGW-BUILDS-WALKS-AND-REMOVALS-THAT-FOLLOW-A-LINK]]). The links are made by the OS.
+TEST(ShippedConfigDocuments, ALinkIsADocumentByWhatItReachesAndADanglingLinkIsNone) {
+    ScratchDir const scratch{Location::Temp, "shipped-config-documents"};
+    fs::path const dir = scratch.path() / "sources";
+    plant(dir / "c.lang.json");
+    plant(scratch.path() / "elsewhere" / "named.lang.json");
+    using dss::test_support::LinkTo;
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(scratch.path() / "elsewhere" / "named.lang.json",
+                                                             dir / "via-link.lang.json", LinkTo::File));
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(dir / "no-such.lang.json", dir / "gone.lang.json",
+                                                             LinkTo::File));
+
+    auto const got = shippedConfigDocuments(dir, ".lang.json");
+    ASSERT_TRUE(got.has_value()) << got.error();
+    std::string took;
+    for (auto const& stem : stemsOf(*got)) took += " " + stem;
+    EXPECT_EQ(stemsOf(*got), (std::vector<std::string>{"c", "via-link"}))
+        << "the listing took " << got->size() << " documents:" << took;
+}
+
+// A DOCUMENT WHOSE REACH CANNOT BE EXAMINED IS REFUSED BY NAME, never skipped as "no document": a looping link
+// named like a document is a document nobody can read, so which documents the directory holds cannot be told --
+// what gcc and clang answer for an include candidate that loops (✔MEASURED 2026-10-28, gcc 13.3 and clang on
+// linux-x86_64-debug: a fatal error naming the path, "Too many levels of symbolic links"). Absence (a dangling
+// link, the case above) stays absence. The link is made by the OS; a link to itself loops on every host.
+TEST(ShippedConfigDocuments, ADocumentWhoseReachCannotBeExaminedIsRefusedNamingIt) {
+    ScratchDir const scratch{Location::Temp, "shipped-config-documents"};
+    fs::path const dir = scratch.path() / "sources";
+    plant(dir / "c.lang.json");
+    using dss::test_support::LinkTo;
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(dir / "loop.lang.json", dir / "loop.lang.json",
+                                                             LinkTo::File));
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(dir / "other.json", dir / "other.json", LinkTo::File));
+
+    auto const got = shippedConfigDocuments(dir, ".lang.json");
+    ASSERT_FALSE(got.has_value()) << "a document that loops was skipped: the listing answered " << got->size()
+                                  << " document(s)";
+    EXPECT_NE(got.error().find("loop.lang.json"), std::string::npos) << got.error();
+    EXPECT_EQ(got.error().find("other.json"), std::string::npos)
+        << "an entry not named as a document of the kind was asked about: " << got.error();
 }

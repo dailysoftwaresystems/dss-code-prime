@@ -1,0 +1,3 @@
+                "its caller handed the template no names of that program (no "
+                "`AsmTemplateProgramNames`), so it resolves to no symbol here — "
+                "it is neither imported nor guessed",

@@ -1,0 +1,1 @@
+        if (!config.hoistTriageBaseAsk || branch.valid()) return false;

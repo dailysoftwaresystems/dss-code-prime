@@ -11,3 +11,16 @@ steps:
       python3 ./check-stale-blockers.py --selftest
     successPattern: 'check-stale-blockers: self-test OK'
     requireInputsUnmoved: true
+
+  # The REPORT: every OPEN row whose Closing-work cell waits on a blocker that has since CLOSED. LEADS, read
+  # before acting; it exits 0 whether or not there are any (it reports, it does not judge).
+  - name: report
+    workingDirectoryRoot: action
+    inputs:
+      band:
+        description: "one band, P0..P5; empty reports every band"
+        default: ''
+    run: |
+      python3 ./check-stale-blockers.py --band="{band}"
+    successPattern: '^check-stale-blockers: \d+ citation\(s\)'
+    requireInputsUnmoved: true

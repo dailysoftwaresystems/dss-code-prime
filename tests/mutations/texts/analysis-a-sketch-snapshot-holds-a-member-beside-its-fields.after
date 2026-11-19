@@ -1,0 +1,3 @@
+            ClosedParamScope definitionParams{};          // scope 0 ⇒ none kept
+        };
+        std::uint64_t beside = 0;

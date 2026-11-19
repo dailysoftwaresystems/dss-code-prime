@@ -1,0 +1,2 @@
+            if (isStandardAttributeSpecifier(sem, tree(), an)) continue;
+            roots.push_back(an);

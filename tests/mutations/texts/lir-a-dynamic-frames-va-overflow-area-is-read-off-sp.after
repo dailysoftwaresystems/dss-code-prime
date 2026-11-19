@@ -1,0 +1,1 @@
+                emitFrameAddr(b, h.lea, result, sp, ovfOffset);   // ★ P69: as above

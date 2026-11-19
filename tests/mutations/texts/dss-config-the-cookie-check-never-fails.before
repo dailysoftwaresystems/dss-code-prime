@@ -1,0 +1,3 @@
+	cmpq	__security_cookie(%rip), %rcx
+	jne	1f
+	ret

@@ -22,6 +22,7 @@
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
+#include "first_convention.hpp"   // dss::test::kFirstConventionOfTheTarget -- the convention a test states
 #include "hir/hir.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
 #include "lir/lir.hpp"
@@ -31,8 +32,10 @@
 #include "lir/lir_regalloc.hpp"
 #include "lir/lir_rewrite.hpp"
 #include "lir/lowering/mir_to_lir.hpp"
+#include "link/object_format_schema.hpp"
 #include "mir/lowering/hir_to_mir.hpp"
 #include "mir/mir.hpp"
+#include "program/model_to_hir.hpp"   // lowerModelToHir — the pipeline's gates
 
 #include <gtest/gtest.h>
 
@@ -90,17 +93,25 @@ TEST(CastIntegration, SourceLevelFloatToIntCastEncodesCvttsdsi) {
         << (model.diagnostics().all().empty()
                 ? "" : model.diagnostics().all()[0].actual);
 
+    auto const format = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-exec");
+    ASSERT_TRUE(format.has_value());
     DiagnosticReporter hirReporter;
-    auto hir = lowerToHir(model, hirReporter);
+    ModelLoweredToHir lowered = lowerModelToHir(model, **format, hirReporter);   // the pipeline's gates
+    auto const& hir = lowered.hir;
+    ASSERT_NE(hir, nullptr);
     ASSERT_TRUE(hir->ok);
     EXPECT_EQ(hirReporter.errorCount(), 0u);
     if (hirReporter.errorCount() != 0u) dumpDiagnostics(hirReporter);
+    ASSERT_TRUE(lowered.lowersToMir) << "the pipeline's gates pass the clean unit on to MIR";
 
     DiagnosticReporter mirReporter;
     // The language's policy through the pipeline's ONE assembly, and the mutability map the
     // constrained static-initializer fold reads a const object's value through (P68 round 13
     // fold F7: the constraint was threaded here without it).
     MirLoweringConfig mirCfg = languageMirLoweringConfig(**loaded);
+    mirCfg.dataModel = DataModel::Lp64;   // a config states its unit's data model
+    mirCfg.symbolIdSpace = MirSymbolIdSpace::endingAt(   // the unit's name table, as the driver states it
+        static_cast<std::uint32_t>(model.symbols().size()));
     HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
                                     model.lattice().interner(), mirReporter,
                                     &hir->sourceMap, mirCfg,
@@ -114,7 +125,7 @@ TEST(CastIntegration, SourceLevelFloatToIntCastEncodesCvttsdsi) {
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     DiagnosticReporter rep;
-    auto lir = lowerToLir(mir.mir, **target, model.lattice().interner(), rep);
+    auto lir = lowerToLir(mir.mir, **target, model.lattice().interner(), rep, dss::test::kFirstConventionOfTheTarget);
     ASSERT_TRUE(lir.ok) << "MIR->LIR failed";
     auto const liveness = analyzeLiveness(lir.lir);
     auto const alloc = allocateRegisters(lir.lir, **target, liveness,

@@ -1,0 +1,1 @@
+    std::uint32_t const ptLoad1Flags = (text.size() + pltSize) != 0 ? PF_X | PF_R : PF_R;

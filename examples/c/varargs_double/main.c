@@ -15,6 +15,8 @@
 // The fixed `n` is an INTEGER (rdi), so the GPR + SSE save areas are BOTH exercised
 // in one function. Runs natively on the x86_64-Linux CI leg.
 
+#include <stdarg.h>
+
 int sum_d(int n, ...) {
     va_list ap;
     va_start(ap, n);

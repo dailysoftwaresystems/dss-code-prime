@@ -7,8 +7,12 @@ dss_add_test(NAME analysis/compilation_unit/test_unit_attribute
 dss_add_test(NAME analysis/compilation_unit/test_import_resolver
              SOURCES test_import_resolver.cpp)
 
-dss_add_test(NAME analysis/compilation_unit/test_type_name_oracle
-             SOURCES test_type_name_oracle.cpp)
+dss_add_test(NAME analysis/compilation_unit/test_unit_type_names
+             SOURCES test_unit_type_names.cpp)
+
+# P69 L2b2 (ruling 570): a unit has its languages' system dirs by construction.
+dss_add_test(NAME analysis/compilation_unit/test_unit_system_dirs
+             SOURCES test_unit_system_dirs.cpp)
 
 # Reaches the shared `core/e2e_harness.hpp` (tokenize-a-shipped-config helper)
 # from a sibling test directory. dss_add_test only puts src/ on the include
@@ -21,5 +25,5 @@ target_include_directories(dss_analysis_compilation_unit_test_unit_attribute
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 target_include_directories(dss_analysis_compilation_unit_test_import_resolver
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
-target_include_directories(dss_analysis_compilation_unit_test_type_name_oracle
+target_include_directories(dss_analysis_compilation_unit_test_unit_type_names
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)

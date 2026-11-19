@@ -1,0 +1,2 @@
+        if (!step.innerDeclarator.valid()) return step.type;
+        node               = step.innerDeclarator;

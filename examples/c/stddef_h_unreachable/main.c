@@ -6,7 +6,11 @@
  * lowering (MIR's Unreachable terminator: `ud2` / `brk #0`) and the program's exit code coexist. The no-fall-through
  * property itself is pinned by tests/mir/test_builtin_unreachable_lowering.cpp; this example pins that both
  * spellings are ACCEPTED where gcc and clang accept them — a non-void function whose last path ends in one is
- * complete — and that the program around them computes the right value. */
+ * complete — and that the program around them computes the right value.
+ *
+ * "Complete" is held by the manifest's `forbidDiagnostics`, not by the build succeeding: since P69 an end DSS calls
+ * reached is, under C (C23 6.9.2p13), a warning (H_NonVoidFunctionEndReachable) on a compile that SUCCEEDS — it was a
+ * refusal before — and `channel`, `pick` and `twice` would each run to the same 42 with that warning on them. */
 #include <stddef.h>
 
 enum colors { red, green, blue };

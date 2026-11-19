@@ -1,0 +1,1 @@
+    std::size_t const names = core::rootSpelling(std::wstring_view{wide}, core::PathGrammar::Win32).volume;

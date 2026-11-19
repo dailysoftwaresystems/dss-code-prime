@@ -71,6 +71,7 @@
 #include "ffi/shipped_lib_descriptor.hpp"
 #include "repo_root.hpp"
 #include "scratch_dir.hpp"
+#include "validation_va_list_binding.hpp"   // the descriptor word a validation read binds (c82)
 
 #include <nlohmann/json.hpp>
 
@@ -164,7 +165,8 @@ public:
 private:
     void add(fs::path const& p, std::string_view arch, ObjectFormatKind fmt) {
         auto d = readShippedLibDescriptor(p, interner_, typeReg_, reporter_,
-                                          modelFor(fmt), arch, fmt);
+                                          modelFor(fmt), arch, fmt,
+                                          dss::test_support::validationVaListBinding(interner_));
         if (!d) { ok_ = false; return; }
         descs_.push_back(std::move(*d));
     }

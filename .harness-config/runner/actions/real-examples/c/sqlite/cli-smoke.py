@@ -164,6 +164,7 @@ import os
 import shutil
 import subprocess
 import sys
+sys.dont_write_bytecode = True  # this program loads owning-tree.py by path: no __pycache__ beside an action
 import tempfile
 
 # A run that hangs must not hang the harness. Generous: these are sub-second
@@ -835,6 +836,28 @@ def _spelled(launcher, path):
     return "%s%s" % (" ".join(launcher) + " " if launcher else "", path)
 
 
+_PATH_TYPES_OWNER = []
+
+
+def _path_types():
+    """owning-tree, loaded ONCE by path from the actions directory (a hyphen is no module name): its argparse kinds --
+    `read_path_arg`, `written_path_arg`, `path_part_arg`, `text_arg`, `option_text_arg` and `command_words_arg` --
+    are the `type=` every argument of this program that takes a value declares. What each refuses is said there once;
+    check-scripts-index's clause 14 asks one of them of every such argument. It FAILS LOUD when owning-tree is
+    absent."""
+    if not _PATH_TYPES_OWNER:
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))), "owning-tree", "owning-tree.py")
+        if not os.path.isfile(path):
+            raise SystemExit("cli-smoke: cannot find %s -- what a path type refuses is said there and "
+                             "nowhere else" % path)
+        spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _PATH_TYPES_OWNER.append(mod)
+    return _PATH_TYPES_OWNER[0]
+
+
 def main(argv=None):
     argv = list(sys.argv[1:]) if argv is None else list(argv)
     # ── `--self-test` IS CHECKED BEFORE argparse, NOT DECLARED IN IT ──────────
@@ -857,7 +880,8 @@ def main(argv=None):
     # required arguments in DECLARATION order, and both driver self-tests assert
     # on the substring "the following arguments are required: --cli".
     p.add_argument("--cli", required=True,
-                   help="the DSS-built sqlite3 CLI, spelled as its LAUNCHER sees it")
+                   help="the DSS-built sqlite3 CLI, spelled as its LAUNCHER sees it",
+                   type=_path_types().read_path_arg("--cli"))
     # ★ THE `=` FORM IS THE ONLY ONE THAT WORKS, AND THIS HELP TEXT USED TO SAY
     # OTHERWISE. It read `e.g. --launcher wsl.exe --launcher -e` — byte-for-byte the
     # invocation ✔MEASURED to fail on 2026-08-05 (TF-C121): a launcher TOKEN may
@@ -870,7 +894,7 @@ def main(argv=None):
     p.add_argument("--launcher", action="append", default=[], metavar="TOKEN",
                    help="one launcher argv token (repeatable). ALWAYS the `=` form, "
                         "e.g. --launcher=arch --launcher=-x86_64 : a token may start "
-                        "with a dash and the space form then fails")
+                        "with a dash and the space form then fails", type=_path_types().command_words_arg("--launcher"))
     # ── THE TWO PRECONDITION ARGUMENTS ───────────────────────────────────────
     # MEASURED BY THE CALLER, not by this file, and that division is deliberate:
     # the binary lives in the LAUNCHER's filesystem namespace (`wsl.exe`, `arch`,
@@ -879,25 +903,31 @@ def main(argv=None):
     # a second resolver here would be a second thing to drift.
     p.add_argument("--leg-spec", required=True, metavar="ARCH:FORMAT",
                    help="the leg's DECLARED spec from the plan, e.g. "
-                        "arm64:elf64-aarch64-linux-exec")
+                        "arm64:elf64-aarch64-linux-exec", type=_path_types().text_arg("--leg-spec"))
     p.add_argument("--cli-target", required=True, metavar="ARCH:CONTAINER:OS",
-                   help="the MEASURED target of --cli, e.g. arm64:elf64:linux")
+                   help="the MEASURED target of --cli, e.g. arm64:elf64:linux",
+                   type=_path_types().text_arg("--cli-target"))
     p.add_argument("--reference", default="",
-                   help="a gcc-built reference sqlite3 (upstream `make sqlite3d`), spelled as ITS launcher sees it")
+                   help="a gcc-built reference sqlite3 (upstream `make sqlite3d`), spelled as ITS launcher sees it",
+                   type=_path_types().read_path_arg("--reference", empty_means_absent=True))
     p.add_argument("--reference-launcher", action="append", default=[], metavar="TOKEN",
                    help="one reference-launcher argv token (repeatable); same `=` "
-                        "form rule as --launcher above")
+                        "form rule as --launcher above", type=_path_types().command_words_arg("--reference-launcher"))
     p.add_argument("--reference-target", default="", metavar="ARCH:CONTAINER:OS",
                    help="the MEASURED target of --reference; REQUIRED whenever "
                         "--reference is given. It is a control only if it equals "
-                        "--cli-target")
+                        "--cli-target", type=_path_types().text_arg("--reference-target"))
     p.add_argument("--expect-version", required=True,
-                   help="SQLITE_VERSION read from the STAGED sqlite3.h this binary was compiled against")
+                   help="SQLITE_VERSION read from the STAGED sqlite3.h this binary was compiled against",
+                   type=_path_types().text_arg("--expect-version"))
     p.add_argument("--expect-source-id", required=True,
-                   help="SQLITE_SOURCE_ID read from that same staged sqlite3.h")
-    p.add_argument("--workdir", required=True, help="scratch dir; two subdirs are created under it")
-    p.add_argument("--label", default="cli", help="leg label, for the report")
-    p.add_argument("--json", default="", help="also write the machine-readable result here")
+                   help="SQLITE_SOURCE_ID read from that same staged sqlite3.h",
+                   type=_path_types().text_arg("--expect-source-id"))
+    p.add_argument("--workdir", required=True, type=_path_types().written_path_arg("--workdir"),
+                   help="scratch dir; two subdirs are created under it")
+    p.add_argument("--label", default="cli", help="leg label, for the report", type=_path_types().text_arg("--label"))
+    p.add_argument("--json", default=None, type=_path_types().written_path_arg("--json"),
+                   help="also write the machine-readable result here")
     args = p.parse_args(argv)
 
     if args.reference and not args.reference_target.strip():

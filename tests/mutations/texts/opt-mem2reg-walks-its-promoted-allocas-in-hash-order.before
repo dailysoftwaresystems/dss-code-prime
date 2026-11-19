@@ -1,0 +1,3 @@
+    std::vector<std::uint32_t> promotedInOrder(promoted_.begin(), promoted_.end());
+    std::sort(promotedInOrder.begin(), promotedInOrder.end());
+    for (std::uint32_t aid : promotedInOrder) {

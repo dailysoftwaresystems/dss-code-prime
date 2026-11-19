@@ -1,0 +1,2 @@
+        body = maybeAppendImplicitReturnZero(node, body, sym, retType, decl);
+        if (false) body = maybeCompleteReachableNonVoidEnd(

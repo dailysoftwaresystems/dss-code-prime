@@ -24,6 +24,8 @@
 // reachable form (a top-level `struct Tag` return type is a pre-FC4 grammar residue) —
 // identical ABI codegen. Runs under qemu-aarch64 (the linux-arm64 CI leg / local qemu).
 
+#include <stdarg.h>
+
 typedef struct { long a; long b; long c; } Big;
 
 Big make(int n, ...) {

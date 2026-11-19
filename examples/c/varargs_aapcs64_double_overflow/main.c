@@ -17,6 +17,8 @@
 // FP-overflow geometry (bad __stack base, wrong pointer bump, a missed register cutover)
 // drops or mis-reads it and flips the exit off 60. Runs under qemu-aarch64.
 
+#include <stdarg.h>
+
 double sum_d(int n, ...) {
     va_list ap;
     va_start(ap, n);

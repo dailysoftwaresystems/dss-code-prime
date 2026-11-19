@@ -1,0 +1,2 @@
+        module.dataItems, DataSectionKind::Rodata, rodataAlignFloor,
+        elfDataWriterName, reporter, /*allowItemRelocations=*/true, groupedDataItems);

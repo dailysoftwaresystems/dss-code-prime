@@ -1,0 +1,1 @@
+        if (row.binding == SymbolBinding::Local || row.name != name) continue;

@@ -1,0 +1,1 @@
+                && !(defersByName && canonicalBinding == SymbolBinding::Weak)) {

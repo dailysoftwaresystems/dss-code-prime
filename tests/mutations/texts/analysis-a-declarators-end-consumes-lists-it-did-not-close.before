@@ -1,0 +1,1 @@
+        if (top.sequence < mark) break;

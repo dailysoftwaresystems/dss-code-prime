@@ -1,0 +1,1 @@
+        if (!typeName.valid() || !typeIsVariablyModified(type) || !sem.declarators.has_value())

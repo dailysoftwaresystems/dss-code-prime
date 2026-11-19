@@ -1,0 +1,1 @@
+        if (name == "open" && ctx.how == Written::Member && args.has_value() && scope.streams.count(ctx.object) != 0)

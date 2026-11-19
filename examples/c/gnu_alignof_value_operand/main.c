@@ -38,14 +38,19 @@
  * S_NonConstantArrayLength: a REGRESSION in the type form, caused by the value
  * form, and invisible to any test that only exercises the new feature.
  *
- * ⚠ NOT CLAIMED HERE: gcc reports the DECLARED alignment of an OVER-ALIGNED
- * OBJECT (`int x __attribute__((aligned(64))); __alignof__(x)` is 64 on gcc and
- * 4 under the type reading), while clang reports the TYPE alignment. DSS takes
- * the type reading — the one the C text and clang give. The divergence is
- * anchored at [[D-CSUBSET-ALIGNOF-VALUE-OVERALIGNED-OBJECT]] rather than
- * silently absorbed, and this file deliberately does NOT pin behaviour its own
- * references disagree about.
+ * ★ SHAPE 9 — AN OBJECT'S OWN ALIGNMENT REQUEST ANSWERS ITS `__alignof__`
+ * (P69, lane `cs`, fold f26e — [[D-CSUBSET-ALIGNOF-VALUE-OVERALIGNED-OBJECT]]).
+ * HISTORY: measured 2026-08-24 (P31), gcc answered the DECLARED alignment of an
+ * over-aligned object and clang 18 the TYPE's, so this file pinned neither.
+ * REFUTED 2026-11-19 by probe n5w: gcc 15.2.0, clang 21.1.8, Apple clang 21 and
+ * MinGW-w64 gcc 13.2.0 ALL answer the declaration's (`int x
+ * __attribute__((aligned(64)))` is 64, a member `s.m` asking 64 is 64), and a
+ * LOWER request on an object (`aligned(1)`) answers 1 (probe n5w2) while a
+ * member's lower request answers its type's — so the answer is required, and
+ * pinned below at both tiers: the constant fold (`_Static_assert`) and the value
+ * the program computes (the checks in `main`).
  */
+#include <stdint.h>
 
 /* SHAPE 7 — THE TYPE FORM, AT FILE SCOPE, IN THE TWO CONST-EXPR POSITIONS THAT
  * ROUTE THROUGH THE MOVED RULE ID. `dss_dim` is `int[8]`. */
@@ -58,6 +63,21 @@ _Static_assert(_Alignof(double) == 8, "the type form must still fold");
 int dss_val_dim[__alignof__(*(double *)0)];
 _Static_assert(__alignof__(*(double *)0) == 8,
                "the value form must fold in a constant expression");
+
+/* SHAPE 9 — the declaration answers: an over-aligned object, a member asking
+ * more than its type, an object asking LESS (answered, and still placed at its
+ * type's alignment, as clang places it), a member asking less (its type's). */
+int dss_over __attribute__((aligned(64))) = 1;
+int dss_under __attribute__((aligned(1))) = 1;
+struct dss_members {
+    char c;
+    int  up __attribute__((aligned(64)));
+    int  down __attribute__((aligned(1)));
+} dss_wm;
+_Static_assert(__alignof__(dss_over) == 64, "an object's raised request answers");
+_Static_assert(__alignof__(dss_under) == 1, "an object's lowered request answers");
+_Static_assert(__alignof__(dss_wm.up) == 64, "a member's raised request answers");
+_Static_assert(__alignof__(dss_wm.down) == 4, "a member's lowered request does not");
 
 /* Kept `volatile` so no arm of the optimizer can fold the loads away and turn a
  * behavioural check into a constant. The `release` arm of this example is where
@@ -110,6 +130,18 @@ int main(void) {
     /* SHAPE 7/8 — the two const-expr array dimensions really are 8 elements. */
     if ((int)(sizeof dss_dim / sizeof dss_dim[0]) != 8) return 9;
     if ((int)(sizeof dss_val_dim / sizeof dss_val_dim[0]) != 8) return 10;
+
+    /* SHAPE 9 — the values the program computes, and where the raised object is. */
+    if ((int)__alignof__(dss_over) != 64) return 11;
+    if ((int)__alignof__(dss_under) != 1) return 12;
+    if ((int)__alignof__(dss_wm.up) != 64) return 13;
+    if ((int)__alignof__(dss_wm.down) != 4) return 14;
+    if (((uintptr_t)&dss_over & 63u) != 0) return 15;
+    if (((uintptr_t)&dss_wm.up & 63u) != 0) return 16;
+    {
+        int local_up __attribute__((aligned(64))) = dss_over;
+        if ((int)__alignof__(local_up) != 64 + local_up - dss_over) return 17;
+    }
 
     /* Every mismatch above already returned its own code, so this arithmetic is
      * a second, weaker check — kept only so the exit code is a FUNCTION of the

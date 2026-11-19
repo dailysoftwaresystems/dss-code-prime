@@ -294,6 +294,62 @@ TEST(LineMapOriginOf, ResolveIsDerivedFromOriginOfAndNeverExtrapolates) {
     EXPECT_LE(r.offset, r.origin->size());
 }
 
+// ★ THE CLIMB IS BOUNDED BY THE RECORDS IT CLIMBS (cycle P69 L2, lane `lm`). A product byte
+// hops to its site, and a site inside another product hops again, each hop into another record.
+// It stopped at a fixed 64 hops and answered Unmapped past them; the records themselves bound it
+// now (`substrate::WalkSteps`), and only a cyclic chain of records, a builder bug, takes more
+// hops: that stops the process, naming the climb.
+namespace {
+// `count` records, product runs of 3 bytes laid end to end after the prefix; record i's site is
+// the start of record i-1's product, record 0's is `firstSite` (4, inside the origin run, unless
+// the caller closes a cycle).
+LineMap chainOfRecords(std::shared_ptr<SourceBuffer> const& origin, std::size_t count,
+                       ByteOffset firstSite) {
+    LineMap map;
+    LineMapSegment seg;
+    seg.synthStart  = 0;
+    seg.synthEnd    = static_cast<ByteOffset>(origin->size());
+    seg.origin      = origin;
+    seg.originStart = 0;
+    map.addSegment(std::move(seg));
+    auto const base = static_cast<ByteOffset>(origin->size());
+    map.setProductBase(base);
+    for (std::size_t i = 0; i < count; ++i) {
+        MacroExpansionSite s;
+        s.productStart  = base + static_cast<ByteOffset>(3 * i);
+        s.productEnd    = s.productStart + 3;
+        s.siteOffset    = i == 0 ? firstSite : base + static_cast<ByteOffset>(3 * (i - 1));
+        s.defOffset     = 1;
+        s.hasDefinition = true;
+        s.name          = "M" + std::to_string(i);
+        map.addExpansion(std::move(s));
+    }
+    return map;
+}
+}  // namespace
+
+TEST(LineMapOriginOf, AChainOfMoreRecordsThanTheOldSixtyFourHopsReachesItsSite) {
+    auto origin = SourceBuffer::fromString("int a;\nint b;\n", "origin.c");
+    LineMap const map = chainOfRecords(origin, 70, /*firstSite=*/4);
+    auto const probe = static_cast<ByteOffset>(origin->size() + 3 * 69 + 1);   // inside the last product
+    SynthOrigin const r = map.originOf(probe);
+    EXPECT_EQ(r.kind, SynthOriginKind::Expansion)
+        << "69 hops back to a site in the origin: a fixed 64 answered Unmapped";
+    EXPECT_EQ(r.offset, 4u);
+    ASSERT_NE(r.expansion, nullptr);
+    EXPECT_EQ(r.expansion->name, "M69");
+}
+
+TEST(LineMapOriginOf, ACyclicChainOfRecordsStopsTheProcessNamingTheClimb) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    auto origin = SourceBuffer::fromString("int a;\nint b;\n", "origin.c");
+    auto const base = static_cast<ByteOffset>(origin->size());
+    // Record 0's site is record 1's product start, and record 1's is record 0's: a cycle.
+    LineMap const map = chainOfRecords(origin, 2, /*firstSite=*/base + 3);
+    EXPECT_DEATH((void)map.originOf(base + 1),
+                 "dss::substrate fatal: originOf's climb through the expansion sites: ");
+}
+
 // ── GROUP 2: end to end — a parse error whose SUBJECT is a product token ───
 
 // A `#`-stringize product. `int STR(name) = 1;` expands to `int "name" = 1;`,

@@ -1,0 +1,1 @@
+(d.code) != (DiagnosticCode::S_UndeclaredIdentifier)

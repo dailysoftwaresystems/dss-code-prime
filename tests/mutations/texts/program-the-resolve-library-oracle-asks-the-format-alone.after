@@ -1,0 +1,2 @@
+                    declaredFormats == nullptr
+                    || ffi::objectFormatInAvailabilitySet(*declaredFormats, format.kind());

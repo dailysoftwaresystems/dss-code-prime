@@ -1,0 +1,1 @@
+            if (chosen.size() < 2) continue;

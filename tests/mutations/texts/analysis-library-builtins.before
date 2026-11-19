@@ -1,0 +1,2 @@
+    std::string_view const lib = cfg.libraryBuiltins.libraryFunctionOf(spelled);
+    if (lib.empty() || !s.resolveLibraryFunction) return InvalidSymbol;

@@ -1,0 +1,1 @@
+        if (true || !interner.isIncompleteArray(rec.type)) continue;

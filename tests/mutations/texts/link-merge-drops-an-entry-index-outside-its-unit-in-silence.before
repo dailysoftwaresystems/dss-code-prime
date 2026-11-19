@@ -1,0 +1,3 @@
+        if (*m.imageEntryOverride >= m.functions.size()) {
+            report(reporter, DiagnosticCode::K_SymbolUndefined, DiagnosticSeverity::Error,
+                   "linked unit #" + std::to_string(i) + " states function index " +

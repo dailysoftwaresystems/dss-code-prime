@@ -1,0 +1,1 @@
+dss-python selftest: FAILED  configure: a cache naming an App Execution Alias is searched again, and the interpreter chosen lies outside the alias directory

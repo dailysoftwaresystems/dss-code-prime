@@ -1,0 +1,1 @@
+        if (told.contains(alias.alias.v)) continue;   // told at its declaration

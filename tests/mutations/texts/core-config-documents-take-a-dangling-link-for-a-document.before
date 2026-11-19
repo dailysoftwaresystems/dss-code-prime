@@ -1,0 +1,1 @@
+        if (reached != core::EntryKind::File) continue;

@@ -653,7 +653,7 @@ TemplateOutcome lowerArmTemplate(std::string_view text,
     ob.reg       = makePhysicalReg(*(*target)->registerByName("x9"), LirRegClass::GPR);
     std::vector<AsmOperandBinding> bindings{ob};
     out.lowered = lowerAsmTemplateToLirRun(*tree, **grammar, **target, bindings,
-                                           builder, rep, {}, nullptr, kind);
+                                           builder, rep, nullptr, {}, nullptr, kind);
     for (auto const& d : rep.all()) out.diagnostics += d.actual + "\n";
     return out;
 }

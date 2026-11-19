@@ -1,0 +1,1 @@
+        if norm_path("", root) != root or DRIVE_RX.match(root) or "\\" in root:

@@ -1,0 +1,13 @@
+{
+  "$comment": "A WEAK ALIAS OF A SELECT-ANY COPY (P69 round 1, lane cs, the review of checkpoint 30, F1; D-CSUBSET-ATTRIBUTE-ALIAS-TARGET-NO-SURFACE). PE discards a losing select-any copy WHOLE, and a STRONG alias it carries goes with it (examples/c/two_units_alias_of_a_selectany_copy_that_loses_pe). A WEAK alias does not: it is a weak definition of its OWN name, never withdrawn with its copy (`linker::carriedNameGoesWithItsCarrier`). When another definition wins the name, every read follows the name, its own unit's included; when it wins the name, it names the KEPT copy of its target. MEASURED 2026-10-20 by lane cs's probes wk1 and wk2 (clang-cl 19.1.5 objects at /Od and /O2 linked by link.exe 14.51 and lld-link 19.1.5; mingw-w64 gcc 13.2.0 at -O0 and -O2 linked by GNU ld 2.42; both unit orders). clang writes such an alias as a weak external whose default is its target's NAME, which outlives the discarded section. `yield_m`, beside a strong definition: all three linkers read 1 everywhere. `hold_m`, the only definition, main reads it: clang's two linkers read 7 (GNU ld refuses: gcc writes the default as a label in the discarded section). `quiet_m`, the same with only b.c naming it: clang's linkers read 7. `pair_m`, a weak alias of its own copy in each unit: clang's linkers read 7 everywhere, since both aliases name the kept copy and are ONE definition. `first_m`, a.c's weak definition beside b.c's weak alias, named by no other unit: GNU ld links it and reads 5 everywhere, the first weak definition (clang's linkers refuse it, two weak externals with different defaults). Checkpoint 30 withdrew a weak alias like a strong one: b.c read 7 through `yield_m` and `first_m`, and main's read of `hold_m` was refused K_SymbolUndefined. Every return before 42 names the first fact that failed. The `release` arm pins that the optimizer reads no value through a weak alias from its own unit's copy, which may lose.",
+  "language": "c",
+  "sources": ["main.c", "a.c", "b.c"],
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

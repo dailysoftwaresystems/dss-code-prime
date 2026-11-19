@@ -1,0 +1,2 @@
+    auto const opened = core::openFileStream(   // BINARY, as the function dump above (its note)
+        std::filesystem::path{path != nullptr ? path : "dss_lir_dump.txt"}, "ab");   // at any length

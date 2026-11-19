@@ -1,0 +1,2 @@
+    bool const everyEntryAdmitted = substrate::runEveryUnit(
+        entries.size(), substrate::namingSilentUnits(rep_, "the dependency walk", entryName, [&](std::size_t i) {

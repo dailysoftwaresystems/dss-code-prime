@@ -1,0 +1,4 @@
+    // In the order the thunks were laid out (P69 fold f26d, the host-toolchain class): the walk stops at the first
+    // collision and names it, and walking the hash map itself named the standard library's first.
+    for (SymbolId const sym : thunkSymbolsInOrder) {
+        std::uint64_t const va = externThunkVaBySym.at(sym);

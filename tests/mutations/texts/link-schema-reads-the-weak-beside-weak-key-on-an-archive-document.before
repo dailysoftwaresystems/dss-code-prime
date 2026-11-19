@@ -1,0 +1,2 @@
+        if (weakDefinitionBesideWeak.stated()
+            && container == ObjectFormatContainer::Archive) {

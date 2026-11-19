@@ -1,0 +1,2 @@
+            if (carried.weakKind.has_value())
+                declared.weakKind = *carried.weakKind;

@@ -2,6 +2,7 @@
 
 #include "core/crypto/sha256.hpp"   // crypto::sha256Hex — the retained content digest
 #include "core/substrate/checked_file_read.hpp"   // the ONE checked whole-file read
+#include "core/substrate/key_order.hpp"           // entriesInKeyOrder — the checks below stop at the first lexeme they meet
 #include "core/substrate/phase_timers.hpp"        // the load-config / build-config phases
 #include "core/types/config_path_walk.hpp"
 #include "core/types/grammar_schema_json.hpp"
@@ -14,6 +15,7 @@
 #include <sstream>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace dss {
 
@@ -60,12 +62,20 @@ constexpr std::string_view kLanguageConfigSuffix = ".lang.json";
                 // those rule-leaves belong to the enclosing sequence tail.
                 // Excluding it makes a peek that matches only the continuation
                 // yield candidates=[] so the parser's nullable skip fires and
-                // the tail parses non-speculatively. Gated to the walk ROOT so
-                // an ENCLOSING non-speculative optional still reaches those
-                // rules through its own (deeper) traversal — the non-
-                // speculative `altRuleBranches` route stays byte-identical.
+                // the tail parses non-speculatively. Gated to the walk ROOT: an
+                // enclosing SPECULATIVE choice probes those rules as its own; an
+                // enclosing NON-speculative one never reaches them, because it
+                // stops at the speculative choice itself (below).
                 if (posId == startPos && p.speculative() && p.hasSkipBranch()
                     && bid == p.skipBranch()) {
+                    continue;
+                }
+                // ★ P69 (lane `cs`, fold f26e): a nested SPECULATIVE choice under a
+                // NON-speculative root is not this root's to enumerate — the parser
+                // routes its cursor there and decides it in place
+                // (`detail::enumerationEnters`, `GrammarSchema::nestedSpeculativeChoice`).
+                if (bid < positions.size()
+                    && !detail::enumerationEnters(positions[startPos], positions[bid])) {
                     continue;
                 }
                 self(self, bid);
@@ -198,6 +208,53 @@ GrammarSchema::GrammarSchema(detail::GrammarSchemaData&& d) noexcept : d_(std::m
         }
     }
 
+    // ── P69 L2b2 (lane `lm`): THE TYPE-NAME TRIAGE'S STATIC HALF ──────────
+    // ONE load-time home for what the triage's two base askers — the early base ask
+    // and the same ask hoisted before a probe opens — need to know before they may
+    // read the type child's base as a token (`CompiledRule::typeBaseAskable`), and
+    // for the entry run that puts the type child at a fixed grammar-token offset
+    // (`CompiledRule::typeChildLeadRun`). Read off the sealed table: a linear walk
+    // of each guarded rule's entry run, no recursion; it names no token, rule or
+    // language beyond the engine's built-in Identifier kind, the kind every
+    // identifier token carries.
+    {
+        SchemaTokenId const identifier =
+            d_.schemaTokens ? d_.schemaTokens->find("Identifier") : SchemaTokenId{};
+        auto const firstHoldsIdentifier = [&](RuleId attr) {
+            if (!attr.valid() || attr.v >= compiledDense_.size() || !identifier.valid()) return false;
+            auto const& set = compiledDense_[attr.v].firstSet;
+            return std::any_of(set.begin(), set.end(),
+                               [&](SchemaTokenId t) { return t.v == identifier.v; });
+        };
+        bool const anAttributeStartsWithAName =
+            firstHoldsIdentifier(d_.semantics.attrSpecRule)
+            || firstHoldsIdentifier(d_.semantics.stdAttrRule);
+        for (auto& rule : compiledDense_) {
+            rule.typeBaseAskable = false;
+            rule.typeChildLeads  = false;
+            rule.typeChildLeadRun.clear();
+            RuleId const typeRule = rule.typeNameCommitRule;
+            if (!typeRule.valid()) continue;
+            bool const typeRuleNullable =
+                typeRule.v < compiledDense_.size() && compiledDense_[typeRule.v].nullable;
+            rule.typeBaseAskable = !typeRuleNullable && !anAttributeStartsWithAName;
+            if (rule.entryPos == 0 || rule.entryPos >= rule.positions.size()) continue;
+            std::vector<std::uint32_t> run;
+            std::uint32_t at = rule.entryPos;
+            while (at < rule.positions.size()
+                   && rule.positions[at].slotKind() == SlotKind::TokenLeaf) {
+                run.push_back(at);
+                at = rule.positions[at].nextPos();
+            }
+            if (at < rule.positions.size()
+                && rule.positions[at].slotKind() == SlotKind::RuleLeaf
+                && rule.positions[at].ruleId().v == typeRule.v) {
+                rule.typeChildLeads   = true;
+                rule.typeChildLeadRun = std::move(run);
+            }
+        }
+    }
+
     // ── longest-match probe index ─────────────────────────────────────
     // D-PERF-TOK-LONGEST-MATCH-PROBES-EVERY-DECLARED-LENGTH-AT-EVERY-POSITION.
     // Derived HERE, in the same sealing pass and for the same reason as the
@@ -238,8 +295,11 @@ GrammarSchema::GrammarSchema(detail::GrammarSchemaData&& d) noexcept : d_(std::m
         // of entries: unmeasurable next to the JSON parse it follows, and NOT
         // debug-only, because a Release build is exactly where a silent
         // miscompile would ship.
-        for (auto const& [lex, meanings] : d_.lexemeTable) {
-            (void)meanings;
+        // ASCENDING, never the hash tables' order (P69 fold 3f): each check aborts
+        // at the FIRST unreachable lexeme it meets, so which one it names must be a
+        // fact of the schema, not of the C++ library's bucket order.
+        for (auto const* entry : substrate::entriesInKeyOrder(d_.lexemeTable)) {
+            std::string const& lex = entry->first;
             if (lex.empty()) continue;
             auto const lens =
                 lexemeLengthsForLeadByte(static_cast<unsigned char>(lex.front()));
@@ -253,9 +313,10 @@ GrammarSchema::GrammarSchema(detail::GrammarSchemaData&& d) noexcept : d_(std::m
                 std::abort();
             }
         }
-        for (auto const& [modeV, table] : d_.lexerModeTokens) {
-            for (auto const& [lex, meanings] : table) {
-                (void)meanings;
+        for (auto const* mode : substrate::entriesInKeyOrder(d_.lexerModeTokens)) {
+            std::uint32_t const modeV = mode->first;
+            for (auto const* entry : substrate::entriesInKeyOrder(mode->second)) {
+                std::string const& lex = entry->first;
                 if (lex.empty()) continue;
                 auto const lens =
                     modeLexemeLengths_[modeV].lengthsFor(
@@ -272,6 +333,15 @@ GrammarSchema::GrammarSchema(detail::GrammarSchemaData&& d) noexcept : d_(std::m
             }
         }
     }
+    // P69 L2b1 (lane `lm`, the L2a2 review's A6): the scope kinds that forbid a token, ASCENDING —
+    // the order `isTokenValidInScope` asks its presence questions in. It iterated the hash map
+    // and stopped at the first open forbidding kind, so how many questions it asked (one unit of
+    // the builder's scope work each) depended on the standard library's iteration order.
+    scopeForbidOrder_.reserve(d_.scopeForbid.size());
+    for (auto const& [scopeV, forbid] : d_.scopeForbid) {
+        if (!forbid.empty()) scopeForbidOrder_.push_back(scopeV);
+    }
+    std::sort(scopeForbidOrder_.begin(), scopeForbidOrder_.end());
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -643,6 +713,38 @@ std::span<RuleId const> GrammarSchema::altRuleBranches(SchemaCursor cur) const n
     return p->altBranchRules();
 }
 
+SchemaCursor GrammarSchema::nestedSpeculativeChoice(SchemaCursor cur,
+                                                    SchemaTokenId tok) const noexcept {
+    auto const* r = ruleRow(cur.rule().v);
+    auto const* root = lookupPos(r, cur);
+    if (root == nullptr || root->slotKind() != SlotKind::AltChoice || root->speculative()) {
+        return SchemaCursor{};
+    }
+    auto const& positions = r->positions;
+    // Each step goes one AltChoice deeper along the branch `tok` selects. The position graph
+    // has no AltChoice-to-AltChoice cycle that consumes nothing (`advance` walks the same
+    // edges unbounded); the bound only keeps a malformed graph from looping.
+    detail::Position const* at = root;
+    for (std::size_t steps = 0; steps < positions.size(); ++steps) {
+        std::uint32_t next = 0;
+        bool found = false;
+        for (auto const bid : at->branches()) {
+            if (bid < positions.size()
+                && detail::tokenBitsContain(positions[bid].expectedBits(), tok.v)) {
+                next  = bid;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return SchemaCursor{};
+        detail::Position const& q = positions[next];
+        if (q.slotKind() != SlotKind::AltChoice) return SchemaCursor{};
+        if (!detail::enumerationEnters(*root, q)) return SchemaCursor{cur.rule(), next};
+        at = &q;
+    }
+    return SchemaCursor{};
+}
+
 SchemaCursor GrammarSchema::advance(SchemaCursor cur, SchemaTokenId tok) const noexcept {
     auto const* r = ruleRow(cur.rule().v);
     if (r == nullptr) return SchemaCursor{};
@@ -869,9 +971,46 @@ GrammarSchema::typeNameCommitPolarity(RuleId rule) const noexcept {
     return r->typeNameCommitPolarity;
 }
 
+bool GrammarSchema::typeBaseAskable(RuleId rule) const noexcept {
+    auto const* r = ruleRow(rule.v);
+    return r != nullptr && r->typeBaseAskable;
+}
+
+std::optional<std::size_t> GrammarSchema::typeChildLeadRunLength(RuleId rule) const noexcept {
+    auto const* r = ruleRow(rule.v);
+    if (r == nullptr || !r->typeChildLeads) return std::nullopt;
+    return r->typeChildLeadRun.size();
+}
+
+bool GrammarSchema::typeChildLeadRunAdmits(RuleId rule, std::size_t i,
+                                           SchemaTokenId tok) const noexcept {
+    auto const* r = ruleRow(rule.v);
+    if (r == nullptr || !r->typeChildLeads || i >= r->typeChildLeadRun.size()) return false;
+    std::uint32_t const pos = r->typeChildLeadRun[i];
+    return pos < r->positions.size()
+        && detail::tokenBitsContain(r->positions[pos].expectedBits(), tok.v);
+}
+
 bool GrammarSchema::commitAfterPrefix(RuleId rule) const noexcept {
     auto const* r = ruleRow(rule.v);
     return r != nullptr && r->commitAfterPrefix;
+}
+
+bool GrammarSchema::isValueReading(RuleId rule) const noexcept {
+    auto const* r = ruleRow(rule.v);
+    return r != nullptr && r->valueReading;
+}
+
+std::span<SchemaTokenId const> GrammarSchema::notFollowedBy(RuleId rule) const noexcept {
+    auto const* r = ruleRow(rule.v);
+    if (r == nullptr) return {};
+    return r->notFollowedBy;
+}
+
+std::span<SchemaTokenId const> GrammarSchema::followedBy(RuleId rule) const noexcept {
+    auto const* r = ruleRow(rule.v);
+    if (r == nullptr) return {};
+    return r->followedBy;
 }
 
 ExprWrapperRules GrammarSchema::exprWrapperRules(RuleId rule) const noexcept {
@@ -909,16 +1048,13 @@ GrammarSchema::loadDiagnostics() const noexcept {
     return d_.loadDiagnostics;
 }
 
-bool GrammarSchema::isTokenValidInScope(SchemaTokenId tok,
-                                       std::span<ScopeKind const> stack) const noexcept {
-    // Walk the scope stack top-down so the innermost scope's rules win —
-    // a `forbid` listed on the innermost frame applies even if an outer
-    // frame allows the token.
-    for (auto it = stack.rbegin(); it != stack.rend(); ++it) {
-        auto scopeIt = d_.scopeForbid.find(static_cast<std::uint16_t>(*it));
-        if (scopeIt != d_.scopeForbid.end() && scopeIt->second.contains(tok.v)) {
-            return false;
-        }
+bool GrammarSchema::isTokenValidInScope(SchemaTokenId tok, ScopeOpenFn open,
+                                        void const* ctx) const noexcept {
+    // `false` iff some open scope forbids `tok`, asked per kind that forbids anything, in one
+    // order on every standard library (`scopeForbidOrder_`).
+    for (std::uint16_t const scopeV : scopeForbidOrder_) {
+        auto const it = d_.scopeForbid.find(scopeV);
+        if (it->second.contains(tok.v) && open(ctx, static_cast<ScopeKind>(scopeV))) return false;
     }
     return true;
 }

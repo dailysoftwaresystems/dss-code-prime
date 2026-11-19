@@ -188,6 +188,15 @@ bool SchemaWalker::takeNullableBranch() noexcept {
     return true;
 }
 
+bool SchemaWalker::routeToNestedSpeculativeChoice(SchemaTokenId tok) noexcept {
+    const auto next = schema_->nestedSpeculativeChoice(cursor_, tok);
+    if (!next.valid()) return false;
+    // A move onto a valid position of the same rule, as `takeNullableBranch` makes: no
+    // valid→invalid transition, so no desync diagnostic is owed.
+    cursor_ = next;
+    return true;
+}
+
 RuleId SchemaWalker::slotRuleRef() const noexcept {
     return schema_->slotRuleRef(cursor_);
 }

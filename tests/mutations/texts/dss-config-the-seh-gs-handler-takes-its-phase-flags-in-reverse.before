@@ -1,0 +1,1 @@
+    checkFrameCookie(gs, (ULONG_PTR)establisherFrame, dispatch);

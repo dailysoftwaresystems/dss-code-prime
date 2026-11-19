@@ -1,0 +1,4 @@
+                    case kComdatSelNoDuplicates:
+                        return fail(DiagnosticCode::F_CorruptedBinary,
+                            "pe::readRelocatableObject: section '" + sec.name + "' is an ASSOCIATIVE COMDAT "
+                            "rooted in a section defined once (COMDAT Selection 5), which this reader refuses.");

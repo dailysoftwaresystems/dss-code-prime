@@ -1,0 +1,1 @@
+    if (fd < 0) return std::unexpected(pathRefusalCode(PathRefusal::HostAnsweredNoReason));   // read AT the failing call

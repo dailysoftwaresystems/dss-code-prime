@@ -1,0 +1,14 @@
+{
+  "$comment": "AN ALIAS OF A WEAK COPY THAT LOSES (P69 round 1, lane cs, the review of checkpoint 27; D-CSUBSET-ATTRIBUTE-ALIAS-TARGET-NO-SURFACE): the ELF control of examples/c/two_units_alias_of_a_selectany_copy_that_loses_pe. ELF keeps a losing weak copy's bytes (the ELF documents' `supersededDefinition`), so the cross-unit election keeps the alias that copy carries in its name's election, on those bytes; only a copy the link discards whole withdraws its aliases (`resolveSettlingCarriedNames`). Two names, one per cell of lane cs's probe mj1's ELF control (gcc 13.3.0 and clang 18.1.3 at -O0 and -O2, GNU ld 2.42 and ld.lld 18.1.3, the units in this order): `one_m`, a.c's weak definition beside b.c's strong alias of its losing weak copy, is the alias's, and every use reads b.c's kept 9; `own_m`, b.c's alias alone, reads b.c's kept 9 in b.c while every other use of `own_w` reads a.c's 7. DSS answered each of them so before this fold, and the fold must keep them. No PE target: the probe measured these units on ELF only, and the PE example is that format's cell. No Mach-O target: every Apple clang refuses an alias, and the Mach-O documents refuse it by name. Every return before 42 names the first fact that failed. The `release` arm pins that the optimizer reads none of these values from a copy that may lose.",
+  "language": "c",
+  "sources": ["main.c", "a.c", "b.c"],
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

@@ -15,6 +15,7 @@
 #include <format>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -211,13 +212,20 @@ ObjectFormatSchema::loadShipped(std::string_view name) {
 namespace {
 
 [[nodiscard]] std::string providerSpelling(RuntimeLibraryBinding const& row) {
-    return row.source.empty() ? ("image '" + row.image + "'")
-                              : ("shipped source '" + row.source + "'");
+    if (row.sources.empty()) return "image '" + row.image + "'";
+    std::string units;
+    for (auto const& s : row.sources) units += (units.empty() ? "'" : ", '") + s + "'";
+    return (row.sources.size() == 1 ? "shipped source " : "shipped sources ") + units;
 }
 
 } // namespace
 
-// Every shipped flavour of this document's kind EXCEPT its namesake, merged. The
+bool ObjectFormatSchema::inFlavourFamilyOf(ObjectFormatSchema const& member) const noexcept {
+    return kind() == member.kind() && targetArch() == member.targetArch();
+}
+
+// Every shipped flavour of this document's FAMILY (`inFlavourFamilyOf`: one kind on
+// one target arch) EXCEPT its namesake, merged. The
 // scan is TOTAL and sorted by filename for the two reasons
 // `runtime::resolveArchiveSiblingFormat` gives: agreement cannot be proven by
 // a scan that stops early, and a disagreement message must not read
@@ -276,7 +284,11 @@ ObjectFormatSchema::assembleFlavourRuntimeLibraries() const {
                 document.generic_string(), member.name(), detail));
         }
         ObjectFormatSchema const& candidate = **loaded;
-        if (candidate.kind() != member.kind()) continue;
+        // ★ P69 fold 3f: the family is ONE KIND ON ONE TARGET ARCH (`inFlavourFamilyOf`, its
+        // one definition): a role may be played by a different image on each arch of a kind.
+        // No shipped family's answer changed under the arch (each role every other row
+        // declares is played by one image across the arches).
+        if (!candidate.inFlavourFamilyOf(member)) continue;
         if (candidate.name() == member.name()) continue;
         for (auto const& row : candidate.runtimeLibraries().bindings) {
             auto const* const existing = merged.rowForRole(row.role);
@@ -285,7 +297,7 @@ ObjectFormatSchema::assembleFlavourRuntimeLibraries() const {
                 declaredBy.push_back(std::string{candidate.name()});
                 continue;
             }
-            if (existing->image == row.image && existing->source == row.source) {
+            if (existing->image == row.image && existing->sources == row.sources) {
                 continue;
             }
             auto const at = static_cast<std::size_t>(
@@ -378,26 +390,23 @@ ObjectFormatSchema::relocationDecodeTable() const {
         if (auto e = mapNative(r.nativeId, r.kind)) {
             return std::unexpected(std::move(*e));
         }
-        // `pltNativeId` is read UNCONDITIONALLY, from the schema, for every
-        // format. It is 0 on every shipped Mach-O and PE document — which is
-        // a fact about those formats (an extern call is the same wire id
-        // whether or not the linker synthesizes a stub), not a reason for
-        // their readers to omit the leg. Omitting it is what made this loop
-        // format-keyed in two places at once.
-        if (r.pltNativeId != 0u) {
-            if (auto e = mapNative(r.pltNativeId, r.kind)) {
-                return std::unexpected(std::move(*e));
-            }
-            table.callSignalNativeIds.insert(r.pltNativeId);
-        }
+        // ⓘ The `pltNativeId` leg that stood here (a second wire id decoding
+        // to the row's kind, and a call signal) is retired with the key: since
+        // P69 a call is a row of its own, `isCall`, read below.
         // The wire types a format spells by the bytes after the field
-        // (X86_64_RELOC_SIGNED_1/_2/_4) decode to the row's own kind: they
-        // differ from `nativeId` in the type alone, never in the addend.
+        // (X86_64_RELOC_SIGNED_1/_2/_4, IMAGE_REL_AMD64_REL32_1.._5) decode to
+        // the row's own kind. Mach-O's differ from `nativeId` in the type
+        // alone; COFF's also lower the addend by their byte count, which the
+        // row declares (`bytesAfterFieldLowersTheAddend`) and the table hands
+        // every reader.
         for (auto const& e : r.nativeIdByBytesAfterField) {
             if (auto err = mapNative(e.nativeId, r.kind)) {
                 return std::unexpected(std::move(*err));
             }
             if (r.isCall) table.callSignalNativeIds.insert(e.nativeId);
+            if (r.bytesAfterFieldLowersTheAddend) {
+                table.addendLoweredByType.emplace(e.nativeId, e.bytesAfterField);
+            }
         }
         if (r.isCall) table.callSignalNativeIds.insert(r.nativeId);
     }
@@ -714,6 +723,41 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                          detail::renderAllowedList(
                              allNames(kWeakDefinitionDialectTable), " or ")));
     }
+    // P69: the per-kind entries say which kinds take ANOTHER dialect than the
+    // block's, so without the block they qualify nothing; and each must name a
+    // real kind and a real dialect, once. The loader cannot produce any of
+    // these (its keys are a JSON object's, its values come from the tables);
+    // a hand-built `ObjectFormatData` can.
+    if (!weakDefinitionByKind.empty() && !weakDefinition.has_value()) {
+        fail("/weakDefinition/byKind",
+             "per-kind weak-definition dialects are stated beside NO "
+             "'weakDefinition' block — they say which kinds take another "
+             "dialect than the block's, and there is none to depart from");
+    }
+    for (std::size_t i = 0; i < weakDefinitionByKind.size(); ++i) {
+        auto const& [kind, dialect] = weakDefinitionByKind[i];
+        if (weakDefinitionKindName(kind).empty()
+            || weakDefinitionDialectName(dialect).empty()) {
+            fail("/weakDefinition/byKind",
+                 std::format("per-kind weak-definition entry #{} names no {} — "
+                             "each states a real kind ({}) and a real dialect "
+                             "({})",
+                             i,
+                             weakDefinitionKindName(kind).empty() ? "kind" : "dialect",
+                             detail::renderAllowedList(
+                                 allNames(kWeakDefinitionKindTable), " or "),
+                             detail::renderAllowedList(
+                                 allNames(kWeakDefinitionDialectTable), " or ")));
+        }
+        for (std::size_t j = 0; j < i; ++j) {
+            if (weakDefinitionByKind[j].first == kind) {
+                fail("/weakDefinition/byKind",
+                     std::format("the weak-definition kind '{}' is given a "
+                                 "dialect twice — one kind, one spelling",
+                                 weakDefinitionKindName(kind)));
+            }
+        }
+    }
 
     // ── D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET: a
     //    PRESENT `objectImportSlot` block must name a prefix ──────────────
@@ -916,6 +960,255 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
         }
     }
 
+    // P69 review M1 (c) + MINOR 8 (D-LK-PE-IMPORT-ADDRESS-SLOT-RESIDUE):
+    // `pcRelativeImportAddress` answers a question only an IMAGE link asks —
+    // what a unit's PC-relative, non-branch reference to an import means — and
+    // an image asks it exactly when its call entry is NOT the import's address,
+    // which is what `externAddrBinding` declares on an image. So on an image the
+    // two come together (one without the other is a format that either cannot
+    // answer the question it raises, or answers one it never raises), and on
+    // any other flavor this one is refused: a relocatable object's final linker
+    // answers it, so the declaration would never be read.
+    {
+        bool const image = backend != nullptr && backend->isImageFlavor(*this);
+        if (pcRelativeImportAddress.has_value() && !image) {
+            fail("/pcRelativeImportAddress",
+                 "'pcRelativeImportAddress' is declared on a format that is not "
+                 "an IMAGE flavor: what a unit's PC-relative reference to an "
+                 "import means is decided by the link that BINDS imports, and "
+                 "for a relocatable object or an archive member that is the "
+                 "final linker, so the declaration would never be read.");
+        }
+        if (image && externAddrBinding.has_value()
+            && !pcRelativeImportAddress.has_value()) {
+            fail("/pcRelativeImportAddress",
+                 "this image declares 'externAddrBinding' — its call entry for "
+                 "an import is not the import's address — but no "
+                 "'pcRelativeImportAddress', so it cannot say what a unit's "
+                 "`leaq puts(%rip)` (which can only reach that call entry) "
+                 "means. Declare \"callEntry\" where the format's linkers bind "
+                 "such a unit to the call entry, or \"refused\" where they refuse "
+                 "it.");
+        }
+        if (image && pcRelativeImportAddress.has_value()
+            && !externAddrBinding.has_value()) {
+            fail("/pcRelativeImportAddress",
+                 "'pcRelativeImportAddress' is declared on an image that declares "
+                 "no 'externAddrBinding': there the call entry IS the import's "
+                 "canonical address, so a PC-relative reference to it needs no "
+                 "decision and the declaration would never be read.");
+        }
+        // P69 re-review MAJOR 2: `importAddressSymbolPrefix` is read only where
+        // a member's imports are BOUND — an image link
+        // (`linker::foldImportAddressReferences`). DSS's own objects never
+        // write `<prefix>X`, so on a relocatable or archive document the
+        // declaration would never be read.
+        if (importAddressSymbolPrefix.has_value() && !image) {
+            fail("/importAddressSymbolPrefix",
+                 "'importAddressSymbolPrefix' is declared on a format that is not "
+                 "an IMAGE flavor: an import's address slot is read by name only "
+                 "by the link that binds a member's imports, and DSS's own "
+                 "objects never write one, so the declaration would never be "
+                 "read.");
+        }
+        // P69 round 3: `archiveCommonResolution` is read from the document of an
+        // archive's MEMBERS (the static link's archive search), which an image
+        // never is.
+        if (archiveCommonResolution.has_value() && image) {
+            fail("/archiveCommonResolution",
+                 "'archiveCommonResolution' is declared on an IMAGE flavor: what "
+                 "an archive search does for a COMMON's name is read from the "
+                 "document that describes the archive's MEMBERS, which an image "
+                 "never is, so the declaration would never be read.");
+        }
+        // P69 round 4: `commonYieldsTo` is read by a link that resolves a common
+        // against OTHER units' definitions — an image, or a relocatable artifact
+        // of several units — and by an image link's archive search. An archive's
+        // members are each one unit, linked alone, so on an archive document the
+        // declaration would never be read.
+        if (commonYieldsTo.has_value() && container == ObjectFormatContainer::Archive) {
+            fail("/commonYieldsTo",
+                 "'commonYieldsTo' is declared on an ARCHIVE document: which "
+                 "definitions a common yields to is read from the document of "
+                 "the link that resolves it against other units — an image or a "
+                 "relocatable artifact — and an archive's members are each "
+                 "linked alone, so the declaration would never be read.");
+        }
+        // P69 (the re-review of fold 3b): `commonAlignmentFromSizeAtMost` says how
+        // a COMMON is aligned, so it is read only where the document states commons.
+        if (commonAlignmentFromSizeAtMost.has_value() && !commonYieldsTo.has_value()
+            && !archiveCommonResolution.has_value()) {
+            fail("/commonAlignmentFromSizeAtMost",
+                 "'commonAlignmentFromSizeAtMost' is declared on a document that "
+                 "states no common (neither 'commonYieldsTo' nor "
+                 "'archiveCommonResolution'): the alignment a linker gives a common "
+                 "is read only where a common is written or resolved, so the "
+                 "declaration would never be read.");
+        }
+        // P69 fold 3c (the review of the fix fold, A1): what EVERY linker gives a
+        // common that states none is the lesser of the two rules — it says where a
+        // common must state its alignment, so it is read only beside the rule a
+        // linker that ignores that statement keeps, and never above it.
+        if (commonAlignmentEveryLinkerGivesAtMost.has_value()) {
+            if (!commonAlignmentFromSizeAtMost.has_value()) {
+                fail("/commonAlignmentEveryLinkerGivesAtMost",
+                     "'commonAlignmentEveryLinkerGivesAtMost' is declared without "
+                     "'commonAlignmentFromSizeAtMost': it says where a common must state "
+                     "its alignment, which is asked only of a format whose commons a "
+                     "linker aligns by their size alone, so the declaration would never "
+                     "be read.");
+            } else if (*commonAlignmentEveryLinkerGivesAtMost > *commonAlignmentFromSizeAtMost) {
+                fail("/commonAlignmentEveryLinkerGivesAtMost",
+                     std::format("'commonAlignmentEveryLinkerGivesAtMost' ({}) exceeds "
+                                 "'commonAlignmentFromSizeAtMost' ({}): what EVERY linker "
+                                 "gives a common is never more than what one of them gives "
+                                 "it.",
+                                 *commonAlignmentEveryLinkerGivesAtMost,
+                                 *commonAlignmentFromSizeAtMost));
+            }
+        }
+        // P69 fold 3c (the review of the fix fold, A4): what a tentative definition
+        // too wide for a common becomes is read only where `admitsCommon` can
+        // refuse one — an OBJECT another linker reads, under a size rule. An image
+        // allocates every common itself.
+        // And where it CAN, it is required: a document whose objects another
+        // linker reads and that states the size rule says what a tentative
+        // definition too wide for a common is written as, or a unit's tentative
+        // definition would meet a question its document never answered.
+        if (!tentativeDefinitionBeyondCommonAlignment.has_value() && !image
+            && commonAlignmentFromSizeAtMost.has_value()) {
+            fail("/tentativeDefinitionBeyondCommonAlignment",
+                 "'commonAlignmentFromSizeAtMost' is stated on a document whose OBJECTS "
+                 "another linker reads, which must state "
+                 "'tentativeDefinitionBeyondCommonAlignment': a tentative definition wider "
+                 "than that rule lets a common of its size be is written as something "
+                 "else, and which is the document's to say.");
+        }
+        if (tentativeDefinitionBeyondCommonAlignment.has_value()
+            && (image || !commonAlignmentFromSizeAtMost.has_value())) {
+            fail("/tentativeDefinitionBeyondCommonAlignment",
+                 image ? "'tentativeDefinitionBeyondCommonAlignment' is declared on an "
+                         "IMAGE flavor: DSS's own link allocates every common of an image "
+                         "at the alignment its unit states, so no tentative definition is "
+                         "ever too wide for a common there and the declaration would never "
+                         "be read."
+                       : "'tentativeDefinitionBeyondCommonAlignment' is declared without "
+                         "'commonAlignmentFromSizeAtMost': only that rule makes a tentative "
+                         "definition too wide for a common, so the declaration would never "
+                         "be read.");
+        }
+        // P69 fold 3: `weakDefinitionBesideStrong` is read where `commonYieldsTo`
+        // is — by a link that sets one unit's weak definition beside another
+        // unit's strong one — and for the same reason never from an archive
+        // document.
+        if (weakDefinitionBesideStrong.stated()
+            && container == ObjectFormatContainer::Archive) {
+            fail("/weakDefinitionBesideStrong",
+                 "'weakDefinitionBesideStrong' is declared on an ARCHIVE document: "
+                 "what a weak definition is beside a strong one of its name is "
+                 "read from the document of the link that resolves the two — an "
+                 "image or a relocatable artifact — and an archive's members are "
+                 "each linked alone, so the declaration would never be read.");
+        }
+        // P69 fold f26b: `weakDefinitionBesideWeak` is read by the same link, for
+        // the same reason never from an archive document.
+        if (weakDefinitionBesideWeak.stated()
+            && container == ObjectFormatContainer::Archive) {
+            fail("/weakDefinitionBesideWeak",
+                 "'weakDefinitionBesideWeak' is declared on an ARCHIVE document: "
+                 "what two weak definitions of one name are is read from the "
+                 "document of the link that resolves them — an image or a "
+                 "relocatable artifact — and an archive's members are each linked "
+                 "alone, so the declaration would never be read.");
+        }
+        // P69 round 4 (lane `lm`): `archiveWeakReferenceSearch` is read from the
+        // document of an archive's MEMBERS — the `container: "archive"` document,
+        // and no other. Round 5: a bare relocatable link reads its archive-writing
+        // sibling's answer as an image link does, so a copy on the relocatable
+        // document would never be read, and one answer per family cannot drift
+        // from a second.
+        if (archiveWeakReferenceSearch.has_value()
+            && container != ObjectFormatContainer::Archive) {
+            fail("/archiveWeakReferenceSearch",
+                 "'archiveWeakReferenceSearch' is declared on a document that is "
+                 "not an ARCHIVE's: whether an archive search fetches a member for "
+                 "a weak reference is read from the document that describes the "
+                 "archive's MEMBERS -- the `container: \"archive\"` document, which "
+                 "every link of the family resolves -- so the declaration would "
+                 "never be read.");
+        }
+        // P69 (lane `lm`, D-LK-WEAK-UNDEFINED-SYMBOL-NAMED-DIRECTLY-IS-NOT-ADDRESS-ZERO):
+        // `weakResolvedToNothing` is read only by an image that binds a weak
+        // symbol nothing defines to NOTHING — one that refuses an undefined
+        // import. An image that may carry an undefined symbol (an ELF shared
+        // object) keeps a weak one for its loader, and a relocatable's final
+        // linker decides it, so on either the block would never be read.
+        if (weakResolvedToNothing.has_value()) {
+            if (!image || backend->allowsUndefinedImports(*this)) {
+                fail("/weakResolvedToNothing",
+                     "'weakResolvedToNothing' is declared on a format whose "
+                     "artifact never binds a weak symbol to nothing: a "
+                     "relocatable object or archive member leaves it to the final "
+                     "linker, and an image that may carry an undefined symbol "
+                     "keeps it for its loader, so the declaration would never be "
+                     "read.");
+            }
+            if (weakResolvedToNothing->absolute == WeakNullReference::NextInstruction) {
+                fail("/weakResolvedToNothing/absolute",
+                     "'nextInstruction' is an answer for a BRANCH; an absolute "
+                     "field holds a value, not a destination. Declare \"zero\" or "
+                     "\"refused\".");
+            }
+            if (weakResolvedToNothing->pcRelative == WeakNullReference::NextInstruction) {
+                fail("/weakResolvedToNothing/pcRelative",
+                     "'nextInstruction' is an answer for a BRANCH; a PC-relative "
+                     "field that is not a branch computes an address. Declare "
+                     "\"zero\" or \"refused\".");
+            }
+            // `zero` for a displacement needs a writer that places the image at
+            // its link address — a backend capability, not a document's to claim.
+            bool const writesZero =
+                image && backend->writesNullAddressReferences(*this);
+            for (auto const& [cls, answer] :
+                 {std::pair<char const*, WeakNullReference>{
+                      "pcRelative", weakResolvedToNothing->pcRelative},
+                  std::pair<char const*, WeakNullReference>{
+                      "branch", weakResolvedToNothing->branch}}) {
+                if (answer == WeakNullReference::Zero && !writesZero) {
+                    fail(std::string{"/weakResolvedToNothing/"} + cls,
+                         std::string{"'"} + cls + "' declares \"zero\", but this "
+                         "format's writer does not place the image at its link "
+                         "address (`writesNullAddressReferences`), so a "
+                         "displacement from it cannot be made to reach address 0. "
+                         "Declare \"refused\"" +
+                         (std::string_view{cls} == "branch"
+                              ? std::string{", or \"nextInstruction\" where the "
+                                            "target's ABI gives such a branch the "
+                                            "instruction after it"}
+                              : std::string{}) +
+                         ".");
+                }
+            }
+        }
+        // P69 fold 3d (D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL, ledger 484):
+        // `imageDefinedSymbols` is read TWICE. Every compile reads it, so a
+        // reference to a name the image will define is direct, never an
+        // import's slot -- on a relocatable or archive document too, whose
+        // object ends in an image later. The link of an IMAGE reads it again,
+        // and there the address each name denotes is the writer's to give: a
+        // backend capability, as `zero` is above. On an image whose writer
+        // gives no such address every reference would be refused "not defined"
+        // at the walker, naming the wrong defect.
+        if (!imageDefinedSymbols.empty() && image
+            && !backend->writesImageDefinedSymbols(*this)) {
+            fail("/imageDefinedSymbols",
+                 "'imageDefinedSymbols' is declared on an image, but this "
+                 "format's writer gives no image-defined name its address "
+                 "(`writesImageDefinedSymbols`), so every reference to one would "
+                 "reach the writer naming nothing it places.");
+        }
+    }
+
     // Cross-row reloc uniqueness + non-empty-name + non-zero-kind:
     // shared substrate with TargetSchema so the two sides of plan
     // 13 §2.6's reloc-taxonomy unifier are validated identically.
@@ -931,9 +1224,11 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
     // reverse map every object READER builds, so it must be a FUNCTION. A
     // wire type may therefore be claimed by AT MOST ONE non-alias row; any
     // further row sharing it must declare `emitOnly` (an emission alias, e.g.
-    // R_X86_64_PC32 serving both the call-site rel32 and the DWARF FDE
-    // pointer, which differ only in an implicit addend bias the wire format
-    // does not carry).
+    // R_X86_64_PC32 serving both `riprel32` — the RIP-relative operand, bias
+    // -4, the row a reader decodes it as — and `pcrel32`, the DWARF FDE
+    // pointer, bias 0, `emitOnly`: two kinds that differ only in an implicit
+    // addend bias the wire format does not carry. The call kind is not one
+    // of them: it is R_X86_64_PLT32 since P69).
     // ✔MEASURED 2026-08-13: without this, an ambiguous pair was discovered at
     // READ time and rejected every x86_64 ELF object — DSS-produced and
     // gcc-produced alike. Checking it here fails the SCHEMA that is wrong
@@ -1012,7 +1307,6 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
         std::unordered_map<std::uint32_t, std::string> claimed;
         for (auto const& r : relocations) {
             if (!r.emitOnly) claimed.emplace(r.nativeId, r.name);
-            if (r.pltNativeId != 0u) claimed.emplace(r.pltNativeId, r.name);
         }
         for (std::size_t i = 0; i < relocations.size(); ++i) {
             auto const& r = relocations[i];
@@ -1021,6 +1315,17 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                      std::format("relocation '{}' is an emission alias "
                                  "(emitOnly), so its bytes-after-field wire "
                                  "types could never be decoded", r.name));
+            }
+            // A statement about how the family's types read their addend, on a
+            // row that lists no such type, states nothing a reader could apply:
+            // it is a misplaced key (or a family that was deleted under it).
+            if (r.bytesAfterFieldLowersTheAddend
+                && r.nativeIdByBytesAfterField.empty()) {
+                fail(std::format("/relocations/{}/bytesAfterFieldLowersTheAddend", i),
+                     std::format("relocation '{}' says its bytes-after-field "
+                                 "wire types lower the addend, and lists no "
+                                 "such type ('nativeIdByBytesAfterField')",
+                                 r.name));
             }
             for (std::size_t j = 0; j < r.nativeIdByBytesAfterField.size(); ++j) {
                 auto const& e = r.nativeIdByBytesAfterField[j];
@@ -1063,19 +1368,19 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
     // matches none. The row's other decode-side declarations have no meaning
     // for a shared type, so a patterned row may not carry them.
     {
-        std::unordered_map<std::uint32_t, std::vector<std::size_t>> patterned;
+        // ASCENDING by wire type (P69 fold 3f): the refusals below come out in the
+        // order the groups are walked, and a hash map's order is the C++ library's.
+        std::map<std::uint32_t, std::vector<std::size_t>> patterned;
         for (std::size_t i = 0; i < relocations.size(); ++i) {
             auto const& r = relocations[i];
             if (r.decodeWhenInstruction.empty()) continue;
             auto const path =
                 std::format("/relocations/{}/decodeWhenInstruction", i);
-            if (r.emitOnly || r.isCall || r.pltNativeId != 0u
-                || !r.nativeIdByBytesAfterField.empty()) {
+            if (r.emitOnly || r.isCall || !r.nativeIdByBytesAfterField.empty()) {
                 fail(path,
                      std::format("relocation '{}' is decoded by instruction, "
                                  "so it cannot also be an emission alias, a "
-                                 "call signal, a PLT variant or a "
-                                 "bytes-after-field family",
+                                 "call signal or a bytes-after-field family",
                                  r.name));
             }
             for (std::size_t j = 0; j < r.decodeWhenInstruction.size(); ++j) {
@@ -1151,6 +1456,58 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
              "input sections may be split into independently placed atoms "
              "('inputSectionPlacement': 'unit' — never — or "
              "'subsectionsWhenDeclared' — only when the object declares it)");
+    }
+
+    // ── inputSectionNames (P69 fold 3e, the orchestrator's ledger 577): how a
+    // reader maps an input section's name to a row. Every separator is
+    // non-empty and stated once; every `readAs` entry names a row of this
+    // document and is NOT one (a writer resolves its rows by kind and must never
+    // meet a reader-only name), and no input section is named twice. Absent, a
+    // reader reads exact row names alone -- what the documents tests build
+    // inline need; every SHIPPED document that declares relocations states it,
+    // which `InputSectionNames.EveryShippedDocumentThatDeclaresRelocationsStatesIt`
+    // (tests/link/test_input_section_names.cpp) holds.
+    if (inputSectionNames.has_value()) {
+        auto const isRow = [&](std::string const& segment, std::string const& name) {
+            return std::any_of(sections.begin(), sections.end(), [&](ObjectFormatSectionInfo const& s) {
+                return s.segment == segment && s.name == name;
+            });
+        };
+        std::vector<std::string> seenSeparators;
+        for (std::size_t i = 0; i < inputSectionNames->subsectionSeparators.size(); ++i) {
+            std::string const& sep = inputSectionNames->subsectionSeparators[i];
+            if (sep.empty()) {
+                fail(std::format("/inputSectionNames/subsectionSeparators/{}", i),
+                     "a subsection separator is a non-empty string");
+            } else if (std::find(seenSeparators.begin(), seenSeparators.end(), sep) != seenSeparators.end()) {
+                fail(std::format("/inputSectionNames/subsectionSeparators/{}", i),
+                     std::format("the separator '{}' is stated twice", sep));
+            }
+            seenSeparators.push_back(sep);
+        }
+        std::vector<std::pair<std::string, std::string>> seenInputs;
+        for (std::size_t i = 0; i < inputSectionNames->readAs.size(); ++i) {
+            InputSectionAlias const& a = inputSectionNames->readAs[i];
+            std::string const at = std::format("/inputSectionNames/readAs/{}", i);
+            if (a.name.empty() || a.rowName.empty()) {
+                fail(at, "a 'readAs' entry names an input section and the row it reads as");
+                continue;
+            }
+            if (isRow(a.segment, a.name)) {
+                fail(at, std::format("'{}{}{}' is a row of this document, which a writer writes: a 'readAs' "
+                                     "entry names only a section no writer of the format writes",
+                                     a.segment, a.segment.empty() ? "" : ",", a.name));
+            }
+            if (!isRow(a.rowSegment, a.rowName)) {
+                fail(at, std::format("'{}' reads as '{}{}{}', which is no row of this document", a.name,
+                                     a.rowSegment, a.rowSegment.empty() ? "" : ",", a.rowName));
+            }
+            std::pair<std::string, std::string> const key{a.segment, a.name};
+            if (std::find(seenInputs.begin(), seenInputs.end(), key) != seenInputs.end()) {
+                fail(at, std::format("the input section '{}' is read as two rows", a.name));
+            }
+            seenInputs.push_back(key);
+        }
     }
 
     // Sections: (kind, encoding) unique cross-row + name non-empty. The format
@@ -1409,6 +1766,29 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
              "`processExit` block — both fields are paired "
              "(D-LK10-ENTRY §2.13). Either declare both or "
              "neither.");
+    }
+    // D-LK-PROCESS-ENTRY-BIAS-TAKEN-FROM-THE-CALLING-CONVENTION:
+    // `entryTransition` pairs with `processExit` the same way. The
+    // trampoline derives where the stack stands at its first instruction
+    // from it (the convention's `callPushBytes` when the loader CALLS the
+    // entry, 0 when it JUMPS), so a trampoline built without one would
+    // have to assume — and assuming the jump is exactly how every Mach-O
+    // x86_64 frame ran 8 bytes off (✔MEASURED P69).
+    if (processExit.has_value() && !entryTransition.has_value()) {
+        fail("/entryTransition",
+             "format declares `processExit` but no `entryTransition` — the "
+             "entry trampoline derives the stack's position at its first "
+             "instruction from how the platform's loader enters the image: "
+             "declare `\"called\"` (a return address is pushed — dyld's "
+             "LC_MAIN, Windows' BaseThreadInitThunk) or `\"jumped\"` (nothing "
+             "pushed — the ELF kernel / ld.so hand-off), MEASURED on the "
+             "platform, never inferred.");
+    }
+    if (!processExit.has_value() && entryTransition.has_value()) {
+        fail("/entryTransition",
+             "format declares `entryTransition` but no `processExit` block — "
+             "only a format DSS builds an entry trampoline for has a process "
+             "entry to describe. Declare both or neither.");
     }
     // ═══════════════════════════════════════════════════════════════
     // THE `processExit` ⟺ `isExecFlavor` BICONDITIONAL.
@@ -1685,6 +2065,41 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
              "\"needs no entry\", which a stray verb would falsify. "
              "(D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE.)");
     }
+    // P69 fold 3e: a stated `entryPrecedence` PARTITIONS `entryVerbs` -- every
+    // realized verb in exactly one group, and no verb the format does not
+    // realize -- so every candidate the election ranks has a rank, and no rank
+    // names a candidate that cannot exist.
+    if (!entryPrecedence.empty()) {
+        std::vector<EntryMaterialization> seen;
+        for (std::size_t g = 0; g < entryPrecedence.size(); ++g) {
+            for (auto const v : entryPrecedence[g]) {
+                if (std::find(entryVerbs.begin(), entryVerbs.end(), v) == entryVerbs.end()) {
+                    fail(std::format("/entryPrecedence/{}", g),
+                         std::format("'entryPrecedence' ranks the verb '{}', which this "
+                                     "format does not realize (`entryVerbs`): no entry "
+                                     "of it can be a candidate to rank.",
+                                     entryMaterializationName(v)));
+                } else if (std::find(seen.begin(), seen.end(), v) != seen.end()) {
+                    fail(std::format("/entryPrecedence/{}", g),
+                         std::format("'entryPrecedence' ranks the verb '{}' twice: a "
+                                     "candidate has ONE rank.",
+                                     entryMaterializationName(v)));
+                } else {
+                    seen.push_back(v);
+                }
+            }
+        }
+        for (auto const v : entryVerbs) {
+            if (std::find(seen.begin(), seen.end(), v) == seen.end()) {
+                fail("/entryPrecedence",
+                     std::format("'entryPrecedence' leaves the realized verb '{}' "
+                                 "unranked: a stated precedence ranks every verb in "
+                                 "`entryVerbs`, or a pair holding that verb would be "
+                                 "decided by no rule.",
+                                 entryMaterializationName(v)));
+            }
+        }
+    }
 
     // A materialization verb that needs argument setup is only realizable if the
     // format actually declares HOW it obtains arguments — the two axes are
@@ -1724,79 +2139,69 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
     // produced are read from whatever the argument registers hold, which is the
     // MEASURED fault the entry-verb set exists to refuse (an envp observed as
     // `0x4`). What a mechanism can hand an entry is a property of the MECHANISM,
-    // stated here once and asked of every declared verb:
+    // asked PER VALUE of every slot of every declared verb (`entry_shape.hpp`'s
+    // slots), and stated ONCE, beside the block it describes
+    // (`processArgsCannotProduce`, target_schema.cpp) -- the synthesized init's
+    // backstop asks the same function of a hand-built block:
     //   * `stack-vector` — the entry-stack vector: argc and NARROW strings, and the
     //     environment vector only where this format DECLARES its position
-    //     (`envpFollowsArgvTerminator` + `vectorSlotBytes`). That layout holds no
-    //     wide vector.
+    //     (`envpFollowsArgvTerminator`; each slot a pointer of the data model). That layout holds no
+    //     wide value, and no module instance, command line or show-window value.
     //   * `crt-argv-accessors` — argc and argv in both widths (the loader requires
-    //     all five accessor names), and each width's environment only where this
-    //     format declares that width's initialize/accessor PAIR.
-    //   * both end at the environment: neither layout has a fourth value, so a
-    //     four-value verb (Darwin's `apple`) is realizable only where the LOADER
-    //     delivers the arguments itself — no `processArgs` block at all, where the
-    //     listed verbs ARE the declaration of what the loader hands over and there
-    //     is no model here to second-guess it with.
-    // And the converse: an environment position or pair that no listed verb
-    // consumes is dead config — nothing would ever read it — refused like the
-    // dead accessor names above.
+    //     all five accessor names), each width's environment only where this
+    //     format declares that width's initialize/accessor PAIR, and the GUI
+    //     startups' values only where it declares their routines (each width's
+    //     WinMain command line, and the module-instance and show-window routines).
+    //   * neither produces Darwin's `apple` vector: that verb is realizable only
+    //     where the LOADER delivers the arguments itself — no `processArgs` block
+    //     at all, where the listed verbs ARE the declaration of what the loader
+    //     hands over and there is no model here to second-guess it with.
+    // ★ PER VALUE, NOT PER COUNT (P69 fold 3f, lane `xa`): this rule used to say
+    // "a mechanism produces at most 3 values (argc, argv, envp)", which refused
+    // WinMain's four though the C runtime produces every one of them.
+    // And the converse: an environment position or pair, or a GUI declaration,
+    // that no listed verb consumes is dead config — nothing would ever read it —
+    // refused like the dead accessor names above.
     if (processArgs.has_value()) {
         ProcessArgs const& pa = *processArgs;
-        constexpr std::size_t kMechanismValuesMax = 3;   // (argc, argv, envp)
         bool const stackVector = pa.mechanism == ArgsMechanism::StackVector;
         bool const crt         = pa.mechanism == ArgsMechanism::CrtArgvAccessors;
-        bool const stackEnvDeclared =
-            pa.envpFollowsArgvTerminator && pa.vectorSlotBytes != 0;
-        bool const narrowPairDeclared = !pa.initializeNarrowEnvironmentFn.empty()
-                                     && !pa.narrowEnvironmentAccessorFn.empty();
-        bool const widePairDeclared = !pa.initializeWideEnvironmentFn.empty()
-                                   && !pa.wideEnvironmentAccessorFn.empty();
-        bool narrowEnvConsumed = false;
-        bool wideEnvConsumed   = false;
+        bool narrowEnvConsumed         = false;
+        bool wideEnvConsumed           = false;
+        bool narrowCommandLineConsumed = false;
+        bool wideCommandLineConsumed   = false;
+        bool winMainRoutinesConsumed   = false;
         for (auto const v : entryVerbs) {
-            auto const params = entryVerbParams(v);
-            if (params.empty()) continue;   // `none` — nothing to materialize
-            bool const wide = entryVerbIsWide(v);
-            bool const env  = entryVerbPassesEnvironment(v);
-            if (env && wide) wideEnvConsumed = true;
-            if (env && !wide) narrowEnvConsumed = true;
-            std::string why;
-            if (params.size() > kMechanismValuesMax) {
-                why = std::format(
-                    "it hands the entry {} values and this mechanism produces at "
-                    "most {} (argc, argv, envp); only a format whose LOADER "
-                    "delivers the arguments itself — no `processArgs` block — "
-                    "can realize more",
-                    params.size(), kMechanismValuesMax);
-            } else if (stackVector && wide) {
-                why = "the entry-stack vector holds NARROW strings only — no wide "
-                      "argument vector exists in that layout";
-            } else if (stackVector && env && !stackEnvDeclared) {
-                why = "`processArgs` does not declare where the environment "
-                      "vector sits (`envpFollowsArgvTerminator` + "
-                      "`vectorSlotBytes`)";
-            } else if (crt && env && !(wide ? widePairDeclared : narrowPairDeclared)) {
-                why = wide
-                    ? "`processArgs` does not declare the wide environment's "
-                      "`initializeWideEnvironmentFn` + `wideEnvironmentAccessorFn` "
-                      "pair"
-                    : "`processArgs` does not declare the narrow environment's "
-                      "`initializeNarrowEnvironmentFn` + "
-                      "`narrowEnvironmentAccessorFn` pair";
-            }
-            if (!why.empty()) {
+            narrowEnvConsumed = narrowEnvConsumed
+                || entryVerbHands(v, EntryArgumentValue::NarrowEnvironment);
+            wideEnvConsumed = wideEnvConsumed
+                || entryVerbHands(v, EntryArgumentValue::WideEnvironment);
+            narrowCommandLineConsumed = narrowCommandLineConsumed
+                || entryVerbHands(v, EntryArgumentValue::NarrowCommandLine);
+            wideCommandLineConsumed = wideCommandLineConsumed
+                || entryVerbHands(v, EntryArgumentValue::WideCommandLine);
+            winMainRoutinesConsumed = winMainRoutinesConsumed
+                || entryVerbHands(v, EntryArgumentValue::ModuleInstance)
+                || entryVerbHands(v, EntryArgumentValue::ShowWindow);
+            // The FIRST value of the verb the mechanism cannot produce names the
+            // refusal: one refusal per verb.
+            for (EntryVerbSlot const& slot : entryVerbSlots(v)) {
+                std::string const why = processArgsCannotProduce(pa, slot.value);
+                if (why.empty()) continue;
                 // Anchored: D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE.
                 fail("/entryVerbs",
                      std::format(
                          "declares the `{}` verb, which the `{}` mechanism cannot "
-                         "realize: {}. The verb would survive candidate selection "
-                         "and the entry would read the values nothing produced "
-                         "from uninitialized argument registers — the MEASURED "
-                         "fault this set exists to refuse (an envp observed as "
-                         "0x4). Declare what the mechanism needs, or drop the "
-                         "verb.",
+                         "realize -- its {}: {}. The verb would survive candidate "
+                         "selection and the entry would read the values nothing "
+                         "produced from uninitialized argument registers — the "
+                         "MEASURED fault this set exists to refuse (an envp "
+                         "observed as 0x4). Declare what the mechanism needs, or "
+                         "drop the verb.",
                          entryMaterializationName(v),
-                         argsMechanismName(pa.mechanism), why));
+                         argsMechanismName(pa.mechanism),
+                         entryArgumentValueName(slot.value), why));
+                break;
             }
         }
         if (stackVector && pa.envpFollowsArgvTerminator && !narrowEnvConsumed) {
@@ -1824,6 +2229,32 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                  "declares the wide environment's CRT exports but `entryVerbs` "
                  "names no wide environment verb — the names would never be "
                  "imported. Declare `argc-wargv-wenvp`, or drop the pair.");
+        }
+        // The GUI startups' declarations (P69 fold 3f, lane `xa`), dead the same way.
+        if (crt && !pa.narrowWinMainCommandLineFn.empty() && !narrowCommandLineConsumed) {
+            // Anchored: D-LK-PE-IMAGE-CANNOT-HONOUR-EVERY-LINKER-DIRECTIVE.
+            fail("/processArgs/narrowWinMainCommandLineFn",
+                 "declares the narrow WinMain command line's C library routine but "
+                 "`entryVerbs` names no verb that reads it — the name would never "
+                 "be imported. Declare `instance-prev-cmdline-show`, or drop the "
+                 "name.");
+        }
+        if (crt && !pa.wideWinMainCommandLineFn.empty() && !wideCommandLineConsumed) {
+            // Anchored: D-LK-PE-IMAGE-CANNOT-HONOUR-EVERY-LINKER-DIRECTIVE.
+            fail("/processArgs/wideWinMainCommandLineFn",
+                 "declares the wide WinMain command line's C library routine but "
+                 "`entryVerbs` names no verb that reads it — the name would never "
+                 "be imported. Declare `instance-prev-wcmdline-show`, or drop the "
+                 "name.");
+        }
+        if (crt && pa.winMainStartupRoutines.has_value() && !winMainRoutinesConsumed) {
+            // Anchored: D-LK-PE-IMAGE-CANNOT-HONOUR-EVERY-LINKER-DIRECTIVE.
+            fail("/processArgs/winMainStartupRoutines",
+                 "declares the GUI startups' module-instance and show-window "
+                 "routines but `entryVerbs` names no verb that reads either value "
+                 "— the routines would never be called. Declare "
+                 "`instance-prev-cmdline-show` or `instance-prev-wcmdline-show`, or "
+                 "drop the routines.");
         }
     }
 

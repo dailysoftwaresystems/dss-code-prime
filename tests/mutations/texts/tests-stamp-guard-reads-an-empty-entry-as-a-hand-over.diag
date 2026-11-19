@@ -1,0 +1,1 @@
+dss-build-stamp selftest: FAILED  configure: an EMPTY hand-over entry hands nothing over, so an undeclared directory is still refused

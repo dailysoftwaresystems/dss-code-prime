@@ -1,0 +1,2 @@
+        if (refused_) return SymbolId{};
+        SymbolId const id = end_.take();

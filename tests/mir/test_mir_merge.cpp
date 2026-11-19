@@ -35,12 +35,12 @@
 #include "core/types/type_lattice/type_interner.hpp"
 #include "core/types/type_lattice/type_lattice.hpp"
 #include "core/types/target_schema.hpp"        // ProcessArgs / ArgsMechanism (c111)
+#include "ffi/shipped_lib_descriptor.hpp"      // isKnownSynthesizeRecipe (the closed vocabulary)
 #include "mir/merge/mir_merge.hpp"
 #include "core/types/unsuppressable_codes.hpp"  // isUnsuppressable (UCRT-P4 gate)
 #include "link/object_format_schema.hpp"        // the shipped runtimeLibraries table
 #include "mir/merge/synth_pe_startup.hpp"       // realizeEntryShape (UCRT-P4)
 #include "mir/merge/synth_seh_funclets.hpp"     // synthesizeSehFunclets (c116)
-#include "mir/merge/synth_stdio_shim.hpp"       // synthesizeStdioShim (D-FFI-PE-CRT-UCRT-MIGRATION P3)
 #include "mir/merge/synth_threads_shim.hpp"      // synthesizeThreadsShim (FC17.9a)
 #include "mir/mir.hpp"
 #include "mir/mir_node.hpp"
@@ -49,8 +49,11 @@
 #include "mir/mir_verifier.hpp"
 
 #include "diagnostic_count.hpp"
+#include "link_facts.hpp"   // ordinaryLinkFormat (P69: mergeCuMirs reads the link's document)
 
 #include <gtest/gtest.h>
+
+#include <limits>
 
 #include <array>
 #include <cstdint>
@@ -179,9 +182,15 @@ std::size_t countOp(Mir const& mir, MirOpcode want) {
 // c111 (D-RUNTIME-PE-MAIN-ARGS) helpers. A one-function Mir whose entry has the
 // given signature, bound to SymbolId{100}, body `return 0;` (the synth reads only
 // the signature, then appends — the body is irrelevant to arg-fetch synthesis).
-Mir buildEntryOnly(TypeInterner& in, TypeId sig) {
+// The module states its data model (P69 fold 3f): LP64 unless a cell names another -- the Win64 cells' slots are
+// 8 bytes under LLP64 as well, and the environment cell reads the 4-byte ILP32 slot by passing it.
+Mir buildEntryOnly(TypeInterner& in, TypeId sig, DataModel model = DataModel::Lp64) {
     TypeId const i32 = in.primitive(TypeKind::I32);
     MirBuilder mb;
+    mb.stateDataModel(model);
+    // Counted as the convention `sig` names (a FnSig's first scalar) counts its arguments.
+    mb.stateArgCounting(argCountingOf(static_cast<CallConv>(in.scalars(sig)[0]) == CallConv::CcMS64));
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, SymbolId{100});
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(e);
@@ -204,6 +213,9 @@ Mir buildEntryOnly(TypeInterner& in, TypeId sig) {
 // would make the refusal test pass for the wrong reason.
 Mir buildVoidEntryOnly(TypeInterner& in, TypeId sig) {
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
+    // Counted as the convention `sig` names (a FnSig's first scalar) counts its arguments.
+    mb.stateArgCounting(argCountingOf(static_cast<CallConv>(in.scalars(sig)[0]) == CallConv::CcMS64));
     mb.addFunction(sig, SymbolId{100});
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(e);
@@ -240,6 +252,20 @@ ProcessArgs ucrtAccessorPa() {
     return pa;
 }
 
+// The pe exec block whole: the UCRT accessors above with the GUI startups' values, as the shipped pe exec document
+// declares them (P69 fold 3f) -- the block every verb of `peEntryVerbs()` is realized against.
+[[nodiscard]] ProcessArgs guiPa() {
+    ProcessArgs pa                = ucrtAccessorPa();
+    pa.narrowWinMainCommandLineFn = "_get_narrow_winmain_command_line";
+    pa.wideWinMainCommandLineFn   = "_get_wide_winmain_command_line";
+    ProcessArgs::WinMainStartupRoutines routines;
+    routines.role             = RuntimeLibraryRole::CompilerSupport;
+    routines.moduleInstanceFn = "__dss_pe_module_instance";
+    routines.showWindowFn     = "__dss_pe_show_window_mode";
+    pa.winMainStartupRoutines = routines;   // a realized role: no library path
+    return pa;
+}
+
 // The elf entry-stack mechanism as the shipped elf formats declare it: argc at
 // [sp+0], argv in place at sp+8, and the environment vector one 8-byte slot past
 // argv's NULL terminator.
@@ -249,7 +275,6 @@ ProcessArgs stackVectorPa() {
     pa.argcStackOffset           = 0;
     pa.argvStackOffset           = 8;
     pa.envpFollowsArgvTerminator = true;
-    pa.vectorSlotBytes           = 8;
     return pa;
 }
 
@@ -268,6 +293,15 @@ TypeId entrySigFor(TypeInterner& in, EntryMaterialization verb, CallConv cc) {
             break;
         case EntryParamShape::PtrPtrU16:
             params.push_back(in.pointer(in.pointer(in.primitive(TypeKind::U16))));
+            break;
+        case EntryParamShape::PtrOpaque:
+            params.push_back(in.pointer(in.primitive(TypeKind::Void)));
+            break;
+        case EntryParamShape::PtrChar:
+            params.push_back(in.pointer(in.primitive(TypeKind::Char)));
+            break;
+        case EntryParamShape::PtrU16:
+            params.push_back(in.pointer(in.primitive(TypeKind::U16)));
             break;
         case EntryParamShape::None:
             ADD_FAILURE() << "the verb table holds the `none` sentinel shape";
@@ -300,6 +334,8 @@ std::vector<EntryMaterialization> peEntryVerbs() {
         EntryMaterialization::ArgcWargv,   // `int wmain(int, wchar_t**)` — pe only
         EntryMaterialization::ArgcArgvEnvp,    // `int main(int, char**, char**)`
         EntryMaterialization::ArgcWargvWenvp,  // MSVC's 3-parameter `wmain`
+        EntryMaterialization::InstancePrevCmdlineShow,   // `WinMain` (P69 fold 3f)
+        EntryMaterialization::InstancePrevWcmdlineShow,  // `wWinMain`
     };
 }
 
@@ -356,6 +392,7 @@ TEST(MirMerge, MergeRewiresCrossCuCallToDirect) {
     Mir mir0;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(sig0, SymbolId{100});  // main
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -374,6 +411,7 @@ TEST(MirMerge, MergeRewiresCrossCuCallToDirect) {
     Mir mir1;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(sig1, SymbolId{50});  // f
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -388,7 +426,7 @@ TEST(MirMerge, MergeRewiresCrossCuCallToDirect) {
     std::vector<std::string> const entries = {"main"};
 
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
     EXPECT_EQ(rep.errorCount(), 0u);
 
@@ -437,6 +475,7 @@ TEST(MirMerge, MergeDedupsSameNamedFfiImports) {
         TypeId const i32 = in.primitive(TypeKind::I32);
         TypeId const sig = in.fnSig({}, i32, CallConv::CcSysV);
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(sig, fnSym);
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -465,7 +504,7 @@ TEST(MirMerge, MergeDedupsSameNamedFfiImports) {
     std::vector<std::string> const entries = {"main"};
 
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
     EXPECT_EQ(rep.errorCount(), 0u);
 
@@ -520,6 +559,7 @@ TEST(MirMerge, MergeOrCombinesEagerImportBitAcrossCollapse) {
         TypeId const i32 = in.primitive(TypeKind::I32);
         TypeId const sig = in.fnSig({}, i32, CallConv::CcSysV);
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(sig, fnSym);
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -552,7 +592,7 @@ TEST(MirMerge, MergeOrCombinesEagerImportBitAcrossCollapse) {
         std::vector<std::string> const entries = {"main"};
         DiagnosticReporter rep;
         auto merged =
-            mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+            mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
         EXPECT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
         if (!merged.has_value()) return false;
         std::size_t putsRows = 0;
@@ -586,6 +626,7 @@ Mir buildCallsExtern(SymbolId fnSym, SymbolId extSym, TypeInterner& in) {
     TypeId const i32 = in.primitive(TypeKind::I32);
     TypeId const sig = in.fnSig({}, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.addFunction(sig, fnSym);
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(e);
@@ -630,7 +671,7 @@ mergeTwoImportCus(ExternImport a, ExternImport b, DiagnosticReporter& rep) {
     std::vector<std::string> const entries = {"main"};
     // Every piece the merge reads is alive for the whole call; the returned
     // module owns its own `Mir` + host lattice, so the locals may die here.
-    return mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+    return mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
 }
 
 // The merged symbol that `fnName`'s first Call actually binds to — the thing a
@@ -1126,6 +1167,7 @@ TEST(MirMerge, MergeClonesMultiBlockCallee) {
     Mir mir0;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(sig0, SymbolId{100});  // main
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -1144,6 +1186,7 @@ TEST(MirMerge, MergeClonesMultiBlockCallee) {
     Mir mir1;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(sig1, SymbolId{50});  // f
         // Derivation-consistent stamps (both arms return → IfThen/IfElse
         // around the virtual exit; ExitBlock is a dormant marker the
@@ -1170,7 +1213,7 @@ TEST(MirMerge, MergeClonesMultiBlockCallee) {
     std::vector<std::string> const entries = {"main"};
 
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
 
     Mir const& mm = merged->mir;
@@ -1226,6 +1269,7 @@ TEST(MirMerge, MergeRederivesStaleInputMarkers) {
     Mir mir0;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(sig0, SymbolId{100});  // main
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -1241,6 +1285,7 @@ TEST(MirMerge, MergeRederivesStaleInputMarkers) {
     Mir mir1;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(sig1, SymbolId{50});  // f
         MirBlockId const e    = mb.createBlock(StructCfMarker::EntryBlock);
         MirBlockId const tail = mb.createBlock(StructCfMarker::ExitBlock);  // STALE
@@ -1264,7 +1309,7 @@ TEST(MirMerge, MergeRederivesStaleInputMarkers) {
     std::vector<std::string> const entries = {"main"};
 
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
     // (a) the merge SUCCEEDS: its internal stored==derived verifier passes
     // BECAUSE the post-clone rederive corrected the stale stamp first.
     ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
@@ -1299,6 +1344,7 @@ TEST(MirMerge, MergeReinternsTypesIntoHost) {
     Mir mir0;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(sig0, SymbolId{100});  // main
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -1315,6 +1361,7 @@ TEST(MirMerge, MergeReinternsTypesIntoHost) {
     Mir mir1;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(sig1, SymbolId{50});  // f
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -1331,7 +1378,7 @@ TEST(MirMerge, MergeReinternsTypesIntoHost) {
     std::vector<std::string> const entries = {"main"};
 
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{77}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{77}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
 
     Mir const& mm = merged->mir;
@@ -1364,7 +1411,8 @@ TEST(MirMerge, MergeDropsShadowedWeak) {
         TypeId const i32  = in.primitive(TypeKind::I32);
         TypeId const sig  = in.fnSig({}, i32, CallConv::CcSysV);
         MirBuilder mb;
-        mb.addFunction(sig, SymbolId{50}, binding, SymbolVisibility::Default);
+        mb.stateDataModel(DataModel::Lp64);
+        mb.addFunction(sig, SymbolId{50}, dss::test_support::linkageOf(binding));
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
         mb.addReturn(mb.addConst(i32Lit(ret), i32));
@@ -1384,7 +1432,7 @@ TEST(MirMerge, MergeDropsShadowedWeak) {
     std::vector<std::string> const entries = {"main"};
 
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
     EXPECT_EQ(rep.errorCount(), 0u) << "weak-vs-strong is NOT a conflict";
 
@@ -1423,6 +1471,7 @@ TEST(MirMerge, MergeRemapsGlobalInitFunc) {
     MirFuncId srcInitFunc{};
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         // __init__ (symbol 200): the module-init function.
         srcInitFunc = mb.addFunction(sig, SymbolId{200});
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
@@ -1442,7 +1491,7 @@ TEST(MirMerge, MergeRemapsGlobalInitFunc) {
     std::vector<std::string> const entries = {"main"};
 
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{55}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{55}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
 
     Mir const& mm = merged->mir;
@@ -1480,6 +1529,7 @@ TEST(MirMerge, MergeRemapsSymbolAddressGlobalTarget) {
     Mir mir0;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(sig0, SymbolId{1});  // main
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -1495,6 +1545,7 @@ TEST(MirMerge, MergeRemapsSymbolAddressGlobalTarget) {
     Mir mir1;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         (void)mb.addGlobal(i32_1, SymbolId{300}, mb.literalPoolAdd(i32Lit(42)),
                            MirFuncId{}, SymbolBinding::Global,
                            SymbolVisibility::Default, /*isConst=*/false,
@@ -1516,7 +1567,7 @@ TEST(MirMerge, MergeRemapsSymbolAddressGlobalTarget) {
     std::vector<std::string> const entries = {"main"};
 
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
 
     Mir const& mm = merged->mir;
@@ -1585,6 +1636,7 @@ TEST(MirMerge, MergeKeepsLocalStaticGlobalDistinctFromSameNamedExtern) {
     Mir mir0;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(sig0, SymbolId{10}, SymbolBinding::Local);  // fa (private)
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -1607,6 +1659,7 @@ TEST(MirMerge, MergeKeepsLocalStaticGlobalDistinctFromSameNamedExtern) {
     Mir mir1;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(sig1, SymbolId{60}, SymbolBinding::Local);  // fb (private)
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -1628,7 +1681,7 @@ TEST(MirMerge, MergeKeepsLocalStaticGlobalDistinctFromSameNamedExtern) {
     std::vector<std::string> const entries = {"main"};
 
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
     Mir const& mm = merged->mir;
 
@@ -1707,6 +1760,7 @@ TEST(MirMerge, MergePreservesFunctionNoOptimize) {
     Mir mir0;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         // sym 400: noOptimize ONLY — the two inline flags deliberately clear, so
         // a transposed argument at the copy site fails here.
         mb.addFunction(fnSig, SymbolId{400}, SymbolBinding::Global,
@@ -1727,7 +1781,7 @@ TEST(MirMerge, MergePreservesFunctionNoOptimize) {
     };
     std::vector<std::string> const entries = {"main"};
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{55}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{55}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
 
     Mir const& mm = merged->mir;
@@ -1767,6 +1821,7 @@ TEST(MirMerge, MergePreservesFunctionNoSanitizeThread) {
     Mir mir0;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         // sym 500: noSanitizeThread ONLY — all three sibling flags deliberately
         // clear, so a transposed/shifted argument at the copy site fails here.
         mb.addFunction(fnSig, SymbolId{500}, SymbolBinding::Global,
@@ -1788,7 +1843,7 @@ TEST(MirMerge, MergePreservesFunctionNoSanitizeThread) {
     };
     std::vector<std::string> const entries = {"main"};
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{56}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{56}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
 
     Mir const& mm = merged->mir;
@@ -1815,6 +1870,7 @@ TEST(MirMerge, MergePreservesGlobalConstness) {
     Mir mir0;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         // gc (sym 300) CONST init 5 → .rodata; gm (sym 301) MUTABLE init 7 → .data
         (void)mb.addGlobal(i32, SymbolId{300}, mb.literalPoolAdd(i32Lit(5)),
                            MirFuncId{}, SymbolBinding::Global,
@@ -1831,7 +1887,7 @@ TEST(MirMerge, MergePreservesGlobalConstness) {
     };
     std::vector<std::string> const entries = {"main"};
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{55}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{55}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
 
     Mir const& mm = merged->mir;
@@ -1863,6 +1919,7 @@ TEST(MirMerge, MergePreservesGlobalThreadLocal) {
     Mir mir0;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         // gt (sym 300) THREAD-LOCAL init 5; gp (sym 301) plain init 7.
         (void)mb.addGlobal(i32, SymbolId{300}, mb.literalPoolAdd(i32Lit(5)),
                            MirFuncId{}, SymbolBinding::Global,
@@ -1879,7 +1936,7 @@ TEST(MirMerge, MergePreservesGlobalThreadLocal) {
     };
     std::vector<std::string> const entries = {"main"};
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{55}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{55}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
 
     Mir const& mm = merged->mir;
@@ -1902,6 +1959,7 @@ TEST(MirMerge, MergeReportsTwoStrongConflict) {
         TypeId const i32 = in.primitive(TypeKind::I32);
         TypeId const sig = in.fnSig({}, i32, CallConv::CcSysV);
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);   // the model of the ELF document it is merged under (P69 fold 3f)
         mb.addFunction(sig, SymbolId{50}, SymbolBinding::Global,
                        SymbolVisibility::Default);
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
@@ -1922,7 +1980,7 @@ TEST(MirMerge, MergeReportsTwoStrongConflict) {
     std::vector<std::string> const entries = {"main"};
 
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
 
     EXPECT_EQ(test_support::countCode(rep, DiagnosticCode::K_SymbolRedefinedAcrossUnits),
               1u)
@@ -1938,9 +1996,10 @@ TEST(MirMerge, MergeReportsTwoStrongConflict) {
 // and the retired code split into four:
 //
 //   * `S_EntryShapeNotDeclared` (0xE061, SEMANTIC tier, per-definition, with a real
-//     source span) — "a function whose name the language declares as an entry
-//     spelling has a signature no declared row for that name has". THAT is where a
-//     3-param `main` and a `void main()` are refused now. Emitted from
+//     source span) — "a definition of a name the format realizes as an entry has a
+//     signature none of its realized rows has". THAT is where a `main(int, char**,
+//     int)` and a `void main()` are WARNED now (P69 fold 3e: entered with the
+//     richest realized row, as gcc and MSVC run them). Emitted from
 //     src/analysis/semantic/semantic_analyzer.cpp.
 //   * `K_ProgramEntryUndefined` (0x801F) / `K_ProgramEntryAmbiguous` (0x8020) —
 //     entry RESOLUTION, which intersects the language's declared entry rows with
@@ -2030,25 +2089,30 @@ inline void expectDiagContains(DiagnosticReporter const& rep, std::string_view n
 //
 // OWNER OF THE COVERAGE, VERIFIED PRESENT RATHER THAN ASSUMED:
 // `S_EntryShapeNotDeclared`, emitted from src/analysis/semantic/semantic_analyzer.cpp
-// and pinned END-TO-END by examples/c/entry_main_int_third_param_refused_positioned,
-// expecting that code with `positioned: true` at an EXACT line:col. That example
+// and pinned END-TO-END by examples/c/entry_main_int_third_param_warned_positioned
+// (a WARNING since P69 fold 3e: the definition is entered with the richest row its
+// format realizes, as gcc and MSVC run it), expecting that code at an EXACT
+// line:col. That example
 // asserts strictly MORE than the test deleted here could: the span it demands is
 // exactly what the MIR tier cannot supply, so if the check ever regresses back to a
 // span-less tier the example goes RED even though the same diagnostic code is still
 // emitted. Its siblings cover the other two halves of the split --
 // entry_wmain_only_refused_elf (`K_ProgramEntryUndefined`, a wmain-only ELF build:
 // `argc-wargv` is not in any ELF format's `entryVerbs`, so `wmain` does not survive
-// candidate selection) and entry_main_and_wmain_ambiguous_pe
-// (`K_ProgramEntryAmbiguous`).
+// candidate selection) and entry_main_and_wmain_pe_takes_main
+// (`K_ProgramEntryChosenByPrecedence`: since P69 fold 3e the format's stated
+// precedence elects `main`, as its reference linkers do).
 //
 // ★ AND THE 3-PARAMETER `main` ITSELF IS NOW SUPPORTED
 // (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE): the language declares its row with the
 // `argc-argv-envp` verb, every exec format realizes it, and
 // examples/c/entry_main_envp RUNS it on every leg. The
-// positioned refusal therefore moved to `int main(int, char**, int)`, a third
-// parameter no reference gives a meaning (clang 18.1.3 refuses it, MEASURED
-// 2026-09-24). The MEASURED fault above is closed by SUPPORT now; the refusal still
-// guards every signature the language does not declare.
+// positioned check therefore moved to `int main(int, char**, int)`, a third
+// parameter no reference gives a meaning (clang 18.1.3 refuses it, gcc warns and
+// MSVC links it, MEASURED 2026-09-24). The MEASURED fault above is closed by
+// SUPPORT; since P69 fold 3e a signature none of the realized rows has is entered
+// with the richest of them and warned, so the entry's own arguments are always the
+// ones the startup passes.
 
 // ── ⓧ REMOVED: RealizeEntryShape.VoidReturnMainRefusedByTheSameCheck ──────────
 //
@@ -2123,20 +2187,23 @@ TEST(RealizeEntryShape, ArgcArgvVerbOnAZeroParamEntryHitsTheArityBackstop) {
 TEST(RealizeEntryShape, EveryEntryRefusalCodeIsUnsuppressable) {
     // The retired `K_EntryShapeNotDeclared` was unsuppressable, and its
     // unsuppressability assertion lived inside the deleted 3-param pin. The code
-    // split into four, so the assertion follows the split — ALL FOUR, because
+    // split into four; three of them still REFUSE, so the assertion follows them —
     // `--suppress` reaching any ONE of them hands back a member of the same family
     // of accepted-then-faulting binaries the whole split exists to refuse:
-    //   * S_EntryShapeNotDeclared     — the definition's signature is not a declared
-    //                                   entry spelling (`int main(int, char**, int)`,
-    //                                   `void main()`);
     //   * K_ProgramEntryUndefined     — an exec-flavored format with NO realizable
     //                                   entry candidate;
     //   * K_ProgramEntryAmbiguous     — more than one realizable candidate;
     //   * K_EntryVerbUnmaterializable — the decided verb and the MIR signature
     //                                   disagree (the pin above).
+    // The fourth, S_EntryShapeNotDeclared, is a WARNING since P69 fold 3e (class
+    // C's N3): a definition of an entry name whose signature is none of the rows
+    // its format realizes is entered all the same, with the richest of them, as
+    // gcc (-Wmain) and MSVC run `int main(int, double)` (✔MEASURED, lane `xa`).
+    // It is suppressible, as gcc's -Wmain is: a silenced one leaves the program
+    // every reference makes.
     // Asserted individually rather than as a count, so a code dropped from
     // `kUnsuppressableCodes` names itself here.
-    EXPECT_TRUE(isUnsuppressable(DiagnosticCode::S_EntryShapeNotDeclared));
+    EXPECT_FALSE(isUnsuppressable(DiagnosticCode::S_EntryShapeNotDeclared));
     EXPECT_TRUE(isUnsuppressable(DiagnosticCode::K_ProgramEntryUndefined));
     EXPECT_TRUE(isUnsuppressable(DiagnosticCode::K_ProgramEntryAmbiguous));
     EXPECT_TRUE(isUnsuppressable(DiagnosticCode::K_EntryVerbUnmaterializable));
@@ -2175,7 +2242,9 @@ TEST(RealizeEntryShape, EveryDeclaredVerbHasAMaterializationArm) {
     // ⓘ WHY EVERY NARROW VERB AND NOT `argc-argv` ALONE
     // (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE). `argc-argv-envp` binds the narrow argv
     // accessor too — it materializes the same argv plus the environment — so a set
-    // that keeps it still realizes `__p___argv` legitimately. The narrow/wide split is what the verb decides, so
+    // that keeps it still realizes `__p___argv` legitimately, and so does WinMain's
+    // `instance-prev-cmdline-show` (its startup configures the narrow argument vector
+    // as every startup does, P69 fold 3f). The narrow/wide split is what the verb decides, so
     // the mutation removes the whole narrow side, read off the verb table
     // (`entryVerbIsWide`) rather than listed by hand.
     //
@@ -2189,7 +2258,10 @@ TEST(RealizeEntryShape, EveryDeclaredVerbHasAMaterializationArm) {
 
     // Materialize ONE verb against the signature its language row declares (spelled
     // from the verb table), and report what the pass produced — a verb never arrives
-    // against a signature the language did not match it to.
+    // against a signature the language did not match it to. The block is the pe exec
+    // format's WHOLE `processArgs` (`guiPa()`: the UCRT accessors and the GUI startups'
+    // routines), since a declared verb's arm is real only beside the block that names
+    // the routines it calls (P69 fold 3f).
     auto const runVerb = [](EntryMaterialization verb, bool& ok,
                             std::string& diagText) {
         TypeInterner in{CompilationUnitId{1}};
@@ -2198,7 +2270,7 @@ TEST(RealizeEntryShape, EveryDeclaredVerbHasAMaterializationArm) {
         std::optional<SymbolId>   entry = SymbolId{100};
         std::vector<ExternImport> ext;
         DiagnosticReporter        rep;
-        ok = realizeEntryShape(mir, in, entry, ext, verb, ucrtAccessorPa(),
+        ok = realizeEntryShape(mir, in, entry, ext, verb, guiPa(),
                                CSymbolDecorationScheme::None,
                                "pe64-x86_64-windows-exec", rep);
         diagText = allDiagText(rep);
@@ -2242,6 +2314,10 @@ TEST(RealizeEntryShape, EveryDeclaredVerbHasAMaterializationArm) {
         << "and `argc-argv-envp`, so the NARROW environment accessor";
     EXPECT_TRUE(has(declared, "_get_initial_wide_environment"))
         << "and `argc-wargv-wenvp`, so the WIDE one";
+    EXPECT_TRUE(has(declared, "_get_narrow_winmain_command_line"))
+        << "and `instance-prev-cmdline-show`, so the NARROW GUI command line";
+    EXPECT_TRUE(has(declared, "_get_wide_winmain_command_line"))
+        << "and `instance-prev-wcmdline-show`, so the WIDE one";
 
     // ── THE MUTANT: the declared set MINUS its narrow verbs. Built by FILTERING
     // rather than by re-typing the list, so the two sets cannot drift apart. ──
@@ -2255,8 +2331,9 @@ TEST(RealizeEntryShape, EveryDeclaredVerbHasAMaterializationArm) {
             mutant.push_back(v);
         }
     }
-    ASSERT_EQ(narrowVerbs, 2u)
-        << "the pe set's narrow verbs are `argc-argv` and `argc-argv-envp`";
+    ASSERT_EQ(narrowVerbs, 3u)
+        << "the pe set's narrow verbs are `argc-argv`, `argc-argv-envp` and "
+           "`instance-prev-cmdline-show`";
     ASSERT_EQ(mutant.size(), peEntryVerbs().size() - narrowVerbs)
         << "the mutation must remove EXACTLY the narrow verbs";
     ASSERT_FALSE(mutant.empty())
@@ -2273,13 +2350,15 @@ TEST(RealizeEntryShape, EveryDeclaredVerbHasAMaterializationArm) {
     auto const mutated = realizableImports(mutant);
     for (char const* narrowName : {"__p___argv", "_configure_narrow_argv",
                                    "_initialize_narrow_environment",
-                                   "_get_initial_narrow_environment"}) {
+                                   "_get_initial_narrow_environment",
+                                   "_get_narrow_winmain_command_line"}) {
         EXPECT_FALSE(has(mutated, narrowName))
             << "with the narrow verbs removed from the declared set, NOTHING the "
                "format can realize may bind " << narrowName << " — if it still "
                "does, the arm is being chosen by something other than the verb";
     }
-    for (char const* wideName : {"__p___wargv", "_get_initial_wide_environment"}) {
+    for (char const* wideName : {"__p___wargv", "_get_initial_wide_environment",
+                                 "_get_wide_winmain_command_line"}) {
         EXPECT_TRUE(has(mutated, wideName))
             << "while the untouched wide verbs must be unaffected — this is what "
                "keeps the assertions above from being satisfiable by a pass that "
@@ -2324,6 +2403,14 @@ struct OrderedCall {
         if (calls[i].symbol == symbol) return i;
     }
     return calls.size();
+}
+
+// `guiPa()` (the pe exec block whole) less one of its declarations.
+template <typename Field>
+[[nodiscard]] ProcessArgs guiPaWithout(Field ProcessArgs::*field) {
+    ProcessArgs pa = guiPa();
+    pa.*field      = Field{};
+    return pa;
 }
 
 }  // namespace
@@ -2494,8 +2581,8 @@ TEST(RealizeEntryShape, StackEnvironmentIsArgvPlusArgcPlusOneSlots) {
     EXPECT_EQ(addend, std::optional<std::int64_t>{1})
         << "one slot past argv's NULL terminator: argc + 1, never argc";
     EXPECT_EQ(scale, std::optional<std::int64_t>{8})
-        << "the DECLARED slot width (`vectorSlotBytes`), multiplied in because a MIR "
-           "Gep index is a BYTE offset";
+        << "the slot width -- a pointer of the module's data model (P69 fold 3f, F3 P16) -- "
+           "multiplied in because a MIR Gep index is a BYTE offset";
     ASSERT_TRUE(gep.has_value()) << "envp must be computed as an address off argv";
     ASSERT_TRUE(entryCall.has_value()) << "the init must call the user entry";
     EXPECT_EQ(entryCall->args, 3u);
@@ -2506,6 +2593,58 @@ TEST(RealizeEntryShape, StackEnvironmentIsArgvPlusArgcPlusOneSlots) {
 
     MirVerifier verifier{mir, &in};
     EXPECT_TRUE(verifier.verify(rep)) << "the synthesized module must verify";
+}
+
+// ★ P69 (lane `xa`, fold 3f -- review-xa3e F3 P16): THE ENVIRONMENT VECTOR'S SLOT IS A POINTER OF THE MODULE'S DATA
+// MODEL, read from the model and never from a document key: an ILP32 module's slots are 4 bytes and an LP64 one's 8;
+// a module stating no model is refused by name rather than placing envp by a guessed width.
+TEST(RealizeEntryShape, StackEnvironmentSlotIsAPointerOfTheModulesModel) {
+    std::vector<EntryMaterialization> const elfVerbs{
+        EntryMaterialization::None, EntryMaterialization::ArgcArgv, EntryMaterialization::ArgcArgvEnvp};
+    for (auto const& [model, slot] :
+         {std::pair{DataModel::Ilp32, std::int64_t{4}}, std::pair{DataModel::Lp64, std::int64_t{8}}}) {
+        SCOPED_TRACE(static_cast<unsigned>(model));
+        TypeInterner in{CompilationUnitId{1}};
+        Mir mir = buildEntryOnly(in, entrySigFor(in, EntryMaterialization::ArgcArgvEnvp, CallConv::CcSysV), model);
+        std::optional<SymbolId>   entry = SymbolId{100};
+        std::vector<ExternImport> ext;
+        DiagnosticReporter        rep;
+        ASSERT_TRUE(realizeEntryShape(
+            mir, in, entry, ext,
+            verbRealizedBy(elfVerbs, EntryMaterialization::ArgcArgvEnvp), stackVectorPa(),
+            CSymbolDecorationScheme::None, "elf64-x86_64-linux-exec", rep))
+            << allDiagText(rep);
+        ASSERT_TRUE(entry.has_value());
+        auto const synthFn = findFuncBySymbol(mir, *entry);
+        ASSERT_TRUE(synthFn.has_value());
+        std::vector<std::int64_t> scales;
+        for (std::uint32_t bi = 0; bi < mir.funcBlockCount(*synthFn); ++bi) {
+            MirBlockId const blk = mir.funcBlockAt(*synthFn, bi);
+            for (std::uint32_t ii = 0; ii < mir.blockInstCount(blk); ++ii) {
+                MirInstId const id = mir.blockInstAt(blk, ii);
+                if (mir.instOpcode(id) != MirOpcode::Mul) continue;
+                for (auto const o : mir.instOperands(id)) {
+                    auto const index = mir.tryConstLiteralIndex(o);
+                    if (!index.has_value()) continue;
+                    auto const& lit = mir.literalValue(*index);
+                    if (auto const* k = std::get_if<std::int64_t>(&lit.value)) scales.push_back(*k);
+                }
+            }
+        }
+        EXPECT_EQ(scales, std::vector<std::int64_t>{slot})
+            << "the environment vector's slot is not a pointer of the module's data model";
+    }
+    TypeInterner in{CompilationUnitId{1}};
+    Mir mir = buildEntryOnly(in, entrySigFor(in, EntryMaterialization::ArgcArgvEnvp, CallConv::CcSysV), DataModel{});
+    std::optional<SymbolId>   entry = SymbolId{100};
+    std::vector<ExternImport> ext;
+    DiagnosticReporter        rep;
+    EXPECT_FALSE(realizeEntryShape(
+        mir, in, entry, ext,
+        verbRealizedBy(elfVerbs, EntryMaterialization::ArgcArgvEnvp), stackVectorPa(),
+        CSymbolDecorationScheme::None, "elf64-x86_64-linux-exec", rep))
+        << "a module stating no data model placed envp";
+    EXPECT_GE(rep.errorCount(), 1u) << allDiagText(rep);
 }
 
 TEST(RealizeEntryShape, ALoaderDeliveredFormPassesThroughUntouched) {
@@ -2542,7 +2681,6 @@ TEST(RealizeEntryShape, AMechanismThatCannotRealizeTheVerbIsRefused) {
     // alternative to refusing is handing the entry values nothing produced.
     ProcessArgs noLayout = stackVectorPa();
     noLayout.envpFollowsArgvTerminator = false;
-    noLayout.vectorSlotBytes = 0;
     ProcessArgs noNarrowPair = ucrtAccessorPa();
     noNarrowPair.initializeNarrowEnvironmentFn.clear();
     noNarrowPair.narrowEnvironmentAccessorFn.clear();
@@ -2564,12 +2702,20 @@ TEST(RealizeEntryShape, AMechanismThatCannotRealizeTheVerbIsRefused) {
          EntryMaterialization::ArgcArgvEnvp, noLayout,
          "does not declare where the environment vector sits"},
         {"the environment verb with no CRT pair", EntryMaterialization::ArgcArgvEnvp,
-         noNarrowPair, "environment initialize/accessor pair"},
+         noNarrowPair, "narrow environment's `initializeNarrowEnvironmentFn`"},
         {"the four-value verb through a CRT", EntryMaterialization::ArgcArgvEnvpApple,
-         ucrtAccessorPa(), "produces at most 3"},
+         ucrtAccessorPa(), "produces Darwin's apple vector"},
         {"the four-value verb on the entry stack",
          EntryMaterialization::ArgcArgvEnvpApple, stackVectorPa(),
-         "produces at most 3"},
+         "produces Darwin's apple vector"},
+        // P69 fold 3f (lane `xa`): the GUI startups' values, asked per value.
+        {"a GUI verb on the entry stack", EntryMaterialization::InstancePrevCmdlineShow,
+         stackVectorPa(), "no module instance, command line or show-window value"},
+        {"a GUI verb with no routines", EntryMaterialization::InstancePrevWcmdlineShow,
+         guiPaWithout(&ProcessArgs::winMainStartupRoutines), "declares no `winMainStartupRoutines`"},
+        {"the narrow GUI verb with no command line", EntryMaterialization::InstancePrevCmdlineShow,
+         guiPaWithout(&ProcessArgs::narrowWinMainCommandLineFn),
+         "declares no `narrowWinMainCommandLineFn`"},
     };
     for (auto const& c : cases) {
         SCOPED_TRACE(c.name);
@@ -2589,6 +2735,103 @@ TEST(RealizeEntryShape, AMechanismThatCannotRealizeTheVerbIsRefused) {
         EXPECT_EQ(mir.moduleFuncCount(), 1u) << "and synthesize nothing";
         ASSERT_TRUE(entry.has_value());
         EXPECT_EQ(entry->v, 100u) << "and leave the entry symbol alone";
+    }
+}
+
+TEST(RealizeEntryShape, TheGuiVerbsFetchEachValueByWhatItIs) {
+    // MSVC's GUI startup (DOCUMENTED, the toolset's exe_common.inl / exe_winmain.cpp; ✔MEASURED 2026-11-17 by its
+    // imports and by `__argc` == 1 inside WinMain): configure the width's argument vector as every startup does, then
+    // `WinMain(&__ImageBase, nullptr, _get_narrow_winmain_command_line(), __scrt_get_show_window_mode())`. The init
+    // makes the same calls -- the instance and the show value through the format's routines, the command line through
+    // the UCRT's routine of the verb's width, the previous instance a null pointer -- and hands them in the verb's
+    // slot order (P69 fold 3f, lane `xa`).
+    struct Case {
+        EntryMaterialization     verb;
+        char const*              configure;
+        char const*              argvAccessor;
+        char const*              commandLine;
+        std::vector<char const*> forbidden;   // the other width's names, and what no GUI verb reads
+    };
+    std::vector<Case> const cases{
+        {EntryMaterialization::InstancePrevCmdlineShow, "_configure_narrow_argv", "__p___argv",
+         "_get_narrow_winmain_command_line",
+         {"_configure_wide_argv", "__p___wargv", "_get_wide_winmain_command_line", "__p___argc",
+          "_initialize_narrow_environment", "_get_initial_narrow_environment"}},
+        {EntryMaterialization::InstancePrevWcmdlineShow, "_configure_wide_argv", "__p___wargv",
+         "_get_wide_winmain_command_line",
+         {"_configure_narrow_argv", "__p___argv", "_get_narrow_winmain_command_line", "__p___argc",
+          "_initialize_wide_environment", "_get_initial_wide_environment"}},
+    };
+    for (auto const& c : cases) {
+        SCOPED_TRACE(entryMaterializationName(c.verb));
+        TypeInterner in{CompilationUnitId{1}};
+        Mir mir = buildEntryOnly(in, entrySigFor(in, c.verb, CallConv::CcMS64));
+        std::optional<SymbolId>   entry = SymbolId{100};
+        std::vector<ExternImport> ext;
+        DiagnosticReporter        rep;
+        ASSERT_TRUE(realizeEntryShape(mir, in, entry, ext, verbRealizedBy(peEntryVerbs(), c.verb), guiPa(),
+                                      CSymbolDecorationScheme::None, "pe64-x86_64-windows-exec", rep))
+            << allDiagText(rep);
+        EXPECT_EQ(rep.errorCount(), 0u) << allDiagText(rep);
+
+        std::unordered_map<std::string, ExternImport const*> byName;
+        for (auto const& e : ext) byName.emplace(e.mangledName, &e);
+        for (char const* want : {c.configure, c.argvAccessor, c.commandLine}) {
+            ASSERT_EQ(byName.count(want), 1u) << "missing UCRT import " << want;
+            EXPECT_EQ(byName[want]->libraryPath, "ucrtbase.dll") << want;
+            EXPECT_FALSE(byName[want]->isData) << want << " is a function";
+        }
+        for (char const* routine : {"__dss_pe_module_instance", "__dss_pe_show_window_mode"}) {
+            ASSERT_EQ(byName.count(routine), 1u) << "missing routine " << routine;
+            EXPECT_EQ(byName[routine]->libraryPath, "")
+                << routine << ": the compilerSupport archive defines it, bound by the link";
+        }
+        for (char const* forbidden : c.forbidden) {
+            EXPECT_EQ(byName.count(forbidden), 0u) << forbidden << " is no value of this verb";
+        }
+
+        ASSERT_TRUE(entry.has_value());
+        auto const synthFn = findFuncBySymbol(mir, *entry);
+        ASSERT_TRUE(synthFn.has_value()) << "the entry must be retargeted to the init";
+        auto const calls = orderedCalls(mir, *synthFn);
+        std::size_t const iConfigure = indexOfCall(calls, byName[c.configure]->symbol.v);
+        std::size_t const iEntry     = indexOfCall(calls, 100u);
+        ASSERT_LT(iEntry, calls.size()) << "the init must call the user entry";
+        EXPECT_LT(iConfigure, iEntry) << "the argument vector is configured before the entry is called";
+        EXPECT_EQ(calls[iEntry].args, 4u) << "the entry receives (instance, previous, command line, show)";
+
+        // The entry's four operands, in the verb's slot order: each a call of the routine of its value, the previous
+        // instance a null constant.
+        std::vector<MirInstId> entryOps;
+        for (std::uint32_t bi = 0; bi < mir.funcBlockCount(*synthFn); ++bi) {
+            MirBlockId const blk = mir.funcBlockAt(*synthFn, bi);
+            for (std::uint32_t ii = 0; ii < mir.blockInstCount(blk); ++ii) {
+                MirInstId const id = mir.blockInstAt(blk, ii);
+                if (mir.instOpcode(id) != MirOpcode::Call) continue;
+                auto const ops = mir.instOperands(id);
+                if (mir.instOpcode(ops[0]) != MirOpcode::GlobalAddr || mir.globalAddrSymbol(ops[0]).v != 100u) {
+                    continue;
+                }
+                for (std::size_t o = 1; o < ops.size(); ++o) entryOps.push_back(ops[o]);
+            }
+        }
+        ASSERT_EQ(entryOps.size(), 4u);
+        auto const calleeOf = [&](MirInstId id) -> std::uint32_t {
+            if (mir.instOpcode(id) != MirOpcode::Call) return 0;
+            auto const ops = mir.instOperands(id);
+            return mir.instOpcode(ops[0]) == MirOpcode::GlobalAddr ? mir.globalAddrSymbol(ops[0]).v : 0u;
+        };
+        EXPECT_EQ(calleeOf(entryOps[0]), byName["__dss_pe_module_instance"]->symbol.v) << "the module instance";
+        ASSERT_EQ(mir.instOpcode(entryOps[1]), MirOpcode::Const) << "the previous instance is a constant";
+        auto const& previous = mir.literalValue(mir.constLiteralIndex(entryOps[1]));
+        auto const* previousValue = std::get_if<std::int64_t>(&previous.value);
+        ASSERT_NE(previousValue, nullptr);
+        EXPECT_EQ(*previousValue, 0) << "the previous instance is null";
+        EXPECT_EQ(calleeOf(entryOps[2]), byName[c.commandLine]->symbol.v) << "the command line of the verb's width";
+        EXPECT_EQ(calleeOf(entryOps[3]), byName["__dss_pe_show_window_mode"]->symbol.v) << "the show-window value";
+
+        MirVerifier verifier{mir, &in};
+        EXPECT_TRUE(verifier.verify(rep)) << "the synthesized module must verify";
     }
 }
 
@@ -2881,6 +3124,9 @@ Mir buildSehParent(TypeInterner& in, SymbolId sym) {
     TypeId const pI32  = in.pointer(i32);
     TypeId const sig   = in.fnSig({}, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
+    mb.stateArgCounting(MirArgCounting::Flat);
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, sym);
     MirBlockId const entry    = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const tryBB    = mb.createBlock(StructCfMarker::Linear);
@@ -3022,6 +3268,9 @@ TEST(SynthSehFunclets, LabelAddressInAFilterExpressionIsRefusedNotCloned) {
     TypeId const sig  = in.fnSig({}, i32, CallConv::CcMS64);
 
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
+    mb.stateArgCounting(MirArgCounting::Flat);
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, SymbolId{100});
     MirBlockId const entry    = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const tryBB    = mb.createBlock(StructCfMarker::Linear);
@@ -3159,6 +3408,9 @@ Mir buildSehParentMultiBlockBody(TypeInterner& in, SymbolId sym) {
     TypeId const pI32  = in.pointer(i32);
     TypeId const sig   = in.fnSig({}, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
+    mb.stateArgCounting(MirArgCounting::Flat);
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, sym);
     MirBlockId const entry    = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const tryBB    = mb.createBlock(StructCfMarker::Linear);
@@ -3313,6 +3565,9 @@ Mir buildSehParentOrderSensitiveMarkers(TypeInterner& in, SymbolId sym) {
     TypeId const boolTy = in.primitive(TypeKind::Bool);
     TypeId const sig   = in.fnSig({}, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
+    mb.stateArgCounting(MirArgCounting::Flat);
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, sym);
     // ⚠ CREATION ORDER IS THE EXPERIMENT. `h2BB` is deliberately created BETWEEN
     // the region's two body blocks — which is not perversity but the state the
@@ -3438,7 +3693,7 @@ TEST(SynthSehFunclets, RelayoutLeavesStructCfMarkersCanonical) {
         EXPECT_TRUE(verifier.verify(vrep))
             << "the region-contiguity relayout left a stale StructCfMarker — "
                "`synthesizeSehFunclets` must re-derive them after its rebuild, "
-               "exactly as realizeEntryShape / synthesizeStdioShim / "
+               "exactly as realizeEntryShape / "
                "synthesizeThreadsShim / mergeCuMirs all do at their own sites";
         for (auto const& d : vrep.all()) ADD_FAILURE() << d.actual;
     }
@@ -3481,6 +3736,9 @@ Mir buildSehParentFilterReadsLocal(TypeInterner& in, SymbolId sym) {
     TypeId const pI32  = in.pointer(i32);
     TypeId const sig   = in.fnSig({}, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
+    mb.stateArgCounting(MirArgCounting::Flat);
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(sig, sym);
     MirBlockId const entry    = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const tryBB    = mb.createBlock(StructCfMarker::Linear);
@@ -3565,6 +3823,701 @@ TEST(SynthSehFunclets, FilterReadingParentLocalEmitsRecoverParentFrameSlot) {
     EXPECT_TRUE(verifier.verify(rep)) << "the H1 SEH-lowered module must verify";
 }
 
+// ═══ D-MIR-NESTED-TRY-REGIONS-REACH-THE-OUTER-HANDLER ═══════════════════════════
+//
+// WHICH HANDLER A FAULT REACHES is decided by two things this pass owns and
+// nothing later re-derives: where each region's blocks are laid out (a scope
+// record is two addresses, and every address between them is guarded) and the
+// ORDER of the records (the handler routine gives the fault to the first record,
+// in table order, whose range holds the address and whose filter accepts).
+//
+// ✔MEASURED 2026-10-08, the base, pe64, baseline and release: two nested regions
+// whose handlers touch only a frame local — a fault in the INNER body ran the
+// OUTER handler (the image's table read `outer [+99,+233)`, `inner [+161,+188)`),
+// and an inner body holding a loop had its range run to the END of the outer one
+// (`outer [+189,+667)`, `inner [+372,+667)`): the outer body's own blocks after
+// the inner region lay inside the inner range.
+// ✔MEASURED the same day, the reference (cl 19.51 x64, /Od and /O2, a program
+// printing its own function's table; every shape answers 42):
+//     two deep                        [+20,+32) [+20,+57)
+//     three deep                      [+20,+32) [+20,+59) [+20,+87)
+//     two siblings inside one parent  [+20,+32) [+40,+59) [+20,+87)
+// — ascending END of the range, a region after every region inside it, siblings
+// by address; the outer range HOLDS the inner handler.
+//
+// The fixtures are hand-built in the order the SOURCE opens the regions (outer
+// region 0 first), which is the order the frontend numbers them and the order the
+// records used to go out in.
+namespace {
+
+// A filter block of region `region`: accepts an access violation.
+void emitAvFilter(MirBuilder& mb, TypeInterner& in, MirBlockId filterBB,
+                  MirBlockId handlerBB, std::uint32_t region) {
+    TypeId const i32 = in.primitive(TypeKind::I32);
+    TypeId const u32 = in.primitive(TypeKind::U32);
+    mb.beginBlock(filterBB);
+    MirInstId const code = mb.addInst(MirOpcode::SehExceptionCode, {}, u32);
+    MirLiteralValue av; av.value = std::int64_t{0xC0000005}; av.core = TypeKind::U32;
+    MirInstId const avc = mb.addConst(std::move(av), u32);
+    MirInstId const cmp = mb.addInst(MirOpcode::ICmpEq,
+                                     std::array<MirInstId, 2>{code, avc}, i32);
+    mb.addSehFilterReturn(cmp, handlerBB, region);
+}
+
+// A handler block TAGGED with its region — an otherwise unused `Const i32
+// 1000 + region` — so a scope record can be attributed to its region by what its
+// handler block holds, never by where the record sits in the table.
+void emitTaggedHandler(MirBuilder& mb, TypeInterner& in, MirBlockId handlerBB,
+                       MirBlockId next, std::uint32_t region) {
+    mb.beginBlock(handlerBB);
+    (void)mb.addConst(i32Lit(1000 + static_cast<std::int64_t>(region)),
+                      in.primitive(TypeKind::I32));
+    mb.addBr(next);
+}
+
+// A guarded one-block body: a load that could fault, the region's end marker.
+void emitFaultingBody(MirBuilder& mb, TypeInterner& in, MirBlockId bodyBB,
+                      MirInstId slot, MirBlockId next, std::uint32_t region) {
+    mb.beginBlock(bodyBB);
+    (void)mb.addInst(MirOpcode::Load, std::array<MirInstId, 1>{slot},
+                     in.primitive(TypeKind::I32));
+    mb.addInst(MirOpcode::SehTryEnd, {}, InvalidType, region);
+    mb.addBr(next);
+}
+
+// One record of the pass, read off the REBUILT function: its region (the tag in
+// its handler block) and the layout positions of its first, last and handler
+// blocks.
+struct RecordRun {
+    std::uint32_t region  = UINT32_MAX;
+    std::uint32_t first   = UINT32_MAX;
+    std::uint32_t last    = UINT32_MAX;
+    std::uint32_t handler = UINT32_MAX;
+};
+
+[[nodiscard]] std::uint32_t layoutPosition(Mir const& mir, MirFuncId f, MirBlockId b) {
+    std::uint32_t const nb = mir.funcBlockCount(f);
+    for (std::uint32_t i = 0; i < nb; ++i) {
+        if (mir.funcBlockAt(f, i).v == b.v) return i;
+    }
+    return UINT32_MAX;
+}
+
+[[nodiscard]] std::vector<RecordRun>
+recordRuns(Mir const& mir, MirFuncId parent, std::vector<MirSehScope> const& scopes) {
+    std::vector<RecordRun> out;
+    for (MirSehScope const& s : scopes) {
+        RecordRun r;
+        r.first   = layoutPosition(mir, parent, s.beginBlock);
+        r.last    = layoutPosition(mir, parent, s.endBlock);
+        r.handler = layoutPosition(mir, parent, s.handlerBlock);
+        std::uint32_t const n = mir.blockInstCount(s.handlerBlock);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            MirInstId const id = mir.blockInstAt(s.handlerBlock, i);
+            if (mir.instOpcode(id) != MirOpcode::Const) continue;
+            auto const& lit = mir.literalValue(mir.constLiteralIndex(id));
+            if (auto const* v = std::get_if<std::int64_t>(&lit.value);
+                v != nullptr && *v >= 1000) {
+                r.region = static_cast<std::uint32_t>(*v - 1000);
+            }
+        }
+        out.push_back(r);
+    }
+    return out;
+}
+
+// How many blocks of the run `[first, last]` hold a `SehTryEnd` of `region`, and
+// how many hold a `SehFilterReturn` (a filter stub).
+struct RunContents {
+    std::uint32_t endsOfRegion = 0;
+    std::uint32_t filterStubs  = 0;
+};
+
+[[nodiscard]] RunContents runContents(Mir const& mir, MirFuncId parent,
+                                      RecordRun const& run, std::uint32_t region) {
+    RunContents c;
+    for (std::uint32_t p = run.first; p <= run.last; ++p) {
+        MirBlockId const b = mir.funcBlockAt(parent, p);
+        std::uint32_t const n = mir.blockInstCount(b);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            MirInstId const id = mir.blockInstAt(b, i);
+            if (mir.instOpcode(id) == MirOpcode::SehTryEnd && mir.instPayload(id) == region) {
+                ++c.endsOfRegion;
+            }
+            if (mir.instOpcode(id) == MirOpcode::SehFilterReturn) ++c.filterStubs;
+        }
+    }
+    return c;
+}
+
+// TWO DEEP, and the inner body holds a LOOP whose block is created LAST — where an
+// optimizer's block order puts a loop body: after the code that follows the loop.
+//
+//   entry      : slot = alloca ; SehTryBegin(0) → [oBody, oFilter]
+//   oBody      : SehTryBegin(1) → [iBody, iFilter]         outer body's entry
+//   iBody      : load ; CondBr → [iLoop, iEnd]             inner body's entry
+//   iEnd       : SehTryEnd(1) ; Br → afterInner
+//   iFilter    : … SehFilterReturn(1) → iHandler
+//   iHandler   : Br → afterInner
+//   afterInner : SehTryEnd(0) ; Br → join                   outer body, after the inner region
+//   oFilter    : … SehFilterReturn(0) → oHandler
+//   oHandler   : Br → join
+//   join       : return 0
+//   iLoop      : Br → iBody                                 INNER body, created last
+//
+// Inner body = {iBody, iLoop, iEnd}; outer body = those three plus oBody, iFilter,
+// iHandler and afterInner (the inner filter stub and the inner handler run inside
+// the outer body: a fault in the inner handler is the outer handler's).
+Mir buildSehNestedInnerLoopCreatedLast(TypeInterner& in, SymbolId sym) {
+    TypeId const i32    = in.primitive(TypeKind::I32);
+    TypeId const pI32   = in.pointer(i32);
+    TypeId const boolTy = in.primitive(TypeKind::Bool);
+    TypeId const sig    = in.fnSig({}, i32, CallConv::CcMS64);
+    MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
+    mb.stateArgCounting(MirArgCounting::Flat);
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
+    mb.addFunction(sig, sym);
+    MirBlockId const entry      = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const oBody      = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const iBody      = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const iEnd       = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const iFilter    = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const iHandler   = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const afterInner = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const oFilter    = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const oHandler   = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const join       = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const iLoop      = mb.createBlock(StructCfMarker::Linear);
+
+    mb.beginBlock(entry);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, pI32, 4);
+    mb.addSehTryBegin(oBody, oFilter, 0);
+
+    mb.beginBlock(oBody);
+    mb.addSehTryBegin(iBody, iFilter, 1);
+
+    mb.beginBlock(iBody);
+    MirInstId const v    = mb.addInst(MirOpcode::Load, std::array<MirInstId, 1>{slot}, i32);
+    MirInstId const zero = mb.addConst(i32Lit(0), i32);
+    MirInstId const cnd  = mb.addInst(MirOpcode::ICmpNe,
+                                      std::array<MirInstId, 2>{v, zero}, boolTy);
+    mb.addCondBr(cnd, iLoop, iEnd);
+
+    mb.beginBlock(iEnd);
+    mb.addInst(MirOpcode::SehTryEnd, {}, InvalidType, 1);
+    mb.addBr(afterInner);
+
+    emitAvFilter(mb, in, iFilter, iHandler, 1);
+    emitTaggedHandler(mb, in, iHandler, afterInner, 1);
+
+    mb.beginBlock(afterInner);
+    mb.addInst(MirOpcode::SehTryEnd, {}, InvalidType, 0);
+    mb.addBr(join);
+
+    emitAvFilter(mb, in, oFilter, oHandler, 0);
+    emitTaggedHandler(mb, in, oHandler, join, 0);
+
+    mb.beginBlock(join);
+    mb.addReturn(mb.addConst(i32Lit(0), i32));
+
+    mb.beginBlock(iLoop);
+    mb.addBr(iBody);
+    return std::move(mb).finish();
+}
+
+// THREE DEEP (regions 0 ⊃ 1 ⊃ 2), every body one block.
+Mir buildSehThreeDeep(TypeInterner& in, SymbolId sym) {
+    TypeId const i32  = in.primitive(TypeKind::I32);
+    TypeId const pI32 = in.pointer(i32);
+    TypeId const sig  = in.fnSig({}, i32, CallConv::CcMS64);
+    MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
+    mb.stateArgCounting(MirArgCounting::Flat);
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
+    mb.addFunction(sig, sym);
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const b0 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const b1 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const b2 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const f2 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const h2 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const a2 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const f1 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const h1 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const a1 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const f0 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const h0 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const join = mb.createBlock(StructCfMarker::Linear);
+
+    mb.beginBlock(entry);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, pI32, 4);
+    mb.addSehTryBegin(b0, f0, 0);
+    mb.beginBlock(b0);
+    mb.addSehTryBegin(b1, f1, 1);
+    mb.beginBlock(b1);
+    mb.addSehTryBegin(b2, f2, 2);
+    emitFaultingBody(mb, in, b2, slot, a2, 2);
+    emitAvFilter(mb, in, f2, h2, 2);
+    emitTaggedHandler(mb, in, h2, a2, 2);
+    mb.beginBlock(a2);
+    mb.addInst(MirOpcode::SehTryEnd, {}, InvalidType, 1);
+    mb.addBr(a1);
+    emitAvFilter(mb, in, f1, h1, 1);
+    emitTaggedHandler(mb, in, h1, a1, 1);
+    mb.beginBlock(a1);
+    mb.addInst(MirOpcode::SehTryEnd, {}, InvalidType, 0);
+    mb.addBr(join);
+    emitAvFilter(mb, in, f0, h0, 0);
+    emitTaggedHandler(mb, in, h0, join, 0);
+    mb.beginBlock(join);
+    mb.addReturn(mb.addConst(i32Lit(0), i32));
+    return std::move(mb).finish();
+}
+
+// TWO SIBLINGS (regions 1 and 2) INSIDE ONE PARENT (region 0). The FIRST sibling's
+// body is TWO blocks and the second's ONE: an order by size would put the second
+// sibling first, the measured order (by address) keeps the first one first.
+Mir buildSehTwoSiblingsInOneParent(TypeInterner& in, SymbolId sym) {
+    TypeId const i32  = in.primitive(TypeKind::I32);
+    TypeId const pI32 = in.pointer(i32);
+    TypeId const sig  = in.fnSig({}, i32, CallConv::CcMS64);
+    MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
+    mb.stateArgCounting(MirArgCounting::Flat);
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
+    mb.addFunction(sig, sym);
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const b0  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const b1  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const b1b = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const f1  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const h1  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const mid = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const b2  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const f2  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const h2  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const aft = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const f0  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const h0  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const join = mb.createBlock(StructCfMarker::Linear);
+
+    mb.beginBlock(entry);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, pI32, 4);
+    mb.addSehTryBegin(b0, f0, 0);
+    mb.beginBlock(b0);
+    mb.addSehTryBegin(b1, f1, 1);
+    mb.beginBlock(b1);
+    (void)mb.addInst(MirOpcode::Load, std::array<MirInstId, 1>{slot}, i32);
+    mb.addBr(b1b);
+    mb.beginBlock(b1b);
+    mb.addInst(MirOpcode::SehTryEnd, {}, InvalidType, 1);
+    mb.addBr(mid);
+    emitAvFilter(mb, in, f1, h1, 1);
+    emitTaggedHandler(mb, in, h1, mid, 1);
+    mb.beginBlock(mid);
+    mb.addSehTryBegin(b2, f2, 2);
+    emitFaultingBody(mb, in, b2, slot, aft, 2);
+    emitAvFilter(mb, in, f2, h2, 2);
+    emitTaggedHandler(mb, in, h2, aft, 2);
+    mb.beginBlock(aft);
+    mb.addInst(MirOpcode::SehTryEnd, {}, InvalidType, 0);
+    mb.addBr(join);
+    emitAvFilter(mb, in, f0, h0, 0);
+    emitTaggedHandler(mb, in, h0, join, 0);
+    mb.beginBlock(join);
+    mb.addReturn(mb.addConst(i32Lit(0), i32));
+    return std::move(mb).finish();
+}
+
+// The measured order, as a predicate over two consecutive records of one
+// function: the earlier one ends first, or they end together and it begins later.
+[[nodiscard]] bool inMeasuredOrder(RecordRun const& earlier, RecordRun const& later) {
+    return earlier.last < later.last
+        || (earlier.last == later.last && earlier.first > later.first);
+}
+
+} // namespace
+
+TEST(SynthSehFunclets, NestedRegionEachGetsItsOwnRunAndTheInnerRecordComesFirst) {
+    TypeInterner in{CompilationUnitId{1}};
+    Mir mir = buildSehNestedInnerLoopCreatedLast(in, SymbolId{100});
+
+    std::vector<ExternImport> ext;
+    std::vector<MirSehScope>  scopes;
+    DiagnosticReporter        rep;
+    ASSERT_TRUE(synthesizeSehFunclets(mir, in, ext, peSehPersonality(),
+                                      CSymbolDecorationScheme::None,
+                                      "pe64-x86_64-windows-exec", scopes, rep))
+        << allDiagText(rep);
+    EXPECT_EQ(rep.errorCount(), 0u) << allDiagText(rep);
+    ASSERT_EQ(scopes.size(), 2u);
+    auto const parent = findFuncBySymbol(mir, SymbolId{100});
+    ASSERT_TRUE(parent.has_value());
+    std::vector<RecordRun> const runs = recordRuns(mir, *parent, scopes);
+
+    // THE ORDER: the inner region's record, then the outer's.
+    EXPECT_EQ(runs[0].region, 1u) << "the first record must be the INNER region's";
+    EXPECT_EQ(runs[1].region, 0u) << "the second record must be the OUTER region's";
+    EXPECT_TRUE(inMeasuredOrder(runs[0], runs[1]));
+
+    // EACH RUN IS EXACTLY ITS BODY. The inner body is three blocks although its loop
+    // block was created after everything else; the outer body is seven.
+    ASSERT_LE(runs[0].first, runs[0].last);
+    ASSERT_LE(runs[1].first, runs[1].last);
+    EXPECT_EQ(runs[0].last - runs[0].first + 1u, 3u)
+        << "the inner run must hold the inner body and nothing else";
+    EXPECT_EQ(runs[1].last - runs[1].first + 1u, 7u)
+        << "the outer run must hold the outer body, the inner region included";
+    RunContents const inner = runContents(mir, *parent, runs[0], /*region=*/1);
+    EXPECT_EQ(inner.endsOfRegion, 1u) << "the inner run ends in the inner region's end";
+    EXPECT_EQ(inner.filterStubs, 0u)  << "no filter stub lies inside the inner run";
+    EXPECT_EQ(runContents(mir, *parent, runs[0], /*region=*/0).endsOfRegion, 0u)
+        << "the block that ends the OUTER body is not in the inner run: a fault in "
+           "it would otherwise be delivered to the inner handler";
+
+    // THE INNER RUN LIES INSIDE THE OUTER ONE, and so does the inner HANDLER (a
+    // fault in it is the outer handler's) — while no handler lies inside its own run.
+    EXPECT_GT(runs[0].first, runs[1].first);
+    EXPECT_LE(runs[0].last, runs[1].last);
+    EXPECT_TRUE(runs[0].handler < runs[0].first || runs[0].handler > runs[0].last)
+        << "the inner handler must lie outside the inner run";
+    EXPECT_TRUE(runs[0].handler >= runs[1].first && runs[0].handler <= runs[1].last)
+        << "the inner handler must lie inside the OUTER run";
+    EXPECT_TRUE(runs[1].handler < runs[1].first || runs[1].handler > runs[1].last)
+        << "the outer handler must lie outside the outer run";
+
+    rederiveStructCfMarkers(mir);
+    MirVerifier verifier{mir, &in};
+    EXPECT_TRUE(verifier.verify(rep)) << allDiagText(rep);
+}
+
+TEST(SynthSehFunclets, RecordsFollowTheMeasuredOrderForThreeDeepAndForSiblings) {
+    struct Case {
+        char const*                name;
+        Mir                      (*build)(TypeInterner&, SymbolId);
+        std::array<std::uint32_t, 3> regionsInTableOrder;
+    };
+    // Region ids are the order the source OPENS the regions: three deep is
+    // 0 ⊃ 1 ⊃ 2; the siblings are 1 then 2, inside 0.
+    std::array<Case, 2> const cases{{
+        {"three deep", &buildSehThreeDeep, {2u, 1u, 0u}},
+        {"two siblings inside one parent", &buildSehTwoSiblingsInOneParent, {1u, 2u, 0u}},
+    }};
+    for (Case const& c : cases) {
+        TypeInterner in{CompilationUnitId{1}};
+        Mir mir = c.build(in, SymbolId{100});
+        std::vector<ExternImport> ext;
+        std::vector<MirSehScope>  scopes;
+        DiagnosticReporter        rep;
+        ASSERT_TRUE(synthesizeSehFunclets(mir, in, ext, peSehPersonality(),
+                                          CSymbolDecorationScheme::None,
+                                          "pe64-x86_64-windows-exec", scopes, rep))
+            << c.name << ": " << allDiagText(rep);
+        ASSERT_EQ(scopes.size(), 3u) << c.name;
+        auto const parent = findFuncBySymbol(mir, SymbolId{100});
+        ASSERT_TRUE(parent.has_value()) << c.name;
+        std::vector<RecordRun> const runs = recordRuns(mir, *parent, scopes);
+        for (std::size_t k = 0; k < 3; ++k) {
+            EXPECT_EQ(runs[k].region, c.regionsInTableOrder[k])
+                << c.name << ": record #" << k;
+        }
+        EXPECT_TRUE(inMeasuredOrder(runs[0], runs[1])) << c.name;
+        EXPECT_TRUE(inMeasuredOrder(runs[1], runs[2])) << c.name;
+        // The last record is the outermost region's and holds both others.
+        EXPECT_LE(runs[2].first, runs[0].first) << c.name;
+        EXPECT_GE(runs[2].last, runs[1].last) << c.name;
+        rederiveStructCfMarkers(mir);
+        MirVerifier verifier{mir, &in};
+        EXPECT_TRUE(verifier.verify(rep)) << c.name << ": " << allDiagText(rep);
+    }
+}
+
+// TWO REGIONS THAT OVERLAP AND DO NOT NEST have no innermost, so no order of their
+// records is right: the pass refuses, naming both. A `__try` is a statement, so
+// no source produces this; a pass that moved a region's end marker would.
+//
+//   entry : SehTryBegin(0) → [a, f0]
+//   a     : SehTryBegin(1) → [b, f1]        region 0's entry; region 1 opens inside it
+//   f1    : … SehFilterReturn(1) → h1
+//   h1    : return                           (region 1's handler leaves the function)
+//   b     : SehTryEnd(0) ; Br → c           region 0 ENDS while region 1 is open
+//   c     : SehTryEnd(1) ; Br → join
+//
+// Region 0 = {a, f1, h1, b}, region 1 = {b, c}: each is one run starting at its
+// entry (positions 1..4 and 4..5), they share `b`, and neither holds the other.
+TEST(SynthSehFunclets, TwoRegionsThatOverlapWithoutNestingAreRefused) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32 = in.primitive(TypeKind::I32);
+    TypeId const sig = in.fnSig({}, i32, CallConv::CcMS64);
+    MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
+    mb.stateArgCounting(MirArgCounting::Flat);
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
+    mb.addFunction(sig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const a  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const f1 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const h1 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const b  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const c  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const f0 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const h0 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const join = mb.createBlock(StructCfMarker::Linear);
+    mb.beginBlock(entry);
+    mb.addSehTryBegin(a, f0, 0);
+    mb.beginBlock(a);
+    mb.addSehTryBegin(b, f1, 1);
+    emitAvFilter(mb, in, f1, h1, 1);
+    mb.beginBlock(h1);
+    mb.addReturn(mb.addConst(i32Lit(7), i32));
+    mb.beginBlock(b);
+    mb.addInst(MirOpcode::SehTryEnd, {}, InvalidType, 0);
+    mb.addBr(c);
+    mb.beginBlock(c);
+    mb.addInst(MirOpcode::SehTryEnd, {}, InvalidType, 1);
+    mb.addBr(join);
+    emitAvFilter(mb, in, f0, h0, 0);
+    emitTaggedHandler(mb, in, h0, join, 0);
+    mb.beginBlock(join);
+    mb.addReturn(mb.addConst(i32Lit(0), i32));
+    Mir mir = std::move(mb).finish();
+
+    std::vector<ExternImport> ext;
+    std::vector<MirSehScope>  scopes;
+    DiagnosticReporter        rep;
+    EXPECT_FALSE(synthesizeSehFunclets(mir, in, ext, peSehPersonality(),
+                                       CSymbolDecorationScheme::None,
+                                       "pe64-x86_64-windows-exec", scopes, rep));
+    std::string const text = allDiagText(rep);
+    EXPECT_NE(text.find("they overlap and neither holds the other"), std::string::npos)
+        << text;
+    EXPECT_NE(text.find("guarded regions 0 and 1"), std::string::npos) << text;
+    EXPECT_TRUE(scopes.empty()) << "a refused module must hand out no record";
+}
+
+// A REGION WHOSE BODY CANNOT BE ONE RUN is refused by the layout's own verifier:
+// two regions that are apart and share a block — the block can follow only one of
+// the two entries. The first region gets its run; the second's body is then in
+// two pieces, and a record over them would guard the first region's entry too.
+//
+//   entry : CondBr → [p0, p1]
+//   p0    : SehTryBegin(0) → [a0, f0]        p1 : SehTryBegin(1) → [a1, f1]
+//   a0    : Br → s                           a1 : Br → s
+//   s     : SehTryEnd(0) ; SehTryEnd(1) ; Br → join
+TEST(SynthSehFunclets, ABodyThatCannotBeLaidOutAsOneRunIsRefused) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32    = in.primitive(TypeKind::I32);
+    TypeId const pI32   = in.pointer(i32);
+    TypeId const boolTy = in.primitive(TypeKind::Bool);
+    TypeId const sig    = in.fnSig({}, i32, CallConv::CcMS64);
+    MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
+    mb.stateArgCounting(MirArgCounting::Flat);
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
+    mb.addFunction(sig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const p0 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const p1 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const a0 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const a1 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const s  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const f0 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const h0 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const f1 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const h1 = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const join = mb.createBlock(StructCfMarker::Linear);
+    mb.beginBlock(entry);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, pI32, 4);
+    MirInstId const v    = mb.addInst(MirOpcode::Load, std::array<MirInstId, 1>{slot}, i32);
+    MirInstId const zero = mb.addConst(i32Lit(0), i32);
+    MirInstId const cnd  = mb.addInst(MirOpcode::ICmpNe,
+                                      std::array<MirInstId, 2>{v, zero}, boolTy);
+    mb.addCondBr(cnd, p0, p1);
+    mb.beginBlock(p0);
+    mb.addSehTryBegin(a0, f0, 0);
+    mb.beginBlock(p1);
+    mb.addSehTryBegin(a1, f1, 1);
+    mb.beginBlock(a0);
+    mb.addBr(s);
+    mb.beginBlock(a1);
+    mb.addBr(s);
+    mb.beginBlock(s);
+    mb.addInst(MirOpcode::SehTryEnd, {}, InvalidType, 0);
+    mb.addInst(MirOpcode::SehTryEnd, {}, InvalidType, 1);
+    mb.addBr(join);
+    emitAvFilter(mb, in, f0, h0, 0);
+    emitTaggedHandler(mb, in, h0, join, 0);
+    emitAvFilter(mb, in, f1, h1, 1);
+    emitTaggedHandler(mb, in, h1, join, 1);
+    mb.beginBlock(join);
+    mb.addReturn(mb.addConst(i32Lit(0), i32));
+    Mir mir = std::move(mb).finish();
+
+    std::vector<ExternImport> ext;
+    std::vector<MirSehScope>  scopes;
+    DiagnosticReporter        rep;
+    EXPECT_FALSE(synthesizeSehFunclets(mir, in, ext, peSehPersonality(),
+                                       CSymbolDecorationScheme::None,
+                                       "pe64-x86_64-windows-exec", scopes, rep));
+    std::string const text = allDiagText(rep);
+    EXPECT_NE(text.find("is not laid out as one run of its function starting at the "
+                        "body's entry"), std::string::npos) << text;
+    EXPECT_TRUE(scopes.empty()) << "a refused module must hand out no record";
+}
+
+// ═══ D-MIR-TRY-FILTER-SHARED-PURE-VALUE-REFUSED-IN-RELEASE ══════════════════════
+//
+// A filter funclet is a function of its own: it keeps none of the parent's
+// registers. A value of the parent reaches it as a parent FRAME SLOT, or as a
+// value it can COMPUTE AGAIN — an instruction that is a function of its operands
+// and of nothing else. The optimizer makes the second kind: CSE hands a filter's
+// `GlobalAddr g` or `3 + 4` the dominating copy computed before the region.
+// ✔MEASURED 2026-10-08 at the base: a filter reading a global the function also
+// wrote before the region compiled at baseline and was REFUSED in release.
+//
+//   entry    : slot = alloca ; g = globaladdr G ; sum = 3 + 4 ; [early = load g] ;
+//              SehTryBegin(0) → [tryBB, filterBB]
+//   filterBB : (code == AV) & (load g == sum)          — reads `g` and `sum`
+//              (code == AV) & (early == sum)           — reads `early`, a LOAD
+namespace {
+
+Mir buildSehFilterReadsValueFromBeforeTheRegion(TypeInterner& in, SymbolId sym,
+                                                bool readsAnEarlierLoad) {
+    TypeId const i32  = in.primitive(TypeKind::I32);
+    TypeId const u32  = in.primitive(TypeKind::U32);
+    TypeId const pI32 = in.pointer(i32);
+    TypeId const sig  = in.fnSig({}, i32, CallConv::CcMS64);
+    MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
+    mb.stateArgCounting(MirArgCounting::Flat);
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
+    (void)mb.addGlobal(i32, SymbolId{300}, mb.literalPoolAdd(i32Lit(7)),
+                       MirFuncId{}, SymbolBinding::Global,
+                       SymbolVisibility::Default, /*isConst=*/false,
+                       MirThreadStorage::Shared);
+    mb.addFunction(sig, sym);
+    MirBlockId const entry     = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const tryBB     = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const filterBB  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const handlerBB = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const joinBB    = mb.createBlock(StructCfMarker::Linear);
+
+    mb.beginBlock(entry);
+    MirInstId const slot  = mb.addInst(MirOpcode::Alloca, {}, pI32, 4);
+    MirInstId const g     = mb.addGlobalAddr(SymbolId{300}, pI32);
+    MirInstId const k3    = mb.addConst(i32Lit(3), i32);
+    MirInstId const k4    = mb.addConst(i32Lit(4), i32);
+    MirInstId const sum   = mb.addInst(MirOpcode::Add, std::array<MirInstId, 2>{k3, k4}, i32);
+    MirInstId const early = mb.addInst(MirOpcode::Load, std::array<MirInstId, 1>{g}, i32);
+    mb.addSehTryBegin(tryBB, filterBB, 0);
+
+    emitFaultingBody(mb, in, tryBB, slot, joinBB, 0);
+
+    mb.beginBlock(filterBB);
+    MirInstId const code = mb.addInst(MirOpcode::SehExceptionCode, {}, u32);
+    MirLiteralValue av; av.value = std::int64_t{0xC0000005}; av.core = TypeKind::U32;
+    MirInstId const avc = mb.addConst(std::move(av), u32);
+    MirInstId const c1  = mb.addInst(MirOpcode::ICmpEq,
+                                     std::array<MirInstId, 2>{code, avc}, i32);
+    MirInstId const read = readsAnEarlierLoad
+        ? early
+        : mb.addInst(MirOpcode::Load, std::array<MirInstId, 1>{g}, i32);
+    MirInstId const c2   = mb.addInst(MirOpcode::ICmpEq,
+                                      std::array<MirInstId, 2>{read, sum}, i32);
+    MirInstId const both = mb.addInst(MirOpcode::And,
+                                      std::array<MirInstId, 2>{c1, c2}, i32);
+    mb.addSehFilterReturn(both, handlerBB, 0);
+
+    emitTaggedHandler(mb, in, handlerBB, joinBB, 0);
+    mb.beginBlock(joinBB);
+    mb.addReturn(mb.addConst(i32Lit(0), i32));
+    return std::move(mb).finish();
+}
+
+} // namespace
+
+TEST(SynthSehFunclets, FilterComputesAgainAValueTheParentComputedBeforeTheRegion) {
+    TypeInterner in{CompilationUnitId{1}};
+    Mir mir = buildSehFilterReadsValueFromBeforeTheRegion(in, SymbolId{100},
+                                                          /*readsAnEarlierLoad=*/false);
+    std::vector<ExternImport> ext;
+    std::vector<MirSehScope>  scopes;
+    DiagnosticReporter        rep;
+    ASSERT_TRUE(synthesizeSehFunclets(mir, in, ext, peSehPersonality(),
+                                      CSymbolDecorationScheme::None,
+                                      "pe64-x86_64-windows-exec", scopes, rep))
+        << allDiagText(rep);
+    EXPECT_EQ(rep.errorCount(), 0u) << allDiagText(rep);
+    ASSERT_EQ(scopes.size(), 1u);
+
+    // The funclet holds its OWN copy of the address and of the sum — operands and
+    // all — and every operand of every instruction in it is an instruction of the
+    // funclet: nothing of the parent's is named across the function boundary.
+    auto const funclet = findFuncBySymbol(mir, scopes[0].filterFuncletSymbol);
+    ASSERT_TRUE(funclet.has_value());
+    std::unordered_map<std::uint32_t, MirOpcode> own;
+    std::uint32_t const nbf = mir.funcBlockCount(*funclet);
+    for (std::uint32_t bi = 0; bi < nbf; ++bi) {
+        MirBlockId const b = mir.funcBlockAt(*funclet, bi);
+        for (std::uint32_t ii = 0; ii < mir.blockInstCount(b); ++ii) {
+            MirInstId const id = mir.blockInstAt(b, ii);
+            own.emplace(id.v, mir.instOpcode(id));
+        }
+    }
+    std::uint32_t addresses = 0, sums = 0, recovered = 0;
+    for (std::uint32_t bi = 0; bi < nbf; ++bi) {
+        MirBlockId const b = mir.funcBlockAt(*funclet, bi);
+        for (std::uint32_t ii = 0; ii < mir.blockInstCount(b); ++ii) {
+            MirInstId const id = mir.blockInstAt(b, ii);
+            for (MirInstId const o : mir.instOperands(id)) {
+                EXPECT_TRUE(own.contains(o.v))
+                    << "a funclet instruction names an instruction of another function";
+            }
+            MirOpcode const op = mir.instOpcode(id);
+            if (op == MirOpcode::RecoverParentFrameSlot) ++recovered;
+            if (op == MirOpcode::GlobalAddr) {
+                ++addresses;
+                EXPECT_EQ(mir.globalAddrSymbol(id).v, 300u);
+            }
+            if (op == MirOpcode::Add) {
+                ++sums;
+                for (MirInstId const o : mir.instOperands(id)) {
+                    auto const it = own.find(o.v);
+                    ASSERT_NE(it, own.end());
+                    EXPECT_EQ(it->second, MirOpcode::Const)
+                        << "the sum's operands are computed again with it";
+                }
+            }
+        }
+    }
+    EXPECT_EQ(addresses, 1u) << "the global's address is computed again in the funclet";
+    EXPECT_EQ(sums, 1u)      << "the sum is computed again in the funclet";
+    EXPECT_EQ(recovered, 0u) << "nothing here is a parent frame slot";
+
+    MirVerifier verifier{mir, &in};
+    EXPECT_TRUE(verifier.verify(rep)) << allDiagText(rep);
+}
+
+TEST(SynthSehFunclets, FilterReadingAnEarlierLoadIsRefusedByName) {
+    TypeInterner in{CompilationUnitId{1}};
+    Mir mir = buildSehFilterReadsValueFromBeforeTheRegion(in, SymbolId{100},
+                                                          /*readsAnEarlierLoad=*/true);
+    std::vector<ExternImport> ext;
+    std::vector<MirSehScope>  scopes;
+    DiagnosticReporter        rep;
+    // A LOAD is memory at an earlier moment: the filter runs at the fault, and the
+    // body may have stored since. It is neither a frame slot nor a function of its
+    // operands, so it stays a refusal — one that names the instruction.
+    EXPECT_FALSE(synthesizeSehFunclets(mir, in, ext, peSehPersonality(),
+                                       CSymbolDecorationScheme::None,
+                                       "pe64-x86_64-windows-exec", scopes, rep));
+    std::string const text = allDiagText(rep);
+    EXPECT_NE(text.find("the value is a 'load'"), std::string::npos) << text;
+    EXPECT_NE(text.find("can neither read from the parent's frame nor compute again "
+                        "from its operands"), std::string::npos) << text;
+}
+
 // ── FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER): synthesizeThreadsShim ──────────────
 // A caller references mtx_lock (pre-minted SymbolId{10}, seeded into functionSymbols by
 // the CST→HIR seam so the reference lowered to a GlobalAddr against a NOT-yet-defined
@@ -3581,6 +4534,9 @@ TEST(SynthThreadsShim, SynthesizesDefinitionAndHelperImportNotTheShimName) {
     TypeId const lockSig = in.fnSig(lockParams, i32, CallConv::CcSysV);  // the descriptor sig
 
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
+    mb.stateArgCounting(MirArgCounting::Flat);
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(mainSig, SymbolId{100});   // main
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(e);
@@ -3632,6 +4588,8 @@ TEST(SynthThreadsShim, EmptyRecipeMapIsNoOp) {
     TypeInterner in{CompilationUnitId{1}};
     TypeId const i32 = in.primitive(TypeKind::I32);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
+    mb.stateArgCounting(MirArgCounting::Flat);
     mb.addFunction(in.fnSig({}, i32, CallConv::CcMS64), SymbolId{100});
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(e);
@@ -3664,6 +4622,9 @@ TEST(SynthThreadsShim, ThrdCreateDirectPassesStartRoutineNoTrampoline) {
     TypeId const createSig = in.fnSig(cp, i32, CallConv::CcMS64);   // (thr, func, arg)->int
 
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Llp64);
+    mb.stateArgCounting(MirArgCounting::Flat);
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(mainSig, SymbolId{100});
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(e);
@@ -3744,7 +4705,7 @@ TEST(SynthThreadsShim, ThrdCreateDirectPassesStartRoutineNoTrampoline) {
 // ── UCRT-P4: A SYNTHESIZED CROSS-ABI CALL NEVER PUNS ITS OPERAND'S TYPE ──────────
 // C11 declares `_Noreturn void thrd_exit(int res)` — SIGNED — while NEITHER vehicle's
 // exit primitive takes that: Win32's `VOID ExitThread(DWORD)` is UNSIGNED (windows.json
-// states it `fn(u32) -> void`, faithful to the real prototype) and pthread's
+// states it `fn(u32 "unsigned long") -> void`, faithful to the real prototype) and pthread's
 // `void pthread_exit(void *)` is a POINTER. Both declarations are correct, so the
 // conversion belongs to the SHIM — and this pin holds the CLASS rather than one line:
 // on EITHER arm the operand handed to the primitive must NOT be the raw `Arg`, and its
@@ -3802,6 +4763,9 @@ TEST(SynthThreadsShim, ThrdExitConvertsExplicitlyToEachVehiclesExitParameterType
         std::array<TypeId, 1> const ep{i32};
         TypeId const exitSig = in.fnSig(ep, voidTy, CallConv::CcMS64);
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Llp64);
+        mb.stateArgCounting(MirArgCounting::Flat);
+        mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
         mb.addFunction(in.fnSig({}, i32, CallConv::CcMS64), SymbolId{100});
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -3828,8 +4792,9 @@ TEST(SynthThreadsShim, ThrdExitConvertsExplicitlyToEachVehiclesExitParameterType
         MirInstId const code = exitArgOperandOf(mir, externs, "ExitThread");
         ASSERT_TRUE(code.valid())
             << "the synthesized thrd_exit body must call the kernel32 ExitThread import";
-        // (1) THE PARAMETER TYPE. windows.json declares ExitThread `fn(u32) -> void`, so a
-        // conforming operand is U32 — an I32 here is the silent pun this pin exists for.
+        // (1) THE PARAMETER TYPE. windows.json declares ExitThread
+        // `fn(u32 "unsigned long") -> void` — a DWORD, 32 bits and unsigned — so a
+        // conforming operand is U32; an I32 here is the silent pun this pin exists for.
         ASSERT_TRUE(mir.instType(code).valid());
         EXPECT_EQ(in.kind(mir.instType(code)), TypeKind::U32)
             << "ExitThread's dwExitCode operand must be U32 (the declared DWORD), never "
@@ -3893,118 +4858,163 @@ TEST(SynthThreadsShim, ThrdExitConvertsExplicitlyToEachVehiclesExitParameterType
     }
 }
 
-// call_once synthesizes ONE module-scoped __dss_once_tramp, address-takes it, and the
-// adapter invokes the C11 void(*)(void) INDIRECTLY. RED-on-disable: dropping the adapter
-// (passing the bare fn as PINIT_ONCE_FN) removes the 3rd function + the indirect call.
-TEST(SynthThreadsShim, CallOnceSynthesizesAddressTakenTrampolineWithIndirectCall) {
+// ── P69 (D-MIR-THREADS-SHIM-SYNTHESIZES-UNREFERENCED-RECIPES): ONLY A REFERENCED RECIPE IS
+// SYNTHESIZED ───────────────────────────────────────────────────────────────────────────────
+// The recipe map carries a recipe for EVERY synthesize-tagged row the TU's headers injected,
+// used or not. The pass synthesizes only the ones the module NAMES — a call's callee or an
+// address taken in code (a `GlobalAddr`), or a member of a global's initializer (a
+// function-pointer table) — which is the MIR-tier statement of the referenced-only rule,
+// `linker::mirReferenceTargetIds` (link/extern_reference_gate.hpp). Three recipes: mtx_lock
+// CALLED by main, thrd_yield named ONLY by a global's initializer, mtx_unlock named by nothing.
+// RED-on-disable: synthesize the whole map and mtx_unlock is defined and LeaveCriticalSection
+// imported — the surplus `#include <threads.h>` put into every pe program that called
+// nothing (✔MEASURED P69: `.text` 0x23 -> 0x81c, imports 1 -> 26).
+TEST(SynthThreadsShim, OnlyReferencedRecipesAreSynthesized) {
     TypeInterner in{CompilationUnitId{1}};
     TypeId const i32    = in.primitive(TypeKind::I32);
     TypeId const voidTy = in.primitive(TypeKind::Void);
     TypeId const pV     = in.pointer(voidTy);
-    TypeId const mainSig = in.fnSig({}, i32, CallConv::CcMS64);
-    std::array<TypeId, 2> const cp{pV, pV};
-    TypeId const onceSig = in.fnSig(cp, voidTy, CallConv::CcMS64);   // (flag, fn)->void
+    std::array<TypeId, 1> const lockParams{pV};
+    TypeId const lockSig = in.fnSig(lockParams, i32, CallConv::CcMS64);
 
     MirBuilder mb;
-    mb.addFunction(mainSig, SymbolId{100});
+    mb.stateDataModel(DataModel::Lp64);
+    mb.stateArgCounting(MirArgCounting::Flat);
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
+    mb.addFunction(in.fnSig({}, i32, CallConv::CcMS64), SymbolId{100});
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(e);
-    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, pV, 8);
-    MirInstId const ga   = mb.addGlobalAddr(SymbolId{10}, in.pointer(onceSig));
-    MirInstId const co[] = {ga, slot, slot};
-    mb.addInst(MirOpcode::Call, co, InvalidType);   // call_once returns void
+    MirInstId const slot   = mb.addInst(MirOpcode::Alloca, {}, pV, 40);
+    MirInstId const lockGa = mb.addGlobalAddr(SymbolId{10}, in.pointer(lockSig));
+    MirInstId const co[]   = {lockGa, slot};
+    mb.addReturn(mb.addInst(MirOpcode::Call, co, i32));
+    // `static void (*const hooks)(void) = thrd_yield;` — the ONLY mention of SymbolId{12}.
+    MirLiteralValue hook;
+    hook.value = MirSymbolAddrValue{/*symbol=*/12u, /*addend=*/0};
+    hook.core  = TypeKind::Ptr;
+    (void)mb.addGlobal(pV, SymbolId{200}, mb.literalPoolAdd(hook), MirFuncId{},
+                       SymbolBinding::Local, SymbolVisibility::Default, /*isConst=*/true,
+                       MirThreadStorage::Shared);
+    Mir mir = std::move(mb).finish();
+
+    std::unordered_map<std::uint32_t, std::string> const recipes{
+        {10u, "mtx_lock"}, {11u, "mtx_unlock"}, {12u, "thrd_yield"}};
+    std::vector<ExternImport> externs;
+    DiagnosticReporter rep;
+    ASSERT_TRUE(synthesizeThreadsShim(
+        mir, in, recipes,
+        LibrarySynthesis{LibrarySynthVehicle::Win32, RuntimeLibraryRole::SystemPrimitives, "kernel32.dll"},
+        CSymbolDecorationScheme::None, externs, rep));
+    EXPECT_FALSE(rep.hasErrors());
+
+    std::unordered_map<std::uint32_t, bool> defined;
+    for (std::uint32_t i = 0; i < mir.moduleFuncCount(); ++i)
+        defined[mir.funcSymbol(mir.funcAt(i)).v] = true;
+    EXPECT_TRUE(defined.contains(10u)) << "mtx_lock is CALLED — it must be synthesized";
+    EXPECT_TRUE(defined.contains(12u))
+        << "thrd_yield is named by a global's initializer — a reference like a call";
+    EXPECT_FALSE(defined.contains(11u))
+        << "mtx_unlock is named by nothing — an unused declaration brings in no body";
+    EXPECT_EQ(mir.moduleFuncCount(), 3u) << "main + the two referenced recipes, nothing else";
+
+    bool enter = false, sw = false, leave = false;
+    for (auto const& imp : externs) {
+        if (imp.mangledName == "EnterCriticalSection") enter = true;
+        if (imp.mangledName == "SwitchToThread")       sw    = true;
+        if (imp.mangledName == "LeaveCriticalSection") leave = true;
+    }
+    EXPECT_TRUE(enter && sw) << "each synthesized body imports its own kernel32 helper";
+    EXPECT_FALSE(leave) << "the unsynthesized mtx_unlock's helper must not be imported";
+
+    MirVerifier verifier{mir, &in};
+    EXPECT_TRUE(verifier.verify(rep)) << "the referenced-only synthesized module must verify";
+}
+
+// A recipe map with NO referenced recipe needs NO vehicle: the pass is a clean no-op even
+// where the format declares none — the case of a Mach-O x86_64 program that includes
+// <threads.h> and calls none of it, which this pass REFUSED to compile before P69 (✔MEASURED,
+// L_UnsupportedLoweringForOpcode "synth recipes are present but the target object format
+// declares no `librarySynthesis` vehicle"). The refusal stays for a REFERENCED recipe
+// (`MissingLibrarySynthesisWithReferencedRecipeFailsLoud` below). RED-on-disable: synthesize
+// (or vehicle-check) the whole map and this reds on the refusal.
+TEST(SynthThreadsShim, UnreferencedRecipesNeedNoVehicle) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32 = in.primitive(TypeKind::I32);
+    MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
+    mb.stateArgCounting(MirArgCounting::Flat);
+    mb.addFunction(in.fnSig({}, i32, CallConv::CcMS64), SymbolId{100});
+    MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(e);
     mb.addReturn(mb.addConst(i32Lit(0), i32));
     Mir mir = std::move(mb).finish();
 
-    std::unordered_map<std::uint32_t, std::string> recipes{{10u, "call_once"}};
+    std::unordered_map<std::uint32_t, std::string> const recipes{
+        {10u, "mtx_lock"}, {11u, "thrd_create"}, {12u, "tss_get"}};
     std::vector<ExternImport> externs;
     DiagnosticReporter rep;
-    ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes,
-                                      LibrarySynthesis{LibrarySynthVehicle::Win32, RuntimeLibraryRole::SystemPrimitives, "kernel32.dll"},
-                                      CSymbolDecorationScheme::None, externs, rep));
+    ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, std::nullopt,
+                                      CSymbolDecorationScheme::LeadingUnderscore, externs, rep));
     EXPECT_FALSE(rep.hasErrors());
+    EXPECT_EQ(mir.moduleFuncCount(), 1u) << "no recipe is referenced, so no body is synthesized";
+    EXPECT_TRUE(externs.empty()) << "and no helper is imported";
+}
 
-    // 3 functions: main + call_once + the synthesized __dss_once_tramp.
-    EXPECT_EQ(mir.moduleFuncCount(), 3u)
-        << "call_once synthesizes the module-scoped __dss_once_tramp adapter";
+// ★ P69 RETIRED THE `call_once` RECIPE: it is DSS's runtime source on pe
+// (runtime/platform/src/threads_once.c) and libSystem's pthread_once on Mach-O, the loader no
+// longer admits the id (a negative in tests/ffi/test_shipped_lib_descriptor.cpp), and this
+// pass has no arm for it on either vehicle — so a referenced `call_once` reaching the pass is
+// the vocab/switch drift its backstop reports, never a body. RED-on-disable: restore either
+// vehicle's arm and that vehicle's leg synthesizes a body instead of refusing.
+TEST(SynthThreadsShim, RetiredCallOnceRecipeIsRefusedOnBothVehicles) {
+    struct Vehicle {
+        char const*             name;
+        LibrarySynthesis        synthesis;
+        CSymbolDecorationScheme scheme;
+    };
+    for (Vehicle const& v :
+         {Vehicle{"win32",
+                  LibrarySynthesis{LibrarySynthVehicle::Win32, RuntimeLibraryRole::SystemPrimitives,
+                                   "kernel32.dll"},
+                  CSymbolDecorationScheme::None},
+          Vehicle{"pthread",
+                  LibrarySynthesis{LibrarySynthVehicle::Pthread, RuntimeLibraryRole::CLibrary,
+                                   "/usr/lib/libSystem.B.dylib"},
+                  CSymbolDecorationScheme::LeadingUnderscore}}) {
+        SCOPED_TRACE(v.name);
+        TypeInterner in{CompilationUnitId{1}};
+        TypeId const i32    = in.primitive(TypeKind::I32);
+        TypeId const voidTy = in.primitive(TypeKind::Void);
+        TypeId const pV     = in.pointer(voidTy);
+        std::array<TypeId, 2> const cp{pV, pV};
+        TypeId const onceSig = in.fnSig(cp, voidTy, CallConv::CcMS64);   // (flag, fn)->void
 
-    // InitOnceExecuteOnce imported; call_once itself never imported.
-    std::optional<std::uint32_t> ioeo;
-    bool importedCallOnce = false;
-    for (auto const& imp : externs) {
-        if (imp.mangledName == "InitOnceExecuteOnce") {
-            ioeo = imp.symbol.v;
-            EXPECT_EQ(imp.libraryPath, "kernel32.dll");
+        MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
+        mb.stateArgCounting(MirArgCounting::Flat);
+        mb.addFunction(in.fnSig({}, i32, CallConv::CcMS64), SymbolId{100});
+        MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(e);
+        MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, pV, 16);
+        MirInstId const ga   = mb.addGlobalAddr(SymbolId{10}, in.pointer(onceSig));
+        MirInstId const co[] = {ga, slot, slot};
+        mb.addInst(MirOpcode::Call, co, InvalidType);
+        mb.addReturn(mb.addConst(i32Lit(0), i32));
+        Mir mir = std::move(mb).finish();
+
+        std::unordered_map<std::uint32_t, std::string> const recipes{{10u, "call_once"}};
+        std::vector<ExternImport> externs;
+        DiagnosticReporter rep;
+        EXPECT_FALSE(synthesizeThreadsShim(mir, in, recipes, v.synthesis, v.scheme, externs, rep))
+            << "call_once is no recipe since P69 — the pass must refuse it, not synthesize it";
+        EXPECT_TRUE(rep.hasErrors());
+        for (std::uint32_t i = 0; i < mir.moduleFuncCount(); ++i)
+            EXPECT_NE(mir.funcSymbol(mir.funcAt(i)).v, 10u) << "no call_once body";
+        for (auto const& imp : externs) {
+            EXPECT_EQ(imp.mangledName.find("InitOnceExecuteOnce"), std::string::npos);
+            EXPECT_EQ(imp.mangledName.find("pthread_once"), std::string::npos);
         }
-        if (imp.mangledName == "call_once") importedCallOnce = true;
     }
-    EXPECT_TRUE(ioeo.has_value()) << "call_once's body imports InitOnceExecuteOnce";
-    EXPECT_FALSE(importedCallOnce) << "call_once is a synthesized def, never a kernel32 import";
-
-    // The trampoline = the 3rd function (symbol not main's 100 nor the recipe's 10),
-    // minted ABOVE the recipe id.
-    std::optional<std::uint32_t> trampSym;
-    MirFuncId trampFn{}, onceFn{};
-    for (std::uint32_t i = 0; i < mir.moduleFuncCount(); ++i) {
-        MirFuncId const f = mir.funcAt(i);
-        std::uint32_t const s = mir.funcSymbol(f).v;
-        if (s == 10u) onceFn = f;
-        else if (s != 100u) { trampSym = s; trampFn = f; }
-    }
-    ASSERT_TRUE(trampSym.has_value());
-    ASSERT_TRUE(onceFn.valid());
-    ASSERT_TRUE(trampFn.valid());
-    EXPECT_GT(*trampSym, 10u) << "the trampoline symbol is minted ABOVE the recipe id";
-
-    // call_once ADDRESS-TAKES the trampoline (GlobalAddr(trampSym) in its body).
-    bool addressTaken = false;
-    for (std::uint32_t bi = 0; bi < mir.funcBlockCount(onceFn); ++bi) {
-        MirBlockId const b = mir.funcBlockAt(onceFn, bi);
-        for (std::uint32_t j = 0; j < mir.blockInstCount(b); ++j) {
-            MirInstId const id = mir.blockInstAt(b, j);
-            if (mir.instOpcode(id) == MirOpcode::GlobalAddr
-                && mir.globalAddrSymbol(id).v == *trampSym)
-                addressTaken = true;
-        }
-    }
-    EXPECT_TRUE(addressTaken) << "call_once passes &__dss_once_tramp to InitOnceExecuteOnce";
-
-    // The trampoline makes an INDIRECT call: a Call whose callee (operand 0) is an Arg,
-    // not a GlobalAddr to a named import.
-    bool indirectCall = false;
-    for (std::uint32_t bi = 0; bi < mir.funcBlockCount(trampFn); ++bi) {
-        MirBlockId const b = mir.funcBlockAt(trampFn, bi);
-        for (std::uint32_t j = 0; j < mir.blockInstCount(b); ++j) {
-            MirInstId const id = mir.blockInstAt(b, j);
-            if (mir.instOpcode(id) == MirOpcode::Call) {
-                auto ops = mir.instOperands(id);
-                if (!ops.empty() && mir.instOpcode(ops[0]) == MirOpcode::Arg)
-                    indirectCall = true;
-            }
-        }
-    }
-    EXPECT_TRUE(indirectCall)
-        << "the trampoline invokes the C11 callback INDIRECTLY through its param Arg";
-
-    // The trampoline's terminator Returns the constant 1 (TRUE): InitOnceExecuteOnce
-    // treats a FALSE (0) return as init-FAILED and would RE-RUN the init — so a `ret 0`
-    // regression (breaking exactly-once) is red at the unit tier, not just the example.
-    bool returnsOne = false;
-    for (std::uint32_t bi = 0; bi < mir.funcBlockCount(trampFn); ++bi) {
-        MirInstId const term = mir.blockTerminator(mir.funcBlockAt(trampFn, bi));
-        if (mir.instOpcode(term) != MirOpcode::Return) continue;
-        auto ops = mir.instOperands(term);
-        ASSERT_EQ(ops.size(), 1u) << "__dss_once_tramp's Return carries the BOOL value";
-        ASSERT_EQ(mir.instOpcode(ops[0]), MirOpcode::Const) << "the return value is a constant";
-        MirLiteralValue const& lit = mir.literalValue(mir.constLiteralIndex(ops[0]));
-        if (auto const* i = std::get_if<std::int64_t>(&lit.value)) returnsOne = (*i == 1);
-        else if (auto const* u = std::get_if<std::uint64_t>(&lit.value)) returnsOne = (*u == 1u);
-    }
-    EXPECT_TRUE(returnsOne)
-        << "__dss_once_tramp must return TRUE(1) — a ret 0 makes InitOnceExecuteOnce re-run init";
-
-    MirVerifier verifier{mir, &in};
-    EXPECT_TRUE(verifier.verify(rep)) << "the call_once + trampoline module must verify";
 }
 
 // thrd_join is the first MULTI-block recipe (WaitForSingleObject; if(res)
@@ -4021,6 +5031,9 @@ TEST(SynthThreadsShim, ThrdJoinIsMultiBlockAndVerifies) {
     TypeId const joinSig = in.fnSig(jp, i32, CallConv::CcMS64);   // (thrd_t, int*)->int
 
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
+    mb.stateArgCounting(MirArgCounting::Flat);
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(mainSig, SymbolId{100});
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(e);
@@ -4079,6 +5092,8 @@ TEST(MirMerge, MultiCuThreadsShimRegistersAndSynthesizes) {
     Mir mir0;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
+        mb.stateArgCounting(MirArgCounting::Flat);
         mb.addFunction(mainSig, SymbolId{100});
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -4098,6 +5113,8 @@ TEST(MirMerge, MultiCuThreadsShimRegistersAndSynthesizes) {
     Mir mir1;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
+        mb.stateArgCounting(MirArgCounting::Flat);
         mb.addFunction(sig1, SymbolId{50});
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -4112,7 +5129,7 @@ TEST(MirMerge, MultiCuThreadsShimRegistersAndSynthesizes) {
 
     std::vector<std::string> const entries{"main"};
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(merged.has_value())
         << "the merge must NOT abort on a referenced-only shim GlobalAddr (multi-CU defect)";
     EXPECT_EQ(rep.errorCount(), 0u);
@@ -4146,6 +5163,163 @@ TEST(MirMerge, MultiCuThreadsShimRegistersAndSynthesizes) {
     EXPECT_TRUE(verifier.verify(rep)) << "the merged + shim-synthesized module must verify";
 }
 
+// ── The merged module carries the END of the merge's whole allocation (P69 round 5,
+// D-MIR-SYNTHESIZED-SYMBOL-MINTED-INSIDE-THE-NAME-TABLE) ──
+// The merged id space is a NEW one, and not every id in it is a symbol the merged module
+// holds: a library-shim symbol is REFERENCED-ONLY until the pass after the merge defines
+// it — step 3c gives it a merged id and a NAME (`symbolNames`) and nothing else. Every
+// pass that then mints a symbol for the merged module (the entry init, a funclet, a helper
+// import) asks the MODULE (`MirBuilder::mintSymbol`), so `mergeCuMirs` states its
+// allocator's end to the module it builds. Counted from the merged module's definitions
+// instead, the next id here is the shim's own: the entry init — a GLOBAL definition, and
+// the first symbol minted after the merge — would be published as `mtx_lock`.
+// The shim is numbered ABOVE every definition on purpose (SymbolId{200}; CU0 keeps its
+// values), as a shipped header's declaration is in a unit that declares it after its own
+// functions. RED-on-disable: state anything but `alloc.end()` in `mergeCuMirs`.
+TEST(MirMerge, TheMergedModuleCarriesTheEndOfTheMergesAllocation) {
+    TypeInterner in0{CompilationUnitId{1}};
+    TypeId const i32_0 = in0.primitive(TypeKind::I32);
+    TypeId const pV0   = in0.pointer(in0.primitive(TypeKind::Void));
+    TypeId const mainSig = in0.fnSig({}, i32_0, CallConv::CcMS64);
+    std::array<TypeId, 1> const lockParams{pV0};
+    TypeId const lockSig = in0.fnSig(lockParams, i32_0, CallConv::CcSysV);
+    Mir mir0;
+    {
+        MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
+        mb.addFunction(mainSig, SymbolId{100});
+        MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(e);
+        MirInstId const slot     = mb.addInst(MirOpcode::Alloca, {}, pV0, 40);
+        MirInstId const lockAddr = mb.addGlobalAddr(SymbolId{200}, in0.pointer(lockSig));
+        MirInstId const callOps[] = {lockAddr, slot};
+        mb.addInst(MirOpcode::Call, callOps, i32_0);
+        mb.addReturn(mb.addConst(i32Lit(0), i32_0));
+        mir0 = std::move(mb).finish();
+    }
+    std::unordered_map<std::uint32_t, std::string> const recipes0{{200u, "mtx_lock"}};
+
+    TypeInterner in1{CompilationUnitId{2}};
+    TypeId const i32_1 = in1.primitive(TypeKind::I32);
+    TypeId const sig1  = in1.fnSig({}, i32_1, CallConv::CcSysV);
+    Mir mir1;
+    {
+        MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
+        mb.addFunction(sig1, SymbolId{50});
+        MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(e);
+        mb.addReturn(mb.addConst(i32Lit(7), i32_1));
+        mir1 = std::move(mb).finish();
+    }
+
+    MergeCuInput cu0{&mir0, &in0, namerOf({{100, "main"}, {200, "mtx_lock"}}), {}};
+    cu0.synthRecipes = &recipes0;
+    MergeCuInput cu1{&mir1, &in1, namerOf({{50, "helper"}}), {}};
+    std::vector<MergeCuInput> cus{cu0, cu1};
+
+    std::vector<std::string> const entries{"main"};
+    DiagnosticReporter rep;
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
+    ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
+    ASSERT_EQ(rep.errorCount(), 0u);
+
+    Mir const& mm = merged->mir;
+    std::uint32_t highestDefined = 0;
+    for (std::uint32_t i = 0; i < mm.moduleFuncCount(); ++i) {
+        std::uint32_t const v = mm.funcSymbol(mm.funcAt(i)).v;
+        if (v > highestDefined) highestDefined = v;
+    }
+    for (std::uint32_t i = 0; i < mm.moduleGlobalCount(); ++i) {
+        std::uint32_t const v = mm.globalSymbol(mm.globalAt(i)).v;
+        if (v > highestDefined) highestDefined = v;
+    }
+    std::optional<std::uint32_t> shimV;
+    for (auto const& [v, name] : merged->symbolNames) {
+        EXPECT_LT(v, mm.symbolIdEnd())
+            << "'" << name << "' (merged id " << v << ") is outside the merged module's id "
+               "space (its end is " << mm.symbolIdEnd() << ")";
+        if (name == "mtx_lock") shimV = v;
+    }
+    ASSERT_TRUE(shimV.has_value()) << "step 3c must name the referenced-only shim's merged id";
+    ASSERT_GT(*shimV, highestDefined)
+        << "CONTROL: the fixture must leave a NAMED id above every definition of the merged "
+           "module — otherwise a count from the definitions clears it by accident and this "
+           "test observes nothing";
+
+    // What every synthesis pass after the merge does: continue the merged module's ids,
+    // then mint. The id is none the merge named.
+    MirBuilder rebuilt;
+    rebuilt.stateDataModel(DataModel::Lp64);
+    rebuilt.continueSymbolIdsOf(mm);
+    SymbolId const fresh = rebuilt.mintSymbolOrAbort("test");
+    EXPECT_GT(fresh.v, *shimV) << "the first id minted for the merged module";
+    auto const named = merged->symbolNames.find(fresh.v);
+    EXPECT_TRUE(named == merged->symbolNames.end())
+        << "the first id minted for the merged module is " << fresh.v
+        << ", which the merge named '" << (named == merged->symbolNames.end() ? "" : named->second)
+        << "'";
+}
+
+// ── A later unit's shim symbols are numbered in their unit's order (P69 fold 3f, lane `xa`) ──
+// Step 3c gives every library-shim symbol a unit leaves undefined a merged id. For a unit after the first (or
+// a first unit's id already taken) it MINTS one, and the threads synthesis emits the shim bodies in merged-id
+// order -- so the order step 3c walks a unit's `synthRecipes` (an unordered_map) in was the order of those
+// bodies in the image: the host library's hash order. The walk is in ascending unit-local id. The map below
+// is filled in neither that order nor its reverse, so an insertion-order walk and a reverse one both red.
+TEST(MirMerge, ALaterUnitsShimSymbolsAreNumberedInTheirUnitsOrder) {
+    TypeInterner in0{CompilationUnitId{1}};
+    TypeId const i32_0   = in0.primitive(TypeKind::I32);
+    TypeId const mainSig = in0.fnSig({}, i32_0, CallConv::CcMS64);
+    Mir mir0;
+    {
+        MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
+        mb.addFunction(mainSig, SymbolId{100});
+        MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(e);
+        mb.addReturn(mb.addConst(i32Lit(0), i32_0));
+        mir0 = std::move(mb).finish();
+    }
+
+    TypeInterner in1{CompilationUnitId{2}};
+    TypeId const i32_1 = in1.primitive(TypeKind::I32);
+    TypeId const sig1  = in1.fnSig({}, i32_1, CallConv::CcSysV);
+    Mir mir1;
+    {
+        MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
+        mb.addFunction(sig1, SymbolId{50});
+        MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(e);
+        mb.addReturn(mb.addConst(i32Lit(7), i32_1));
+        mir1 = std::move(mb).finish();
+    }
+    std::unordered_map<std::uint32_t, std::string> recipes1;
+    recipes1.emplace(30u, "mtx_unlock");
+    recipes1.emplace(10u, "mtx_init");
+    recipes1.emplace(20u, "mtx_lock");
+
+    MergeCuInput cu0{&mir0, &in0, namerOf({{100, "main"}}), {}};
+    MergeCuInput cu1{&mir1, &in1,
+                     namerOf({{50, "helper"}, {10, "mtx_init"}, {20, "mtx_lock"}, {30, "mtx_unlock"}}), {}};
+    cu1.synthRecipes = &recipes1;
+    std::vector<MergeCuInput> cus{cu0, cu1};
+
+    std::vector<std::string> const entries{"main"};
+    DiagnosticReporter rep;
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
+    ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
+    ASSERT_EQ(rep.errorCount(), 0u);
+
+    std::unordered_map<std::string, std::uint32_t> idOf;
+    for (auto const& [v, name] : merged->symbolNames) idOf.emplace(name, v);
+    ASSERT_TRUE(idOf.contains("mtx_init") && idOf.contains("mtx_lock") && idOf.contains("mtx_unlock"))
+        << "step 3c names every shim symbol of the later unit";
+    EXPECT_LT(idOf.at("mtx_init"), idOf.at("mtx_lock")) << "the shim symbols are numbered in their unit's order";
+    EXPECT_LT(idOf.at("mtx_lock"), idOf.at("mtx_unlock")) << "the shim symbols are numbered in their unit's order";
+}
+
 // ── D-CSUBSET-C11-THREADS-MACHO: the `pthread` vehicle (Darwin libSystem) ──────────────
 
 // The pthread vehicle mirrors the win32 test above: SymbolId{10} (mtx_lock) becomes a
@@ -4161,6 +5335,9 @@ TEST(SynthThreadsShim, PthreadVehicleSynthesizesDefinitionAndPthreadHelperImport
     TypeId const lockSig = in.fnSig(lockParams, i32, CallConv::CcAAPCS64);
 
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
+    mb.stateArgCounting(MirArgCounting::PerClass);
+    mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
     mb.addFunction(mainSig, SymbolId{100});
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(e);
@@ -4206,17 +5383,27 @@ TEST(SynthThreadsShim, PthreadVehicleSynthesizesDefinitionAndPthreadHelperImport
     EXPECT_TRUE(verifier.verify(rep)) << "the pthread-shim-synthesized module must verify";
 }
 
-// RED-on-disable for the new fail-loud: a NON-empty recipe map with NO declared vehicle
-// must fail loud (never silently assume win32). This is the guard that keeps the vehicle a
-// config value, not a defaulted format identity.
-TEST(SynthThreadsShim, MissingLibrarySynthesisWithNonEmptyRecipesFailsLoud) {
+// RED-on-disable for the new fail-loud: a REFERENCED recipe with NO declared vehicle must
+// fail loud (never silently assume win32). This is the guard that keeps the vehicle a
+// config value, not a defaulted format identity. (Since P69 the guard is reached only by a
+// recipe the module names — `UnreferencedRecipesNeedNoVehicle` above is its other half — so
+// main CALLS mtx_lock here.)
+TEST(SynthThreadsShim, MissingLibrarySynthesisWithReferencedRecipeFailsLoud) {
     TypeInterner in{CompilationUnitId{1}};
     TypeId const i32 = in.primitive(TypeKind::I32);
+    TypeId const pV  = in.pointer(in.primitive(TypeKind::Void));
+    std::array<TypeId, 1> const lockParams{pV};
+    TypeId const lockSig = in.fnSig(lockParams, i32, CallConv::CcMS64);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
+    mb.stateArgCounting(MirArgCounting::Flat);
     mb.addFunction(in.fnSig({}, i32, CallConv::CcMS64), SymbolId{100});
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(e);
-    mb.addReturn(mb.addConst(i32Lit(0), i32));
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, pV, 64);
+    MirInstId const ga   = mb.addGlobalAddr(SymbolId{10}, in.pointer(lockSig));
+    MirInstId const co[] = {ga, slot};
+    mb.addReturn(mb.addInst(MirOpcode::Call, co, i32));
     Mir mir = std::move(mb).finish();
 
     std::unordered_map<std::uint32_t, std::string> recipes{{10u, "mtx_lock"}};
@@ -4224,15 +5411,18 @@ TEST(SynthThreadsShim, MissingLibrarySynthesisWithNonEmptyRecipesFailsLoud) {
     DiagnosticReporter rep;
     EXPECT_FALSE(synthesizeThreadsShim(mir, in, recipes, std::nullopt, CSymbolDecorationScheme::LeadingUnderscore,
                                        externs, rep))
-        << "recipes present + no vehicle MUST fail loud, never assume a primitive family";
+        << "a referenced recipe + no vehicle MUST fail loud, never assume a primitive family";
     EXPECT_TRUE(rep.hasErrors());
 }
 
-// Per-recipe COVERAGE (multi-form contract, §A.5): every one of the 21 pthread recipes (the
-// 18 non-trampoline + the 3 trampolines thrd_create/call_once/thrd_join) must (a) land as a
-// definition, (b) import its SPECIFIC pthread primitive from libSystem, and (c) verify. A
-// subset-only test would let a latent miss at an unexercised recipe survive.
-TEST(SynthThreadsShim, PthreadAllTwentyOneRecipesEmitAndVerify) {
+// Per-recipe COVERAGE (multi-form contract, §A.5): every pthread recipe — the 18
+// non-trampoline, Cycle 2's thrd_create/thrd_join, and Cycle 3's thrd_sleep/mtx_timedlock/
+// cnd_timedwait/thrd_equal (P69: call_once left the vocabulary, so the vocabulary's 24 are
+// all here) — must (a) land as a definition, (b) import its SPECIFIC pthread primitive from
+// libSystem, and (c) verify. A subset-only test would let a latent miss at an unexercised
+// recipe survive. Each scaffold `main` takes the recipe's ADDRESS: since P69 a recipe nothing
+// names is not synthesized at all.
+TEST(SynthThreadsShim, PthreadEveryRecipeEmitsAndVerifies) {
     struct Case { char const* recipe; char const* helper; };
     static constexpr Case kCases[] = {
         {"mtx_init", "pthread_mutex_init"},   {"mtx_lock", "pthread_mutex_lock"},
@@ -4245,16 +5435,29 @@ TEST(SynthThreadsShim, PthreadAllTwentyOneRecipesEmitAndVerify) {
         {"tss_set", "pthread_setspecific"},   {"tss_delete", "pthread_key_delete"},
         {"thrd_current", "pthread_self"},     {"thrd_yield", "sched_yield"},
         {"thrd_exit", "pthread_exit"},        {"thrd_detach", "pthread_detach"},
-        {"thrd_create", "pthread_create"},    {"call_once", "pthread_once"},
-        {"thrd_join", "pthread_join"},
+        {"thrd_create", "pthread_create"},    {"thrd_join", "pthread_join"},
+        {"thrd_sleep", "nanosleep"},          {"mtx_timedlock", "pthread_mutex_trylock"},
+        {"cnd_timedwait", "pthread_cond_timedwait"}, {"thrd_equal", "pthread_equal"},
     };
+    static_assert(std::size(kCases) == 24, "every recipe of the closed vocabulary");
     for (auto const& c : kCases) {
+        SCOPED_TRACE(c.recipe);
+        EXPECT_TRUE(ffi::isKnownSynthesizeRecipe(c.recipe)) << "a case the vocabulary does not hold";
         TypeInterner in{CompilationUnitId{1}};
         TypeId const i32 = in.primitive(TypeKind::I32);
+        TypeId const pV  = in.pointer(in.primitive(TypeKind::Void));
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
+        mb.stateArgCounting(MirArgCounting::PerClass);
+        mb.stateSelfContainedSymbolIds();   // a hand-built module is its own table
         mb.addFunction(in.fnSig({}, i32, CallConv::CcMS64), SymbolId{100});
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
+        // `void *p = (void *)&<recipe>;` — the address taken, so the module names it.
+        MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, pV, 8);
+        MirInstId const addr = mb.addGlobalAddr(SymbolId{10}, pV);
+        MirInstId const st[] = {addr, slot};
+        mb.addInst(MirOpcode::Store, st, InvalidType);
         mb.addReturn(mb.addConst(i32Lit(0), i32));
         Mir mir = std::move(mb).finish();
 
@@ -4304,6 +5507,8 @@ TEST(MirMerge, MultiCuThreadsShimSynthesizesPthreadVehicle) {
     Mir mir0;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);   // the model of the ELF document it is merged under (P69 fold 3f)
+        mb.stateArgCounting(MirArgCounting::PerClass);
         mb.addFunction(mainSig, SymbolId{100});
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -4322,6 +5527,8 @@ TEST(MirMerge, MultiCuThreadsShimSynthesizesPthreadVehicle) {
     Mir mir1;
     {
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);   // the model of the ELF document it is merged under (P69 fold 3f)
+        mb.stateArgCounting(MirArgCounting::PerClass);
         mb.addFunction(sig1, SymbolId{50});
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -4336,7 +5543,7 @@ TEST(MirMerge, MultiCuThreadsShimSynthesizesPthreadVehicle) {
 
     std::vector<std::string> const entries{"main"};
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(merged.has_value());
     EXPECT_EQ(rep.errorCount(), 0u);
 
@@ -4382,6 +5589,7 @@ TEST(MirMerge, MergePreservesVocabularyIdentityAcrossCus) {
         TypeId const ptr  = in.pointer(elem);
         TypeId const sig  = in.fnSig({}, ptr, CallConv::CcSysV);
         MirBuilder mb;
+        mb.stateDataModel(DataModel::Lp64);
         mb.addFunction(sig, sym);
         MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(e);
@@ -4410,7 +5618,7 @@ TEST(MirMerge, MergePreservesVocabularyIdentityAcrossCus) {
     std::vector<std::string> const entries = {"main"};
 
     DiagnosticReporter rep;
-    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{88}}, entries, rep);
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{88}}, entries, dss::test_support::ordinaryLinkFormat(), rep);
     ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
 
     Mir const& mm = merged->mir;
@@ -4444,1107 +5652,222 @@ TEST(MirMerge, MergePreservesVocabularyIdentityAcrossCus) {
     EXPECT_TRUE(verifier.verify(rep)) << "merged module must verify";
 }
 
-// ── D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): synthesizeStdioShim ───────────────────
-//
-// The <stdio.h> printf-family sibling of the SynthThreadsShim suite above. The modern
-// UCRT (`ucrtbase.dll`) exports NO concrete `sprintf` — only the common core
-// `__stdio_common_vsprintf` — so the pe `sprintf` row in stdio.json carries
-// `synthesize: "sprintf"` and this pass supplies the body. NOTHING about that surface was
-// unit-covered when it landed; these tests are that cover.
-//
-// Two properties carry the weight, and BOTH fail SILENTLY rather than loudly if they
-// regress (wrong text at runtime, never a compile or link error):
-//   * the body must route through the module's ALREADY-IMPORTED UCRT core and mint no
-//     import of its own (the "the helpers are ordinary descriptor imports" contract — the
-//     eager-import law is what proves the core really exists as an export, so a
-//     self-minted import would bypass that proof);
-//   * the body must carry the `VaHomeArgAreaAddr` leaf, which is simultaneously (a) the
-//     Win64 `va_list` value `&home[namedArgCount]`, (b) lir_callconv's prologue-spill
-//     signal, and (c) the ONLY thing making the inliner refuse to splice the shim into a
-//     caller (src/opt/passes/inlining.cpp). Under the MULTI-CU driver the shim is
-//     synthesized PRE-optimize, so the release pipeline's Inlining pass really is offered
-//     this body — see examples/c/shipped_sprintf_ucrt_crosscu for the end-to-end
-//     runtime witness of that seam.
-
-namespace {
-
-// The shim's caller-side scaffold: one `main` that references `sprintf` (pre-minted
-// SymbolId{10}, seeded into functionSymbols by the CST→HIR seam so the reference lowered
-// to a GlobalAddr against a NOT-yet-defined callee) and returns.
-Mir buildSprintfCaller(TypeInterner& in) {
-    TypeId const i32 = in.primitive(TypeKind::I32);
-    TypeId const pCh = in.pointer(in.primitive(TypeKind::Char));
-    std::array<TypeId, 2> const sp{pCh, pCh};
-    TypeId const sprintfSig = in.fnSig(sp, i32, CallConv::CcMS64, /*isVariadic=*/true);
-
-    MirBuilder mb;
-    mb.addFunction(in.fnSig({}, i32, CallConv::CcMS64), SymbolId{100});   // main
-    MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
-    mb.beginBlock(e);
-    MirInstId const buf = mb.addInst(MirOpcode::Alloca, {}, pCh, 64);
-    MirInstId const ga  = mb.addGlobalAddr(SymbolId{10}, in.pointer(sprintfSig));
-    MirInstId const co[] = {ga, buf, buf};
-    mb.addInst(MirOpcode::Call, co, i32);
-    mb.addReturn(mb.addConst(i32Lit(0), i32));
-    return std::move(mb).finish();
-}
-
-// The UCRT core as an ORDINARY descriptor import — exactly what stdio.json's pe
-// `__stdio_common_vsprintf` row produces, bound to ucrtbase.dll.
-std::vector<ExternImport> ucrtCoreImports() {
-    ExternImport core;
-    core.symbol      = SymbolId{20};
-    core.mangledName = "__stdio_common_vsprintf";
-    core.libraryPath = "ucrtbase.dll";
-    core.isData      = false;
-    return {core};
-}
-
-// Locate a definition by its SymbolId value.
-std::optional<MirFuncId> findFuncBySymbol(Mir const& mir, std::uint32_t symV) {
-    for (std::uint32_t i = 0; i < mir.moduleFuncCount(); ++i) {
-        MirFuncId const f = mir.funcAt(i);
-        if (mir.funcSymbol(f).v == symV) return f;
-    }
-    return std::nullopt;
-}
-
-// D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3) — WHY THESE TESTS PASS A WHOLE `VaListLayout`
-// AND NOT THE `VaListStrategy` THEY USED TO. The strategy ALONE does not determine the
-// va leaf: `HomogeneousPointer` forks on `variadicUsesOverflowBase` into the Win64 home
-// base (`VaHomeArgAreaAddr`) and the Apple-arm64 overflow base (`VaOverflowArgAreaAddr`)
-// — see src/mir/merge/synth_stdio_shim.hpp. So the layout is spelled out FIELD BY FIELD
-// here, and `variadicUsesOverflowBase = false` is written explicitly rather than left to
-// the struct's default: it is the field that makes `VaHomeArgAreaAddr` the RIGHT leaf
-// below instead of an accident. `namedArgSlotBytes` is filled so the layout is a
-// plausible whole, not a one-field stub. The overflow-base twin arm is pinned by its own
-// dedicated suite (tests/mir/test_synth_stdio_shim_valist.cpp).
-VaListLayout vaListLayoutOf(VaListStrategy strategy) {
-    VaListLayout l;
-    l.strategy                 = strategy;
-    l.namedArgSlotBytes        = 8;
-    l.variadicUsesOverflowBase = false;
-    return l;
-}
-
-} // namespace
-
-// The HAPPY PATH, asserted STRUCTURALLY rather than "it returned true": the referenced
-// `sprintf` becomes a DEFINED variadic function whose single block carries the
-// `VaHomeArgAreaAddr` leaf at the right named-arg count and calls the module's existing
-// UCRT core — while the import list is left EXACTLY as it was found.
-//
-// RED-ON-DISABLE (each assertion independently): drop the `ap` operand from the ops array
-// and the leaf assertion reds; point `coreAddr` at a freshly minted symbol and the
-// "callee is SymbolId{20}" assertion reds; have the pass push its own ExternImport and
-// the "imports unchanged" assertion reds.
-TEST(SynthStdioShim, SprintfSynthesizesVariadicBodyOverImportedUcrtCore) {
-    TypeInterner in{CompilationUnitId{1}};
-    Mir mir = buildSprintfCaller(in);
-
-    std::unordered_map<std::uint32_t, std::string> const recipes{{10u, "sprintf"}};
-    std::vector<ExternImport> externs = ucrtCoreImports();
-    std::vector<ExternImport> const before = externs;
-    DiagnosticReporter rep;
-    ASSERT_TRUE(synthesizeStdioShim(mir, in, recipes,
-                                    vaListLayoutOf(VaListStrategy::HomogeneousPointer),
-                                    externs, rep));
-    EXPECT_FALSE(rep.hasErrors());
-
-    // (a) SymbolId{10} (sprintf) is now a DEFINED module function, and main survived.
-    auto const shim = findFuncBySymbol(mir, 10u);
-    ASSERT_TRUE(shim.has_value()) << "sprintf must be a synthesized definition";
-    EXPECT_TRUE(findFuncBySymbol(mir, 100u).has_value()) << "main must be cloned verbatim";
-    EXPECT_EQ(mir.moduleFuncCount(), 2u) << "exactly one shim appended (main + sprintf)";
-
-    // (b) The shim's OWN signature is VARIADIC with the 2 FIXED params (buf, fmt) —
-    // `...` is a marker, so a non-variadic sig here would mean the Win64 prologue never
-    // spills the home area at all and `ap` would point at uninitialized stack.
-    TypeId const shimSig = mir.funcSignature(*shim);
-    EXPECT_TRUE(in.fnIsVariadic(shimSig)) << "the sprintf shim must itself be variadic";
-    EXPECT_EQ(in.fnParams(shimSig).size(), 2u) << "sprintf's FIXED arity is (buf, fmt)";
-
-    // (c) The body: exactly one VaHomeArgAreaAddr, payload == the named-arg slot count
-    // (2), and a Call whose CALLEE operand is a GlobalAddr to the imported core.
-    ASSERT_EQ(mir.funcBlockCount(*shim), 1u) << "every printf-family recipe is single-block";
-    MirBlockId const b = mir.funcBlockAt(*shim, 0);
-    std::uint32_t vaLeaves = 0;
-    std::uint32_t calls    = 0;
-    std::optional<std::uint32_t> calleeSym;
-    for (std::uint32_t i = 0; i < mir.blockInstCount(b); ++i) {
-        MirInstId const id = mir.blockInstAt(b, i);
-        if (mir.instOpcode(id) == MirOpcode::VaHomeArgAreaAddr) {
-            ++vaLeaves;
-            EXPECT_EQ(mir.instPayload(id), 2u)
-                << "the va leaf is &home[namedArgCount]; sprintf's named count is 2";
-        }
-        if (mir.instOpcode(id) == MirOpcode::Call) {
-            ++calls;
-            auto const ops = mir.instOperands(id);
-            ASSERT_FALSE(ops.empty());
-            if (mir.instOpcode(ops[0]) == MirOpcode::GlobalAddr)
-                calleeSym = mir.globalAddrSymbol(ops[0]).v;
-            // callee + (opts, buf, count, fmt, locale, ap) == 7 operands.
-            EXPECT_EQ(ops.size(), 7u) << "__stdio_common_vsprintf takes 6 arguments";
-        }
-    }
-    EXPECT_EQ(vaLeaves, 1u)
-        << "exactly one VaHomeArgAreaAddr: the va_list value, the prologue-spill signal, "
-           "AND the inliner's refusal trigger (src/opt/passes/inlining.cpp)";
-    EXPECT_EQ(calls, 1u) << "the shim forwards through exactly one core call";
-    ASSERT_TRUE(calleeSym.has_value()) << "the shim must call through a GlobalAddr";
-    EXPECT_EQ(*calleeSym, 20u)
-        << "the shim must call the module's ALREADY-IMPORTED __stdio_common_vsprintf";
-
-    // (d) The pass mints NO import — the cores are ordinary descriptor imports, which is
-    // what makes the eager-import law their existence proof. `sprintf` itself must never
-    // be imported (ucrtbase exports no such symbol; importing it would break every
-    // binary's LOAD).
-    ASSERT_EQ(externs.size(), before.size()) << "synthesizeStdioShim must mint no import";
-    for (std::size_t i = 0; i < externs.size(); ++i)
-        EXPECT_EQ(externs[i].mangledName, before[i].mangledName);
-    for (auto const& e : externs)
-        EXPECT_NE(e.mangledName, "sprintf") << "sprintf must NEVER be an import";
-
-    MirVerifier verifier{mir, &in};
-    EXPECT_TRUE(verifier.verify(rep)) << "the stdio-shim-synthesized module must verify";
-}
-
-// An EMPTY recipe map is a clean no-op — and it must short-circuit BEFORE the va-strategy
-// check, so it stays clean even with NO strategy resolved (every elf/macho build and
-// every pe TU that includes no printf family). Locks the pass to a pure DATA gate, never
-// a format check. RED-ON-DISABLE: move the `recipeBySymbol.empty()` early return below
-// the strategy gate and this reds.
-TEST(SynthStdioShim, EmptyRecipeMapIsNoOpEvenWithNoVaStrategy) {
-    TypeInterner in{CompilationUnitId{1}};
-    Mir mir = buildSprintfCaller(in);
-    std::size_t const before = mir.moduleFuncCount();
-
-    std::unordered_map<std::uint32_t, std::string> const recipes;   // empty
-    std::vector<ExternImport> externs;
-    DiagnosticReporter rep;
-    ASSERT_TRUE(synthesizeStdioShim(mir, in, recipes, std::nullopt, externs, rep));
-    EXPECT_FALSE(rep.hasErrors());
-    EXPECT_EQ(mir.moduleFuncCount(), before) << "no shim appended for an empty map";
-    EXPECT_TRUE(externs.empty()) << "no import planted for an empty map";
-}
-
-// FAIL-LOUD (1/3): a recipe id with NO switch arm. The family split routes every Stdio id
-// here, so an id this pass cannot build MUST be a reported error AND a `false` return —
-// never a silently missing definition (which surfaces, if at all, as an undefined symbol
-// far downstream, and on pe as a 0xC0000139 at LOAD).
-TEST(SynthStdioShim, UnknownRecipeIdFailsLoud) {
-    TypeInterner in{CompilationUnitId{1}};
-    Mir mir = buildSprintfCaller(in);
-
-    std::unordered_map<std::uint32_t, std::string> const recipes{{10u, "no_such_recipe"}};
-    std::vector<ExternImport> externs = ucrtCoreImports();
-    DiagnosticReporter rep;
-    EXPECT_FALSE(synthesizeStdioShim(mir, in, recipes,
-                                     vaListLayoutOf(VaListStrategy::HomogeneousPointer),
-                                     externs, rep))
-        << "a recipe with no synth arm MUST fail loud, never silently skip the definition";
-    EXPECT_TRUE(rep.hasErrors())
-        << "the refusal must carry a real diagnostic, not a bare false";
-}
-
-// FAIL-LOUD (2/3): the UCRT core is NOT among the module's imports — i.e. stdio.json
-// declared a `synthesize` row without the `__stdio_common_v*` row it needs. Unchecked,
-// this is exactly the drift that yields a shim calling nothing.
-TEST(SynthStdioShim, MissingUcrtCoreImportFailsLoud) {
-    TypeInterner in{CompilationUnitId{1}};
-    Mir mir = buildSprintfCaller(in);
-
-    std::unordered_map<std::uint32_t, std::string> const recipes{{10u, "sprintf"}};
-    std::vector<ExternImport> externs;   // NO __stdio_common_vsprintf
-    DiagnosticReporter rep;
-    EXPECT_FALSE(synthesizeStdioShim(mir, in, recipes,
-                                     vaListLayoutOf(VaListStrategy::HomogeneousPointer),
-                                     externs, rep))
-        << "an unimported UCRT core MUST fail loud (descriptor/pass drift)";
-    EXPECT_TRUE(rep.hasErrors()) << "the refusal must carry a real diagnostic";
-}
-
-// FAIL-LOUD (3/3): NO va-list model resolved. `CuMirModule::vaListLayout`
-// (D-FFI-PE-CRT-UCRT-MIGRATION Phase 3 widened it from `optional<VaListStrategy>` to
-// `optional<VaListLayout>`) is `std::optional` precisely so UNRESOLVED is distinguishable
-// from resolved — and widening it did NOT weaken that, because a default-constructed
-// `VaListLayout` is a REAL one: its `strategy` defaults to SysVRegisterSave, so a
-// non-optional field would READ as "the target declared SysV" when the truth is "nobody
-// ever asked the target". With a real stdio recipe in hand that ambiguity must be an
-// ERROR: the alternative is forwarding a va_list under a guessed ABI, which miscompiles
-// silently.
-TEST(SynthStdioShim, NulloptVaListStrategyWithRecipesFailsLoud) {
-    TypeInterner in{CompilationUnitId{1}};
-    Mir mir = buildSprintfCaller(in);
-
-    std::unordered_map<std::uint32_t, std::string> const recipes{{10u, "sprintf"}};
-    std::vector<ExternImport> externs = ucrtCoreImports();
-    DiagnosticReporter rep;
-    EXPECT_FALSE(synthesizeStdioShim(mir, in, recipes, std::nullopt, externs, rep))
-        << "recipes present + NO resolved va_list strategy MUST fail loud, never default";
-    EXPECT_TRUE(rep.hasErrors()) << "the refusal must carry a real diagnostic";
-}
-
-// FAIL-LOUD (bonus): a RESOLVED but unimplemented strategy. Only the HomogeneousPointer
-// arm is built (both of its bases — see `vaListLayoutOf` above); no elf/macho descriptor
-// declares a stdio synthesize recipe, so the SysVRegisterSave and Aapcs64DualCursor arms
-// would be speculative builds. Refusing is right; silently emitting the pointer-shaped
-// forward under a register-save-area target would be a wrong-ABI miscompile. Distinct from
-// the nullopt case above: this one is "the target ANSWERED, with a model we don't
-// implement".
-TEST(SynthStdioShim, UnimplementedVaListStrategyFailsLoud) {
-    TypeInterner in{CompilationUnitId{1}};
-    Mir mir = buildSprintfCaller(in);
-
-    std::unordered_map<std::uint32_t, std::string> const recipes{{10u, "sprintf"}};
-    std::vector<ExternImport> externs = ucrtCoreImports();
-    DiagnosticReporter rep;
-    EXPECT_FALSE(synthesizeStdioShim(mir, in, recipes,
-                                     vaListLayoutOf(VaListStrategy::SysVRegisterSave),
-                                     externs, rep))
-        << "an unimplemented va_list model MUST fail loud, never forward under a wrong ABI";
-    EXPECT_TRUE(rep.hasErrors()) << "the refusal must carry a real diagnostic";
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════════
-// D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3) — THE STDIO SHIM OPERAND CONTRACT (SIX ARMS)
-// ═══════════════════════════════════════════════════════════════════════════════════
-//
-// WHY THIS SECTION EXISTS, stated as the defect it closes rather than as "more
-// coverage". Everything above pins the shim's SHAPE by reading three things about the
-// synthesized call — `ops[0]` (the callee), `ops.size()`, and `ops.back()`. Every
-// operand BETWEEN those was unasserted, and three of the five recipes shipped at the
-// time (`fprintf`, `vfprintf`, `sscanf`) had no unit at all. TF-C119 added a SIXTH
-// recipe, `snprintf`; its SINGLE-ARM operand pins live beside its va-leaf and
-// multi-block story in tests/mir/test_synth_stdio_shim_valist.cpp (ARM 6/6), and the
-// all-six together test at the end of this section covers it here.
-//
-// ★ THAT GAP WAS MEASURED, NOT SUPPOSED (TF-C112). Each mutation below was applied to
-// src/mir/merge/synth_stdio_shim.cpp one at a time and BOTH mir stdio binaries re-run:
-//   * TRANSPOSING `buf` and `fmt` in the sprintf arm — a wrong-argument miscompile that
-//     formats the destination buffer and writes the result over the format string —
-//     passed EVERY assertion in both files, AND the MirVerifier. Both operands are
-//     `char*`, so no type check at any tier can see it; only the POSITION can.
-//   * `kIobStdout = 1 -> 2`, i.e. `printf` silently writing to STDERR, likewise passed
-//     everything: the sole test holding that operand discarded it with `has_value()`.
-// So the rule below is: EVERY operand of EVERY arm is pinned BY POSITION, and where an
-// operand is a COMPUTED value (`printf`'s stream, every variadic arm's `ap`) it is
-// pinned as THAT instruction's result rather than as "an instruction of that kind
-// exists somewhere in the body" — an aggregate a sibling code path can satisfy on its
-// own is not a guard.
-//
-// The `_Options` / `_BufferCount` / iob-index values are re-stated here from the UCRT
-// contract (corecrt_stdio_config.h, and stdio.json's own `$comment`) rather than read
-// back out of the pass: the pass's constants are file-local `constexpr`s in an
-// anonymous namespace, and importing them would make any future change to them
-// self-approving.
-//
-// ★ RED-ON-DISABLE, DEMONSTRATED BY BREAKING EACH GUARDED THING. Every mutation below
-// was applied to src/mir/merge/synth_stdio_shim.cpp ONE AT A TIME, both mir stdio
-// binaries re-run, and the source then restored (verified byte-identical afterwards by
-// `git hash-object`). Each reds the named assertion and nothing else in this file:
-//   sprintf `buf`/`fmt` transposed      -> SprintfArmPassesBufCountFmtInThatOrder
-//                                          ("slot holds parameter `Arg 1`, want `Arg 0`")
-//   sprintf _Options LEGACY_NULLTERM->0 -> the same test ("Const is 0, want 1")
-//   sscanf _BufferCount -> 0            -> SscanfArmUsesTheScanfCoreWithZeroOptions
-//                                          ("Const is 0, want -1")
-//   printf _Locale nullP() -> u64c(0)   -> PrintfArmForwardsStdoutFmtAndApByPosition
-//                                          ("Const core is #9, want #27")
-//   kIobStdout 1 -> 2                   -> the same test ("Const is 2, want 1")
-//   printf forwards NULL as _Stream     -> the same test, on the CHAIN — the accessor
-//     while still calling the accessor      call is STILL emitted, so "the body calls
-//                                           __acrt_iob_func" stays true; only "the
-//                                           `_Stream` slot IS that call" catches it
-//   fprintf `stream`/`fmt` transposed   -> FprintfArmForwardsItsStreamAndFmtByPosition
-//   fprintf vaStart(2) -> vaStart(1)    -> that test + the all-six test's fprintf row
-//   vfprintf `sig` -> `vsig`            -> VfprintfArmForwardsItsDeclaredApAndIsNotVariadic
-//   vfprintf Arg 2 -> vaStart(2)        -> that test, on the `ap` slot AND both
-//                                          zero-leaf assertions
-//   sscanf re-pointed at the vsprintf   -> SscanfArmUsesTheScanfCoreWithZeroOptions,
-//     core                                 which MISSES its core rather than matching
-//                                          the wrong one, plus the all-six test
-//   the sprintf missing-core path emits -> EveryPostCloneFailurePathLeavesTheModuleUntouched
-//     the body and publishes the           (func count 2 vs 1, and the symbol DEFINED)
-//     builder before returning false       while the fail-loud assertions stay green
-
-namespace {
-
-// Pre-minted shim symbols — the rows stdio.json tags `synthesize`. `sprintf` keeps id
-// 10 (the id every test above already uses) so the two halves of this file describe
-// one module rather than two conventions.
-constexpr std::uint32_t kShimSprintf  = 10;
-constexpr std::uint32_t kShimPrintf   = 11;
-constexpr std::uint32_t kShimFprintf  = 12;
-constexpr std::uint32_t kShimVfprintf = 13;
-constexpr std::uint32_t kShimSscanf   = 14;
-// TF-C119. The family's structural outlier: THREE named args, a non-pointer among
-// them, and the only recipe whose body is more than one block.
-constexpr std::uint32_t kShimSnprintf = 15;
-
-// The UCRT cores + the stdin/stdout/stderr accessor, as ORDINARY descriptor imports.
-constexpr std::uint32_t kCoreVsprintf = 20;
-constexpr std::uint32_t kCoreVfprintf = 21;
-constexpr std::uint32_t kCoreVsscanf  = 22;
-constexpr std::uint32_t kCoreAcrtIob  = 23;
-
-// The UCRT `_Options` bits, restated from corecrt_stdio_config.h. `sprintf` passes
-// LEGACY_VSPRINTF_NULL_TERMINATION (bit 0); every other arm passes ZERO — and on the
-// scanf side that is load-bearing rather than incidental, because bit 0 there is
-// SECURECRT, which turns `__stdio_common_vsscanf` into `sscanf_s` and makes every `%s`
-// consume an EXTRA buffer-size argument out of `ap`. Wrong bits corrupt the argument
-// stream or the NUL handling; none of them diagnoses.
-constexpr std::int64_t kOptNone                   = 0;
-constexpr std::int64_t kOptLegacyVsprintfNullTerm = 1;
-// UCRT's UNBOUNDED sentinel, `(size_t)-1`. The pass builds it as `~0ull` narrowed into
-// the pool's signed arm, so the stored literal is -1.
-constexpr std::int64_t kBufferCountUnbounded = -1;
-// TF-C119: `snprintf`'s bit — STANDARD_SNPRINTF_BEHAVIOR (bit 1,
-// corecrt_stdio_config.h). WITHOUT it the core is the pre-C99 `_snprintf`,
-// which returns -1 on truncation where C99 requires the would-be length. It is the
-// first shipped recipe to pass a nonzero bit that is NOT sprintf's legacy bit 0,
-// which is precisely why a value hoisted out of the sprintf arm must red here.
-constexpr std::int64_t kOptStandardSnprintfBehavior = 2;
-// `__acrt_iob_func(0/1/2)` == stdin/stdout/stderr. `printf` IS `fprintf` to STDOUT, so
-// this index is the difference between conforming output and output on the wrong
-// stream — with nothing at any tier to notice.
-constexpr std::int64_t kIobStdout = 1;
-
-// All four helpers the six arms reach through, as ORDINARY descriptor imports (what
-// stdio.json's pe rows produce). Distinct from `ucrtCoreImports()` above, which
-// deliberately carries only the sprintf core.
-std::vector<ExternImport> allStdioHelperImports() {
-    auto make = [](std::uint32_t sym, char const* name) {
-        ExternImport e;
-        e.symbol      = SymbolId{sym};
-        e.mangledName = name;
-        e.libraryPath = "ucrtbase.dll";
-        e.isData      = false;
-        return e;
+// ★ P69 (lane `cs`, fold f26d): THE MERGED MODULE'S FACTS ARE ITS UNITS' FACTS JOINED, AND EACH FUNCTION KEEPS ITS
+// OWN ARG COUNTING. `mergeCuMirs` read the aliasing mode and the char-types rule from unit 0 ALONE — a disagreement
+// settled by unit order: a strict unit 0 merged with a permissive unit made the whole program strict, so the
+// permissive unit's accesses were optimized under a rule its source never promised (READ). The join, one home
+// (`joinUnitFacts`): strict TBAA only where every unit states it, the char-types rule where any does, the pair's
+// counting where they agree. A function stamped with another convention's counting (`g`) crosses with it.
+// RED-ON-DISABLE: take unit 0's facts, and "strict, then permissive" is strict; drop the clone's stamp, and `g`
+// reads per class.
+TEST(MirMerge, TheMergedModulesFactsAreItsUnitsJoinedAndEachFunctionKeepsItsCounting) {
+    constexpr MirAliasingMode S = MirAliasingMode::StrictTBAA;
+    constexpr MirAliasingMode P = MirAliasingMode::Permissive;
+    struct Facts {
+        MirAliasingMode aliasing;
+        bool            charTypes;
     };
-    return {make(kCoreVsprintf, "__stdio_common_vsprintf"),
-            make(kCoreVfprintf, "__stdio_common_vfprintf"),
-            make(kCoreVsscanf, "__stdio_common_vsscanf"),
-            make(kCoreAcrtIob, "__acrt_iob_func")};
-}
-
-// Each shim's C declaration, so the caller-side scaffold references it with its REAL
-// arity and variadicity instead of a stub that only happens to verify. `vfprintf` is
-// the odd one: three DECLARED parameters and NOT variadic (C 7.21.6.8).
-// `sizeParamIndex` exists for `snprintf` alone: it is the only recipe with a named
-// parameter that is NOT a pointer (`size_t n` at index 1). The scaffold must spell that
-// honestly — the pass DEFINES the shim with a `u64` in that slot and the MirVerifier
-// every test below runs compares the definition against this reference, so a `ptr` here
-// would red on a SCAFFOLD defect and read as a pass defect.
-constexpr std::uint32_t kNoSizeParam = 0xFFFFFFFFu;
-struct ShimDecl {
-    std::uint32_t symbol;
-    std::uint32_t fixedArgc;
-    bool          variadic;
-    std::uint32_t sizeParamIndex = kNoSizeParam;
-};
-constexpr ShimDecl kDeclPrintf{kShimPrintf, 1, true};      // (fmt, ...)
-constexpr ShimDecl kDeclFprintf{kShimFprintf, 2, true};    // (stream, fmt, ...)
-constexpr ShimDecl kDeclVfprintf{kShimVfprintf, 3, false}; // (stream, fmt, ap)
-constexpr ShimDecl kDeclSprintf{kShimSprintf, 2, true};    // (buf, fmt, ...)
-constexpr ShimDecl kDeclSscanf{kShimSscanf, 2, true};      // (buf, fmt, ...)
-constexpr ShimDecl kDeclSnprintf{kShimSnprintf, 3, true, 1};  // (buf, size_t n, fmt, ...)
-
-// The caller-side scaffold: one `main` that references each shim through a GlobalAddr
-// against a NOT-yet-defined callee — the shape the CST->HIR seam leaves behind for a
-// `synthesize`-tagged descriptor row — and calls it at its declared arity.
-Mir buildStdioCaller(TypeInterner& in, std::vector<ShimDecl> const& decls) {
-    TypeId const i32 = in.primitive(TypeKind::I32);
-    TypeId const u64 = in.primitive(TypeKind::U64);
-    TypeId const pCh = in.pointer(in.primitive(TypeKind::Char));
-
-    MirBuilder mb;
-    mb.addFunction(in.fnSig({}, i32, CallConv::CcMS64), SymbolId{100});   // main
-    MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
-    mb.beginBlock(e);
-    MirInstId const buf = mb.addInst(MirOpcode::Alloca, {}, pCh, 64);
-    MirLiteralValue nLit;
-    nLit.value = 16;
-    nLit.core  = TypeKind::U64;
-    MirInstId const nArg = mb.addConst(nLit, u64);
-    for (ShimDecl const& d : decls) {
-        std::vector<TypeId> params(d.fixedArgc, pCh);
-        if (d.sizeParamIndex != kNoSizeParam) params[d.sizeParamIndex] = u64;
-        TypeId const shimSig = in.fnSig(params, i32, CallConv::CcMS64, d.variadic);
-        std::vector<MirInstId> call{mb.addGlobalAddr(SymbolId{d.symbol}, in.pointer(shimSig))};
-        for (std::uint32_t i = 0; i < d.fixedArgc; ++i)
-            call.push_back(i == d.sizeParamIndex ? nArg : buf);
-        mb.addInst(MirOpcode::Call, call, i32);
-    }
-    mb.addReturn(mb.addConst(i32Lit(0), i32));
-    return std::move(mb).finish();
-}
-
-std::unordered_map<std::uint32_t, std::string> recipeMap(
-    std::vector<std::pair<std::uint32_t, char const*>> const& rows) {
-    std::unordered_map<std::uint32_t, std::string> m;
-    for (auto const& [sym, name] : rows) m.emplace(sym, name);
-    return m;
-}
-
-// Locate the synthesized forward BY ITS CALLEE SYMBOL. Selecting by callee (rather
-// than "the first Call in the block") is load-bearing twice over: `printf`'s body holds
-// TWO calls, and asking for a SPECIFIC core is what makes a mis-wired arm — `sscanf`
-// routed to `__stdio_common_vsprintf`, which shares the very same six-parameter TypeId
-// so the verifier stays silent — a MISS rather than a false match.
-std::optional<MirInstId> coreCallOf(Mir const& mir, MirFuncId fn, std::uint32_t coreSymV) {
-    for (std::uint32_t bi = 0; bi < mir.funcBlockCount(fn); ++bi) {
-        MirBlockId const b = mir.funcBlockAt(fn, bi);
-        for (std::uint32_t i = 0; i < mir.blockInstCount(b); ++i) {
-            MirInstId const id = mir.blockInstAt(b, i);
-            if (mir.instOpcode(id) != MirOpcode::Call) continue;
-            auto const ops = mir.instOperands(id);
-            if (ops.empty()) continue;
-            if (mir.instOpcode(ops[0]) != MirOpcode::GlobalAddr) continue;
-            if (mir.globalAddrSymbol(ops[0]).v == coreSymV) return id;
-        }
-    }
-    return std::nullopt;
-}
-
-std::uint32_t countOpcodeIn(Mir const& mir, MirFuncId fn, MirOpcode op) {
-    std::uint32_t n = 0;
-    for (std::uint32_t bi = 0; bi < mir.funcBlockCount(fn); ++bi) {
-        MirBlockId const b = mir.funcBlockAt(fn, bi);
-        for (std::uint32_t i = 0; i < mir.blockInstCount(b); ++i)
-            if (mir.instOpcode(mir.blockInstAt(b, i)) == op) ++n;
-    }
-    return n;
-}
-
-// ── SINGLE-SLOT IDENTITY PROBES ─────────────────────────────────────────────────────
-// Each answers "does THIS operand slot hold THAT value" and reports what it found
-// instead. A plain `EXPECT_EQ(opcode, …)` followed by a payload read would take the
-// whole test binary down on the first mismatch — `EXPECT` records and falls THROUGH,
-// straight into an accessor that aborts — instead of failing one assertion and letting
-// the remaining slots report too. These probes exist to avoid that.
-//
-// ★ THEY NOW ASK THROUGH THE `try*` TWINS RATHER THAN HAND-ROLLING THE OPCODE TEST
-// [[D-MIR-ACCESSORS-ABORT-ON-WRONG-OPCODE]]. Same guarantee, one mechanism, and the
-// twin cannot drift from its aborting sibling because it delegates to it.
-//
-// ⚠ CORRECTED HERE: this block used to name `Mir::instPayload` among the accessors
-// that "abort LOUD on a wrong opcode". It does NOT — `instPayload` is the RAW payload
-// reader (`instArena_.at(id).payload`), bounds- and provenance-checked but with no
-// opcode test at all, so it has no `try*` twin and needs none. `isVaLeaf` below still
-// tests the opcode first, but for the OPPOSITE reason: a raw read on the wrong opcode
-// yields a meaningless NUMBER rather than a crash, which is the quieter failure.
-
-testing::AssertionResult isArg(Mir const& mir, MirInstId op, std::uint32_t ordinal) {
-    auto const idx = mir.tryArgIndex(op);
-    if (!idx.has_value())
-        return testing::AssertionFailure()
-               << "slot holds opcode #" << static_cast<int>(mir.instOpcode(op))
-               << ", not the parameter `Arg " << ordinal << "`";
-    if (*idx != ordinal)
-        return testing::AssertionFailure()
-               << "slot holds parameter `Arg " << *idx << "`, want `Arg "
-               << ordinal << "` — the arm forwarded the WRONG PARAMETER into this slot "
-                             "(a transposition; both are pointers, so no type check "
-                             "anywhere can see it)";
-    auto const pos = mir.tryArgPosition(op);
-    if (pos != ordinal)
-        return testing::AssertionFailure()
-               << "`Arg " << ordinal << "` records flat call-operand position "
-               << pos.value_or(0);
-    return testing::AssertionSuccess();
-}
-
-testing::AssertionResult isIntConst(Mir const& mir, MirInstId op, std::int64_t want,
-                                    TypeKind wantCore) {
-    auto const litIdx = mir.tryConstLiteralIndex(op);
-    if (!litIdx.has_value())
-        return testing::AssertionFailure()
-               << "slot holds opcode #" << static_cast<int>(mir.instOpcode(op))
-               << ", not a Const (want " << want << ")";
-    MirLiteralValue const& lit = mir.literalValue(*litIdx);
-    auto const* got = std::get_if<std::int64_t>(&lit.value);
-    if (got == nullptr)
-        return testing::AssertionFailure() << "Const does not carry an integer literal";
-    if (*got != want)
-        return testing::AssertionFailure()
-               << "Const is " << *got << ", want " << want;
-    if (lit.core != wantCore)
-        return testing::AssertionFailure()
-               << "Const core is #" << static_cast<int>(lit.core) << ", want #"
-               << static_cast<int>(wantCore)
-               << " — the core is what separates a zero `_Options` MASK from a NULL "
-                  "`_Locale` POINTER, which are otherwise the same literal";
-    return testing::AssertionSuccess();
-}
-
-// `_Locale = NULL` (the ambient locale) — a null POINTER const, not an integer zero.
-testing::AssertionResult isNullLocale(Mir const& mir, MirInstId op) {
-    return isIntConst(mir, op, 0, TypeKind::Ptr);
-}
-
-// The `ap` slot must hold the va LEAF ITSELF at the recipe's own named-arg count.
-testing::AssertionResult isVaLeaf(Mir const& mir, MirInstId op, MirOpcode leaf,
-                                  std::uint32_t payload) {
-    if (mir.instOpcode(op) != leaf)
-        return testing::AssertionFailure()
-               << "the `ap` slot holds opcode #" << static_cast<int>(mir.instOpcode(op))
-               << ", not the va leaf #" << static_cast<int>(leaf);
-    if (mir.instPayload(op) != payload)
-        return testing::AssertionFailure()
-               << "va leaf payload is " << mir.instPayload(op) << ", want " << payload
-               << " — the leaf is &home[namedArgCount], so a wrong count silently skips "
-                  "or re-reads an argument slot";
-    return testing::AssertionSuccess();
-}
-
-// `printf`'s STREAM operand must BE the `__acrt_iob_func(1)` call's result — the full
-// chain, not "the body calls the accessor somewhere". A shim that fetched stdout and
-// then handed the core a different value would satisfy the weaker form.
-testing::AssertionResult isAcrtIobCall(Mir const& mir, MirInstId op, std::int64_t index) {
-    if (mir.instOpcode(op) != MirOpcode::Call)
-        return testing::AssertionFailure()
-               << "the `_Stream` slot holds opcode #"
-               << static_cast<int>(mir.instOpcode(op)) << ", not the accessor call";
-    auto const ops = mir.instOperands(op);
-    if (ops.size() != 2)
-        return testing::AssertionFailure()
-               << "__acrt_iob_func takes exactly one argument (callee + 1 == 2 operands), "
-                  "found "
-               << ops.size();
-    if (mir.instOpcode(ops[0]) != MirOpcode::GlobalAddr ||
-        mir.globalAddrSymbol(ops[0]).v != kCoreAcrtIob)
-        return testing::AssertionFailure()
-               << "the `_Stream` slot's call does not go to __acrt_iob_func";
-    return isIntConst(mir, ops[1], index, TypeKind::U32);
-}
-
-VaListLayout const kWin64Layout = [] {
-    VaListLayout l;
-    l.strategy                 = VaListStrategy::HomogeneousPointer;
-    l.namedArgSlotBytes        = 8;
-    l.variadicUsesOverflowBase = false;
-    return l;
-}();
-
-}  // namespace
-
-// ── ARM 1/6 · printf ────────────────────────────────────────────────────────────────
-//   int printf(char const* fmt, ...)
-//     -> __stdio_common_vfprintf(0, __acrt_iob_func(1), fmt, NULL, ap)
-//
-// The STREAM operand is the interesting one: it is the only COMPUTED argument in the
-// family, and its index selects the destination file. `__acrt_iob_func(2)` is stderr —
-// which compiles, links, loads, runs, and puts every `printf` on the wrong stream. It
-// is pinned here as the accessor call's RESULT with the accessor's own argument read.
-TEST(SynthStdioShim, PrintfArmForwardsStdoutFmtAndApByPosition) {
-    TypeInterner in{CompilationUnitId{1}};
-    Mir mir = buildStdioCaller(in, {kDeclPrintf});
-
-    std::vector<ExternImport> const externs = allStdioHelperImports();
-    DiagnosticReporter rep;
-    ASSERT_TRUE(synthesizeStdioShim(mir, in, recipeMap({{kShimPrintf, "printf"}}),
-                                    kWin64Layout, externs, rep));
-    ASSERT_FALSE(rep.hasErrors());
-
-    auto const shim = findFuncBySymbol(mir, kShimPrintf);
-    ASSERT_TRUE(shim.has_value()) << "printf must be a synthesized definition";
-
-    TypeId const shimSig = mir.funcSignature(*shim);
-    EXPECT_TRUE(in.fnIsVariadic(shimSig)) << "printf is variadic";
-    EXPECT_EQ(in.fnParams(shimSig).size(), 1u) << "printf's FIXED arity is (fmt)";
-
-    auto const call = coreCallOf(mir, *shim, kCoreVfprintf);
-    ASSERT_TRUE(call.has_value())
-        << "printf must forward through the STREAM core __stdio_common_vfprintf";
-    auto const ops = mir.instOperands(*call);
-    ASSERT_EQ(ops.size(), 6u)
-        << "callee + (_Options, _Stream, _Format, _Locale, _ArgList)";
-
-    EXPECT_TRUE(isIntConst(mir, ops[1], kOptNone, TypeKind::U64))
-        << "_Options must be 0: DSS links no legacy_stdio_definitions.lib, so plain 0 "
-           "IS the modern C-conforming behavior";
-    EXPECT_TRUE(isAcrtIobCall(mir, ops[2], kIobStdout))
-        << "_Stream must be __acrt_iob_func(1) == stdout; index 2 is stderr and nothing "
-           "downstream can tell the difference";
-    EXPECT_TRUE(isArg(mir, ops[3], 0)) << "_Format is printf's Arg 0";
-    EXPECT_TRUE(isNullLocale(mir, ops[4]));
-    EXPECT_TRUE(isVaLeaf(mir, ops[5], MirOpcode::VaHomeArgAreaAddr, 1))
-        << "_ArgList is the va leaf at printf's 1 named arg";
-
-    EXPECT_FALSE(coreCallOf(mir, *shim, kCoreVsprintf).has_value())
-        << "printf must not reach the BUFFERED core";
-    EXPECT_FALSE(coreCallOf(mir, *shim, kCoreVsscanf).has_value());
-
-    MirVerifier verifier{mir, &in};
-    EXPECT_TRUE(verifier.verify(rep));
-}
-
-// ── ARM 2/6 · fprintf ───────────────────────────────────────────────────────────────
-//   int fprintf(FILE* stream, char const* fmt, ...)
-//     -> __stdio_common_vfprintf(0, stream, fmt, NULL, ap)
-//
-// Structurally `printf` minus the accessor: the stream arrives as `Arg 0`. `stream` and
-// `fmt` are ADJACENT operands of the same core, and transposing them is a wrong-output
-// miscompile no type check can see (`FILE*` is `ptr<void>` and `fmt` is `char*` at MIR,
-// but the CALL is untyped against the core's FnSig) — so both are pinned by ordinal.
-TEST(SynthStdioShim, FprintfArmForwardsItsStreamAndFmtByPosition) {
-    TypeInterner in{CompilationUnitId{1}};
-    Mir mir = buildStdioCaller(in, {kDeclFprintf});
-
-    std::vector<ExternImport> const externs = allStdioHelperImports();
-    DiagnosticReporter rep;
-    ASSERT_TRUE(synthesizeStdioShim(mir, in, recipeMap({{kShimFprintf, "fprintf"}}),
-                                    kWin64Layout, externs, rep));
-    ASSERT_FALSE(rep.hasErrors());
-
-    auto const shim = findFuncBySymbol(mir, kShimFprintf);
-    ASSERT_TRUE(shim.has_value()) << "fprintf must be a synthesized definition";
-
-    TypeId const shimSig = mir.funcSignature(*shim);
-    EXPECT_TRUE(in.fnIsVariadic(shimSig)) << "fprintf is variadic";
-    EXPECT_EQ(in.fnParams(shimSig).size(), 2u) << "fprintf's FIXED arity is (stream, fmt)";
-
-    auto const call = coreCallOf(mir, *shim, kCoreVfprintf);
-    ASSERT_TRUE(call.has_value());
-    auto const ops = mir.instOperands(*call);
-    ASSERT_EQ(ops.size(), 6u)
-        << "callee + (_Options, _Stream, _Format, _Locale, _ArgList)";
-
-    EXPECT_TRUE(isIntConst(mir, ops[1], kOptNone, TypeKind::U64));
-    EXPECT_TRUE(isArg(mir, ops[2], 0)) << "_Stream is fprintf's Arg 0";
-    EXPECT_TRUE(isArg(mir, ops[3], 1)) << "_Format is fprintf's Arg 1";
-    EXPECT_TRUE(isNullLocale(mir, ops[4]));
-    EXPECT_TRUE(isVaLeaf(mir, ops[5], MirOpcode::VaHomeArgAreaAddr, 2))
-        << "_ArgList is the va leaf at fprintf's 2 named args";
-
-    // fprintf takes its stream as an ARGUMENT — it must never fetch one.
-    EXPECT_FALSE(coreCallOf(mir, *shim, kCoreAcrtIob).has_value())
-        << "fprintf writes to the CALLER's stream; calling __acrt_iob_func here would "
-           "pin output to a fixed file regardless of the argument";
-
-    MirVerifier verifier{mir, &in};
-    EXPECT_TRUE(verifier.verify(rep));
-}
-
-// ── ARM 3/6 · vfprintf — THE ONE THAT IS NOT VARIADIC ───────────────────────────────
-//   int vfprintf(FILE* stream, char const* fmt, va_list ap)
-//     -> __stdio_common_vfprintf(0, stream, fmt, NULL, ap)
-//
-// C 7.21.6.8 gives `vfprintf` a DECLARED `va_list ap` parameter that already points at
-// the CALLER's first unnamed argument, so the shim forwards `Arg 2` verbatim. Two
-// things must therefore be true here and nowhere else in the family, and BOTH are
-// silent if they regress:
-//   * NO `Va*ArgAreaAddr` leaf. One would re-derive `ap` from THIS frame — which has no
-//     varargs at all — so `ap` would point at whatever follows the shim's own named
-//     args instead of at the caller's list.
-//   * a NON-variadic signature. The va leaf's presence is `lir_callconv`'s
-//     prologue-spill signal, and a `vsig` here would additionally declare a variadic
-//     frame nothing ever fills.
-TEST(SynthStdioShim, VfprintfArmForwardsItsDeclaredApAndIsNotVariadic) {
-    TypeInterner in{CompilationUnitId{1}};
-    Mir mir = buildStdioCaller(in, {kDeclVfprintf});
-
-    std::vector<ExternImport> const externs = allStdioHelperImports();
-    DiagnosticReporter rep;
-    ASSERT_TRUE(synthesizeStdioShim(mir, in, recipeMap({{kShimVfprintf, "vfprintf"}}),
-                                    kWin64Layout, externs, rep));
-    ASSERT_FALSE(rep.hasErrors());
-
-    auto const shim = findFuncBySymbol(mir, kShimVfprintf);
-    ASSERT_TRUE(shim.has_value()) << "vfprintf must be a synthesized definition";
-
-    TypeId const shimSig = mir.funcSignature(*shim);
-    EXPECT_FALSE(in.fnIsVariadic(shimSig))
-        << "★ vfprintf is NOT variadic (C 7.21.6.8) — `ap` is a declared parameter. A "
-           "variadic signature here hands lir_callconv a prologue-spill signal for a "
-           "function that receives no varargs";
-    EXPECT_EQ(in.fnParams(shimSig).size(), 3u)
-        << "vfprintf's arity is (stream, fmt, ap) — all three DECLARED";
-
-    auto const call = coreCallOf(mir, *shim, kCoreVfprintf);
-    ASSERT_TRUE(call.has_value());
-    auto const ops = mir.instOperands(*call);
-    ASSERT_EQ(ops.size(), 6u)
-        << "callee + (_Options, _Stream, _Format, _Locale, _ArgList)";
-
-    EXPECT_TRUE(isIntConst(mir, ops[1], kOptNone, TypeKind::U64));
-    EXPECT_TRUE(isArg(mir, ops[2], 0)) << "_Stream is vfprintf's Arg 0";
-    EXPECT_TRUE(isArg(mir, ops[3], 1)) << "_Format is vfprintf's Arg 1";
-    EXPECT_TRUE(isNullLocale(mir, ops[4]));
-    EXPECT_TRUE(isArg(mir, ops[5], 2))
-        << "★ _ArgList must be the DECLARED `Arg 2`, forwarded verbatim — not a leaf, "
-           "and not some other parameter";
-
-    EXPECT_EQ(countOpcodeIn(mir, *shim, MirOpcode::VaHomeArgAreaAddr), 0u)
-        << "★ vfprintf must emit NO va leaf: one would re-derive `ap` from a frame with "
-           "no varargs in it";
-    EXPECT_EQ(countOpcodeIn(mir, *shim, MirOpcode::VaOverflowArgAreaAddr), 0u)
-        << "neither leaf, on either base";
-    EXPECT_FALSE(coreCallOf(mir, *shim, kCoreAcrtIob).has_value())
-        << "vfprintf writes to the CALLER's stream";
-
-    MirVerifier verifier{mir, &in};
-    EXPECT_TRUE(verifier.verify(rep));
-}
-
-// ── ARM 4/6 · sprintf ───────────────────────────────────────────────────────────────
-//   int sprintf(char* buf, char const* fmt, ...)
-//     -> __stdio_common_vsprintf(LEGACY_VSPRINTF_NULL_TERMINATION, buf, (size_t)-1,
-//                                fmt, NULL, ap)
-//
-// ★ THE TRANSPOSITION THIS TEST WAS WRITTEN FOR. `buf` and `fmt` are BOTH `char*`, they
-// sit two operands apart in the same call, and swapping them makes the shim format the
-// destination buffer as a control string and write the result over the format string.
-// Measured (TF-C112): that swap passed every pre-existing assertion in both stdio test
-// binaries and the MirVerifier, because the only thing that distinguishes the two
-// operands is their POSITION.
-TEST(SynthStdioShim, SprintfArmPassesBufCountFmtInThatOrder) {
-    TypeInterner in{CompilationUnitId{1}};
-    Mir mir = buildStdioCaller(in, {kDeclSprintf});
-
-    std::vector<ExternImport> const externs = allStdioHelperImports();
-    DiagnosticReporter rep;
-    ASSERT_TRUE(synthesizeStdioShim(mir, in, recipeMap({{kShimSprintf, "sprintf"}}),
-                                    kWin64Layout, externs, rep));
-    ASSERT_FALSE(rep.hasErrors());
-
-    auto const shim = findFuncBySymbol(mir, kShimSprintf);
-    ASSERT_TRUE(shim.has_value());
-
-    TypeId const shimSig = mir.funcSignature(*shim);
-    EXPECT_TRUE(in.fnIsVariadic(shimSig));
-    EXPECT_EQ(in.fnParams(shimSig).size(), 2u) << "sprintf's FIXED arity is (buf, fmt)";
-
-    auto const call = coreCallOf(mir, *shim, kCoreVsprintf);
-    ASSERT_TRUE(call.has_value())
-        << "sprintf must forward through the BUFFERED core __stdio_common_vsprintf";
-    auto const ops = mir.instOperands(*call);
-    ASSERT_EQ(ops.size(), 7u)
-        << "callee + (_Options, _Buffer, _BufferCount, _Format, _Locale, _ArgList)";
-
-    EXPECT_TRUE(isIntConst(mir, ops[1], kOptLegacyVsprintfNullTerm, TypeKind::U64))
-        << "sprintf pairs LEGACY_VSPRINTF_NULL_TERMINATION (bit 0) with the unbounded "
-           "count; dropping it changes the core's NUL handling SILENTLY";
-    EXPECT_TRUE(isArg(mir, ops[2], 0))
-        << "★ _Buffer is sprintf's Arg 0. If this reads `Arg 1`, the arm transposed buf "
-           "and fmt: the shim formats the destination as a control string and writes "
-           "the result over the format string — both are char*, so nothing else sees it";
-    EXPECT_TRUE(isIntConst(mir, ops[3], kBufferCountUnbounded, TypeKind::U64))
-        << "_BufferCount is UCRT's (size_t)-1 UNBOUNDED sentinel — sprintf has no limit";
-    EXPECT_TRUE(isArg(mir, ops[4], 1))
-        << "★ _Format is sprintf's Arg 1 — the other half of the transposition pair";
-    EXPECT_TRUE(isNullLocale(mir, ops[5]));
-    EXPECT_TRUE(isVaLeaf(mir, ops[6], MirOpcode::VaHomeArgAreaAddr, 2));
-
-    EXPECT_FALSE(coreCallOf(mir, *shim, kCoreVsscanf).has_value())
-        << "sprintf must not reach the SCANF core — the two share one six-parameter "
-           "TypeId, so a swap is invisible to the verifier";
-    EXPECT_FALSE(coreCallOf(mir, *shim, kCoreAcrtIob).has_value());
-
-    MirVerifier verifier{mir, &in};
-    EXPECT_TRUE(verifier.verify(rep));
-}
-
-// ── ARM 5/6 · sscanf ────────────────────────────────────────────────────────────────
-//   int sscanf(char const* buf, char const* fmt, ...)
-//     -> __stdio_common_vsscanf(0, buf, (size_t)-1, fmt, NULL, ap)
-//
-// ★ THE MIS-WIRE THIS TEST WAS WRITTEN FOR. `__stdio_common_vsscanf` and
-// `__stdio_common_vsprintf` take the SAME six parameters, so the pass gives them ONE
-// shared TypeId — which means routing `sscanf` to the printf core is type-correct at
-// every tier and caught by nothing. The callee symbol is therefore asserted POSITIVELY
-// (the call must go to the scanf core) and the printf core is asserted ABSENT.
-//
-// `_Options` is the second load-bearing operand: bit 0 here is SECURECRT, which turns
-// the core into `sscanf_s` — every `%s` then consumes an EXTRA buffer-size argument out
-// of `ap`, silently desynchronising the whole argument stream.
-TEST(SynthStdioShim, SscanfArmUsesTheScanfCoreWithZeroOptions) {
-    TypeInterner in{CompilationUnitId{1}};
-    Mir mir = buildStdioCaller(in, {kDeclSscanf});
-
-    std::vector<ExternImport> const externs = allStdioHelperImports();
-    DiagnosticReporter rep;
-    ASSERT_TRUE(synthesizeStdioShim(mir, in, recipeMap({{kShimSscanf, "sscanf"}}),
-                                    kWin64Layout, externs, rep));
-    ASSERT_FALSE(rep.hasErrors());
-
-    auto const shim = findFuncBySymbol(mir, kShimSscanf);
-    ASSERT_TRUE(shim.has_value());
-
-    TypeId const shimSig = mir.funcSignature(*shim);
-    EXPECT_TRUE(in.fnIsVariadic(shimSig));
-    EXPECT_EQ(in.fnParams(shimSig).size(), 2u) << "sscanf's FIXED arity is (buf, fmt)";
-
-    auto const call = coreCallOf(mir, *shim, kCoreVsscanf);
-    ASSERT_TRUE(call.has_value())
-        << "★ sscanf MUST forward through __stdio_common_vsscanf. Routing it to "
-           "__stdio_common_vsprintf is type-identical (one shared TypeId) and would "
-           "make the shim FORMAT into the caller's read-only source string";
-    EXPECT_FALSE(coreCallOf(mir, *shim, kCoreVsprintf).has_value())
-        << "★ and it must NOT reach the printf core at all";
-
-    auto const ops = mir.instOperands(*call);
-    ASSERT_EQ(ops.size(), 7u)
-        << "callee + (_Options, _Buffer, _BufferCount, _Format, _Locale, _ArgList)";
-
-    EXPECT_TRUE(isIntConst(mir, ops[1], kOptNone, TypeKind::U64))
-        << "★ _Options MUST be 0. Bit 0 is SECURECRT (`sscanf_s`: every %s eats an extra "
-           "buffer-size argument out of `ap`) and bit 1 is LEGACY_WIDE_SPECIFIERS — both "
-           "corrupt argument consumption rather than diagnose";
-    EXPECT_TRUE(isArg(mir, ops[2], 0)) << "_Buffer is sscanf's Arg 0 (the source string)";
-    EXPECT_TRUE(isIntConst(mir, ops[3], kBufferCountUnbounded, TypeKind::U64))
-        << "_BufferCount is the UNBOUNDED sentinel — a sscanf source is NUL-terminated";
-    EXPECT_TRUE(isArg(mir, ops[4], 1)) << "_Format is sscanf's Arg 1";
-    EXPECT_TRUE(isNullLocale(mir, ops[5]));
-    EXPECT_TRUE(isVaLeaf(mir, ops[6], MirOpcode::VaHomeArgAreaAddr, 2))
-        << "_ArgList is the va leaf at sscanf's 2 named args";
-
-    MirVerifier verifier{mir, &in};
-    EXPECT_TRUE(verifier.verify(rep));
-}
-
-// ── ALL SIX IN ONE PASS ─────────────────────────────────────────────────────────────
-//
-// The arms above each run alone, which cannot catch a value that is right per-recipe
-// but shared across them. Synthesizing the whole family in ONE invocation is what makes
-// a hoisted constant fail: a hardcoded named-arg count reds on whichever recipe does
-// not have it, and a core resolved once and reused reds on whichever arm needs the
-// other one. It also pins the emission ORDER contract (sorted by SymbolId — the
-// determinism the pass sorts for), and that `main` survives the rebuild.
-//
-// ★ TF-C119 — `snprintf` MAKES THIS FIXTURE COVER SOMETHING NO SINGLE-RECIPE ONE CAN,
-// and that is why it was extended rather than left at five. `snprintf` is the ONLY arm
-// whose body is more than one block (the `r < 0 ? -1 : r` clamp:
-// synth_stdio_shim.cpp) and therefore the only one that leaves the builder
-// sitting in a NON-ENTRY block when the emission loop moves on to the next recipe. The
-// pass stamps structural markers module-wide with ONE `rederiveStructCfMarkers` after
-// `finish()` — so the MIXED single-/multi-block module is the shape it must survive,
-// and the shape the real pe64 build produces on every `#include <stdio.h>`. Before this
-// extension that mixed case was exercised by no fixture at all: the five-arm module was
-// uniformly single-block, and the one multi-block module was a one-recipe fixture in
-// tests/mir/test_synth_stdio_shim_valist.cpp. The marker assertions below (and the
-// MirVerifier, which RECOMPUTES the derivation and compares stored == derived per
-// reachable block) are what makes that coverage real rather than incidental.
-TEST(SynthStdioShim, AllSixArmsSynthesizeTogetherWithPerRecipeValues) {
-    TypeInterner in{CompilationUnitId{1}};
-    Mir mir = buildStdioCaller(
-        in, {kDeclSprintf, kDeclPrintf, kDeclFprintf, kDeclVfprintf, kDeclSscanf,
-             kDeclSnprintf});
-
-    std::vector<ExternImport> const externs = allStdioHelperImports();
-    DiagnosticReporter rep;
-    ASSERT_TRUE(synthesizeStdioShim(mir, in,
-                                    recipeMap({{kShimSprintf, "sprintf"},
-                                               {kShimPrintf, "printf"},
-                                               {kShimFprintf, "fprintf"},
-                                               {kShimVfprintf, "vfprintf"},
-                                               {kShimSscanf, "sscanf"},
-                                               {kShimSnprintf, "snprintf"}}),
-                                    kWin64Layout, externs, rep));
-    ASSERT_FALSE(rep.hasErrors());
-
-    EXPECT_EQ(mir.moduleFuncCount(), 7u) << "main + six shims";
-    EXPECT_TRUE(findFuncBySymbol(mir, 100u).has_value()) << "main must survive the rebuild";
-
-    // Emission order is SORTED BY SymbolId — the pass sorts precisely because
-    // `unordered_map` iteration is not stable and a shifting function order would make
-    // the binary non-reproducible. main is the clone, so the shims start at index 1.
-    ASSERT_EQ(mir.moduleFuncCount(), 7u);
-    std::vector<std::uint32_t> const wantOrder{100,           kShimSprintf,  kShimPrintf,
-                                               kShimFprintf,  kShimVfprintf, kShimSscanf,
-                                               kShimSnprintf};
-    for (std::uint32_t i = 0; i < wantOrder.size(); ++i)
-        EXPECT_EQ(mir.funcSymbol(mir.funcAt(i)).v, wantOrder[i])
-            << "function #" << i << ": shim emission must be sorted by SymbolId so the "
-                                   "output is byte-reproducible";
-
-    // Per-recipe named-arg counts, all produced by the SAME invocation: printf has one
-    // fixed parameter, snprintf has three, and the rest have two — so any hoisted
-    // constant reds here. snprintf's `3` is the one a copy-paste gets wrong: it is the
-    // only value in this column that no sibling shares.
-    struct LeafCase { std::uint32_t shim; std::uint32_t core; std::size_t apSlot;
-                      std::uint32_t named; };
-    for (LeafCase const& c : std::vector<LeafCase>{
-             {kShimPrintf, kCoreVfprintf, 5, 1},
-             {kShimFprintf, kCoreVfprintf, 5, 2},
-             {kShimSprintf, kCoreVsprintf, 6, 2},
-             {kShimSscanf, kCoreVsscanf, 6, 2},
-             {kShimSnprintf, kCoreVsprintf, 6, 3}}) {
-        SCOPED_TRACE(testing::Message() << "shim symbol " << c.shim);
-        auto const fn = findFuncBySymbol(mir, c.shim);
-        ASSERT_TRUE(fn.has_value());
-        auto const call = coreCallOf(mir, *fn, c.core);
-        ASSERT_TRUE(call.has_value()) << "each arm must reach ITS OWN core";
-        auto const ops = mir.instOperands(*call);
-        ASSERT_EQ(ops.size(), c.apSlot + 1);
-        EXPECT_TRUE(isVaLeaf(mir, ops[c.apSlot], MirOpcode::VaHomeArgAreaAddr, c.named));
-    }
-
-    // ★ snprintf and sprintf SHARE `__stdio_common_vsprintf`, so the two arms sit one
-    // constant apart in the same call shape — pinned here in the SAME module so a value
-    // hoisted out of either arm reds. These are the two operands that carry snprintf's
-    // entire meaning, and both faults are silent (see the single-arm test in
-    // tests/mir/test_synth_stdio_shim_valist.cpp for what each one does at runtime).
-    {
-        auto const sn = findFuncBySymbol(mir, kShimSnprintf);
-        auto const sp = findFuncBySymbol(mir, kShimSprintf);
-        ASSERT_TRUE(sn.has_value() && sp.has_value());
-        auto const snCall = coreCallOf(mir, *sn, kCoreVsprintf);
-        auto const spCall = coreCallOf(mir, *sp, kCoreVsprintf);
-        ASSERT_TRUE(snCall.has_value() && spCall.has_value());
-        auto const snOps = mir.instOperands(*snCall);
-        auto const spOps = mir.instOperands(*spCall);
-        ASSERT_EQ(snOps.size(), 7u);
-        ASSERT_EQ(spOps.size(), 7u);
-        EXPECT_TRUE(isIntConst(mir, snOps[1], kOptStandardSnprintfBehavior, TypeKind::U64))
-            << "snprintf's _Options is bit 1 (STANDARD_SNPRINTF_BEHAVIOR)";
-        EXPECT_TRUE(isIntConst(mir, spOps[1], kOptLegacyVsprintfNullTerm, TypeKind::U64))
-            << "…and sprintf's, in the SAME module, is still bit 0 — one _Options "
-               "hoisted across both arms reds on whichever it does not fit";
-        EXPECT_TRUE(isArg(mir, snOps[3], 1))
-            << "snprintf's _BufferCount is the caller's REAL n (`Arg 1`)";
-        EXPECT_TRUE(isIntConst(mir, spOps[3], kBufferCountUnbounded, TypeKind::U64))
-            << "…while sprintf's, in the same module, is the (size_t)-1 sentinel";
-    }
-
-    // …and vfprintf, in the same module, still emits no leaf and forwards its parameter.
-    auto const vf = findFuncBySymbol(mir, kShimVfprintf);
-    ASSERT_TRUE(vf.has_value());
-    EXPECT_EQ(countOpcodeIn(mir, *vf, MirOpcode::VaHomeArgAreaAddr), 0u);
-    EXPECT_FALSE(in.fnIsVariadic(mir.funcSignature(*vf)));
-    auto const vfCall = coreCallOf(mir, *vf, kCoreVfprintf);
-    ASSERT_TRUE(vfCall.has_value());
-    ASSERT_EQ(mir.instOperands(*vfCall).size(), 6u);
-    EXPECT_TRUE(isArg(mir, mir.instOperands(*vfCall)[5], 2));
-
-    // Exactly ONE body fetches stdout, and it is printf's.
-    for (std::uint32_t sym : {kShimFprintf, kShimVfprintf, kShimSprintf, kShimSscanf,
-                              kShimSnprintf})
-        EXPECT_FALSE(coreCallOf(mir, *findFuncBySymbol(mir, sym), kCoreAcrtIob).has_value())
-            << "only printf has a fixed destination stream; symbol " << sym;
-    EXPECT_TRUE(
-        coreCallOf(mir, *findFuncBySymbol(mir, kShimPrintf), kCoreAcrtIob).has_value());
-
-    // ── THE MIXED-MODULE MARKER REDERIVE ────────────────────────────────────────────
-    // One `rederiveStructCfMarkers` runs over the WHOLE module after `finish()`, and
-    // this module is mixed: five one-block bodies plus `main`, and one three-block body.
-    // Markers are a pure function of the CFG (mir_struct_markers.hpp), so the derivation
-    // must not be perturbed by a neighbouring function's shape — a rederive that leaked
-    // the multi-block arm's state, or that ran per-function against the wrong block
-    // range, shows up HERE and in the verifier below and nowhere else in the suite.
-    for (std::uint32_t sym : {100u, kShimSprintf, kShimPrintf, kShimFprintf,
-                              kShimVfprintf, kShimSscanf}) {
-        SCOPED_TRACE(testing::Message() << "single-block function " << sym);
-        auto const fn = findFuncBySymbol(mir, sym);
-        ASSERT_TRUE(fn.has_value());
-        ASSERT_EQ(mir.funcBlockCount(*fn), 1u)
-            << "every arm but snprintf is a single straight-line block";
-        EXPECT_EQ(mir.blockMarker(mir.funcBlockAt(*fn, 0)), StructCfMarker::EntryBlock);
-    }
-    {
-        auto const sn = findFuncBySymbol(mir, kShimSnprintf);
-        ASSERT_TRUE(sn.has_value());
-        ASSERT_EQ(mir.funcBlockCount(*sn), 3u)
-            << "★ snprintf keeps its `r < 0 ? -1 : r` clamp when synthesized ALONGSIDE "
-               "five single-block siblings — collapsing it to a bare `return r` drops "
-               "the UCRT header's normalization";
-        EXPECT_EQ(mir.blockMarker(mir.funcBlockAt(*sn, 0)), StructCfMarker::EntryBlock);
-        // Both arms RETURN, so the if has no real join: rule 4 marks succs[0] IfThen and
-        // succs[1] IfElse and derives no IfJoin (mir_struct_markers.hpp).
-        EXPECT_EQ(mir.blockMarker(mir.funcBlockAt(*sn, 1)), StructCfMarker::IfThen);
-        EXPECT_EQ(mir.blockMarker(mir.funcBlockAt(*sn, 2)), StructCfMarker::IfElse);
-        EXPECT_EQ(countOpcodeIn(mir, *sn, MirOpcode::CondBr), 1u);
-        EXPECT_EQ(countOpcodeIn(mir, *sn, MirOpcode::ICmpSlt), 1u)
-            << "the clamp's predicate is a SIGNED less-than — an unsigned compare makes "
-               "every negative result look large and positive";
-    }
-
-    MirVerifier verifier{mir, &in};
-    EXPECT_TRUE(verifier.verify(rep));
-}
-
-// ── THE "NO HALF-BUILT DEFINITION" PIN, MOVED ONTO THE PATHS THAT CAN VIOLATE IT ────
-//
-// ★ THIS PIN WAS ON THE WRONG PATHS. Both places it existed (the nullopt-layout and
-// unimplemented-strategy refusals, in test_synth_stdio_shim_valist.cpp) return BEFORE
-// `MirBuilder` is even constructed, so "the module is unchanged" there is guaranteed by
-// statement order and asserts nothing. The paths that CAN violate it are the ones below:
-// every one of them is reached AFTER the whole module has been cloned into the builder,
-// with a function possibly open.
-//
-// That is not a hypothetical. src/mir/merge/synth_stdio_shim.cpp's own comment at the
-// `coreSym` lambda records the shape it used to have — report the failure, hand back a
-// default-constructed `SymbolId`, and let the arm use it as operand 0 of the `Call`,
-// which `MirBuilder::checkSameModule_` waves through because an untagged id passes. The
-// invariant the pass now holds, and this test states: on ANY failure the caller's `Mir`
-// is left EXACTLY as it was found — no appended definition, no partial body, and the
-// shim symbol still UNDEFINED so the next stage reports an undefined symbol rather than
-// consuming a wrong-ABI body.
-TEST(SynthStdioShim, EveryPostCloneFailurePathLeavesTheModuleUntouched) {
-    struct Case {
-        char const*   what;
-        std::uint32_t shim;
-        char const*   recipe;
-        char const*   dropHelper;   // "" == drop nothing (the unknown-recipe backstop)
-        ShimDecl      decl;         // the caller-side reference, at the arm's real arity
+    struct Cell {
+        char const* what;
+        Facts       u0, u1, merged;
     };
-    // One case per `return false` that sits AFTER the clone loop in the pass.
-    std::vector<Case> const cases{
-        {"printf without the stdout accessor", kShimPrintf, "printf", "__acrt_iob_func",
-         kDeclPrintf},
-        {"printf without the stream core", kShimPrintf, "printf", "__stdio_common_vfprintf",
-         kDeclPrintf},
-        {"fprintf without the stream core", kShimFprintf, "fprintf", "__stdio_common_vfprintf",
-         kDeclFprintf},
-        {"vfprintf without the stream core", kShimVfprintf, "vfprintf", "__stdio_common_vfprintf",
-         kDeclVfprintf},
-        {"sprintf without the buffered core", kShimSprintf, "sprintf", "__stdio_common_vsprintf",
-         kDeclSprintf},
-        {"sscanf without the scanf core", kShimSscanf, "sscanf", "__stdio_common_vsscanf",
-         kDeclSscanf},
-        // ★ the MULTI-BLOCK arm: its refusal is the one with the most module state to
-        // leak (three blocks and an open builder), so it earns its own row rather than
-        // riding sprintf's — both refuse over the SAME missing core.
-        {"snprintf without the buffered core", kShimSnprintf, "snprintf",
-         "__stdio_common_vsprintf", kDeclSnprintf},
-        {"an id the recipe/switch vocabularies disagree on", kShimSprintf, "no_such_recipe", "",
-         kDeclSprintf},
+    std::vector<Cell> const cells = {
+        {"strict, then strict: strict", {S, false}, {S, false}, {S, false}},
+        {"strict, then permissive: permissive", {S, false}, {P, false}, {P, false}},
+        {"permissive, then strict: permissive", {P, false}, {S, false}, {P, false}},
+        {"the char-types rule in the second unit alone: it holds", {S, false}, {S, true}, {S, true}},
+        {"the char-types rule in the first unit alone: it holds", {S, true}, {S, false}, {S, true}},
     };
-
-    for (Case const& c : cases) {
+    for (Cell const& c : cells) {
         SCOPED_TRACE(c.what);
-        TypeInterner in{CompilationUnitId{1}};
-        Mir mir = buildStdioCaller(in, {c.decl});
-        std::size_t const before = mir.moduleFuncCount();
-
-        std::vector<ExternImport> externs;
-        for (auto const& e : allStdioHelperImports())
-            if (e.mangledName != c.dropHelper) externs.push_back(e);
-        std::size_t const wantHelpers = (*c.dropHelper == '\0') ? std::size_t{4} : std::size_t{3};
-        ASSERT_EQ(externs.size(), wantHelpers)
-            << "the case must actually remove the helper it names — otherwise this row "
-               "silently tests the happy path";
-
+        // CU0: int main(void) { return 0; } and g(double, long), a function of another convention.
+        TypeInterner in0{CompilationUnitId{1}};
+        TypeId const i32_0 = in0.primitive(TypeKind::I32);
+        std::array<TypeId, 2> const gps{in0.primitive(TypeKind::F64), in0.primitive(TypeKind::I64)};
+        Mir mir0;
+        {
+            MirBuilder mb;
+            mb.stateDataModel(DataModel::Lp64);
+            mb.stateArgCounting(MirArgCounting::PerClass);
+            mb.setAliasingMode(c.u0.aliasing);
+            mb.setCharTypesAliasAll(c.u0.charTypes);
+            mb.addFunction(in0.fnSig({}, i32_0, CallConv::CcSysV), SymbolId{100});
+            MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+            mb.beginBlock(e);
+            mb.addReturn(mb.addConst(i32Lit(0), i32_0));
+            MirFuncId const g =
+                mb.addFunction(in0.fnSig(gps, in0.primitive(TypeKind::Void), CallConv::CcMS64), SymbolId{101});
+            mb.stateFunctionArgCounting(g, MirArgCounting::Flat);
+            MirBlockId const ge = mb.createBlock(StructCfMarker::EntryBlock);
+            mb.beginBlock(ge);
+            (void)mb.addArg(0, gps[0], /*position=*/0);
+            (void)mb.addArg(1, gps[1], /*position=*/1);
+            mb.addReturn();
+            mir0 = std::move(mb).finish();
+        }
+        // CU1: int h(void) { return 7; }
+        TypeInterner in1{CompilationUnitId{2}};
+        TypeId const i32_1 = in1.primitive(TypeKind::I32);
+        Mir mir1;
+        {
+            MirBuilder mb;
+            mb.stateDataModel(DataModel::Lp64);
+            mb.stateArgCounting(MirArgCounting::PerClass);
+            mb.setAliasingMode(c.u1.aliasing);
+            mb.setCharTypesAliasAll(c.u1.charTypes);
+            mb.addFunction(in1.fnSig({}, i32_1, CallConv::CcSysV), SymbolId{50});
+            MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+            mb.beginBlock(e);
+            mb.addReturn(mb.addConst(i32Lit(7), i32_1));
+            mir1 = std::move(mb).finish();
+        }
+        std::vector<MergeCuInput> cus = {
+            MergeCuInput{&mir0, &in0, namerOf({{100, "main"}, {101, "g"}}), {}},
+            MergeCuInput{&mir1, &in1, namerOf({{50, "h"}}), {}},
+        };
+        std::vector<std::string> const entries = {"main"};
         DiagnosticReporter rep;
-        EXPECT_FALSE(synthesizeStdioShim(mir, in, recipeMap({{c.shim, c.recipe}}),
-                                         kWin64Layout, externs, rep))
-            << "a missing helper / unknown recipe MUST fail loud";
-        EXPECT_TRUE(rep.hasErrors()) << "the refusal must carry a real diagnostic";
-
-        // ★ The pin, on the path where it means something.
-        EXPECT_EQ(mir.moduleFuncCount(), before)
-            << "a failure AFTER the module was cloned into the builder must not publish "
-               "the builder: no definition may be appended";
-        EXPECT_FALSE(findFuncBySymbol(mir, c.shim).has_value())
-            << "the shim symbol must remain UNDEFINED — a half-built body would be "
-               "consumed by the next stage as though synthesis had succeeded";
-        EXPECT_TRUE(findFuncBySymbol(mir, 100u).has_value())
-            << "and the caller's own functions must survive untouched";
-
-        MirVerifier verifier{mir, &in};
-        DiagnosticReporter vrep;
-        EXPECT_TRUE(verifier.verify(vrep))
-            << "the module handed back on the failure path must still verify";
+        auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries,
+                                  dss::test_support::ordinaryLinkFormat(), rep);
+        // A refused merge names what refused it, not only how many.
+        auto const said = [&rep] {
+            std::string s;
+            for (auto const& d : rep.all())
+                s += "\n  " + std::string{diagnosticCodeName(d.code)} + ": " + d.actual;
+            return s;
+        };
+        ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount() << said();
+        Mir const& mm = merged->mir;
+        EXPECT_EQ(mm.aliasingMode(), c.merged.aliasing);
+        EXPECT_EQ(mm.charTypesAliasAll(), c.merged.charTypes);
+        EXPECT_EQ(mm.argCounting(), MirArgCounting::PerClass) << "the pair's counting, which both units state";
+        auto const gF = findFuncByName(mm, merged->symbolNames, "g");
+        ASSERT_TRUE(gF.has_value()) << "g is externally visible and is merged";
+        EXPECT_EQ(mm.funcArgCounting(*gF), MirArgCounting::Flat) << "g keeps its own convention's counting";
+        auto const hF = findFuncByName(mm, merged->symbolNames, "h");
+        ASSERT_TRUE(hF.has_value());
+        EXPECT_EQ(mm.funcArgCounting(*hF), MirArgCounting::PerClass) << "and h the pair's";
     }
+}
+
+// THE JOIN NAMES THE FACT THAT DISAGREES (ledger 637): a fact that must be equal across the units one module joins
+// is refused by ITS name and both values -- a second such fact (a data model) would otherwise be reported as the
+// first. The CONTROL: a unit that states none adds nothing, and two equal statements join.
+TEST(MirMerge, TwoUnitsStatingAMustAgreeFactDifferentlyAreRefusedByTheFactsName) {
+    MirModuleFacts flat;
+    flat.argCounting = MirArgCounting::Flat;
+    flat.dataModel   = DataModel::Lp64;   // every unit states its model (P69 fold 3f): the join reads only counting
+    MirModuleFacts perClass;
+    perClass.argCounting = MirArgCounting::PerClass;
+    perClass.dataModel   = DataModel::Lp64;
+    auto const refused = joinUnitFacts(flat, perClass);
+    ASSERT_FALSE(refused.has_value()) << "two countings joined";
+    EXPECT_STREQ(refused.error().fact, "argCounting");
+    EXPECT_EQ(refused.error().a, static_cast<std::uint32_t>(MirArgCounting::Flat));
+    EXPECT_EQ(refused.error().b, static_cast<std::uint32_t>(MirArgCounting::PerClass));
+    MirModuleFacts noCounting;
+    noCounting.dataModel = DataModel::Lp64;
+    auto const withNone = joinUnitFacts(noCounting, perClass);
+    ASSERT_TRUE(withNone.has_value()) << "a unit stating no counting refused";
+    EXPECT_EQ(withNone->argCounting, MirArgCounting::PerClass);
+    auto const same = joinUnitFacts(perClass, perClass);
+    ASSERT_TRUE(same.has_value());
+    EXPECT_EQ(same->argCounting, MirArgCounting::PerClass);
+}
+
+// THE NO-EXEMPTION FORM (ledger 637(3)): a fact every unit must STATE refuses an unstated unit by the fact's name,
+// exactly as a mismatch -- on either side, and both. Its CONTROL: two units stating one value join to it. (The
+// exempt form beside it, for contrast: an unstated unit adds nothing.)
+TEST(MirMerge, AFactEveryUnitMustStateRefusesAnUnstatedUnitByName) {
+    using C = MirArgCounting;
+    for (auto const& [a, b] : {std::pair{C::Unstated, C::Flat}, std::pair{C::Flat, C::Unstated},
+                               std::pair{C::Unstated, C::Unstated}, std::pair{C::Flat, C::PerClass}}) {
+        auto const r = joinMustAgreeFact("everyUnitStatesIt", a, b, C::Unstated, MirUnstatedFact::IsRefused);
+        ASSERT_FALSE(r.has_value()) << "joined " << static_cast<unsigned>(a) << " with " << static_cast<unsigned>(b);
+        EXPECT_STREQ(r.error().fact, "everyUnitStatesIt");
+        EXPECT_EQ(r.error().a, static_cast<std::uint32_t>(a));
+        EXPECT_EQ(r.error().b, static_cast<std::uint32_t>(b));
+    }
+    auto const agreed =
+        joinMustAgreeFact("everyUnitStatesIt", C::Flat, C::Flat, C::Unstated, MirUnstatedFact::IsRefused);
+    ASSERT_TRUE(agreed.has_value()) << "two units stating one value refused";
+    EXPECT_EQ(*agreed, C::Flat);
+    auto const exempt =
+        joinMustAgreeFact("addsNothing", C::Unstated, C::Flat, C::Unstated, MirUnstatedFact::AddsNothing);
+    ASSERT_TRUE(exempt.has_value());
+    EXPECT_EQ(*exempt, C::Flat);
+}
+
+// ★ P69 (lane `xa`, fold 3f -- review-xa3e F3, ledger 639): THE DATA MODEL IS A FACT EVERY UNIT MUST STATE AND
+// AGREE ON. Units lowered for two models were lowered for two pairs, and a unit stating none would take another's
+// in silence: each is refused by the fact's name, on either side, with both values; two units stating one model
+// join to it.
+TEST(MirMerge, TheDataModelIsAFactEveryUnitMustStateAndAgreeOn) {
+    auto const facts = [](DataModel m) {
+        MirModuleFacts f;
+        f.argCounting = MirArgCounting::PerClass;
+        f.dataModel   = m;
+        return f;
+    };
+    for (auto const& [a, b] : {std::pair{DataModel{}, DataModel::Lp64}, std::pair{DataModel::Lp64, DataModel{}},
+                               std::pair{DataModel{}, DataModel{}}, std::pair{DataModel::Lp64, DataModel::Llp64}}) {
+        auto const r = joinUnitFacts(facts(a), facts(b));
+        ASSERT_FALSE(r.has_value()) << "joined model " << static_cast<unsigned>(a) << " with "
+                                    << static_cast<unsigned>(b);
+        EXPECT_STREQ(r.error().fact, "dataModel");
+        EXPECT_EQ(r.error().a, static_cast<std::uint32_t>(a));
+        EXPECT_EQ(r.error().b, static_cast<std::uint32_t>(b));
+    }
+    for (DataModel const m : {DataModel::Lp64, DataModel::Llp64}) {
+        auto const joined = joinUnitFacts(facts(m), facts(m));
+        ASSERT_TRUE(joined.has_value()) << "two units stating one model refused";
+        EXPECT_EQ(joined->dataModel, m);
+    }
+}
+
+// ★ P69 (lane `cs`, fold f26d -- review-csf26c2 N9): THE MERGE'S FRESH IDS AT THE LAST VALUE. The merged module's
+// counting door (`SymbolAllocator`) takes from the core's cursor (core/types/symbol_id_cursor.hpp), seeded past unit
+// 0's highest id: a unit 0 whose highest id is the last value but one leaves no fresh id, and the merge aborts by
+// name. It seeded `maxCu0 + 1`, which at the last value wrapped onto 0, the invalid id, and minted live ids from
+// there. RED-ON-DISABLE: let `mint` count past the cursor (`next_++`), and the merge hands unit 1's function an id.
+TEST(MirMergeDeathTest, AMergeWhoseFreshIdsAreExhaustedAbortsByName) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    auto const mergeAtTheEdge = [] {
+        TypeInterner in0{CompilationUnitId{1}};
+        TypeId const i32_0 = in0.primitive(TypeKind::I32);
+        Mir mir0;
+        {
+            MirBuilder mb;
+            mb.stateDataModel(DataModel::Lp64);
+            mb.stateArgCounting(MirArgCounting::PerClass);
+            mb.addFunction(in0.fnSig({}, i32_0, CallConv::CcSysV),
+                           SymbolId{std::numeric_limits<std::uint32_t>::max() - 1u});
+            MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+            mb.beginBlock(e);
+            mb.addReturn(mb.addConst(i32Lit(0), i32_0));
+            mir0 = std::move(mb).finish();
+        }
+        TypeInterner in1{CompilationUnitId{2}};
+        TypeId const i32_1 = in1.primitive(TypeKind::I32);
+        Mir mir1;
+        {
+            MirBuilder mb;
+            mb.stateDataModel(DataModel::Lp64);
+            mb.stateArgCounting(MirArgCounting::PerClass);
+            mb.addFunction(in1.fnSig({}, i32_1, CallConv::CcSysV), SymbolId{50});
+            MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+            mb.beginBlock(e);
+            mb.addReturn(mb.addConst(i32Lit(7), i32_1));
+            mir1 = std::move(mb).finish();
+        }
+        std::vector<MergeCuInput> cus = {
+            MergeCuInput{&mir0, &in0, namerOf({{std::numeric_limits<std::uint32_t>::max() - 1u, "main"}}), {}},
+            MergeCuInput{&mir1, &in1, namerOf({{50, "h"}}), {}},
+        };
+        std::vector<std::string> const entries = {"main"};
+        DiagnosticReporter rep;
+        (void)mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, dss::test_support::ordinaryLinkFormat(),
+                          rep);
+    };
+    EXPECT_DEATH(mergeAtTheEdge(), "merged module's SymbolId space is exhausted");
 }

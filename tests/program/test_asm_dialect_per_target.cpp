@@ -35,6 +35,7 @@
 #include "program/program.hpp"
 #include "scoped_env.hpp"    // the ONE env override (this file used to carry a copy)
 #include "scratch_dir.hpp"
+#include "driver_diagnostics_listener.hpp"   // AskedDriverCodes
 
 #include <gtest/gtest.h>
 
@@ -416,6 +417,7 @@ TEST(AsmDialectPerTarget, DirectoryBuildWithANamedLanguageIgnoresForeignFiles) {
 // the single-claimant branch in `addFile`) and this test fails — the file
 // parses silently under whichever dialect was registered first.
 TEST(AsmDialectPerTarget, TwoRegisteredLanguagesClaimingOneExtensionFailLoud) {
+    dss::test_support::AskedDriverCodes const asked{dss::DiagnosticCode::D_UnknownFileExtension};   // the ambiguous extension IS the subject
     ScratchDir scratch{Location::InsideRepo, "asm-dialect"};
     scratch.useAsCwd();
     auto const src = writeFile(scratch.path(), "ambiguous.s", kUnmarkedAsm);

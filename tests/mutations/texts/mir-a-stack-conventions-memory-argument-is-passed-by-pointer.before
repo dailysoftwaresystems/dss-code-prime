@@ -1,0 +1,2 @@
+            if (config.aggregate.memoryArgument == AggregateMemoryArgument::Stack)
+                return placeOneOperand(cursor, ArgCarrier::StackBytes, kByValueStackArgExhaustNone);

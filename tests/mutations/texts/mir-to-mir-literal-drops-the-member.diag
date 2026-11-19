@@ -1,0 +1,1 @@
+static union { int i; float f; } u = { .f = 42.0f };

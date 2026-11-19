@@ -1,0 +1,7 @@
+    auto const opened = core::openHandle(p,
+                                         GENERIC_WRITE,
+                                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                         CREATE_NEW,   // the exclusive claim
+                                         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT);
+    if (!opened) return std::unexpected(opened.error());
+    HANDLE const h = static_cast<HANDLE>(*opened);

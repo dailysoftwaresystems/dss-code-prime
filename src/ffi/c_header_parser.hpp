@@ -103,8 +103,13 @@ struct DSS_EXPORT HeaderReadError {
 // entry with `EmptyImportLibrary` (silent-failure surface: a row
 // downstream with no library identity would be unlinkable).
 //
+// The header's unit is read as the build reads one: its OWN streams first —
+// the driver's D_*/F_* (an `#include` that resolved nowhere) and its trees'
+// L_*/P_* (a parse the parser recovered from included) — and a unit that
+// carries an Error in any of them is refused `HeaderParseFailed` before any
+// analysis runs on it.
 // Diagnostics from the c frontend pipe through `reporter`
-// (P_*/L_*/S_*/H_*) AND the FF2-layer F_* verdict; `--suppress` /
+// (D_*/F_*/L_*/P_*/S_*/H_*) AND the FF2-layer F_* verdict; `--suppress` /
 // `--warnings-as-errors` apply. Underlying causes that were
 // suppressed by user policy are inlined into the wrap message so
 // the FF2 verdict stays self-sufficient.

@@ -1,0 +1,1 @@
+            for (auto const& [fmt, src] : out.realization) {                    // (3)

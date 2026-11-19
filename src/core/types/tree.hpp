@@ -135,12 +135,27 @@ public:
 
     [[nodiscard]] std::string_view        text(NodeId id) const;
 
-    // ── discriminant-asserting accessors ──
-    // Debug-asserts on wrong kind; in release, returns the stored value
-    // (which is meaningless if the discriminant is wrong, but won't crash).
+    // ── discriminant-checked accessors ──
+    // `rule()` requires an Internal node and `tokenKind()` a Token node: they are
+    // for a caller that has ESTABLISHED the node's kind. Any other kind is a broken
+    // precondition and is FATAL IN EVERY BUILD. It used to be a debug-only
+    // `assert`: a release build returned the stored field, which is meaningless
+    // for that kind — a silent misread of the node's payload
+    // ([[D-C-ANALYZER-READS-AN-ERROR-NODE-AS-A-RULE-ON-A-RECOVERED-TREE]]).
     [[nodiscard]] RuleId        rule(NodeId id)      const;   // requires Internal
     [[nodiscard]] SchemaTokenId tokenKind(NodeId id) const;   // requires Token
     [[nodiscard]] std::optional<DiagnosticIndex> diagnostic(NodeId id) const;
+
+    // ── kind-checked queries — what a SCAN asks ──
+    // NodeKind has THREE arms. A scan over nodes whose kind it has not itself
+    // established — a node's children or descendants on a tree the parser
+    // RECOVERED, which the language server analyzes — meets parser recovery
+    // (`NodeKind::Error`) nodes beside the Internal and Token ones, and a test for
+    // one arm establishes neither of the other two. These answer for a node of ANY
+    // kind: the rule of an Internal node, the token kind of a Token node, and
+    // std::nullopt for every other kind.
+    [[nodiscard]] std::optional<RuleId>        ruleIfInternal(NodeId id) const;
+    [[nodiscard]] std::optional<SchemaTokenId> tokenKindIfToken(NodeId id) const;
 
     // ── cursors ──
     //

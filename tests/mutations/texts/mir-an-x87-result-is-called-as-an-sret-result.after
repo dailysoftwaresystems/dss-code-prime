@@ -1,0 +1,3 @@
+        if (abi.kind == AbiPassing::Kind::Memory || abi.kind == AbiPassing::Kind::X87) {
+            MirInstId const call =
+                mir.addInst(MirOpcode::Call, operands, InvalidType, callPayload,

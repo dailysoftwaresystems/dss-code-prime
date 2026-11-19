@@ -1,0 +1,4 @@
+    if (hasCalls && outgoingAreaAlign > 1u)
+        layout.outgoingArgAreaSize =
+            (layout.outgoingArgAreaSize + outgoingAreaAlign - 1u) / outgoingAreaAlign
+            * outgoingAreaAlign;

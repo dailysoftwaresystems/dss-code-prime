@@ -9,6 +9,7 @@
 | | |
 |---|---|
 | Status        | 🔒 **reserved.** No work begins until a real VHDL/Verilog target is requested. Plan exists to (a) prevent software HIR (plan 09) from designing in ways that foreclose hardware semantics and (b) reserve the namespace + name. |
+| Scheduled | per [`30`](./30-pr-scope-plan%20-%20tbd.md) (2026-10-22): opened by its trigger (a VHDL or Verilog target requested). |
 | Predecessors  | ✅ [`09-hir-plan`](./09-hir-plan%20-%20ok.md) (software HIR exists, proves the substrate — HR1 ✅ 2026-05-26 proves the open-core+extensions discipline this sibling-IR will mirror). ✅ [`08.5-substrate-prep-plan`](./08.5-substrate-prep-plan%20-%20ok.md) (lattice + arena substrate reused — complete). |
 | Successors    | Hardware-targeting language pairs in [`10-source-translation-plan`](./10-source-translation-plan%20-%20tbd.md). |
 | Scope         | **Unspecified — placeholder.** Will detail when triggered. |

@@ -1,0 +1,1 @@
+one parse reads each descriptor of its closure once (snapouter, snapinner)

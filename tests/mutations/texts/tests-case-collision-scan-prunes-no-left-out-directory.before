@@ -1,0 +1,1 @@
+                if (!inTree.empty() && !ignores.decide(names, true).empty()) return WalkStep::Prune;

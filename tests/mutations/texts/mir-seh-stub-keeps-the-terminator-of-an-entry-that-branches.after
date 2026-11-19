@@ -1,0 +1,1 @@
+        if (curFilterBB_.v == 0 || src_.instOpcode(src_.blockTerminator(curFilterBB_)) != MirOpcode::SehFilterReturn) return std::nullopt;  // not a filter's entry

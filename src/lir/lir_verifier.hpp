@@ -139,10 +139,30 @@ verifyLirVregClassesAgainstMir(Lir const&                 lir,
 // emits `L_VirtualRegInPostRegalloc` for virtual-reg violations and
 // `L_InvalidSpillSlotSentinel` for frame-op payload-0 violations.
 // Separate from `verifyLir` because pre-rewrite LIR legitimately
-// contains virtuals.
+// contains virtuals. It also states the carrier's stage rule (below) at
+// every checkpoint it runs at.
 [[nodiscard]] DSS_EXPORT bool
 verifyLirPostRegalloc(Lir const& lir, TargetSchema const& schema,
                       DiagnosticReporter& reporter);
+
+// ★ THE BY-VALUE STACKED-AGGREGATE CARRIER'S STAGE RULE — its ONE home (P69,
+// lane `cs`, fold f26c). MIR→LIR passes a wholly-stacked by-value aggregate
+// to a Call as the `(Reg, ByValueStackAgg)` carrier, because that tier has no
+// calling convention in scope. `lowerWideCallArgs` walks EVERY Call, copies
+// each such aggregate into the outgoing bytes it places it at, and takes the
+// carrier off the Call — so from its output on no instruction carries a
+// `ByValueStackAgg` operand, and liveness, the allocator, the rewrite, the
+// peephole and `lir_callconv` hold no arm for one. This rule is how that is
+// CHECKED rather than believed: `lowerWideCallArgs` runs it on the module it
+// produced, and `verifyLirPostRegalloc` runs it at each later checkpoint. An
+// instruction carrying the marker — with or without the address register
+// in front of it or a placement `MemOffset` after it — is refused with
+// `L_UnsupportedLoweringForOpcode`, naming the instruction, its opcode and
+// the operand. A PRE-pass module (MIR→LIR's output, a `.dsslir` read back)
+// carries the form legitimately and is not judged by this rule.
+[[nodiscard]] DSS_EXPORT bool
+verifyLirStackedAggregatesLowered(Lir const& lir, TargetSchema const& schema,
+                                  DiagnosticReporter& reporter);
 
 // Text-load verifier (ML8 cycle 2). Runs the subset of `verifyLir`
 // rules that don't require an MIR cross-reference — currently just

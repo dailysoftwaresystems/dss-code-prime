@@ -1,0 +1,1 @@
+            rec.declaresNoPrototype = false && declarationGivesNoPrototype(idxIt->second, tree, rec, in);

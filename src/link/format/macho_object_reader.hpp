@@ -7,6 +7,7 @@
 #include "core/types/target_schema.hpp"
 #include "link/object_format_schema.hpp"
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -57,8 +58,9 @@
 //     is the identity, not the section name alone.
 //   * (4) the reverse reloc map keys on the PACKED nativeId
 //     `r_info & 0xF7000000` (the r_type|r_length|r_pcrel bits, NOT
-//     r_extern / r_symbolnum). There is NO `pltNativeId` variant on
-//     Mach-O -- an extern call is BRANCH26/BRANCH against the same
+//     r_extern / r_symbolnum). There is NO PLT-variant wire id on
+//     Mach-O (and the `pltNativeId` key that once spelled one on ELF is
+//     retired since P69) -- an extern call is BRANCH26/BRANCH against the same
 //     nativeId whether or not ld64 synthesizes a stub -- so the "extern
 //     is a function" signal is the FORMAT row's DECLARED `isCall` role
 //     (D-LK-MACHO-ISDATA-NO-CALL-SIGNAL), never a PLT-variant id and
@@ -78,15 +80,22 @@
 //     ★ A FORMAT THAT DECLARES NO `isCall` ROW REFUSES rather than
 //     guesses -- see the extern bullet below.
 //   * SHN_UNDEF-equivalent N_UNDF symbols become `externImports`. Mach-O
-//     carries NO STT_FUNC-style type hint, so `isData` is seeded DATA and
-//     forced to false (function) ONLY when a relocation the FORMAT
-//     declares `"isCall": true` on targets the extern (agnostic -- a
-//     declared role read from the schema, no hardcoded reloc number and
-//     no arch test). This is the same reloc-based inference the ELF
-//     reader's STT_NOTYPE path uses. If the format declares no such row
-//     AT ALL, an extern reached by any relocation FAILS LOUD: DATA would
-//     be a silent guess, and a mis-typed import is a wrong answer rather
-//     than a diagnostic (D-LK-MACHO-ISDATA-NO-CALL-SIGNAL).
+//     carries NO STT_FUNC-style type hint, so the object states a kind only
+//     by a CALL: a relocation the FORMAT declares `"isCall": true` on makes
+//     the row a stated function (agnostic -- a declared role read from the
+//     schema, no hardcoded reloc number and no arch test). Every other row
+//     states nothing and is `ExternKindOrigin::Pending`, and its DEFINITION
+//     decides, as ld64 takes it -- the same rule the ELF reader applies to
+//     STT_NOTYPE (since P69, D-LK-MEMBER-UNTYPED-EXTERN-TAKEN-AS-DATA; every
+//     row was seeded DATA before). If the format declares no such row AT
+//     ALL, an extern reached by any relocation FAILS LOUD: a call could not
+//     be told from an address, and a misread import is a wrong answer
+//     rather than a diagnostic (D-LK-MACHO-ISDATA-NO-CALL-SIGNAL).
+//   * an EXTERNAL N_UNDF symbol with a non-zero `n_value` is a COMMON (a
+//     tentative definition under -fcommon) and becomes a COMMON row
+//     (`ExternImport::commonSize`, its alignment from `n_desc`'s
+//     GET_COMM_ALIGN), which the link allocates once per name (P69,
+//     D-LK-OBJECT-READERS-MISREAD-COMMON-SYMBOLS).
 //   * defined function / data symbols become `ModuleSymbol` rows (name +
 //     binding + visibility) for the merge's cross-CU name-matching.
 //   * TWO defined symbols at ONE section offset are ONE atom under SEVERAL
@@ -137,6 +146,20 @@
 //     by a multi-item round-trip test.
 
 namespace dss::macho {
+
+// ★ THE LOAD COMMANDS OF A RELOCATABLE OBJECT (P69 fold 3f). The reader READS these five -- and the LC_LINKER_OPTION its
+// document names (`macho.linkerOptions`); it steps over the ones its document states a reason for
+// (`macho.skippedLoadCommands`) and REFUSES every other by name. Until fold 3f it read LC_SEGMENT_64 and LC_SYMTAB alone
+// and stepped over every other command without a word. ✔MEASURED (P69 fold 3f, run 20261117-192243-260e95c2: Apple clang 21's relocatable
+// objects, arm64 and x86_64, and ld64's `-r` outputs): eight commands -- these five, LC_LINKER_OPTION,
+// LC_LINKER_OPTIMIZATION_HINT and LC_DATA_IN_CODE.
+inline constexpr std::uint32_t kLcSegment64        = 0x19u;   // LC_SEGMENT_64
+inline constexpr std::uint32_t kLcSymtab           = 0x02u;   // LC_SYMTAB
+inline constexpr std::uint32_t kLcDysymtab         = 0x0Bu;   // LC_DYSYMTAB
+inline constexpr std::uint32_t kLcBuildVersion     = 0x32u;   // LC_BUILD_VERSION
+inline constexpr std::uint32_t kLcVersionMinMacosx = 0x24u;   // LC_VERSION_MIN_MACOSX
+inline constexpr std::array<std::uint32_t, 5> kLoadCommandsTheReaderReads{
+    kLcSegment64, kLcSymtab, kLcDysymtab, kLcBuildVersion, kLcVersionMinMacosx};
 
 // Reconstruct an `AssembledModule` from a Mach-O 64-bit MH_OBJECT
 // relocatable object's raw bytes. Returns `nullopt` (and emits a

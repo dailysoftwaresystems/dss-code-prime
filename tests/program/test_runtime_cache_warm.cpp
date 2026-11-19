@@ -1,39 +1,48 @@
-// D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF — THE RUNTIME OBJECT CACHE'S
-// ctest FIXTURE. It asserts almost nothing and that is the point: its product
-// is a SIDE EFFECT on the machine, and it exists so that the suite's EXACT
-// pipeline-shape instruments measure one build instead of two.
+// D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF — EVERY SHIPPED RUNTIME ARCHIVE,
+// TAKEN THROUGH THE DRIVER'S CACHE ONCE. It asserts almost nothing: its product
+// is a SIDE EFFECT on the machine — a filled per-user runtime object cache — and
+// what it refuses is having attempted nothing.
 //
-// ═══ WHY A FIXTURE IS THE RIGHT ANSWER AND A RELAXED ASSERTION IS NOT ════════
+// ═══ WHAT IT WAS, AND WHY NO ENTRY DEPENDS ON IT ANY MORE ════════════════════
 //
-// Several tests read `PhaseTimers::read(<phase>).runs` and compare it for
-// EQUALITY — `program/test_driver_argument_supply` is the one that made this
-// necessary, with *"a 1-CU exec build must run Optimize TWICE"*. That instrument
-// is exact on purpose: delete the driver's program-stage `optimizeModule` call
-// and the count drops by exactly one, whatever either schedule contains.
+// It was a ctest FIXTURE. Some tests read `PhaseTimers::read(<phase>).runs` and
+// compare it for EQUALITY — `program/test_driver_argument_supply`, with *"a
+// 1-CU exec build must run Optimize TWICE"*, an instrument that is exact on
+// purpose: delete the driver's program-stage `optimizeModule` call and the count
+// drops by exactly one, whatever either schedule contains.
 //
-// `PhaseTimers` is PROCESS-GLOBAL. So the instrument's real precondition is
-// *no OTHER build ran in this process*, and it held for free until the shipped
-// runtime stopped being compiled inside the user's build. Now a cache MISS runs
-// a nested `Program` build to materialise the runtime archive, and that build
-// legitimately opens phase scopes of its own: ✔MEASURED, a cold-cache pe64
-// `--config=release` exec build reads `Optimize.runs` = 6 (the sole CU's two
-// plus two per runtime unit) and a warm one reads 2.
+// `PhaseTimers` is PROCESS-GLOBAL, and a build that MISSES the runtime object
+// cache runs a nested `Program` build per runtime unit, which opens phase scopes
+// of its own. So the count after one compile is the program's own only when
+// that compile found every runtime archive already made, and ctest was told to
+// run this entry before that binary.
 //
-// ⛔ THE TEMPTING FIX — `EXPECT_GE(runs, 2u)` — IS STRICTLY WORSE, and the
-// arithmetic says so rather than taste. On a cold cache the honest count is 6;
-// with the program-stage call DELETED it would be 5, and `GE(2)` passes both.
-// So relaxing the comparison does not make the instrument robust to the extra
-// build, it makes it BLIND to the defect it exists for exactly when the extra
-// build happens. The precondition is what broke, so the precondition is what is
-// repaired here.
+// ★★★ AN ORDER OF ctest ENTRIES IS NOT A STATE OF THE CACHE. ✔MEASURED
+// 2026-10-12: that binary started WITHOUT ctest, on a cache nothing had filled,
+// read 30 where 2. `dssharness check-mutations` starts a runner exactly so, in
+// a tree whose compiler has a build stamp — and so a cache root — that no other
+// build ever had; and a mutant of one of the compiler's own sources has a stamp
+// of its own, so it never finds a cache. The cases that need the cache in a
+// KNOWN state make that state themselves now: each owns a cache directory,
+// makes its build twice, takes the first count for the negative and compares
+// the second (`program/test_driver_argument_supply`,
+// `mir/test_thin_lto_artifact_identity`).
 //
-// ⓘ This is the ctest expression of the packaged-`dist/` story
-// `runtime_object_cache.hpp` describes: an INSTALLED compiler ships its runtime
-// archives read-only under `<configRoot>/runtime/platform/dist/` and never
-// misses at all. A source checkout has no packaged `dist/`, so the first build
-// on each machine materialises them — and this fixture is where that first
-// build happens, instead of inside whichever test ctest happened to schedule
-// first.
+// ⛔ THE OTHER TEMPTING FIX — `EXPECT_GE(runs, 2u)` — IS STRICTLY WORSE, and the
+// arithmetic says so rather than taste. On a cache that holds nothing the count
+// is 2 plus two per runtime unit; with the program-stage call DELETED it is one
+// less, and `GE(2)` passes both. Relaxing the comparison does not make the
+// instrument robust to the extra builds, it makes it BLIND to the defect it
+// exists for exactly when they happen.
+//
+// ⓘ What is left of this entry is the packaged-`dist/` story
+// `runtime_object_cache.hpp` describes, for a source checkout: an INSTALLED
+// compiler ships its runtime archives read-only under
+// `<configRoot>/runtime/platform/dist/` and never misses at all; a checkout has
+// none, so the first build of each (target, format, configuration) on a machine
+// materialises them. This entry makes all of those first builds in one place.
+// Nothing orders it before any other entry, and nothing may lean on its having
+// run.
 //
 // ═══ WHAT IT DOES, AND WHY NOTHING HERE IS A LITERAL ═════════════════════════
 //
@@ -52,17 +61,18 @@
 //   * the CONFIGS come from the closed `CompileConfig` vocabulary.
 //   * STATIC-ARCHIVE formats are skipped, because an archive OUTPUT does not
 //     link the runtime at all (see the `container` note at the runtime-archive
-//     call site in `program.cpp`) — warming a key nothing reads would be a
-//     fixture asserting its own busywork.
+//     call site in `program.cpp`) — warming a key nothing reads would be an
+//     entry asserting its own busywork.
 //
 // ⚠ IT DOES NOT REQUIRE EVERY COMPILE TO SUCCEED, and that restraint is
 // deliberate rather than lax: whether a given format can host a bare `main` is
 // `program/test_shipped_runtime_compiles`'s and the corpus examples' business,
-// not this fixture's — and the runtime archives are resolved and STORED before
+// not this entry's — and the runtime archives are resolved and STORED before
 // the link is even attempted, so a pair that cannot produce an image still
 // warms the cache it was run for. What it DOES refuse is vacuity: zero realizing
-// keys, zero pairs, or zero attempts would all make this fixture a no-op that
-// reports success, which is precisely the shape a fixture rots into.
+// keys, zero pairs, or zero attempts would all make this entry a no-op that
+// reports success, which is precisely the shape an entry kept for its side
+// effect rots into.
 
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/object_format_kind.hpp"
@@ -136,7 +146,7 @@ TEST(RuntimeObjectCacheWarm, MaterializeEveryRealizedRuntimeArchive) {
     // ⓘ The CLOSED vocabulary is the table, walked whole; the `unknown`
     // sentinel is excluded through the shared predicate rather than by name,
     // exactly as `program/test_shipped_runtime_compiles` does it — a new
-    // enumerator therefore joins this fixture by existing.
+    // enumerator therefore joins this entry by existing.
     std::vector<std::string> realizingKeys;
     for (auto const& row : kObjectFormatKindTable.rows) {
         if (!isSelectableObjectFormatKind(row.first)) continue;
@@ -146,7 +156,7 @@ TEST(RuntimeObjectCacheWarm, MaterializeEveryRealizedRuntimeArchive) {
     }
     ASSERT_FALSE(realizingKeys.empty())
         << "NO object-format kind realizes a shipped runtime source, so this "
-           "fixture would warm nothing while reporting success. Either the "
+           "entry would warm nothing while reporting success. Either the "
            "corpus declares no 'realization' at all — in which case the runtime "
            "object cache has no subject — or the discovery is broken.";
 
@@ -207,7 +217,7 @@ TEST(RuntimeObjectCacheWarm, MaterializeEveryRealizedRuntimeArchive) {
     }
 
     // ★★ VACUITY, REFUSED AT EVERY LEVEL IT COULD CREEP IN. "No failures" over
-    // zero pairs is the classic way a fixture stops doing anything while still
+    // zero pairs is the classic way such an entry stops doing anything while still
     // reporting green, and each of these three names a different level at which
     // that could happen.
     EXPECT_GT(pairs, 0u)
@@ -219,7 +229,6 @@ TEST(RuntimeObjectCacheWarm, MaterializeEveryRealizedRuntimeArchive) {
         << built << " of " << attempts
         << " warm-up compile(s) produced an artifact. NOT every pair has to — "
            "whether a format can host a bare `main` is another test's subject — "
-           "but if NONE can, this fixture ran nothing that could have populated "
-           "the cache and the exact phase-count instruments it protects are "
-           "measuring an unknown number of builds.";
+           "but if NONE can, this entry ran nothing that could have populated "
+           "the cache, and filling it is all this entry is for.";
 }

@@ -491,3 +491,113 @@ TEST(CrossCuResolve, ZeroFillAgainstFileBackedComparesAsImplicitZeros) {
                "the empty span as 'nothing to compare' would have folded them";
     }
 }
+
+// ── THE RANK AMONG THE WEAK DEFINITIONS OF ONE NAME ────────────────────────
+//
+// D-LK-WEAK-EXTERNAL-BODY-OUTRANKED-A-SELECT-ANY-DEFINITION-BY-LINK-ORDER.
+// The caller states a rank per weak definition (`CrossCuDef::weakRank`) and the
+// kernel compares numbers: a higher rank replaces a lower one whatever the keys
+// and whatever the order of arrival; one rank folds as weak definitions always
+// did; a strong definition wins over every rank; and a definition another weak
+// definition outranks is not one of the copies whose promise the fold checks.
+namespace {
+
+CrossCuDef rankedWeak(std::uint32_t cuId, std::uint32_t sym, std::string name, std::uint8_t rank) {
+    CrossCuDef d = def(cuId, sym, std::move(name), SymbolBinding::Weak);
+    d.weakRank   = rank;
+    return d;
+}
+
+// Every order of `defs` resolves `name` to `(cu, sym)`.
+void expectWinnerInEveryOrder(std::vector<CrossCuDef> defs, std::string const& name, std::uint32_t cu,
+                              std::uint32_t sym) {
+    std::vector<std::size_t> order(defs.size());
+    for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::size_t permutations = 0;
+    do {
+        std::vector<CrossCuDef> permuted;
+        for (std::size_t const i : order) permuted.push_back(defs[i]);
+        auto const r = resolveCrossCuDefs(std::span<CrossCuDef const>{permuted});
+        ASSERT_EQ(r.winners.count(name), 1u);
+        EXPECT_EQ(r.winners.at(name).cuId.v, cu) << "permutation #" << permutations;
+        EXPECT_EQ(r.winners.at(name).symbol.v, sym) << "permutation #" << permutations;
+        EXPECT_TRUE(r.conflicts.empty()) << "permutation #" << permutations;
+        ++permutations;
+    } while (std::next_permutation(order.begin(), order.end()));
+}
+
+} // namespace
+
+TEST(CrossCuResolve, AWeakDefinitionOfAHigherRankReplacesALowerOneInEveryOrder) {
+    using dss::linker::kUnrankedWeakDefinition;
+    using dss::linker::kYieldingWeakDefinition;
+    ASSERT_LT(kYieldingWeakDefinition, kUnrankedWeakDefinition);
+    // The yielding definition holds the LOWEST key: folded as equals it would win.
+    expectWinnerInEveryOrder({rankedWeak(1, 1, "v", kYieldingWeakDefinition),
+                              rankedWeak(2, 2, "v", kUnrankedWeakDefinition)},
+                             "v", 2, 2);
+    // Two yielding definitions around the one that outranks them: three definitions, six orders.
+    expectWinnerInEveryOrder({rankedWeak(1, 1, "v", kYieldingWeakDefinition),
+                              rankedWeak(2, 2, "v", kUnrankedWeakDefinition),
+                              rankedWeak(3, 3, "v", kYieldingWeakDefinition)},
+                             "v", 2, 2);
+}
+
+TEST(CrossCuResolve, WeakDefinitionsOfOneRankFoldAsTheyAlwaysDid) {
+    using dss::linker::kUnrankedWeakDefinition;
+    using dss::linker::kYieldingWeakDefinition;
+    for (std::uint8_t const rank : {kYieldingWeakDefinition, kUnrankedWeakDefinition}) {
+        SCOPED_TRACE("rank " + std::to_string(rank));
+        expectWinnerInEveryOrder({rankedWeak(2, 2, "v", rank), rankedWeak(1, 7, "v", rank), rankedWeak(3, 1, "v", rank)},
+                                 "v", 1, 7);
+    }
+    // A definition that states no rank is the unranked one: every producer that says nothing folds as before.
+    EXPECT_EQ(def(1, 1, "v", SymbolBinding::Weak).weakRank, kUnrankedWeakDefinition);
+}
+
+TEST(CrossCuResolve, AStrongDefinitionWinsOverEveryRank) {
+    using dss::linker::kUnrankedWeakDefinition;
+    using dss::linker::kYieldingWeakDefinition;
+    expectWinnerInEveryOrder({rankedWeak(1, 1, "v", kUnrankedWeakDefinition),
+                              rankedWeak(2, 2, "v", kYieldingWeakDefinition),
+                              def(3, 3, "v", SymbolBinding::Global)},
+                             "v", 3, 3);
+}
+
+// An outranked definition is not one of the copies the fold compares: its duplicate-match promise is not asked of
+// it, and it is not asked in ONE order of the link and not another. Two yielding definitions that promise
+// byte-identical copies and are NOT identical, beside the definition that outranks both: no broken promise is
+// recorded in any order — and without the outranking definition the same two break their promise in every order.
+TEST(CrossCuResolve, AnOutrankedDefinitionsPromiseIsNotAsked) {
+    using dss::linker::kUnrankedWeakDefinition;
+    using dss::linker::kYieldingWeakDefinition;
+    auto const a = bodyOf("AAAA");
+    auto const b = bodyOf("BBBB");
+    auto const c = bodyOf("CCCC");
+    auto const yielding = [&](std::uint32_t cu, std::span<std::uint8_t const> body) {
+        CrossCuDef d = weakDef(cu, cu, "v", dss::DuplicateMatch::ExactContent, body);
+        d.weakRank   = kYieldingWeakDefinition;
+        return d;
+    };
+    CrossCuDef top = weakDef(3, 3, "v", dss::DuplicateMatch::Any, c);
+    top.weakRank   = kUnrankedWeakDefinition;
+    std::vector<CrossCuDef> const three{yielding(1, a), yielding(2, b), top};
+    std::vector<std::size_t>      order{0, 1, 2};
+    do {
+        std::vector<CrossCuDef> permuted;
+        for (std::size_t const i : order) permuted.push_back(three[i]);
+        auto const r = resolveCrossCuDefs(std::span<CrossCuDef const>{permuted});
+        EXPECT_TRUE(r.duplicateMismatches.empty())
+            << "an outranked definition's promise was checked (order " << order[0] << order[1] << order[2] << ")";
+        ASSERT_EQ(r.winners.count("v"), 1u);
+        EXPECT_EQ(r.winners.at("v").cuId.v, 3u);
+    } while (std::next_permutation(order.begin(), order.end()));
+
+    // CONTROL: the two alone are the copies the fold compares, and their promise is broken.
+    for (bool const swapped : {false, true}) {
+        std::vector<CrossCuDef> two{yielding(1, a), yielding(2, b)};
+        if (swapped) std::swap(two[0], two[1]);
+        auto const r = resolveCrossCuDefs(std::span<CrossCuDef const>{two});
+        EXPECT_EQ(r.duplicateMismatches.size(), 1u) << "CONTROL: two definitions of one rank are compared";
+    }
+}

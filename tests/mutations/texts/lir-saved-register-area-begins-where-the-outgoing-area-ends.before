@@ -1,0 +1,3 @@
+        if (savedRegAreaAlign <= 1u) return outgoingArgAreaSize;   // nothing saved
+        return (outgoingArgAreaSize + savedRegAreaAlign - 1u)
+             / savedRegAreaAlign * savedRegAreaAlign;

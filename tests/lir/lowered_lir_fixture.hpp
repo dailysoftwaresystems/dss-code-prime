@@ -18,8 +18,10 @@
 #include "hir/lowering/cst_to_hir.hpp"
 #include "lir/lir.hpp"
 #include "lir/lowering/mir_to_lir.hpp"
+#include "link/object_format_schema.hpp"
 #include "mir/lowering/hir_to_mir.hpp"
 #include "mir/mir.hpp"
+#include "program/model_to_hir.hpp"   // lowerModelToHir — the pipeline's gates
 
 #include <gtest/gtest.h>
 
@@ -28,7 +30,9 @@
 #include <cstdlib>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace dss::test_support {
@@ -144,7 +148,10 @@ lirFuncInstCount(Lir const& lir, LirFuncId f) {
 // survived it.
 inline void enforceLoweringExpectation(LoweredLir const& out,
                                        LoweringExpectation expect) {
-    bool const refused = out.hirReporter.hasErrors() || !out.hir->ok ||
+    // P69 L2b2: the fixture keeps the pipeline's gates (`lowerModelToHir`), so a model with an
+    // error has NO HIR (and no MIR or LIR) — that unit is refused at the analysis.
+    bool const refused = out.model.hasErrors() || out.hir == nullptr ||
+                         out.hirReporter.hasErrors() || !out.hir->ok ||
                          out.mirReporter.hasErrors() || !out.mir.ok ||
                          out.lirReporter.hasErrors() || !out.lir.ok;
 
@@ -163,12 +170,14 @@ inline void enforceLoweringExpectation(LoweredLir const& out,
         ADD_FAILURE()
             << "lowerCToLir: A TIER REFUSED THIS SOURCE AND THE PIN IS "
                "ASSERTING OVER WHAT SURVIVED THE REFUSAL.\n"
-               "  hir.ok=" << out.hir->ok
+               "  model errors=" << out.model.diagnostics().errorCount()
+            << " | hir.ok=" << (out.hir != nullptr && out.hir->ok)
             << " errors=" << out.hirReporter.errorCount()
             << " | mir.ok=" << out.mir.ok
             << " errors=" << out.mirReporter.errorCount()
             << " | lir.ok=" << out.lir.ok
             << " errors=" << out.lirReporter.errorCount()
+            << renderTierErrors("model", out.model.diagnostics())
             << renderTierErrors("hir", out.hirReporter)
             << renderTierErrors("mir", out.mirReporter)
             << renderTierErrors("lir", out.lirReporter)
@@ -219,10 +228,17 @@ inline void enforceLoweringExpectation(LoweredLir const& out,
 // substrate) hands the pre-built schema in directly; the c →
 // HIR → MIR half of the pipeline is target-independent, so only the
 // MIR→LIR step consumes it.
+//
+// `longDoubleFormat`: the pair's `long double` axis, threaded into `analyze` as
+// `compile_pipeline.cpp` threads the active format's. The default (None) states
+// no axis, which is what every caller passed before P69 round 4; a source that
+// names `long double` states the axis it lowers on (x87-80 for an x86_64 ELF or
+// Mach-O pair).
 [[nodiscard]] inline LoweredLir
 lowerCToLir(std::string src, std::shared_ptr<TargetSchema> target,
                   std::uint16_t mirCcIndex = 0,
-                  LoweringExpectation expect = LoweringExpectation::Lowers) {
+                  LoweringExpectation expect = LoweringExpectation::Lowers,
+                  LongDoubleFormat longDoubleFormat = LongDoubleFormat::None) {
     auto loaded = GrammarSchema::loadShipped("c");
     if (!loaded) { ADD_FAILURE() << "loadShipped(c) failed"; std::abort(); }
     UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
@@ -256,10 +272,36 @@ lowerCToLir(std::string src, std::shared_ptr<TargetSchema> target,
     // `analyze` takes it NON-OWNING.
     auto model = analyze(cu, DiagnosticBudget::libraryDefault(),
                          DataModel::Lp64, std::nullopt, vaStrategy, std::nullopt,
-                         std::nullopt, LongDoubleFormat::None, target.get());
+                         std::nullopt, longDoubleFormat, target.get());
+    // The target's ELF document: the format the unit is built for.
+    std::string_view const arch = target->name();
+    char const* const formatName = arch == "x86_64" ? "elf64-x86_64-linux-exec"
+                                   : arch == "arm64" ? "elf64-aarch64-linux-exec"
+                                                     : nullptr;
+    // A miss THROWS (`no_abort_in_tests_guard`): GoogleTest reports it as a failure of the one test.
+    if (formatName == nullptr) {
+        throw std::runtime_error("lowerCToLir: no ELF document for target '" + std::string{arch} + "'");
+    }
+    auto const format = ObjectFormatSchema::loadShipped(formatName);
+    if (!format) {
+        throw std::runtime_error(std::string{"lowerCToLir: ObjectFormatSchema::loadShipped("} + formatName
+                                 + ") failed");
+    }
     DiagnosticReporter hirReporter;
-    auto hir = lowerToHir(model, hirReporter);
+    ModelLoweredToHir lowered = lowerModelToHir(model, **format, hirReporter);   // the pipeline's gates
+    auto hir = std::move(lowered.hir);
     DiagnosticReporter mirReporter;
+    if (!lowered.lowersToMir) {   // the build stops here, and so does the fixture: MIR and LIR never entered
+        HirToMirResult mir;
+        mir.ok = false;
+        MirToLirResult lir;
+        lir.ok = false;
+        LoweredLir out{std::move(model), std::move(hir), std::move(hirReporter),
+                       std::move(mir), std::move(mirReporter), std::move(target),
+                       DiagnosticReporter{}, std::move(lir)};
+        fixture_detail::enforceLoweringExpectation(out, expect);
+        return out;
+    }
     // The LANGUAGE's policy, through the ONE assembly `compile_pipeline.cpp` uses
     // (`languageMirLoweringConfig`) — the static-initializer constraint and its constant forms
     // among it. ⚠ P68 round 13 (fold F7): this fixture assembled the config by hand and read
@@ -267,6 +309,9 @@ lowerCToLir(std::string src, std::shared_ptr<TargetSchema> target,
     // const object's value folding — a lowering the product never does, and the FOURTH miss of
     // the class the note below records three times (TF-C78 / TF-C81 / TF-C92).
     MirLoweringConfig mirCfg = languageMirLoweringConfig(**loaded);
+    mirCfg.dataModel = (*format)->dataModel();   // the format's, as the driver states it (P69 fold 3f)
+    mirCfg.symbolIdSpace = MirSymbolIdSpace::endingAt(   // the unit's name table, as the driver states it
+        static_cast<std::uint32_t>(model.symbols().size()));
     // Thread the SELECTED CC's by-value aggregate + va_list params into MIR
     // lowering, mirroring compile_pipeline.cpp — so a struct-by-value OR a
     // variadic-callee (va_start/va_arg) source lowers through THIS fixture too
@@ -275,25 +320,12 @@ lowerCToLir(std::string src, std::shared_ptr<TargetSchema> target,
     if (auto const* cc = target->callingConvention(mirCcIndex)) {
         mirCfg.aggregateLayout           = target->aggregateLayout();
         mirCfg.aggregateLayoutLoaded     = target->aggregateLayoutLoaded();
-        mirCfg.aggregateClassification   = cc->aggregateClassification;
-        mirCfg.aggregateMaxRegBytes      = cc->aggregateMaxRegBytes;
-        mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
-        mirCfg.argSlotAligned            = cc->slotAligned;
-        mirCfg.argGprCount               =
-            static_cast<std::uint32_t>(cc->argGprs.size());
-        mirCfg.argFprCount               =
-            static_cast<std::uint32_t>(cc->argFprs.size());
-        mirCfg.aggregateStackExhaustsRegisters =
-            cc->aggregateStackExhaustsRegisters;
-        // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: the stacked-arg
-        // packing rules decide `va_start`'s overflow base for a callee whose named
-        // params overflow the arg registers. ⚠ THREADED HERE AS PART OF ADDING THE
-        // FIELD, not as a follow-up — the docblock below records this fixture
-        // silently reading a default THREE times (TF-C78 / TF-C81 / TF-C92) and
-        // every test concluding the feature was absent. A default here would make
-        // the Apple `va_start` pin PASS against slot packing.
-        mirCfg.stackArgPacking           = cc->stackArgPacking;
-        mirCfg.vaListLayout              = cc->vaListLayout;
+        // The convention's facts, through the ONE assembly `compile_pipeline.cpp` calls
+        // (`takeCallingConvention`). ⚠ P69 fold f26c2: this fixture listed the fields by
+        // hand and missed the two that fold added (the even register pair, Apple's stacked
+        // variadic arguments) — the miss the docblock below records three times one map
+        // over (TF-C78 / TF-C81 / TF-C92), closed for the convention at its one home.
+        takeCallingConvention(mirCfg, *target, *cc);
     }
     // D-CSUBSET-VLA (C1b): thread the captured VLA size-expr map so a `int a[n]`
     // source lowers its runtime-operand Alloca through THIS fixture too (else the
@@ -376,9 +408,18 @@ lowerCToLir(std::string src, std::shared_ptr<TargetSchema> target,
                                     // records hitting three times.
                                     &hir->enclosingFunctionMap);
     DiagnosticReporter lirReporter;
+    // The LIR lowering reads the SAME convention the MIR config took (`mirCcIndex`), as
+    // `compile_pipeline.cpp` passes it — the format facts between stay their defaults.
     MirToLirResult lir = lowerToLir(mir.mir, *target,
                                     model.lattice().interner(),
-                                    lirReporter);
+                                    lirReporter, mirCcIndex,
+                                    /*externImports=*/{}, /*externCallDispatch=*/std::nullopt,
+                                    /*dataImportBinding=*/std::nullopt, /*tlsAccess=*/std::nullopt,
+                                    /*sehScopes=*/{}, /*wideFloatSoftcallLibrary=*/std::nullopt,
+                                    /*externAddrBinding=*/std::nullopt, /*charIsUnsigned=*/std::nullopt,
+                                    /*atomicsRuntime=*/std::nullopt, /*indirectSlotBindings=*/{},
+                                    /*preemptibleDefinitionBindings=*/{}, /*definedSymbolNames=*/{},
+                                    /*assemblyFormatKind=*/std::nullopt, /*imageDefinedNames=*/{});
     LoweredLir out{std::move(model), std::move(hir), std::move(hirReporter),
                    std::move(mir), std::move(mirReporter), std::move(target),
                    std::move(lirReporter), std::move(lir)};

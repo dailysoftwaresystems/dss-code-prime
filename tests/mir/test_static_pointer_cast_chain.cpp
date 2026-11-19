@@ -152,7 +152,6 @@ constexpr std::size_t kRealPairFloor = 22;
 // headers, and the pair's own consequences (its `NULL` among them).
 [[nodiscard]] CompilationUnit unitFor(RealPair const& p, std::string_view source) {
     UnitBuilder builder{cLanguage(), DiagnosticBudget::libraryDefault()};
-    applySystemDirs(builder, *cLanguage());
     applyTargetFormatPair(builder, *p.target, *p.format);
     builder.addInMemory(std::string{source}, "cast_chain.c");
     return std::move(builder).finish();

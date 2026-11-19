@@ -6,9 +6,10 @@ The sweep **never invents** a value; it reads it from the authority and reconcil
 
 | Fact | Authority |
 |---|---|
-| Current ctest count | a fresh `ctest --test-dir build --output-on-failure` |
+| Current ctest count | a fresh `dssharness test --legs windows-x86_64-debug --json` (its record names the count) |
 | Push / commit state | `git log`, `git rev-list … origin/<branch>` |
-| Anchor exists / is cited in src | `.harness-config/runner/actions/check-anchor-registry/check-anchor-registry.{ps1,sh}` + grep `src/` |
+| Anchor exists / is cited in src | `dssharness read-anchor <ID>` (the row); `dssharness check-anchor-citations --current-tree` and `dssharness run check-anchor-registry` (every cited id resolves) + grep `src/` |
+| Anchor open / closed counts | `dssharness check-anchor-balance` (the balance) and `dssharness read-anchors` (the rows) — never a grep over status glyphs |
 | Anchor is *closed* | code present + test green + full anchor scope covered; else a flag |
 | What an implementation actually does | `src/` + the cycle that landed it (git) |
 | Plan-file lifecycle (`- ok`/`- tbd`) | the plan's own §0 status + git (flag the rename) |
@@ -34,8 +35,8 @@ it is always a flag rather than an auto-fix.
 
 | Need | Command / path |
 |---|---|
-| Real suite count | `ctest --test-dir build --output-on-failure` |
-| Anchor guard (src↔registry) | `python .harness-config/runner/actions/check-anchor-registry/check-anchor-registry.py` (ctest `anchor_registry_guard`) |
+| Real suite count | `dssharness test --legs windows-x86_64-debug --json` |
+| Anchor guard (src↔registry) | `dssharness run check-anchor-registry` (ctest `anchor_registry_guard`) |
 | Push state | `git rev-list --left-right --count origin/<branch>...HEAD` |
 | All plans | `.plans/` (numbered `00`–`22`, `08.x`, registry, `v2-gap-catalog`, `ZZ-final-goal`) |
 | Anchor registry — WORKING (open rows only) | `.plans/_deferred-anchor-registry-production.md` — the only one since the harness registry retired on 2026-09-16 |

@@ -1,0 +1,2 @@
+                    return s.target->callingConventionIsOrDerivesFrom(active, id);
+                }) && false) {

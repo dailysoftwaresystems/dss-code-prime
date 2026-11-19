@@ -1,0 +1,3 @@
+        scanAttributeSemantics(s, cfg, tree, root, /*emitUnknown=*/false, facts, scope);
+    }
+    (void)snap;

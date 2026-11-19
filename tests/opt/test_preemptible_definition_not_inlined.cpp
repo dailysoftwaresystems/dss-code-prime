@@ -29,6 +29,7 @@
 #include "mir/mir_opcode.hpp"
 #include "opt/optimizer.hpp"
 #include "opt/passes/inlining.hpp"
+#include "link_facts.hpp"   // linkageOf (P69: a weak MIR definition states its kind)
 
 #include <gtest/gtest.h>
 
@@ -53,7 +54,8 @@ constexpr std::uint32_t kCallerSym = 100u;
     TypeId const fnSig = interner.fnSig(std::span<TypeId const>{}, i32,
                                         CallConv::CcSysV);
     MirBuilder mb;
-    mb.addFunction(fnSig, SymbolId{kCalleeSym}, binding, visibility);
+    mb.addFunction(fnSig, SymbolId{kCalleeSym},
+                   dss::test_support::linkageOf(binding, visibility));
     {
         MirBlockId const bb = mb.createBlock(StructCfMarker::EntryBlock);
         mb.beginBlock(bb);

@@ -1,0 +1,1 @@
+        bool const stated = own != byCName->end() && own->second.statedRoute.has_value();

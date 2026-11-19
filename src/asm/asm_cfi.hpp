@@ -151,13 +151,14 @@ resolveFuncCfi(AssembledFunction const&     fn,
             // dangling remember_state is harmless (nothing pops it).
             if (end >= out.codeLength) continue;
             out.ops.push_back(CfiOp{end, op.kind, op.reg, op.srcReg,
-                                    op.offset});
+                                    op.offset, op.savedBytes});
             continue;
         }
         if (!op.inst.valid()) {
             // Anchor 3 -- function entry. See the header docblock: this is a
             // state a producer STATES, never one inferred from a miss.
-            out.ops.push_back(CfiOp{0, op.kind, op.reg, op.srcReg, op.offset});
+            out.ops.push_back(CfiOp{0, op.kind, op.reg, op.srcReg, op.offset,
+                                    op.savedBytes});
             if (prologueOpCount.has_value() && oi + 1 == *prologueOpCount) {
                 prologueEnd = 0u;
             }
@@ -175,8 +176,10 @@ resolveFuncCfi(AssembledFunction const&     fn,
                 "produced no bytes -- the unwind description and the emitted "
                 "code disagree", cfiOpKindName(op.kind), op.inst.v));
         }
+        // Every field the producer stated goes over, the stored width with the
+        // rest: a width dropped here reaches the writer as "none stated".
         out.ops.push_back(CfiOp{it->second, op.kind, op.reg, op.srcReg,
-                                op.offset});
+                                op.offset, op.savedBytes});
         if (prologueOpCount.has_value() && oi + 1 == *prologueOpCount) {
             prologueEnd = it->second;
         }

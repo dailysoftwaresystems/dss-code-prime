@@ -1,0 +1,1 @@
+            return scalarInitializerValue(tree, schema, value);

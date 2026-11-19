@@ -195,10 +195,12 @@ TEST(DiagnosticBudgetThreading, PreprocessResultDiagnosticsCarriesTheBudget) {
 
 // ── SITES 7+8: `provisionalTokDiags` and `tokenizeToPP`'s Tokenizer ────────
 // These two are serially composed — the tokenizer drains into
-// `provisionalTokDiags`, which forwards into `result.diagnostics` — so no
-// observation can tell which of them capped. This pin proves the CHAIN honours
-// the budget; `SourceEnumeration` below names each of the two sites
-// individually.
+// `provisionalTokDiags`, which forwards into `result.diagnostics` through a
+// FILTER. Since D9(c) the two are a STAGING pair (`Config::unbounded()`, the
+// tokenizer inheriting its reporter's volume) and the budget applies once, at
+// `result.diagnostics`, after the filter: a gate ahead of the filter dropped
+// the candidates it had to judge. This pin proves the CHAIN still honours the
+// budget; `SourceEnumeration` below allowlists the staging reporter by name.
 TEST(DiagnosticBudgetThreading, PreprocessTokenizeChainHonoursTheRaisedPerCodeCap) {
     auto schema = shipped("c");
     auto src    = SourceBuffer::fromString(illegalCharSource(kIllegalCharLines),
@@ -263,7 +265,8 @@ TEST(DiagnosticBudgetThreading, BudgetDoesNotCarryPolicyIntoATier) {
 // one of the four that were missed was missed by reading rather than by
 // enumerating.
 //
-// The rule is INVERTED on purpose, exactly like `check-anchor-balance.py`:
+// The rule is INVERTED on purpose, exactly like `dssharness check-anchor-balance`,
+// which reads a row as open unless its Status cell starts with the closed mark:
 // a construction is a VIOLATION unless it is visibly budget-derived, so a
 // shape nobody has thought of yet counts as a violation, which is the safe
 // direction. Deliberately-unbudgeted throwaways are allowlisted BY THEIR EXACT
@@ -322,7 +325,7 @@ TEST(DiagnosticBudgetThreadingSourceEnumeration,
         {"src/core/types/tree_builder.cpp", {}},
         {"src/analysis/preprocess/preprocessor.cpp",
          {
-             {"DiagnosticReporter scratch;", 4,
+             {"DiagnosticReporter scratch;", 3,
               "pre-scan / re-reported throwaways: their contents are either "
               "discarded or re-reported into a budgeted reporter, so they are "
               "never an operator-visible budget. RAISED 5 -> 6 (cycle P36) for "
@@ -349,7 +352,22 @@ TEST(DiagnosticBudgetThreadingSourceEnumeration,
               "evaluator's, and if this number ever falls again without a "
               "deletion in `preprocessor.cpp` to point at, a reporter was "
               "silently re-pointed at a budgeted one and the question is "
-              "whether its contents can now reach the operator"},
+              "whether its contents can now reach the operator. LOWERED 4 -> 3 "
+              "(P69 fold f26e, D9(c)): the paste product's scratch became a "
+              "STAGING reporter -- its own entry below -- because the relay out "
+              "of it filters, and a filter can judge only what a gate kept"},
+             {"DiagnosticReporter scratch{DiagnosticReporter::Config::unbounded()};", 1,
+              "STAGING (D9(c)): the paste product's tokenize, relayed into the "
+              "budgeted `rep_` by `relaySelectedFrom`, which admits P_MalformedNumber "
+              "only and refuses a source with any volume gate -- the operator's "
+              "budget applies at `rep_`, after the filter"},
+             {"DiagnosticReporter provisionalTokDiags{DiagnosticReporter::Config::unbounded()};", 1,
+              "STAGING (D9(c)): the main tokenize's provisional stream, relayed into "
+              "the budgeted `result.diagnostics` by `relaySelectedFrom`, which "
+              "drops a conversion diagnostic of a token nobody converts. Budgeted "
+              "here, the gate dropped the candidates the filter had to judge -- a "
+              "converted token's diagnostic behind 50 unconverted ones of its code "
+              "was never reported. The budget applies after the filter"},
              {"DiagnosticReporter macroRep;   // throwaway - malformed surfaced downstream",
               1, "throwaway; the malformed macro is surfaced downstream"},
          }},

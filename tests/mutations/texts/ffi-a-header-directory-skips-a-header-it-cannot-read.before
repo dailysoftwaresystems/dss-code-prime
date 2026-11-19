@@ -1,0 +1,2 @@
+            if (entry.reachError) {
+                unreadable = "'" + entry.at.spelling().generic() + "' is named as a header but what it "

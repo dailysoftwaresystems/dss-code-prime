@@ -1,0 +1,3 @@
+    if (false) {
+        emit(reporter, DiagnosticCode::D_DirectoryScanFailed,
+             "InputResolver: what '"

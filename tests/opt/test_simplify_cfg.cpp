@@ -119,6 +119,7 @@ TEST(SimplifyCfg, CondBrNonConstantPreserved) {
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const tArm  = mb.createBlock(StructCfMarker::IfThen);
@@ -180,6 +181,7 @@ TEST(SimplifyCfg, TrampolineToSuccessorWithPhiNotThreaded) {
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const tArm  = mb.createBlock(StructCfMarker::IfThen);
@@ -346,6 +348,7 @@ TEST(SimplifyCfg, BlockMergeDecidedPerFunctionInMultiFunctionModule) {
     TypeId const params[] = {boolT};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
 
     // fn0 — mergeable (entry, mid): mid single-pred with real content.
     mb.addFunction(fnSig, SymbolId{100});
@@ -475,6 +478,7 @@ TEST(SimplifyCfg, MergeSurvivorTakesDerivedMarker) {
     TypeId const params[] = {boolT};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     // entry → CondBr(cond, tArm, mid).  mid(Linear) → exit(LoopExit).
     // (mid, exit) is the merge candidate we're testing. The entry
@@ -584,6 +588,7 @@ TEST(SimplifyCfg, TargetWithMultiplePredsNotMerged) {
     TypeId const params[] = {boolT};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const tArm  = mb.createBlock(StructCfMarker::Linear);
@@ -672,6 +677,7 @@ TEST(SimplifyCfg, PhiIncomingRedirectedAcrossMerge) {
     TypeId const params[] = {boolT};
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     // entry → tHead(Linear) → tMerged(Linear) → join(Linear);
     //  entry → fArm(Linear) → join.
@@ -954,6 +960,7 @@ TEST(SimplifyCfg, StructCfMarkersUnchangedWhenNoTransformsFire) {
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     // Build a CFG with diverse markers + no eligible transforms.
     MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
@@ -1105,6 +1112,7 @@ TEST(SimplifyCfg, TrampolineElisionOutputSatisfiesDerivedMarkers) {
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const tArm  = mb.createBlock(StructCfMarker::IfThen);
@@ -1489,6 +1497,7 @@ TEST(SimplifyCfg, TrampolineCycleAnchorIsRpoEarliestMemberAndAbsorbsExternalEntr
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const p     = mb.createBlock(StructCfMarker::IfThen);
@@ -1591,6 +1600,7 @@ TEST(SimplifyCfg, TwoDisjointTrampolineCyclesEachKeepExactlyOneAnchor) {
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const x     = mb.createBlock(StructCfMarker::LoopHeader);

@@ -1,0 +1,2 @@
+    if (reporter.reportsReceived() == saidBefore)
+        entry->surfaceByFormat.push_back({fmt, archKey, out});

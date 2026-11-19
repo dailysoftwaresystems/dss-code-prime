@@ -6,6 +6,8 @@
 #include "lir/lir.hpp"
 
 #include <cstddef>
+#include <cstdint>
+#include <vector>
 
 // 2-address legalize pass — plan 13 AS3.
 //
@@ -51,6 +53,13 @@ struct DSS_EXPORT LirTwoAddrLegalizeResult {
     // legalize invariant (`result == operands[tied]` for every
     // two-address opcode) is NOT guaranteed to hold.
     bool        allFunctionsLegalized = false;
+    // D-LIR-DESCRIPTOR-BLOCK-IDS-SHIFTED-BY-A-BLOCK-INSERTING-PASS: every rebuild publishes its block entry
+    // image, and this pass rebuilds block for block, so what it publishes is the identity IT PERFORMED —
+    // written down where each source block is begun, from the map the rebuild goes through. Indexed by the
+    // SOURCE module's block arena (`LirBlockId.v`; slot 0 holds 0): the `.v` of the block of `lir` where
+    // that block's instructions begin. `lir/lir_descriptor_blocks.hpp` follows the blocks data names
+    // through it, and refuses a rebuild that publishes none.
+    std::vector<std::uint32_t> blockEntryImage;
 
     // Mirrors `LirCallconvResult::ok()` discipline: shape-consistency is
     // the success channel. The pass must have rebuilt exactly as many

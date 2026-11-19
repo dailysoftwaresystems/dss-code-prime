@@ -1,0 +1,1 @@
+            if (well) data.inputSectionNames = std::move(names);

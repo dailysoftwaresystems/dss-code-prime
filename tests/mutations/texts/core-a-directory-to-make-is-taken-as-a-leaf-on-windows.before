@@ -1,0 +1,1 @@
+    std::wstring const      spelled = HostPathAccess::reference(p, Use::Container);

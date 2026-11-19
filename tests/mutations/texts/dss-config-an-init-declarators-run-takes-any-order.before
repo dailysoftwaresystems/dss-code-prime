@@ -1,0 +1,5 @@
+        "declarator",
+        { "repeat": "stdAttr" },
+        { "repeat": "attrSpec" },
+        { "repeat": { "sequence": [ "asmLabel", { "repeat": "attrSpec" } ] } },
+        { "optional": { "sequence": [ "AssignOp", "initValue" ] } }

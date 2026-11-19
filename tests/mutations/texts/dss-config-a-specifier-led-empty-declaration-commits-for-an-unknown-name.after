@@ -1,0 +1,2 @@
+      "sequence": [ "localDeclSpecifiers", "identDeclHead", "declAttrRun", "EndStatement" ],
+      "commitRequiresTypeName": "identDeclHead"

@@ -1,0 +1,35 @@
+{
+  "$comment": "★★ THE PRODUCT OF A RELOCATABLE LINK (`ld -r`) IS AN OBJECT A DSS LINK READS, ON BOTH MACH-O ISAs (P69 send-back 5; D-LK-MACHO-LD-R-EH-FRAME-RELOCATIONS-REFUSED-AT-READ). The object named to the link is Apple's `cc -r -nostdlib` of the compiler's object of `int dss_unwind_first(void) { return 3; } int dss_unwind_shared(void) { return dss_unwind_first() + 4; }`. A relocatable link keeps EVERY reference of the DWARF call-frame section (`__TEXT,__eh_frame`) as a PAIR of relocation entries at one address -- a symbol to subtract (SUBTRACTOR), then the symbol it is subtracted from (UNSIGNED) -- and stores only the addend in the field: four entries per record, `func.eh - EH_Frame1 + 4` on its CIE pointer and `<function> - func.eh - 8` on its pc-begin, beside the local labels `EH_Frame1` and one `func.eh` per record. Until P69 the Mach-O reader refused such an object BY NAME (it bound each record on the STORED value, which here is half of a reference), so a library shipped as one prelinked object could not be linked at all. ✔MEASURED 2026-10-08 (Apple clang 21.0.0 (clang-2100.1.1.101), ld-1267; arm64 and x86_64): the same main.c built by Apple clang and linked with the object runs to 42 under Apple's ld; Apple's own `dwarfdump --eh-frame` cannot read the section of either product ('missing CIE': it applies no relocation). The reader now applies the pairs its format document declares (`macho.differenceRelocations`) on a copy of the section, in the object's own address space, before it decodes -- which hands the decoder exactly the bytes the compiler's object holds -- and refuses every other relocation there by name. ✔MEASURED 2026-10-08, both ISAs: the image DSS builds of this example is byte-identical to the one it builds with the compiler's own object in the product's place, and holds one call-frame record per foreign function at the extent the object states (11 and 14 bytes on x86_64, 8 and 24 on arm64; `MachoUnwindRelocations.TheImageDescribesEachFunctionAsItsObjectDid`). The reader-level pins run on every host over these same bytes: the suite `MachoUnwindRelocations` (`tests/link/test_macho_object_reader.cpp`). main.c is DSS's; the 35 it adds keeps the answer apart from the exit code of a program that did nothing. The `release` arm pins that optimizing the DSS half changes nothing about how the foreign half is read.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "prebuiltLibraries": [
+        {
+          "$comment": "Apple's relocatable link of the arm64 object. Source and rebuild commands: `tests/link/data/relinked_unwind.source.c` (Apple clang 21.0.0 `-arch arm64 -O0 -fasynchronous-unwind-tables -femit-dwarf-unwind=always -c`, then `cc -arch arm64 -r -nostdlib`; md5 b550e31a4b8df5a86d6061c6ac92c17e). A relocatable object named to the link is an OBJECT INPUT, linked eagerly. The witness is the label only a relocatable link writes into the section: the compiler's own object has none of that name.",
+          "path": "tests/link/data/relinked_unwind_arm64_macho.o",
+          "containerWitness": "EH_Frame1"
+        }
+      ]
+    },
+    {
+      "spec": "x86_64:macho64-x86_64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "prebuiltLibraries": [
+        {
+          "$comment": "Apple's relocatable link of the x86_64 object. Source and rebuild commands: `tests/link/data/relinked_unwind.source.c` (Apple clang 21.0.0 `-arch x86_64 -O0 -c`, then `cc -arch x86_64 -r -nostdlib`; md5 3f0f6eb0e2429d0aeaf138e65bdae861). The witness is the label only a relocatable link writes into the section.",
+          "path": "tests/link/data/relinked_unwind_x86_64_macho.o",
+          "containerWitness": "EH_Frame1"
+        }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

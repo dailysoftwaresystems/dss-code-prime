@@ -91,18 +91,13 @@ struct DSS_EXPORT AsmTextModule {
     // driver copies these into `AssembledModule::symbols` — the linker matches
     // across CUs by NAME, which the numeric IR does not carry.
     std::vector<ModuleSymbol> symbols;
-    // The function a `.globl`-exported entry-named label defined, if any. The
-    // driver stamps it onto `AssembledModule::userEntrySymbol` so the trampoline
-    // injector calls the right function instead of falling back to functions[0].
-    // ★ "EXPORTED" IS ENFORCED, NOT JUST DESCRIBED (2026-08-13). This sentence
-    // and the code disagreed: the lowering elected on NAME alone and ignored
-    // the `.globl` set entirely, so a `main:` without `.globl` was elected here
-    // and then emitted with LOCAL linkage — the exact "entry symbol is local,
-    // link failure points nowhere near the cause" outcome the dialect's own
-    // `.globl` note warns about. An entry-named label that is not exported is
-    // now a DIAGNOSTIC; leaving this nullopt instead would send the trampoline
-    // to functions[0], which is the silent arm.
-    std::optional<SymbolId>   userEntrySymbol;
+    // ⓘ NO ENTRY IS ELECTED HERE (P69 fold 3e, the review of fold 3d's X1). This
+    // lowering used to elect the program's entry by the dialect's own label list
+    // -- a SECOND election over a SECOND vocabulary, which never saw an object
+    // input's `main` and, with no `--language`, never ran at all. The unit's
+    // module is now a candidate source like any object's: the driver reads its
+    // exported entry-named functions (`collectObjectEntryCandidates`) and elects
+    // among every input's with the one election (`resolveProgramEntry`).
     // Every symbol this file REFERENCES but does not DEFINE. The driver hands
     // these to `assemble()` through its `externs` span — the same channel the
     // ordinary pipeline uses for `MirToLirResult::externImports`, so an
@@ -221,9 +216,12 @@ struct DSS_EXPORT AsmTextModule {
 // tier, so a non-dialect grammar arriving here is a driver bug and fails loud
 // rather than producing an empty module).
 //
-// `entryNames` are the source language's program-entry spellings, as the driver
-// resolved them for the active format; a defined label matching one of them
-// becomes `userEntrySymbol`. Empty is legal (a relocatable/object build).
+// `entryNames` are this build's program-entry names AS THE BINARY SPELLS THEM
+// (`entryLinkNames`' link names for the active format). A defined label that is
+// one of them must be exported -- an entry with local linkage is invisible to
+// the election -- and is refused by name when it is not. This lowering elects
+// nothing (see `AsmTextModule::symbols`). Empty is legal (a build that starts
+// no program).
 //
 // `formatKind` is the object format kind the unit is assembled for (P68 round
 // 9) — only a KEY into the dialect's `symbolParts`: an address-part operator

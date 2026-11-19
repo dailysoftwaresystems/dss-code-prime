@@ -1,0 +1,1 @@
+        if (curFilterBB_.v == 0) return std::nullopt;  // not a filter's entry

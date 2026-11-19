@@ -1,0 +1,1 @@
+            if (commonRuleUnknown) return true;   // an earlier unit's, reported

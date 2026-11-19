@@ -1,0 +1,1 @@
+                    enter(selected);        // lower the winner — may invalidate `f`

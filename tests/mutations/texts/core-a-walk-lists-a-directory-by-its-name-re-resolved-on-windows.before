@@ -1,0 +1,2 @@
+    std::wstring const at      = HostPathAccess::reference(dir, Use::Container);
+    std::wstring const pattern = below(at, L"*");

@@ -1,0 +1,2 @@
+    bool const everySourceRead = substrate::runEveryUnit(
+        sources.size(), substrate::namingSilentUnits(reporter, "the FFI ingest", sourceName, [&](std::size_t s) {

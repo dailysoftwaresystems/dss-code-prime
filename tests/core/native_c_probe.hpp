@@ -372,6 +372,174 @@ namespace internal {
     return internal::msvcToolchainQueryTally();
 }
 
+// ══ LLD-LINK — FROM ANY VISUAL STUDIO INSTANCE THAT CARRIES THE LLVM COMPONENT ═══════════
+//
+// The COFF witnesses in `tests/link/` judge a DSS object with BOTH of Windows' reference
+// linkers, link.exe and lld-link. lld-link ships in the `VC\Tools\Llvm\x64\bin` directory
+// of an instance that has the LLVM component (Microsoft.VisualStudio.Component.VC.Llvm.Clang),
+// and that need not be the instance `locateMsvcToolchain` answers with: `-latest` picks ONE
+// instance by its own rule, and a host may keep its LLVM component in another — any edition,
+// BuildTools included. ✔MEASURED (this repository's Windows host, 2026-10-28): the latest
+// instance carried no LLVM component while another held lld-link 19.1.5, and six lld-link
+// halves of tests/link/test_coff_comdat_selection.cpp, which derived lld-link from the cl
+// instance's own path, skipped as "no lld-link" on a host that has it. So the question is put
+// to the INSTALLED INSTANCES, every one, never answered from one instance's path; and a name
+// on PATH is no answer either (any `lld-link` would pass it).
+//
+// The answer, like `locateMsvcToolchain`'s, is asked ONCE PER PROCESS and keeps the
+// outcomes apart: no Visual Studio Installer, or no instance carrying the component, is
+// ABSENT (the one skip); a vswhere that cannot run is a broken step (red); an instance that
+// carries the component without `lld-link.exe` where the component puts it is a stale path
+// assumption here (red), never a skip. Where several instances hold it, the first vswhere
+// lists is taken and `detail` names the one used.
+struct LldLinkLocation {
+    ProbeStatus status = ProbeStatus::ToolAbsent;
+    std::string detail;   // human-readable, in BOTH directions
+    fs::path    lldLink;  // set iff `ok()`
+
+    [[nodiscard]] bool ok() const noexcept { return status == ProbeStatus::Ok; }
+    // The ONE status an lld-link arm may legitimately skip on.
+    [[nodiscard]] bool toolAbsent() const noexcept {
+        return status == ProbeStatus::ToolAbsent;
+    }
+    [[nodiscard]] std::string describe() const {
+        return describeFailure(status, "lld-link", detail);
+    }
+};
+
+namespace internal {
+[[nodiscard]] inline std::size_t& lldLinkQueryTally() noexcept {
+    static std::size_t n = 0;
+    return n;
+}
+
+[[nodiscard]] inline LldLinkLocation queryLldLink(fs::path const& work) {
+    ++lldLinkQueryTally();
+    fs::path const vswhere =
+        fs::path{"C:/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"};
+    if (!fileExists(vswhere))
+        return {ProbeStatus::ToolAbsent,
+                "no Visual Studio Installer (vswhere.exe) on this machine", {}};
+
+    fs::path const outTxt = work / "llvm-instances.txt";
+    std::string const q =
+        "\"\"" + vswhere.string() + "\" -products * "
+        "-requires Microsoft.VisualStudio.Component.VC.Llvm.Clang "
+        "-property installationPath > \"" + outTxt.string() + "\"\"";
+    if (std::system(q.c_str()) != 0)
+        return {ProbeStatus::ToolQueryFailed,
+                "vswhere.exe is present but the query for the LLVM component failed: `" + q + "`",
+                {}};
+
+    std::ifstream in{outTxt};
+    std::string looked;
+    for (std::string line; std::getline(in, line);) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+        if (line.empty()) continue;
+        fs::path const lld = fs::path{line} / "VC" / "Tools" / "Llvm" / "x64" / "bin" / "lld-link.exe";
+        if (fileExists(lld))
+            return {ProbeStatus::Ok, "lld-link of the instance at `" + line + "`", lld};
+        looked += " `" + lld.string() + "`";
+    }
+    if (looked.empty())
+        return {ProbeStatus::ToolAbsent,
+                "no Visual Studio instance carries Microsoft.VisualStudio.Component.VC.Llvm.Clang", {}};
+    return {ProbeStatus::ToolIncomplete,
+            "vswhere listed instances carrying the LLVM component, but none holds lld-link.exe where "
+            "that component puts it:" + looked, {}};
+}
+}  // namespace internal
+
+[[nodiscard]] inline LldLinkLocation locateLldLink(fs::path const& work) {
+    static LldLinkLocation const located = internal::queryLldLink(work);
+    return located;
+}
+
+// How many times THIS PROCESS has asked vswhere for the LLVM component — kept at one by
+// `locateLldLink`. Nothing may depend on it for behaviour.
+[[nodiscard]] inline std::size_t lldLinkQueries() noexcept {
+    return internal::lldLinkQueryTally();
+}
+
+// ══ MINGW'S x86-64 GCC — IDENTIFIED BY THE TARGET IT REPORTS ═══════════════════════════
+//
+// The MinGW arms of the PE object witnesses in `tests/link/` link a DSS `.obj` with the
+// `gcc` on PATH. A NAME on PATH is not that toolchain: a Cygwin or MSYS gcc answers to
+// `gcc` too, and links for another runtime (`*-pc-cygwin`, `*-pc-msys`), and a 32-bit
+// MinGW cannot take an x86-64 object at all. So the one locator asks the compiler what it
+// targets (`gcc -dumpmachine`) and admits only `x86_64-*-mingw32` — MinGW-w64's own
+// spelling (✔MEASURED, the Windows host's gcc: `x86_64-w64-mingw32`). Every other answer is
+// ABSENT, and the skip says which target it saw; a `gcc` that cannot answer the question
+// is a broken step and goes RED, like every other locator in this file.
+//
+// It was four private copies, each with a rule of its own (`where gcc` alone in two of
+// them), so a pin passed by any `gcc` at all and the copies could only drift. Two still
+// stand beside this one, each its own predicate: `locateMingwGcc` in
+// tests/link/test_coff_object_reader.cpp (any `gcc` that compiles a probe) and the
+// `where gcc` gate of tests/link/test_coff_linker_directives.cpp.
+struct MingwLocation {
+    ProbeStatus status = ProbeStatus::ToolAbsent;
+    std::string detail;  // human-readable, in BOTH directions
+    std::string target;  // what `gcc -dumpmachine` reported; empty if it never answered
+
+    [[nodiscard]] bool ok() const noexcept { return status == ProbeStatus::Ok; }
+    // The ONE status a MinGW arm may legitimately skip on.
+    [[nodiscard]] bool toolAbsent() const noexcept {
+        return status == ProbeStatus::ToolAbsent;
+    }
+    [[nodiscard]] std::string describe() const {
+        return describeFailure(status, "MinGW's x86-64 gcc", detail);
+    }
+};
+
+[[nodiscard]] inline MingwLocation locateMingwGcc(fs::path const& work) {
+    MingwLocation m;
+#if defined(_WIN32)
+    if (std::system("where gcc >nul 2>&1") != 0) {
+        m.detail = "no `gcc` on PATH -- the MinGW arm is inert on this host";
+        return m;
+    }
+    fs::path const answer = work / "mingw_dumpmachine.txt";
+    std::error_code gone;
+    fs::remove(answer, gone);  // a stale answer must not vouch for this gcc
+    if (std::system(captureCmd("gcc -dumpmachine", answer).c_str()) != 0) {
+        m.status = ProbeStatus::ToolQueryFailed;
+        m.detail = "`gcc -dumpmachine` exited non-zero" + tailOf(answer, 5, "gcc -dumpmachine");
+        return m;
+    }
+    {
+        std::ifstream in{answer};
+        std::getline(in, m.target);
+    }
+    while (!m.target.empty()
+           && (m.target.back() == '\r' || m.target.back() == ' ' || m.target.back() == '\t')) {
+        m.target.pop_back();
+    }
+    if (m.target.empty()) {
+        m.status = ProbeStatus::ToolQueryFailed;
+        m.detail = "`gcc -dumpmachine` answered no target" + tailOf(answer, 5, "gcc -dumpmachine");
+        return m;
+    }
+    std::string_view const t{m.target};
+    std::string_view constexpr arch{"x86_64-"};
+    std::string_view constexpr runtime{"-mingw32"};
+    bool const isMingw64 = t.size() > arch.size() + runtime.size() && t.substr(0, arch.size()) == arch
+                        && t.substr(t.size() - runtime.size()) == runtime;
+    if (!isMingw64) {
+        m.detail = "the `gcc` on PATH reports target `" + m.target
+                 + "`, not MinGW-w64's x86_64-*-mingw32 -- the MinGW arm is inert on this host";
+        return m;
+    }
+    m.status = ProbeStatus::Ok;
+#else
+    // `where` and `nul` are cmd.exe's: on a POSIX shell `>nul` creates a FILE named `nul`
+    // in the working directory, and a MinGW toolchain is not this host's anyway.
+    (void)work;
+    m.detail = "not a Windows host -- the MinGW arm is inert here";
+#endif
+    return m;
+}
+
 // ══ THE MSVC DEVELOPER ENVIRONMENT — ENTERED ONCE PER PROCESS ═════════════════════════
 //
 // ★★★ THE ENTRY WAS THE COST, NOT THE TOOLS. `cl`, `lib` and `link` need the INCLUDE, LIB

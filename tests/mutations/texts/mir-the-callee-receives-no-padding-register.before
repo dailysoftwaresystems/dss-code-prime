@@ -1,0 +1,2 @@
+            if (!mir.addArg(pad.ordinal, interner.primitive(TypeKind::I64), pad.position).valid())
+                return false;

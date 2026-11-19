@@ -1,0 +1,3 @@
+std::optional<SchemaTokenId> Tree::tokenKindIfToken(NodeId id) const {
+    auto const& n = node_(id);
+    return n.tokenKind;

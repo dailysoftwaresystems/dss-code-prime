@@ -1,0 +1,1 @@
+            return {Written::Named, qualifier, {}, begin};

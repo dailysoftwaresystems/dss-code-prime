@@ -1,0 +1,2 @@
+    Handle const firstHandle = reachedHandle(first, FILE_READ_ATTRIBUTES, ec);
+    if (!firstHandle) return false;

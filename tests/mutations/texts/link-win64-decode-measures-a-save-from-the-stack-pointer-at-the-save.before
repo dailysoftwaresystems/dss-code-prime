@@ -1,0 +1,2 @@
+CfiRegRef::physical(*r), {},
+                                            c.bytes - base, 0u});

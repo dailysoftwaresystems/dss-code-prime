@@ -16,6 +16,7 @@
 // accepted a cwd argument" into "the child actually started there", and
 // "we passed a hostile string" into "the child received those exact bytes".
 
+#include "core/substrate/path_identity.hpp"   // the resolver answers a value: asked of the home (H6c)
 #include "core/substrate/process_spawn.hpp"
 
 // THE TEST HARNESS USED TO LEAVE ITS ARGV UNESCAPED. The TEST-TIER spawner, which now
@@ -26,10 +27,13 @@
 // reports the child's received argv back to the parent — so it is the one place
 // the harness's quoting can be judged by what the CHILD actually got, rather
 // than by re-reading the string the parent produced.
+#include "os_link.hpp"     // links made by the OS: MinGW's library makes none
 #include "run_binary.hpp"
 
 #include "scoped_env.hpp"  // the environment arm's pins set what the child must NOT get
 #include "scratch_dir.hpp"
+#include "spawn_image.hpp"  // the image argv[0] names, as the product names it (H6c)
+#include "system_reason_text.hpp"  // the test side's one oracle for an OS code's own text (H6c2)
 #include "test_wait_budget.hpp"  // kWaitBudget — the shared, measured wait cap
 
 #include <gtest/gtest.h>
@@ -79,6 +83,8 @@ using dss::substrate::resolveExecutableOnPath;
 using dss::substrate::spawnAndWaitInherit;
 using dss::substrate::spawnAndWaitRedirectStdout;
 using dss::substrate::SpawnResult;
+using dss::test_support::spawnArgvInherit;
+using dss::test_support::spawnArgvRedirectStdout;
 using dss::substrate::tryBuildWindowsCommandLine;
 
 #if !defined(_WIN32)
@@ -141,6 +147,37 @@ constexpr std::string_view kFloodStdoutDirective = "--dss-fixture-flood-stdout";
 // is how the environment arm's pins read the CHILD's own environment rather
 // than the parent's idea of what it handed on.
 constexpr std::string_view kProbeEnvDirective = "--dss-fixture-probe-env";
+
+// The working-directory PROBE directive (P69 H6c's spawn universe): the child records its OWN directory as the OS
+// answers it (GetCurrentDirectoryW, `WCWD`), what a `cwd.mark` there holds (`MARK`, "(none)" for no such file) and
+// the image it runs as the home names it (`runningExecutable`, QueryFullProcessImageNameW: `SELF`) -- in the MARKER.
+constexpr std::string_view kProbeCwdDirective = "--dss-fixture-probe-cwd";
+
+#if defined(_WIN32)
+std::string utf8OfWide(std::wstring const& w) {
+    if (w.empty()) return {};
+    int const   n = ::WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
+    std::string out(static_cast<std::size_t>(n), '\0');
+    ::WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), out.data(), n, nullptr, nullptr);
+    return out;
+}
+std::wstring ownDirectoryW() {
+    DWORD const  n = ::GetCurrentDirectoryW(0, nullptr);
+    std::wstring buf(n, L'\0');
+    buf.resize(::GetCurrentDirectoryW(n, buf.data()));
+    return buf;
+}
+std::string markInOwnDirectory() {
+    HANDLE const h = ::CreateFileW(L"cwd.mark", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return "(none)";
+    std::string out(64, '\0');
+    DWORD       got = 0;
+    ::ReadFile(h, out.data(), static_cast<DWORD>(out.size()), &got, nullptr);
+    ::CloseHandle(h);
+    out.resize(got);
+    return out;
+}
+#endif
 
 // ★ MORE THAN ANY PIPE BUFFER, WHICH IS THE ENTIRE POINT OF THE HEADLINE PIN.
 // Linux gives an anonymous pipe 64 KiB; a Windows anonymous pipe defaults to
@@ -225,6 +262,11 @@ struct Marker {
     // Written ONLY by the environment probe: per probed name, the value the
     // CHILD saw, or nullopt when it did not receive the variable at all.
     std::vector<std::pair<std::string, std::optional<std::string>>> env;
+    // Written ONLY by the working-directory probe (Windows): the child's own directory, the mark it read there, and
+    // its image as the home names it.
+    std::string wcwd;
+    std::string mark;
+    std::string self;
 };
 
 // Parse a marker blob. Returns nullopt with `error` filled on ANY malformed
@@ -274,6 +316,12 @@ std::optional<Marker> parseMarker(std::string const& blob, std::string& error) {
                                     value.substr(equals + 1));
         } else if (tag == "NOENV") {
             marker.env.emplace_back(value, std::nullopt);
+        } else if (tag == "WCWD") {
+            marker.wcwd = value;
+        } else if (tag == "MARK") {
+            marker.mark = value;
+        } else if (tag == "SELF") {
+            marker.self = value;
         } else if (tag != "ARGV0") {
             error = "unknown record tag '" + tag + "'";
             return std::nullopt;
@@ -324,7 +372,7 @@ FixtureRun runFixture(fs::path const&                 markerPath,
     argv.insert(argv.end(), payload.begin(), payload.end());
 
     FixtureRun run;
-    run.result = spawnAndWaitInherit(argv, cwd, withheld);
+    run.result = spawnAndWaitInherit(dss::core::HostPath{selfPath()}, argv, cwd, withheld);   // its own image
     if (auto const blob = readFileBinary(markerPath)) {
         run.marker = parseMarker(*blob, run.markerError);
     } else {
@@ -361,7 +409,7 @@ RedirectRun runFixtureRedirected(fs::path const&                 markerPath,
     argv.insert(argv.end(), payload.begin(), payload.end());
 
     RedirectRun run;
-    run.result = spawnAndWaitRedirectStdout(argv, cwd, stdoutFile, withheld);
+    run.result = spawnAndWaitRedirectStdout(dss::core::HostPath{selfPath()}, argv, cwd, stdoutFile, withheld);
     if (auto const blob = readFileBinary(markerPath)) {
         run.marker = parseMarker(*blob, run.markerError);
     } else {
@@ -1033,7 +1081,7 @@ TEST(ResolveExecutableOnPath, AnAbsentNameIsNotFound) {
     auto const hit =
         resolveExecutableOnPath("dss-no-such-program-3f1c9a2e-please-fail");
     ASSERT_FALSE(hit.has_value())
-        << "resolved to " << (hit ? hit->string() : std::string{});
+        << "resolved to " << (hit ? hit->spelling().display() : std::string{});
 }
 
 // HERMETIC, and therefore an EXACT assertion rather than a host survey: the
@@ -1082,17 +1130,148 @@ TEST(ResolveExecutableOnPath, FindsANameOnPathAndNotOtherwise) {
             << " — on Windows the stem carries no extension, so this lookup "
                "can only succeed through PATHEXT probing";
     }
-    EXPECT_TRUE(fs::exists(*hit)) << hit->string();
-    EXPECT_TRUE(hit->is_absolute())
+    std::error_code kindEc;
+    EXPECT_EQ(dss::core::reachedKind(*hit, dss::core::Use::Leaf, kindEc), dss::core::EntryKind::File)
+        << hit->spelling().display();
+    // The answer's TEXT, asked lexically (its rendering), is absolute.
+    EXPECT_TRUE(fs::path{hit->spelling().display()}.is_absolute())
         << "a resolved path must be absolute so it stays valid after the "
-           "child changes directory: " << hit->string();
+           "child changes directory: " << hit->spelling().display();
 
     std::error_code ec;
-    EXPECT_TRUE(fs::equivalent(*hit, selfPath(), ec))
-        << "resolved " << hit->string() << " but expected "
+    EXPECT_TRUE(dss::core::reachedSameFile(*hit, selfPath(), dss::core::Use::Leaf, ec))
+        << "resolved " << hit->spelling().display() << " but expected "
         << selfPath().string()
         << (ec ? " (equivalent() failed: " + ec.message() + ")"
                : std::string{});
+}
+
+// A DANGLING LINK IS NO PROGRAM, on every build: a PATH entry holding a dangling link named like the program is
+// passed over, and the search goes on to the entry that holds it -- what the MSVC and POSIX builds always did.
+// libstdc++ on Windows reads a dangling link's own attributes and calls it a regular file, so the MinGW build
+// stopped the search at the link ([[D-CORE-MINGW-BUILDS-WALKS-AND-REMOVALS-THAT-FOLLOW-A-LINK]]).
+TEST(ResolveExecutableOnPath, ADanglingLinkOnAnEarlierPathEntryIsPassedOver) {
+    fs::path const    ownDir = selfPath().parent_path();
+    std::string const stem   = selfPath().stem().string();
+    dss::test_support::ScratchDir earlier{dss::test_support::Location::Temp, "process-spawn-dangling-path"};
+    // The name the search tries first in that entry: the stem itself on POSIX, the stem with `.exe` on Windows.
+#if defined(_WIN32)
+    fs::path const link = earlier.path() / (stem + ".exe");
+#else
+    fs::path const link = earlier.path() / stem;
+#endif
+    DSS_ASSERT_LINK_MADE(dss::test_support::makeSymbolicLink(earlier.path() / "no-such-program", link,
+                                                             dss::test_support::LinkTo::File));
+
+    PathVarGuard guard;
+    setPathVar(earlier.path().string() + std::string(1, kPathListSeparator) + ownDir.string());
+    auto const        hit  = resolveExecutableOnPath(stem);
+    // Which directory the answer is in, by IDENTITY (its level, a container, against each entry's).
+    auto const        in   = [&](fs::path const& dir) {
+        return dss::core::PathIdentity::of(dss::core::containingDirectory(*hit), dss::core::Use::Container)
+            == dss::core::PathIdentity::of(dir, dss::core::Use::Container);
+    };
+    std::string const took = !hit.has_value()     ? "nothing"
+                           : in(earlier.path())   ? "the dangling link"
+                           : in(ownDir)           ? "the program"
+                                                  : "another file";
+    EXPECT_EQ(took, "the program") << "the search took " << took;
+}
+
+// A NAME HOLDING A WINDOWS WILDCARD IS NO PROGRAM. On Windows the candidate is classified by the record
+// `FindFirstFileW` returns, and the OS reads `<`, `>` and `"` as wildcards as well as `*` and `?` (DOS_STAR,
+// DOS_QM, DOS_DOT): ✔MEASURED 2026-10-21, `tool.ex>` and `tool"exe` each find `tool.exe`. An App Execution Alias
+// record is taken for a program from that record alone, so a wildcard spelling of one resolved to it. The record
+// here is made in a scratch directory (✔MEASURED 2026-10-21: any process may set the alias reparse tag on a file
+// it creates), so the case needs none of the host's own aliases; the name itself resolving is its control.
+// POSIX holds no wildcard in a file name: `<`, `>` and `"` are ordinary characters there.
+TEST(ResolveExecutableOnPath, ANameHoldingAWindowsWildcardIsNoProgram) {
+#if !defined(_WIN32)
+    GTEST_SKIP() << "a POSIX file name holds no wildcard; the Windows legs ask this";
+#else
+    dss::test_support::ScratchDir dir{dss::test_support::Location::Temp, "process-spawn-wildcard"};
+    fs::path const record = dir.path() / "tool.exe";
+    {
+        HANDLE const file = ::CreateFileW(record.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                          FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        ASSERT_NE(file, INVALID_HANDLE_VALUE) << "cannot create " << record.string() << ": " << ::GetLastError();
+        // The alias layout: version 3, then four NUL-ended strings (package, app id, target, app type).
+        std::wstring const strings = std::wstring(L"Dss.Probe_0") + L'\0' + L"Dss.Probe_0!App" + L'\0'
+                                   + L"C:\\Windows\\System32\\cmd.exe" + L'\0' + L"0" + L'\0';
+        std::vector<unsigned char> buffer(12 + strings.size() * sizeof(wchar_t), 0);
+        ULONG const  tag     = 0x8000001BUL;   // IO_REPARSE_TAG_APPEXECLINK
+        USHORT const length  = static_cast<USHORT>(buffer.size() - 8);
+        ULONG const  version = 3;
+        std::memcpy(buffer.data(), &tag, sizeof tag);
+        std::memcpy(buffer.data() + 4, &length, sizeof length);
+        std::memcpy(buffer.data() + 8, &version, sizeof version);
+        std::memcpy(buffer.data() + 12, strings.data(), strings.size() * sizeof(wchar_t));
+        DWORD      returned = 0;
+        BOOL const set      = ::DeviceIoControl(file, FSCTL_SET_REPARSE_POINT, buffer.data(),
+                                                static_cast<DWORD>(buffer.size()), nullptr, 0, &returned, nullptr);
+        DWORD const error = set ? ERROR_SUCCESS : ::GetLastError();
+        ::CloseHandle(file);
+        ASSERT_TRUE(set) << "the OS set no alias reparse point on " << record.string() << " (error " << error << ")";
+    }
+    PathVarGuard guard;
+    setPathVar(dir.path().string());
+    EXPECT_TRUE(resolveExecutableOnPath("tool.exe").has_value()) << "the alias record itself is no program: the "
+                                                                   "case cannot tell a wildcard from a miss";
+    // Each spelled with an extension, so the search tries it as given (a name without one is tried with PATHEXT
+    // appended, a spelling no record matches). ONE SPELLING PER WILDCARD THE OS READS -- `>` (DOS_QM), `?`, `*`,
+    // `<` (DOS_STAR) and a trailing `"` (DOS_DOT, which also matches nothing at a name's end) -- each of which,
+    // asked of FindFirstFileW, finds `tool.exe` (the shapes the substrate's comment measured: "a<" and "abc\""
+    // found abc), so a set missing any one of them lets that one through.
+    for (char const* spelled : {"tool.ex>", "tool.ex?", "tool.e*", "tool.ex<", "tool.exe\""}) {
+        auto const hit = resolveExecutableOnPath(spelled);
+        EXPECT_FALSE(hit.has_value()) << "`" << spelled << "` resolved to "
+                                      << (hit ? hit->spelling().display() : std::string{})
+                                      << ": a wildcard found a program it does not name";
+    }
+#endif
+}
+
+// A SPAWN OF A VALUE THAT NAMES NOTHING IS REFUSED BY NAME (P69 H6c2, T4): a GIVEN narrow spelling that is no UTF-8
+// names no Windows file, so neither an image nor a working directory spelled so is handed to CreateProcessW -- and an
+// ill-formed working directory is never read as "inherit the parent's". On POSIX a name is bytes.
+TEST(SpawnAndWait, AnIllFormedImageOrWorkingDirectoryIsRefusedByName) {
+#if !defined(_WIN32)
+    GTEST_SKIP() << "a POSIX name is bytes: no narrow spelling is ill-formed there";
+#else
+    // A diagnostic is UTF-8 text: the byte that is no UTF-8 is spelt in it as its escape, `\xFF`, never as itself.
+    SpawnResult const image = spawnAndWaitInherit(dss::core::HostPath{std::string{"bad\xFF.exe"}}, {"bad"});
+    EXPECT_FALSE(image.spawned);
+    EXPECT_NE(image.diagnostic.find("the image 'bad\\xFF.exe' is refused"), std::string::npos) << image.diagnostic;
+    SpawnResult const cwd = spawnAndWaitInherit(dss::core::HostPath{selfPath()}, {"self", "--gtest_list_tests"},
+                                                dss::core::HostPath{std::string{"dir\xC3"}});
+    EXPECT_FALSE(cwd.spawned) << "the child ran in a directory that names nothing";
+    EXPECT_NE(cwd.diagnostic.find("the working directory 'dir\\xC3' is refused"), std::string::npos)
+        << cwd.diagnostic;
+#endif
+}
+
+// A CANDIDATE THAT NAMES NO LAST NAME IS NOT FOUND, NEVER THROWN (P69 H6c2, H1): `..` searched below a FIRST-LEVEL
+// PATH entry reaches the volume's root, and a root spelled as the command is taken as given -- on Windows each has no
+// sibling by a PATHEXT extension (`withSuffix` answers `NoLastName`; until H6c2 it threw, uncaught, and the compiler
+// aborted with no diagnostic), on POSIX each is a directory. The probe answers "not found" for both.
+TEST(ResolveExecutableOnPath, ACandidateThatNamesNoLastNameIsNotFound) {
+    dss::test_support::ScratchDir scratch{dss::test_support::Location::Temp, "process-spawn-no-last-name"};
+    // The scratch's first-level ancestor: the directory just below its volume root (`C:\Users`, `/tmp`).
+    fs::path firstLevel = fs::absolute(scratch.path());
+    while (firstLevel.has_parent_path() && firstLevel.parent_path().has_parent_path()
+           && firstLevel.parent_path() != firstLevel.parent_path().root_path())
+        firstLevel = firstLevel.parent_path();
+    ASSERT_FALSE(firstLevel.empty());
+    PathVarGuard guard;
+    setPathVar(firstLevel.string());
+    std::optional<dss::core::HostPath> found;
+    ASSERT_NO_THROW(found = resolveExecutableOnPath(".."));
+    EXPECT_FALSE(found.has_value()) << "`..` below `" << firstLevel.string() << "` resolved to "
+                                    << (found ? found->spelling().display() : std::string{});
+    std::string const root = fs::absolute(scratch.path()).root_path().string();
+    ASSERT_NO_THROW(found = resolveExecutableOnPath(root));
+    EXPECT_FALSE(found.has_value()) << "the root `" << root << "` resolved to "
+                                    << (found ? found->spelling().display() : std::string{});
 }
 
 // A command that already carries a directory component is NOT a PATH lookup —
@@ -1108,8 +1287,48 @@ TEST(ResolveExecutableOnPath, APathIsTakenAsGivenWithoutSearching) {
     auto const hit = resolveExecutableOnPath(selfPath().string());
     ASSERT_TRUE(hit.has_value()) << selfPath().string();
     std::error_code ec;
-    EXPECT_TRUE(fs::equivalent(*hit, selfPath(), ec)) << hit->string();
+    EXPECT_TRUE(dss::core::reachedSameFile(*hit, selfPath(), dss::core::Use::Leaf, ec)) << hit->spelling().display();
 }
+
+#if defined(_WIN32)
+// ★ AN APP EXECUTION ALIAS IS A PROGRAM, AS CreateProcessW RUNS IT. The aliases Windows keeps in
+// `%LOCALAPPDATA%\Microsoft\WindowsApps` (`python3.exe`, `winget.exe`, ...) are zero-byte reparse
+// points tagged IO_REPARSE_TAG_APPEXECLINK; the process loader resolves them, and MS-STL's
+// `fs::is_regular_file` cannot follow them -- so a CMake cache naming the `python3.exe` alias had
+// every script self-test refused as "not found as an executable" while the same path ran from any
+// shell. The resolver asks the OS instead. The case takes the first alias the host holds and hands
+// its path over as given (no PATH search); a host that holds none says so, and nothing passes.
+TEST(ResolveExecutableOnPath, AnAppExecutionAliasIsAProgramAsCreateProcessRunsIt) {
+    wchar_t const* local = _wgetenv(L"LOCALAPPDATA");
+    if (local == nullptr || *local == L'\0') {
+        GTEST_SKIP() << "LOCALAPPDATA is unset: there is no App Execution Alias directory to look in";
+    }
+    fs::path const          dir = fs::path(local) / L"Microsoft" / L"WindowsApps";
+    std::optional<fs::path> alias;
+    WIN32_FIND_DATAW        found{};
+    HANDLE const            search = ::FindFirstFileW((dir / L"*.exe").wstring().c_str(), &found);
+    if (search != INVALID_HANDLE_VALUE) {
+        do {
+            if ((found.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+                && found.dwReserved0 == 0x8000001BUL /* IO_REPARSE_TAG_APPEXECLINK */) {
+                alias = dir / found.cFileName;
+                break;
+            }
+        } while (::FindNextFileW(search, &found));
+        ::FindClose(search);
+    }
+    if (!alias.has_value()) {
+        GTEST_SKIP() << "this host holds no App Execution Alias in its WindowsApps directory: the case did "
+                        "not run";
+    }
+    std::u8string const spelled = alias->u8string();
+    std::string const   utf8(spelled.begin(), spelled.end());
+    auto const          hit = resolveExecutableOnPath(utf8);
+    ASSERT_TRUE(hit.has_value()) << "the App Execution Alias " << utf8
+                                 << " was refused as no program, though CreateProcessW runs it";
+    EXPECT_EQ(hit->spelling().display(), utf8);   // the alias itself, by its rendering
+}
+#endif
 
 // ★ THE CURRENT DIRECTORY IS NEVER SEARCHED — including through the back door
 // POSIX leaves open, where an EMPTY PATH entry means "the current directory"
@@ -1141,7 +1360,7 @@ TEST(ResolveExecutableOnPath, AnEmptyPathEntryDoesNotMeanTheCurrentDirectory) {
                                 // does not corrupt every test after it
 
     EXPECT_FALSE(hit.has_value())
-        << "resolved '" << stem << "' to " << (hit ? hit->string() : "")
+        << "resolved '" << stem << "' to " << (hit ? hit->spelling().display() : std::string{})
         << " while standing in its own directory with PATH=" << pathUsed
         << " — an empty PATH entry was treated as the current directory";
 }
@@ -1195,8 +1414,8 @@ TEST(ResolveExecutableOnPath, ANonAsciiUtf8NameResolvesRegardlessOfCodePage) {
     // stem exactly and the file by identity rather than the whole string.
     EXPECT_EQ(hit->stem().wstring(), std::wstring{L"g\u00e9n\u00e9rateur"});
     std::error_code ec;
-    EXPECT_TRUE(fs::equivalent(*hit, tool, ec))
-        << "resolved " << hit->string() << " but expected " << tool.string()
+    EXPECT_TRUE(dss::core::reachedSameFile(*hit, tool, dss::core::Use::Leaf, ec))
+        << "resolved " << hit->spelling().display() << " but expected " << tool.string()
         << (ec ? " (equivalent() failed: " + ec.message() + ")"
                : std::string{});
 }
@@ -1206,7 +1425,7 @@ TEST(ResolveExecutableOnPath, ANonAsciiUtf8NameResolvesRegardlessOfCodePage) {
 // ══ spawnAndWaitInherit ═══════════════════════════════════════════════════
 
 TEST(SpawnAndWaitInherit, EmptyArgvIsReportedNotAborted) {
-    auto const r = spawnAndWaitInherit({});
+    auto const r = spawnArgvInherit({});
     EXPECT_FALSE(r.spawned);
     EXPECT_FALSE(r.diagnostic.empty());
 }
@@ -1218,7 +1437,7 @@ TEST(SpawnAndWaitInherit, EmptyArgvIsReportedNotAborted) {
 // indistinguishable and this test would go red.
 TEST(SpawnAndWaitInherit, AnAbsentProgramIsNotSpawnedAndSaysWhy) {
     auto const missing =
-        spawnAndWaitInherit({"dss-no-such-program-3f1c9a2e-please-fail",
+        spawnArgvInherit({"dss-no-such-program-3f1c9a2e-please-fail",
                              "--whatever"});
     EXPECT_FALSE(missing.spawned);
     EXPECT_FALSE(missing.diagnostic.empty())
@@ -1245,7 +1464,7 @@ TEST(SpawnAndWaitInherit, AnAbsentProgramIsNotSpawnedAndSaysWhy) {
 // leave every substring assertion in this file green.
 TEST(SpawnAndWaitInherit, TheNotFoundDiagnosticSaysNothingAboutPermissions) {
     auto const r =
-        spawnAndWaitInherit({"dss-no-such-program-3f1c9a2e-please-fail"});
+        spawnArgvInherit({"dss-no-such-program-3f1c9a2e-please-fail"});
     EXPECT_FALSE(r.spawned);
     EXPECT_EQ(r.diagnostic,
               "spawnAndWaitInherit: 'dss-no-such-program-3f1c9a2e-please-fail' "
@@ -1288,7 +1507,7 @@ TEST(SpawnAndWaitInherit, APresentButNonExecutableFileIsNotReportedAsMissing) {
     PathVarGuard guard;
     setPathVar(scratch.path().string());
 
-    auto const r = spawnAndWaitInherit({"dss-non-executable-hook", "--x"});
+    auto const r = spawnArgvInherit({"dss-non-executable-hook", "--x"});
     EXPECT_FALSE(r.spawned);
     EXPECT_EQ(r.diagnostic,
               "spawnAndWaitInherit: 'dss-non-executable-hook' was not found as "
@@ -1326,7 +1545,7 @@ TEST(SpawnAndWaitInherit, ASignalKilledChildReportsTheSignalAndNamesIt) {
     ASSERT_TRUE(run.result.spawned) << run.result.diagnostic;
     EXPECT_EQ(run.result.exitCode, 128 + SIGKILL);
     EXPECT_EQ(run.result.diagnostic,
-              "spawnAndWaitInherit: '" + resolved->string()
+              "spawnAndWaitInherit: '" + resolved->spelling().display()
                   + "' was terminated by signal " + std::to_string(SIGKILL)
                   + " (reported as exit code " + std::to_string(128 + SIGKILL)
                   + ")");
@@ -1388,14 +1607,14 @@ TEST(SpawnAndWaitInherit, AResolvableFileThatIsNotAnExecutableImageIsNotSpawned)
     auto const resolved = resolveExecutableOnPath(tool.string());
     ASSERT_TRUE(resolved.has_value()) << tool.string();
 
-    auto const plain = spawnAndWaitInherit({tool.string(), "--x"});
+    auto const plain = spawnArgvInherit({tool.string(), "--x"});
     EXPECT_FALSE(plain.spawned)
         << "the OS refused the image, so there is no process whose exit code "
            "could be reported: "
         << plain.diagnostic;
     EXPECT_EQ(plain.exitCode, 0);
     EXPECT_EQ(plain.diagnostic,
-              expectedImageFailureDiagnostic(resolved->string(), "", ENOEXEC));
+              expectedImageFailureDiagnostic(resolved->spelling().display(), "", ENOEXEC));
 
     // The SAME failure with a working directory, which the two arms report
     // differently on purpose: the fork arm's child chdir'd successfully and then
@@ -1404,10 +1623,10 @@ TEST(SpawnAndWaitInherit, AResolvableFileThatIsNotAnExecutableImageIsNotSpawned)
     // covers instead of picking one.
     fs::path const childDir = scratch.path() / "child cwd";
     ASSERT_TRUE(fs::create_directory(childDir));
-    auto const withCwd = spawnAndWaitInherit({tool.string(), "--x"}, childDir);
+    auto const withCwd = spawnArgvInherit({tool.string(), "--x"}, childDir);
     EXPECT_FALSE(withCwd.spawned) << withCwd.diagnostic;
     EXPECT_EQ(withCwd.diagnostic,
-              expectedImageFailureDiagnostic(resolved->string(),
+              expectedImageFailureDiagnostic(resolved->spelling().display(),
                                              childDir.string(), ENOEXEC));
 }
 
@@ -1517,7 +1736,7 @@ TEST(SpawnAndWaitInherit, AnArgumentWithAnEmbeddedNulIsRejectedBeforeAnyChild) {
     payload += "after";
     ASSERT_EQ(payload.size(), std::size_t{12});
 
-    auto const r = spawnAndWaitInherit(
+    auto const r = spawnArgvInherit(
         {selfPath().string(), std::string{kFixtureFlag}, marker.string(), "0",
          payload});
 
@@ -1537,7 +1756,7 @@ TEST(SpawnAndWaitInherit, AnArgumentWithAnEmbeddedNulIsRejectedBeforeAnyChild) {
     std::string argv0 = "dss";
     argv0.push_back('\0');
     argv0 += "tool";
-    auto const first = spawnAndWaitInherit({argv0, "--x"});
+    auto const first = spawnArgvInherit({argv0, "--x"});
     EXPECT_FALSE(first.spawned);
     EXPECT_EQ(first.diagnostic,
               "spawnAndWaitInherit: argv[0] contains an embedded NUL byte, "
@@ -1572,7 +1791,7 @@ TEST(SpawnAndWaitInherit, ANonAsciiArgv0ReachesCreateProcessRatherThanNotFound) 
     PathVarGuard guard;
     setPathVar(scratch.path().string());
 
-    auto const r = spawnAndWaitInherit({"g\xC3\xA9n\xC3\xA9rateur", "--x"});
+    auto const r = spawnArgvInherit({"g\xC3\xA9n\xC3\xA9rateur", "--x"});
     EXPECT_FALSE(r.spawned);
     EXPECT_EQ(r.diagnostic.rfind(
                   "spawnAndWaitInherit: CreateProcessW failed for '", 0),
@@ -1590,7 +1809,7 @@ TEST(SpawnAndWaitInherit, ANonAsciiArgv0ReachesCreateProcessRatherThanNotFound) 
 // bytes — but "your PATH is wrong" is the one thing that is definitely not the
 // problem, and it is the sentence an operator would act on.
 TEST(SpawnAndWaitInherit, AnArgv0ThatIsNotUtf8IsReportedAsAnEncodingFault) {
-    auto const r = spawnAndWaitInherit({"tool-\x80-name", "--x"});
+    auto const r = spawnArgvInherit({"tool-\x80-name", "--x"});
     EXPECT_FALSE(r.spawned);
     EXPECT_EQ(r.diagnostic,
               "spawnAndWaitInherit: argv[0] is not valid UTF-8 (invalid UTF-8 "
@@ -1606,7 +1825,7 @@ TEST(SpawnAndWaitInherit, AMissingWorkingDirectoryIsReportedBeforeSpawning) {
     fs::path const absent = scratch.path() / "no-such-subdir";
     ASSERT_FALSE(fs::exists(absent));
 
-    auto const r = spawnAndWaitInherit(
+    auto const r = spawnArgvInherit(
         {selfPath().string(), std::string{kFixtureFlag},
          (scratch.path() / "never.marker").string(), "0"},
         absent);
@@ -1884,6 +2103,59 @@ TEST(SpawnAndWaitRedirectStdout, AnUncreatableCaptureFileIsReportedAndNoChildRun
            "handed a clean exit code with nothing to read";
 }
 
+// THE REASON IS THE HOST'S OWN, READ AT THE CALL THAT FAILED (P69 H6c2). The
+// redirect's create is refused for two different reasons -- its directory is
+// MISSING, or its "directory" is a FILE -- and the diagnostic names exactly the
+// code the host itself answers to the same create of the same spelling: the
+// ORACLE is that create, made here (CreateFileW of the literal `\\?\` spelling
+// and GetLastError; POSIX `open` and errno), and its text the system's own
+// (`systemReasonText`, never the product's renderer). A code read after a call
+// that reset it, or one fixed in the message, names the wrong reason here.
+TEST(SpawnAndWaitRedirectStdout, AnUncreatableCaptureFileNamesTheHostsOwnReason) {
+    dss::test_support::ScratchDir scratch{dss::test_support::Location::Temp,
+                                          "process-spawn-redirect-reason"};
+    fs::path const notADirectory = scratch.path() / "a-file";
+    {
+        std::ofstream plant{notADirectory, std::ios::binary};
+        plant << "a file where the capture's directory should be\n";
+    }
+    ASSERT_TRUE(fs::is_regular_file(notADirectory));
+    struct Shape {
+        char const* what;
+        fs::path    capture;
+    };
+    Shape const shapes[] = {
+        {"its directory is missing", scratch.path() / "no-such-subdir" / "cap.out"},
+        {"its directory is a file", notADirectory / "cap.out"},
+    };
+    for (Shape const& shape : shapes) {
+        fs::path const marker = scratch.path() / "never.marker";
+#if defined(_WIN32)
+        fs::path literal = shape.capture;
+        literal.make_preferred();
+        std::wstring const spelling = L"\\\\?\\" + literal.native();
+        HANDLE const       probe    = ::CreateFileW(spelling.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                                                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        DWORD const oracle = probe == INVALID_HANDLE_VALUE ? ::GetLastError() : ERROR_SUCCESS;
+        if (probe != INVALID_HANDLE_VALUE) ::CloseHandle(probe);
+        ASSERT_NE(oracle, static_cast<DWORD>(ERROR_SUCCESS)) << shape.what << ": the host made the file";
+#else
+        int const probe  = ::open(shape.capture.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        int const oracle = probe < 0 ? errno : 0;
+        if (probe >= 0) ::close(probe);
+        ASSERT_NE(oracle, 0) << shape.what << ": the host made the file";
+#endif
+        auto const run = runFixtureRedirected(marker, 0, {}, shape.capture);
+
+        EXPECT_FALSE(run.result.spawned) << shape.what << ": " << run.result.diagnostic;
+        EXPECT_NE(run.result.diagnostic.find("' (" + dss::test_support::systemReasonText(oracle) + "), so '"),
+                  std::string::npos)
+            << shape.what << ": the diagnostic must name the host's own reason for this create, "
+            << dss::test_support::systemReasonText(oracle) << ", and it says: " << run.result.diagnostic;
+        EXPECT_FALSE(fs::exists(marker)) << shape.what << ": a child ran although its capture was impossible";
+    }
+}
+
 // An EMPTY path is the internal sentinel for "inherit", so letting it through
 // this entry point would turn the one function whose purpose is to capture
 // output into one that silently produces none. Refused, by exact message.
@@ -1892,7 +2164,7 @@ TEST(SpawnAndWaitRedirectStdout, AnEmptyCapturePathIsRefusedNotTreatedAsInherit)
                                           "process-spawn-redirect-empty"};
     fs::path const marker = scratch.path() / "never.marker";
 
-    auto const r = spawnAndWaitRedirectStdout(
+    auto const r = spawnArgvRedirectStdout(
         {selfPath().string(), std::string{kFixtureFlag}, marker.string(), "0"},
         /*cwd=*/{}, /*stdoutFile=*/{});
 
@@ -1922,7 +2194,7 @@ TEST(SpawnAndWaitRedirectStdout, AnAbsentProgramNamesThisEntryPointAndLeavesNoFi
                                           "process-spawn-redirect-missing"};
     fs::path const capturePath = scratch.path() / "never-created.out";
 
-    auto const r = spawnAndWaitRedirectStdout(
+    auto const r = spawnArgvRedirectStdout(
         {"dss-no-such-program-3f1c9a2e-please-fail", "--whatever"},
         /*cwd=*/{}, capturePath);
 
@@ -2885,6 +3157,318 @@ TEST(SpawnEnvironment, OnWindowsAWithheldNameMatchesRegardlessOfCase) {
 }
 #endif
 
+// ════ THE SPAWN'S WORKING DIRECTORY AND IMAGE, EVERY MEASURED CELL (P69 H6c) ════
+// The working directory is a CONTAINER: its reference is taken once by the reference rule (a GIVEN spelling), and the
+// spawn hands the DOS spelling of that reference WITH its separator (A3, A12). Its pins, each generated from the
+// probe's logs (never from this code):
+//   UNIVERSE  (spawn_directory_cells.inc) 8 spelling kinds x 7 names x {last, middle} x twin {present, absent}: the
+//             child starts in the directory the verbatim container reference names -- the MEASURED answer -- or the
+//             spawn refuses it by name: a directory that does not exist, or a reference holding a segment that ends in
+//             ONE period (#14: CreateProcessW removes that period in every form, so it starts the twin or nothing);
+//             the child's own directory (GetCurrentDirectoryW) is a DOS spelling, never `\\?\` (A3).
+//   LENGTH    (spawn_length_cells.inc) a drive's and a share's directory 250..262 characters long: the child starts
+//             exactly where the DOS form with its separator started one (258 characters with it), and prints the
+//             directory it was handed; past that the spawn refuses it by name.
+//   IMAGE     (image_cells.inc) the image a LISTED value names starts -- the literal one beside a twin -- and the
+//             child names its own image by the OS's answer (`runningExecutable`, QueryFullProcessImageNameW, #17); the
+//             GIVEN plain spelling starts what the measured plain spelling started (the twin, or nothing).
+#if defined(_WIN32)
+namespace {
+
+struct SpawnCell {
+    char const* kind;
+    char const* name;
+    bool        middle;
+    bool        twin;
+    char const* asWrittenReach;
+    char const* asWrittenCwd;
+    char const* dosContainerReach;
+    char const* dosContainerCwd;
+    char const* verbatimReach;
+    char const* verbatimCwd;
+};
+constexpr SpawnCell kSpawnCells[] = {
+#include "spawn_directory_cells.inc"
+};
+
+struct LengthCell {
+    char const* kind;
+    int         length;
+    bool        asWrittenStarts;
+    bool        dosContainerStarts;
+    bool        verbatimStarts;
+};
+constexpr LengthCell kLengthCells[] = {
+#include "spawn_length_cells.inc"
+};
+
+struct ImageCell {
+    bool        twin;
+    char const* place;
+    char const* plainImage;
+    char const* verbatimImage;
+};
+constexpr ImageCell kImageCells[] = {
+#include "image_cells.inc"
+};
+
+[[nodiscard]] std::wstring wideOf(char const* s) { return std::wstring(s, s + std::strlen(s)); }
+void makeDirVerbatim(std::wstring const& abs) { ::CreateDirectoryW((L"\\\\?\\" + abs).c_str(), nullptr); }
+void putFileVerbatim(std::wstring const& abs, std::string const& text) {
+    HANDLE const h = ::CreateFileW((L"\\\\?\\" + abs).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    ::WriteFile(h, text.data(), static_cast<DWORD>(text.size()), &written, nullptr);
+    ::CloseHandle(h);
+}
+// The probe's key of a name (its directory under the twin mode's area).
+[[nodiscard]] std::wstring keyOfName(std::wstring const& n) {
+    if (n == L"e.") return L"dot";
+    if (n == L"e..") return L"dot2";
+    if (n == L"...") return L"dots";
+    if (n == L"d ") return L"space";
+    if (n == L"NUL") return L"nul";
+    if (n == L"CON") return L"con";
+    return L"plain";
+}
+[[nodiscard]] std::wstring trimmedTwinOf(std::wstring const& n) {
+    if (n == L"e." || n == L"e..") return L"e";
+    if (n == L"d ") return L"d";
+    return L"";
+}
+// `rel` below the absolute drive directory `S` in the spelling kind `kind`; the process's directory is `S`.
+[[nodiscard]] std::wstring spelledAs(std::wstring const& kind, std::wstring const& S, std::wstring const& rel) {
+    std::wstring const noDrive = S.substr(2);
+    if (kind == L"abs") return S + L"\\" + rel;
+    if (kind == L"cwd") return rel;
+    if (kind == L"drv") return S.substr(0, 2) + rel;
+    if (kind == L"root") return noDrive + L"\\" + rel;
+    if (kind == L"share") return L"\\\\localhost\\" + S.substr(0, 1) + L"$" + noDrive + L"\\" + rel;
+    if (kind == L"verb") return L"\\\\?\\" + S + L"\\" + rel;
+    if (kind == L"dev") return L"\\\\.\\" + S + L"\\" + rel;
+    return L"\\??\\" + S + L"\\" + rel;
+}
+[[nodiscard]] std::wstring withBase(char const* measured, std::wstring const& S) {
+    std::wstring s = wideOf(measured);
+    std::size_t const at = s.find(L"<S>");
+    if (at != std::wstring::npos) s.replace(at, 3, S);
+    return s;
+}
+struct WorkingDirectoryKept {
+    std::wstring was;
+    WorkingDirectoryKept() {
+        std::wstring buf(MAX_PATH, L'\0');
+        was = buf.substr(0, ::GetCurrentDirectoryW(MAX_PATH, buf.data()));
+    }
+    ~WorkingDirectoryKept() { ::SetCurrentDirectoryW(was.c_str()); }
+};
+
+}  // namespace
+#endif
+
+TEST(SpawnWorkingDirectory, EveryMeasuredSpellingStartsTheChildWhereItsReferenceNamesOrIsRefusedByName) {
+#if !defined(_WIN32)
+    GTEST_SKIP() << "the spawn universe is Win32's: CreateProcessW's trims and spellings exist on no POSIX host";
+#else
+    dss::test_support::ScratchDir scratch{dss::test_support::Location::Temp, "spawn-universe"};
+    WorkingDirectoryKept          kept;
+    std::wstring const            S = scratch.path().native();
+    ASSERT_TRUE(S.size() >= 3 && S[1] == L':' && S.size() < 180) << "the scratch lies on no drive, or too deep";
+    for (wchar_t const* mode : {L"SP", L"SA"}) {
+        for (wchar_t const* n : {L"e.", L"e..", L"...", L"d ", L"NUL", L"CON", L"n"}) {
+            std::wstring const name = n, area = S + L"\\" + mode + L"\\" + keyOfName(name);
+            makeDirVerbatim(S + L"\\" + mode);
+            makeDirVerbatim(area);
+            putFileVerbatim(area + L"\\cwd.mark", "PARENT");
+            makeDirVerbatim(area + L"\\" + name);
+            putFileVerbatim(area + L"\\" + name + L"\\cwd.mark", "LIT");
+            makeDirVerbatim(area + L"\\" + name + L"\\sub");
+            putFileVerbatim(area + L"\\" + name + L"\\sub\\cwd.mark", "LIT-sub");
+            std::wstring const twin = trimmedTwinOf(name);
+            if (std::wstring{mode} == L"SP" && !twin.empty()) {
+                makeDirVerbatim(area + L"\\" + twin);
+                putFileVerbatim(area + L"\\" + twin + L"\\cwd.mark", "TWIN");
+                makeDirVerbatim(area + L"\\" + twin + L"\\sub");
+                putFileVerbatim(area + L"\\" + twin + L"\\sub\\cwd.mark", "TWIN-sub");
+            }
+        }
+    }
+    ::SetCurrentDirectoryW(S.c_str());
+    std::error_code shareEc;
+    bool const      shareServed = dss::core::reachedKind(fs::path{spelledAs(L"share", S, L"SP")},
+                                                         dss::core::Use::Container, shareEc)
+                             == dss::core::EntryKind::Directory;
+    std::size_t started = 0, refusedByName = 0, refusedPeriod = 0, shareNotServed = 0;
+    int         k = 0;
+    for (SpawnCell const& c : kSpawnCells) {
+        ++k;
+        std::wstring const kind = wideOf(c.kind), name = wideOf(c.name);
+        SCOPED_TRACE("cell " + std::to_string(k) + " " + c.kind + " '" + c.name + "' " + (c.middle ? "middle" : "last")
+                     + (c.twin ? ", twin present" : ", twin absent"));
+        if (kind == L"share" && !shareServed) {
+            ++shareNotServed;
+            continue;
+        }
+        std::wstring const rel = std::wstring{c.twin ? L"SP" : L"SA"} + L"\\" + keyOfName(name) + L"\\" + name
+                               + (c.middle ? L"\\sub" : L"");
+        fs::path const     marker = scratch.path() / ("cell-" + std::to_string(k) + ".marker");
+        auto const run = runFixture(marker, 0, {std::string{kProbeCwdDirective}}, fs::path{spelledAs(kind, S, rel)});
+        // #14: a verbatim kind keeps a one-period name in its reference (the rule takes `\\?\` as written and `\??\`
+        // as its `\\?\` twin), and CreateProcessW starts the twin or nothing through it in every form (MEASURED).
+        bool const periodKept = (kind == L"verb" || kind == L"nt") && name == L"e.";
+        std::string const reach{c.verbatimReach};
+        if (periodKept) {
+            ++refusedPeriod;
+            EXPECT_FALSE(run.result.spawned) << "a reference with a segment ending in ONE period was handed on";
+            EXPECT_NE(run.result.diagnostic.find("ends in ONE period"), std::string::npos) << run.result.diagnostic;
+            continue;
+        }
+        if (reach.rfind("err ", 0) == 0) {
+            ++refusedByName;
+            EXPECT_FALSE(run.result.spawned) << "the measured reference names no directory, yet a child started";
+            EXPECT_NE(run.result.diagnostic.find("working directory '"), std::string::npos) << run.result.diagnostic;
+            continue;
+        }
+        ++started;
+        ASSERT_TRUE(run.result.spawned) << run.result.diagnostic;
+        ASSERT_TRUE(run.marker.has_value()) << run.markerError;
+        std::string const want = reach == "lit" ? "LIT" : reach == "twin" ? "TWIN" : "PARENT";
+        EXPECT_EQ(run.marker->mark, want + (c.middle && want != "PARENT" ? "-sub" : ""))
+            << "the child started in another directory than the reference names (it printed " << run.marker->wcwd << ")";
+        EXPECT_NE(run.marker->wcwd.rfind("\\\\?\\", 0), 0u) << "the child's directory is not DOS: " << run.marker->wcwd;
+    }
+    EXPECT_EQ(started + refusedByName + refusedPeriod + shareNotServed, std::size(kSpawnCells));
+    EXPECT_EQ(refusedPeriod, 8u) << "verb and nt x `e.` x {last, middle} x twin {P, A}";
+    std::cout << "spawn universe: " << started << " started, " << refusedByName << " refused by name, " << refusedPeriod
+              << " refused for a one-period segment, " << shareNotServed << " share cell(s) on a host serving none\n";
+    ::SetCurrentDirectoryW(kept.was.c_str());
+#endif
+}
+
+TEST(SpawnWorkingDirectory, ADirectoryAtTheLengthBoundaryStartsExactlyWhereTheDosFormWithItsSeparatorStarts) {
+#if !defined(_WIN32)
+    GTEST_SKIP() << "the boundary is Win32's MAX_PATH; no POSIX host has it";
+#else
+    dss::test_support::ScratchDir scratch{dss::test_support::Location::Temp, "spawn-length"};
+    std::wstring const            S = scratch.path().native();
+    ASSERT_TRUE(S.size() >= 3 && S[1] == L':' && S.size() < 200) << "the scratch lies on no drive, or too deep";
+    makeDirVerbatim(S + L"\\LEN");
+    std::error_code shareEc;
+    bool const      shareServed = dss::core::reachedKind(fs::path{spelledAs(L"share", S, L"LEN")},
+                                                         dss::core::Use::Container, shareEc)
+                             == dss::core::EntryKind::Directory;
+    std::size_t asked = 0;
+    for (LengthCell const& c : kLengthCells) {
+        std::wstring const kind = wideOf(c.kind);
+        SCOPED_TRACE(std::string{c.kind} + " " + std::to_string(c.length));
+        if (kind == L"share" && !shareServed) continue;
+        ++asked;
+        std::wstring const prefix = spelledAs(kind, S, L"LEN\\q");
+        ASSERT_LT(prefix.size(), static_cast<std::size_t>(c.length));
+        std::wstring const name   = L"q" + std::wstring(static_cast<std::size_t>(c.length) - prefix.size(), L'x');
+        std::wstring const dir    = prefix.substr(0, prefix.size() - 1) + name;
+        makeDirVerbatim(S + L"\\LEN\\" + name);
+        ASSERT_EQ(dir.size(), static_cast<std::size_t>(c.length));
+        auto const run = runFixture(scratch.path() / ("len-" + std::string{c.kind} + std::to_string(c.length) + ".marker"),
+                                    0, {std::string{kProbeCwdDirective}}, fs::path{dir});
+        if (c.dosContainerStarts) {
+            ASSERT_TRUE(run.result.spawned) << run.result.diagnostic;
+            ASSERT_TRUE(run.marker.has_value()) << run.markerError;
+            // The child's PRINTED directory (N12): a child this deep cannot open a relative name past its own MAX_PATH.
+            EXPECT_EQ(run.marker->wcwd, std::string(dir.begin(), dir.end())) << "the child started elsewhere";
+        } else {
+            EXPECT_FALSE(run.result.spawned) << "a directory past the boundary was handed on";
+            EXPECT_NE(run.result.diagnostic.find("working directory '"), std::string::npos) << run.result.diagnostic;
+        }
+    }
+    EXPECT_GE(asked, 13u) << "the drive's rows are asked on every Windows host";
+#endif
+}
+
+TEST(SpawnImage, AListedImageStartsItselfAndTheChildNamesItByTheOsAnswer) {
+#if !defined(_WIN32)
+    GTEST_SKIP() << "an image name the OS trims is Win32's; POSIX starts the image its spelling names";
+#else
+    dss::test_support::ScratchDir scratch{dss::test_support::Location::Temp, "spawn-image"};
+    std::wstring const            S = scratch.path().native();
+    ASSERT_TRUE(S.size() >= 3 && S[1] == L':' && S.size() < 180) << "the scratch lies on no drive, or too deep";
+    // The copies load the test's own libraries from its directory: the child searches PATH for them.
+    std::string const path = selfPath().parent_path().string() + ";" + (std::getenv("PATH") ? std::getenv("PATH") : "");
+    dss::test_support::ScopedEnv const libraries{"PATH", path.c_str()};
+    std::wstring const self = selfPath().native();
+    std::size_t        asked = 0;
+    for (ImageCell const& c : kImageCells) {
+        std::string const place{c.place};
+        SCOPED_TRACE(place + (c.twin ? ", twin present" : ", twin absent"));
+        std::wstring const area = S + (c.twin ? L"\\IP\\" : L"\\IA\\")
+                                + (place.rfind("dir-", 0) == 0 ? wideOf(c.place + 4) : wideOf(c.place));
+        makeDirVerbatim(S + (c.twin ? L"\\IP" : L"\\IA"));
+        makeDirVerbatim(area);
+        bool const         inDir = place.rfind("dir-", 0) == 0;
+        std::wstring const key   = inDir ? wideOf(c.place + 4) : L"";
+        std::wstring const dirName = key == L"dot" ? L"e." : key == L"dot2" ? L"e.." : key == L"space" ? L"d "
+                                   : key == L"nul" ? L"NUL" : L"n";
+        std::wstring const literal = inDir ? area + L"\\" + dirName + L"\\u3.exe"
+                                           : area + L"\\u3.exe" + (place == "file-dot" ? L"." : L" ");
+        if (inDir) makeDirVerbatim(area + L"\\" + dirName);
+        ASSERT_TRUE(::CopyFileW(self.c_str(), (L"\\\\?\\" + literal).c_str(), FALSE)) << ::GetLastError();
+        if (c.twin) {
+            std::wstring const twinDir = inDir ? trimmedTwinOf(dirName) : L"";
+            if (inDir && !twinDir.empty()) {
+                makeDirVerbatim(area + L"\\" + twinDir);
+                ::CopyFileW(self.c_str(), (L"\\\\?\\" + area + L"\\" + twinDir + L"\\u3.exe").c_str(), FALSE);
+            } else if (!inDir) {
+                ::CopyFileW(self.c_str(), (L"\\\\?\\" + area + L"\\u3.exe").c_str(), FALSE);
+            }
+        }
+        // The image as a LISTED value: the listed directory's `u3.exe`, or the listed image itself.
+        std::optional<dss::core::HostPath> image;
+        static_cast<void>(dss::core::walkTree(fs::path{area}, [&](dss::core::TreeEntry const& e) {
+            std::wstring const n = e.at.filename().native();
+            if (inDir && n == dirName) image = e.at / "u3.exe";
+            if (!inDir && n == literal.substr(area.size() + 1)) image = e.at;
+            return dss::core::WalkStep::Prune;
+        }));
+        ASSERT_TRUE(image.has_value()) << "the walk did not list the image's place";
+        ++asked;
+        fs::path const marker = scratch.path() / ("image-" + std::to_string(asked) + ".marker");
+        std::vector<std::string> const argv{"u3", std::string{kFixtureFlag}, marker.string(), "0",
+                                            std::string{kProbeCwdDirective}};
+        SpawnResult const r = spawnAndWaitInherit(*image, argv);
+        ASSERT_TRUE(r.spawned) << r.diagnostic;
+        std::string        markerError;
+        auto const         blob = readFileBinary(marker);
+        ASSERT_TRUE(blob.has_value()) << "the listed image wrote no marker";
+        auto const m = parseMarker(*blob, markerError);
+        ASSERT_TRUE(m.has_value()) << markerError;
+        std::wstring const measuredLiteral = withBase(c.verbatimImage, S);
+        EXPECT_EQ(dss::core::PathIdentity::of(fs::path{m->self}, dss::core::Use::Leaf),
+                  dss::core::PathIdentity::of(fs::path{L"\\\\?\\" + literal}, dss::core::Use::Leaf))
+            << "the child names " << m->self << ", not the listed image (the verbatim spelling started "
+            << std::string(measuredLiteral.begin(), measuredLiteral.end()) << ")";
+        // GIVEN: the plain spelling starts what the measured plain spelling started.
+        std::string const plain{c.plainImage};
+        fs::path const    plainMarker = scratch.path() / ("plain-" + std::to_string(asked) + ".marker");
+        std::vector<std::string> const plainArgv{"u3", std::string{kFixtureFlag}, plainMarker.string(), "0",
+                                                 std::string{kProbeCwdDirective}};
+        SpawnResult const p = spawnAndWaitInherit(fs::path{literal}, plainArgv);
+        if (plain.rfind("err ", 0) == 0) {
+            EXPECT_FALSE(p.spawned) << "the measured plain spelling started nothing";
+        } else {
+            ASSERT_TRUE(p.spawned) << p.diagnostic;
+            auto const pblob = readFileBinary(plainMarker);
+            ASSERT_TRUE(pblob.has_value());
+            auto const pm = parseMarker(*pblob, markerError);
+            ASSERT_TRUE(pm.has_value()) << markerError;
+            EXPECT_EQ(dss::core::PathIdentity::of(fs::path{pm->self}, dss::core::Use::Leaf),
+                      dss::core::PathIdentity::of(fs::path{L"\\\\?\\" + withBase(c.plainImage, S)}, dss::core::Use::Leaf))
+                << "the GIVEN plain spelling started " << pm->self;
+        }
+    }
+    EXPECT_EQ(asked, std::size(kImageCells));
+#endif
+}
+
 // ── main: spawn fixture OR test runner ─────────────────────────────────────
 //
 // Owning `main` (rather than linking gtest_main) is what lets the flag be
@@ -2923,6 +3507,17 @@ int main(int argc, char** argv) {
                 }
             }
         }
+#if defined(_WIN32)
+        // The working-directory probe: this process's OWN directory, the mark there, and its image (the home's
+        // answer, so the image a LISTED value started is named by the OS, never by the module name).
+        if (argc >= 5 && std::string_view{argv[4]} == kProbeCwdDirective) {
+            appendRecord(blob, "WCWD", utf8OfWide(ownDirectoryW()));
+            appendRecord(blob, "MARK", markInOwnDirectory());
+            std::error_code           selfEc;
+            dss::core::HostPath const image = dss::core::runningExecutable(selfEc);
+            appendRecord(blob, "SELF", selfEc ? "<" + selfEc.message() + ">" : image.spelling().display());
+        }
+#endif
         // BINARY mode: a text-mode write would translate '\n' to CRLF on
         // Windows and corrupt both the length prefixes and any payload that
         // contains a newline.

@@ -1,10 +1,12 @@
 #include "link/format/macho.hpp"
+#include "link/format/address_class_word.hpp"   // requireTheWritersAddressWidth -- one class per writer
 #include "link/format/object_format_backends.hpp"
 
 #include "core/crypto/sha256.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "link/format/byte_emit.hpp"
 #include "link/format/dwarf_cfi.hpp"
+#include "link/format/eh_frame_handler_refusal.hpp"
 #include "link/format/exec_data_section.hpp"
 #include "link/format/exec_reloc_apply.hpp"
 #include "link/format/interior_block_symbol_va.hpp"
@@ -228,15 +230,18 @@ constexpr std::size_t kSection64Size      = 80;
 constexpr std::size_t kSymtabCommandSize  = 24;
 constexpr std::size_t kNlist64Size        = 16;
 constexpr std::size_t kRelocationInfoSize = 8;
-// The address width of the 64-bit Mach-O wire format, in bytes — the
-// same `64` the `k*64Size` record sizes above are named for. Deliberately
-// NOT spelled `kGotSlotSize` (which happens to hold the same 8): one says
-// "how wide is an address in this file format", the other "how big is a
-// __got entry", and a use site that folded them would read as if the GOT
-// governed DWARF record padding. Consumed by the `__eh_frame` builder
-// (CIE/FDE records pad to the address size) and as that section's
-// alignment.
-constexpr std::uint32_t kMachO64AddressSize = 8;
+// ★ MACH-O 64'S CLASS WORD, NAMED ONCE (P69 fold 3e, X9 R10; P69 fold 3f,
+// review-xa3e F6): the address width of the 64-bit Mach-O wire format, in
+// bytes — the same `64` the `k*64Size` record sizes above are named for. The
+// `__got` slot, a rebase site and a data pointer are each this wide, the
+// `__eh_frame` builder pads its CIE/FDE records to it and aligns that section
+// to it, and `encode` refuses a document whose data model's pointer is another
+// width (`requireTheWritersAddressWidth`). It used to be TWO words of 8, this
+// one spelled `kMachO64AddressBytes` beside a `kMachO64AddressBytes` further
+// down: one fact with two owners. `kGotSlotSize` stays its own name on
+// purpose -- "how big is a __got entry" reads it, so a use site does not read
+// as if the GOT governed DWARF record padding.
+constexpr std::uint32_t kMachO64AddressBytes = 8;
 
 // ── nlist_64 as a FIXED-WIDTH RECORD, not five appends ─────────
 //
@@ -473,7 +478,7 @@ constexpr std::uint64_t kLinkeditBlobAlign = 8;
 // for one table is how the next table appended to the chain re-opens this.
 // The string table alone needs 1 and follows a 16-byte-record table, so it
 // is aligned for free and takes no step.
-constexpr std::uint64_t kObjectTrailerAlign = kMachO64AddressSize;
+constexpr std::uint64_t kObjectTrailerAlign = kMachO64AddressBytes;
 
 // Emit one `build_version_command` (LC_BUILD_VERSION, 24 bytes, ntools=0)
 // — the SINGLE chokepoint shared by both the static (encodeExec) and
@@ -639,23 +644,17 @@ static_assert(MH_WEAK_DEFINES != MH_BINDS_TO_WEAK,
 
 // Each `tlv_descriptor` is 3 native words (thunk / key / offset).
 constexpr std::uint64_t kTlvDescriptorSize         = 24;
-// The on-disk symbol every TLV descriptor's word0 binds to: the libSystem
-// bootstrap thunk. Apple's runtime declares the C function `_tlv_bootstrap`
-// (one leading underscore, a reserved-namespace runtime name); the Apple C
-// ABI prepends ONE more underscore for the on-disk symbol, so the linked
-// image references `__tlv_bootstrap` (TWO underscores) — exactly as this
-// format's `_exit` import is the on-disk name of C `exit`. dyld overwrites
-// each bound word0 with its real tlv_get_addr at load; the bootstrap itself
-// aborts if ever called (it never is). Verified against Apple's
-// threadLocalVariables.c (`void _tlv_bootstrap(){ abort(); }`) + the
-// leading-underscore C-ABI rule this format already encodes for `_exit`.
-constexpr std::string_view kTlvBootstrapSymbol = "__tlv_bootstrap";
-// The dylib that exports `__tlv_bootstrap`: libSystem (every macOS process
-// links it; it is also this format's `_exit` home + the sole loadDylib). The
-// writer looks up its bind ORDINAL via `dylibOrdinal` and fails loud if the
-// image does not declare it in loadDylibs (a config that dropped libSystem).
-constexpr std::string_view kTlvBootstrapLibrary =
-    "/usr/lib/libSystem.B.dylib";
+// The routine every TLV descriptor's word0 binds to, and the image exporting
+// it, are the FORMAT's: `tlsAccess.bootstrap` names the routine as the object
+// file spells it (Darwin's `__tlv_bootstrap`: Apple's runtime declares the C
+// function `_tlv_bootstrap`, and the Apple C ABI prepends one more
+// underscore, as this format's `_exit` import is the on-disk name of C
+// `exit`) and the ROLE of its image (libSystem's `cLibrary`), which the bind
+// below resolves through the role table. dyld overwrites each bound word0
+// with its real tlv_get_addr at load; the bootstrap itself aborts if ever
+// called (it never is). P69 fold 3f (ledger 716): they were two literals
+// here, a second owner of the role table and a loader name no document
+// stated.
 
 // dyld bind opcodes (<mach-o/loader.h>) — consumed by the dynamic
 // arm's bind-stream emitter.
@@ -715,7 +714,8 @@ constexpr std::uint8_t REBASE_TYPE_POINTER                        = 1;
 
 constexpr std::size_t kDyldInfoCommandSize = 48;
 constexpr std::size_t kDysymtabCommandSize = 80;
-constexpr std::size_t kGotSlotSize         = 8;
+// A `__got` entry is one address of the class word above (`kMachO64AddressBytes`).
+constexpr std::size_t kGotSlotSize = kMachO64AddressBytes;
 
 // ── Per-cputype __stubs substrate (MIRRORS elf.cpp's emitPltStub) ──
 //
@@ -1503,6 +1503,13 @@ encode(AssembledModule const&    module,
        ObjectFormatSchema const& objectFormatSchema,
        DiagnosticReporter&       reporter,
        ImageRequest const&       request) {
+    // ★ THIS WRITER WRITES ONE CLASS, whose address is `kMachO64AddressBytes` (P69 fold 3e,
+    // the review of fold 3d's X9): a document whose data model's pointer is
+    // another width is refused here, by name, before any slot is sized.
+    if (!::dss::link::format::requireTheWritersAddressWidth(objectFormatSchema, kMachO64AddressBytes,
+                                                           "macho::encode", reporter)) {
+        return {};
+    }
     auto const& fmt = objectFormatSchema;
     // ── SELF-GUARD (D-LINK-…-KIND-IDENTITY-BRANCHES, TF-C125) ──────────
     //
@@ -1540,6 +1547,16 @@ encode(AssembledModule const&    module,
                  + "' (kind="
                  + std::string{link::objectFormatBackendName(fmt.backend())}
                  + ")");
+        return {};
+    }
+    // The FIRST question about what the image holds, asked once for every kind and before the dispatch below: an
+    // MH_EXECUTE must hold the instruction it starts at; an MH_DYLIB, whose document declares no entry, may hold its
+    // data alone and exports it, as ld64 `-dynamiclib` writes one (✔MEASURED, P69 fold 3d, Apple clang 21 +
+    // ld-1267: a `__text` of 0 bytes in an r-x `__TEXT`, the 4-byte `__data`, LC_ID_DYLIB and no LC_MAIN, and a
+    // program reading the datum exits 42). ✔MEASURED (run 20261103-182329-b11a07e8): asked inside the exec arms,
+    // it came after the dispatch's code-signature gate, which refused a program of data alone under
+    // K_FormatLacksImportSupport, a second and wrong answer.
+    if (!link::format::anImageThatStartsAProgramHoldsAnInstruction(module, fmt, "macho::encode", reporter)) {
         return {};
     }
 
@@ -1591,6 +1608,20 @@ encode(AssembledModule const&    module,
     // an entry no carrier can hold is refused whichever door it came through.
     // A pure predicate on success, so the linker path reports nothing twice.
     if (!enforceImageRequest(request, fmt, "macho::encode", reporter)) {
+        return {};
+    }
+    // P69 fold 3c: a definition its unit states is the ONE instance of its name
+    // in the process is refused by name where the document states no binding
+    // that spells one (`weak_definition_gate.hpp`) — never written as a plain
+    // definition, one instance per image.
+    if (!link::format::requireOneInstancePerProcessSpelling(module, fmt, "macho::encode", reporter)) {
+        return {};
+    }
+    // P69 fold 3d: a carried handler of the Win64 shape (data written after an
+    // UNWIND_INFO) has no place in an `__eh_frame` -- refused by name, one gate
+    // for every Mach-O flavor. The DWARF shape is stated by the dynamic image's
+    // `__eh_frame` and refused below by the flavors that write none.
+    if (link::format::refuseAWin64HandlerTheEhFrameCannotState(module.functions, "macho::encode", reporter)) {
         return {};
     }
 
@@ -1701,7 +1732,21 @@ encode(AssembledModule const&    module,
                        request.runpaths.size() == 1 ? "y was" : "ies were",
                        fmt.name()));
         }
+        // P69 fold 3d: the static arm writes no `__eh_frame`, so it states no
+        // handler -- refused by name, before any byte.
+        if (link::format::refuseAHandlerThisFlavourCannotState(
+                module.functions, "macho::encode (MH_EXECUTE, imports nothing)",
+                "an image that imports nothing is written with no `__eh_frame` to state it in", reporter)) {
+            return {};
+        }
         return encodeExec(module, targetSchema, fmt, *secText, reporter);
+    }
+    // P69 fold 3d: the MH_OBJECT arm writes no `__eh_frame`, so it states no
+    // handler -- refused by name, before any byte.
+    if (link::format::refuseAHandlerThisFlavourCannotState(
+            module.functions, "macho::encode (MH_OBJECT)",
+            "this writer's relocatable object carries no `__eh_frame` to state it in", reporter)) {
+        return {};
     }
 
     // NOTE: the MH_OBJECT path does not APPLY relocations (the assembler
@@ -2038,6 +2083,32 @@ encode(AssembledModule const&    module,
     }
     if (hasBss && !registerDataSyms(bssLayout, IDX_BSS, bssAddr)) return {};
 
+    // THE WEAK-NAME RULE, this writer's arm
+    // (D-LK-WEAK-NAME-REFERENCE-BOUND-TO-THE-BODY-NOT-THE-NAME): a plain
+    // reference row naming one of this object's own external-linkage names gets
+    // no N_UNDF record. Its id is the nlist of the NAME, so a relocation written
+    // through a weak name names the `.weak_definition` symbol, as Apple's
+    // assembler writes it (✔MEASURED 2026-10-08: BR26 / X86_64_RELOC_BRANCH
+    // against `weak external _shared`). The emission below writes each canonical
+    // record followed by its aliases, in `definedAliases` order.
+    {
+        std::unordered_map<std::string, std::uint32_t> recordOfDefinedName;
+        auto const noteNamesOf = [&](SymbolId id) {
+            std::uint32_t const canonical = symIdxBySymbol.at(id);
+            if (objNames.definedBinding(id) != SymbolBinding::Local) {
+                recordOfDefinedName.emplace(objNames.definedName(id, "_sym_"), canonical);
+            }
+            std::uint32_t next = canonical + 1u;
+            for (ModuleSymbol const* alias : objNames.definedAliases(id)) {
+                recordOfDefinedName.emplace(alias->name, next++);
+            }
+        };
+        for (auto const& f : funcSyms) noteNamesOf(f.symId);
+        for (auto const& d : dataSyms) noteNamesOf(d.symId);
+        link::format::pointOwnNameReferencesAtTheirRecords(module, recordOfDefinedName,
+                                                           symIdxBySymbol);
+    }
+
     // Undefined externs: any reloc target that is neither a defined
     // function nor a defined data symbol. Scans DATA-ITEM relocations too
     // (the ELF c145 mirror) — a relro const table of libc function pointers
@@ -2053,6 +2124,15 @@ encode(AssembledModule const&    module,
         for (auto const& rel : fn.relocations) noteExternTarget(rel.target);
     for (auto const& di : module.dataItems)
         for (auto const& rel : di.relocations) noteExternTarget(rel.target);
+    // A COMMON row (P69, D-LK-OBJECT-READERS-MISREAD-COMMON-SYMBOLS) is a
+    // DEFINITION handed on to the final linker: it gets its record whether or
+    // not a relocation names it (spelled in the emission loop below).
+    std::unordered_map<SymbolId, ExternImport const*> commonRowOf;
+    for (auto const& imp : module.externImports) {
+        if (imp.commonSize == 0u) continue;
+        commonRowOf.emplace(imp.symbol, &imp);
+        noteExternTarget(imp.symbol);
+    }
     for (auto const& e : externSyms) {
         if (symIdxBySymbol.emplace(e, nextSymIdx).second) ++nextSymIdx;
     }
@@ -2123,8 +2203,54 @@ encode(AssembledModule const&    module,
                                  fn.symbol.v));
                 return {};
             }
+            // ★ AN ADDEND THE FIELD CANNOT HOLD (P69 fold 3e): an instruction
+            // field (arm64's PAGE21 / PAGEOFF12 / BRANCH26) holds instruction
+            // bits, so a non-zero addend travels in the format's ADDEND record
+            // (`macho.addendRelocation`), written just before the entry it
+            // carries the addend for, at the same address -- as Apple clang
+            // writes `l_.str.1 + 2` (✔MEASURED 2026-11-13) and ld64 and DSS's
+            // reader read it. A format that declares no such record still
+            // refuses the addend, by the helper below and naming the relocation.
+            std::int64_t                 fieldAddend = rel.addend;
+            std::optional<std::uint32_t> addendRecordInfo;
+            if (fieldWidth == 0u && rel.addend != 0
+                && fmt.macho().addendRelocation.has_value()) {
+                auto const& record = *fmt.macho().addendRelocation;
+                // ★ ONLY FOR AN ENTRY THE RECORD MAY CARRY (P69 fold 3f, `carriesAddendOf`):
+                // Apple's assembler writes the record before PAGE21, PAGEOFF12 and BRANCH26
+                // and refuses an addend on a GOT page reference (✔MEASURED, Apple clang
+                // 21.0.0), and DSS's reader refuses a record before any other entry -- so an
+                // addend on any other instruction relocation is refused here, naming it.
+                if (auto const* row = fmt.relocationByKind(rel.kind); row != nullptr) {
+                    std::uint32_t const wire = row->nativeIdFor(rel.bytesAfterField);
+                    if (std::find(record.carriesAddendOf.begin(), record.carriesAddendOf.end(), wire)
+                        == record.carriesAddendOf.end()) {
+                        emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                             std::format("Mach-O writer: relocation '{}' in symbol #{} has addend {}, "
+                                         "and object format '{}' carries no addend of it: its field "
+                                         "holds instruction bits and its addend record "
+                                         "(`addendRelocation.carriesAddendOf`) does not list wire id {}",
+                                         row->name, fn.symbol.v, rel.addend, fmt.name(), wire));
+                        return {};
+                    }
+                }
+                std::uint32_t const bits = record.addendBits;
+                std::int64_t const lowest  = bits == 0u || bits > 24u ? 0 : -(std::int64_t{1} << (bits - 1u));
+                std::int64_t const highest = bits == 0u || bits > 24u ? -1 : (std::int64_t{1} << (bits - 1u)) - 1;
+                if (rel.addend < lowest || rel.addend > highest) {
+                    emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                         std::format("Mach-O writer: relocation in symbol #{}: "
+                                     "addend {} does not fit the {}-bit addend "
+                                     "record of object format '{}'",
+                                     fn.symbol.v, rel.addend, bits, fmt.name()));
+                    return {};
+                }
+                addendRecordInfo = record.nativeId
+                                 | (static_cast<std::uint32_t>(rel.addend) & ((1u << bits) - 1u));
+                fieldAddend = 0;
+            }
             auto const placed = link::format::placeRelocationAddend(
-                *addendStorage, *tri, rel.addend,
+                *addendStorage, *tri, fieldAddend,
                 std::span<std::uint8_t>{textBody.data() + fieldAt, fieldWidth});
             if (!placed.has_value()) {
                 emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
@@ -2172,6 +2298,11 @@ encode(AssembledModule const&    module,
             std::uint32_t const rInfo =
                 fmtReloc->nativeIdFor(rel.bytesAfterField) | (1u << 27)
                 | (symIdx & 0x00FFFFFFu);
+            if (addendRecordInfo.has_value()) {   // r_extern 0: it names no symbol
+                appendU32LE(textRelocs, rAddress);
+                appendU32LE(textRelocs, *addendRecordInfo);
+                ++textRelocCount;
+            }
             appendU32LE(textRelocs, rAddress);
             appendU32LE(textRelocs, rInfo);
             ++textRelocCount;
@@ -2192,11 +2323,12 @@ encode(AssembledModule const&    module,
     // nativeId is always used (no PLT variant — a slot bound through a stub
     // would read jump-stub bytes as the pointer value).
     //
-    // ADDEND: Mach-O relocation_info has NO addend column. The __text table
-    // above fails loud on a non-zero addend because an arm64 INSTRUCTION
-    // reloc (BRANCH26/PAGE21/PAGEOFF12) expresses addends via paired
-    // ARM64_RELOC_ADDEND records this writer does not emit — the immediate
-    // fields cannot carry a full addend in place. A DATA slot is different:
+    // ADDEND: Mach-O relocation_info has NO addend column. An arm64
+    // INSTRUCTION reloc (BRANCH26/PAGE21/PAGEOFF12) cannot carry its addend in
+    // its field, so the __text table above writes it in the paired
+    // ARM64_RELOC_ADDEND record (`macho.addendRelocation`, since P69 fold 3e;
+    // this paragraph said, until fold 3f, that the writer emits none and fails
+    // loud instead). A DATA slot is different:
     // for ARM64_RELOC_UNSIGNED (r_extern=1) ld64 reads the 8-byte slot
     // CONTENT as the implicit addend (final = S + slot) — the IN-PLACE
     // addend convention clang itself emits for `&arr[1]`-style initializers.
@@ -2246,12 +2378,16 @@ encode(AssembledModule const&    module,
                 // relocation_info against DATA bytes (silently corrupt
                 // output). Reject any non-Linear kind outright (c147
                 // silent-failure-review fold).
+                // An ADDRESS the loader moves (`loaderRebasesTheField`, the
+                // one predicate; P69 fold 3e, X9 R6 -- it asked `pcRelative`
+                // alone, so a thread-local or image-relative row passed).
                 if (tri->formulaKind != RelocFormulaKind::Linear
-                    || tri->pcRelative || tri->widthBytes == 0) {
+                    || !loaderRebasesTheField(*tri) || tri->widthBytes == 0) {
                     emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
                          std::format("macho::encode (MH_OBJECT): {} data "
                                      "item SymbolId={{ {} }} relocation '{}' "
-                                     "is pc-relative, zero-width, or a "
+                                     "is pc-relative, thread-local, "
+                                     "image-relative, zero-width, or a "
                                      "non-linear instruction fixup - a data "
                                      "pointer needs a plain absolute fixup "
                                      "with a concrete write width.",
@@ -2508,6 +2644,29 @@ encode(AssembledModule const&    module,
     for (auto const& e : externSyms) {
         std::string const symName = objNames.externName(e, "_sym_");
         std::uint32_t const nameOff = strtab.add(symName);
+        if (auto const common = commonRowOf.find(e); common != commonRowOf.end()) {
+            // The common: N_UNDF|N_EXT with the SIZE in n_value and the
+            // alignment's log2 in bits 8-11 of n_desc (<mach-o/nlist.h>
+            // SET_COMM_ALIGN), private-extern when its visibility hides it —
+            // what clang writes under -fcommon.
+            ExternImport const& row = *common->second;
+            std::uint8_t const nType = isExternallyVisible(SymbolBinding::Global,
+                                                           row.commonVisibility)
+                                           ? static_cast<std::uint8_t>(N_UNDF | N_EXT)
+                                           : static_cast<std::uint8_t>(N_UNDF | N_EXT | N_PEXT);
+            auto const alignLog2 = static_cast<std::uint16_t>(std::countr_zero(row.commonAlignment));
+            if (alignLog2 > 0x0Fu) {
+                emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                     std::format("macho::encode (MH_OBJECT): the common symbol '{}' asks for "
+                                 "2^{} bytes of alignment, and n_desc carries a common's "
+                                 "alignment in four bits (at most 2^15).",
+                                 symName, alignLog2));
+                return {};
+            }
+            appendNlist(nameOff, nType, /*n_sect=*/0,
+                        static_cast<std::uint16_t>(alignLog2 << 8), row.commonSize);
+            continue;
+        }
         // D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE: the n_desc half of
         // this record now carries the import's REFERENCE binding, read through
         // the `externName`/`externBinding` lockstep pair rather than hardcoded —
@@ -2580,6 +2739,52 @@ encode(AssembledModule const&    module,
     // Apple `clang -c` emits the command into every `.o` it writes.
     auto const& im = fmt.machoImage();
     bool const emitBuildVersion = im.buildVersion.has_value();
+    // ★ P69 fold 3f (`#pragma comment`'s Mach-O half): what the unit asks its final linker, ONE LC_LINKER_OPTION per
+    // request, after LC_SYMTAB, where clang writes them (✔MEASURED P69 fold 3f) -- each library one string, the
+    // document's `library` prefix and its name, then each other option its own strings. A command is its count and
+    // its NUL-terminated strings, zero-filled to 8. A document that states no command writes no request it would
+    // drop: it refuses the module by name.
+    std::vector<std::vector<std::string>> linkerOptionCommands;
+    auto const& optionsBlock = fmt.macho().linkerOptions;
+    {
+        auto const& requests = module.linkerRequests;
+        if ((!requests.dependentLibraries.empty() || !requests.linkerOptions.empty())
+            && !optionsBlock.has_value()) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("macho::encode (MH_OBJECT): the unit asks its final linker for '{}', and format '{}' "
+                             "states no 'macho.linkerOptions' command to ask it in -- writing the object without "
+                             "it would drop the request.",
+                             !requests.dependentLibraries.empty()
+                                 ? requests.dependentLibraries.front()
+                                 : spelledLinkerOption(requests.linkerOptions.front()),
+                             fmt.name()));
+            return {};
+        }
+        for (auto const& lib : requests.dependentLibraries) {
+            linkerOptionCommands.push_back({optionsBlock->library + lib});
+        }
+        linkerOptionCommands.insert(linkerOptionCommands.end(), requests.linkerOptions.begin(),
+                                    requests.linkerOptions.end());
+        for (auto const& words : linkerOptionCommands) {
+            bool const spellable = !words.empty() && std::none_of(words.begin(), words.end(), [](std::string const& w) {
+                return w.empty() || w.find('\0') != std::string::npos;
+            });
+            if (!spellable) {
+                emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                     std::format("macho::encode (MH_OBJECT): the linker option '{}' has an empty string or one "
+                                 "holding a NUL, which no LC_LINKER_OPTION string reads back as",
+                                 spelledLinkerOption(words)));
+                return {};
+            }
+        }
+    }
+    auto const linkerOptionCommandSize = [](std::vector<std::string> const& words) {
+        std::size_t size = 12u;   // cmd, cmdsize, count
+        for (auto const& w : words) size += w.size() + 1u;
+        return (size + 7u) & ~std::size_t{7};
+    };
+    std::size_t linkerOptionBytes = 0;
+    for (auto const& words : linkerOptionCommands) linkerOptionBytes += linkerOptionCommandSize(words);
     // ★ THE ONE OWNER of the load-command byte total. `mach_header_64.
     // sizeofcmds` and the `textRawOffset` the whole file layout hangs off are
     // the SAME number, and they were previously two copies of one expression;
@@ -2590,7 +2795,7 @@ encode(AssembledModule const&    module,
     std::size_t const sizeOfCommands =
         kSegmentCommand64Size + numSections * kSection64Size
         + (emitBuildVersion ? kBuildVersionCommandSize : 0u)
-        + kSymtabCommandSize;
+        + kSymtabCommandSize + linkerOptionBytes;
     std::size_t const headerAndCommands = kMachHeader64Size + sizeOfCommands;
 
     // File image of the flat section span: every file-backed section's
@@ -2667,10 +2872,11 @@ encode(AssembledModule const&    module,
     appendU32LE(bytes, id.cputype);
     appendU32LE(bytes, id.cpusubtype);
     appendU32LE(bytes, static_cast<std::uint32_t>(id.filetype));
-    // ncmds: LC_SEGMENT_64 + [LC_BUILD_VERSION] + LC_SYMTAB. Counted from the
-    // SAME predicate `sizeOfCommands` is sized from — a command the header
-    // does not count leaves ld64 walking off the end of the command list.
-    appendU32LE(bytes, emitBuildVersion ? 3u : 2u);
+    // ncmds: LC_SEGMENT_64 + [LC_BUILD_VERSION] + LC_SYMTAB + each
+    // LC_LINKER_OPTION. Counted from the SAME predicates `sizeOfCommands` is
+    // sized from — a command the header does not count leaves ld64 walking off
+    // the end of the command list.
+    appendU32LE(bytes, (emitBuildVersion ? 3u : 2u) + static_cast<std::uint32_t>(linkerOptionCommands.size()));
     appendU32LE(bytes, static_cast<std::uint32_t>(sizeOfCommands));
     // flags: VERBATIM from the format schema, interpreted by nothing here.
     // The object/staticlib schemas declare MH_SUBSECTIONS_VIA_SYMBOLS (0x2000)
@@ -2790,6 +2996,20 @@ encode(AssembledModule const&    module,
     appendU32LE(bytes, numberOfSymbols);
     appendU32LE(bytes, static_cast<std::uint32_t>(stringTableOffset));
     appendU32LE(bytes, static_cast<std::uint32_t>(stringTableSize));
+
+    // Each LC_LINKER_OPTION (P69 fold 3f), after LC_SYMTAB as clang writes them.
+    for (auto const& words : linkerOptionCommands) {
+        std::size_t const start = bytes.size();
+        std::size_t const size  = linkerOptionCommandSize(words);
+        appendU32LE(bytes, optionsBlock->command);
+        appendU32LE(bytes, static_cast<std::uint32_t>(size));
+        appendU32LE(bytes, static_cast<std::uint32_t>(words.size()));
+        for (auto const& w : words) {
+            bytes.insert(bytes.end(), w.begin(), w.end());
+            bytes.push_back(0);
+        }
+        while (bytes.size() - start < size) bytes.push_back(0);
+    }
 
     // Sanity: the emitted load-command block is exactly the size the header
     // advertised and `textRawOffset` was derived from. Both exec arms carry
@@ -2994,12 +3214,7 @@ encodeExec(AssembledModule const&    module,
         funcTextStart.push_back(start);
         textBody.insert(textBody.end(), fn.bytes.begin(), fn.bytes.end());
     }
-    if (textBody.empty()) {
-        emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
-             "macho::encodeExec: `__text` is empty — every "
-             "AssembledFunction contributed zero bytes.");
-        return {};
-    }
+    // (That this MH_EXECUTE holds the instruction it starts at was `macho::encode`'s first question.)
     // The static (no-extern) path emits no __TEXT,__const yet — a
     // read-only data global routes through encodeExecDynamic (the
     // global_int corpus reaches it via the _exit trampoline, which
@@ -3066,6 +3281,18 @@ encodeExec(AssembledModule const&    module,
     // calls the same helper.
     if (!link::format::addInteriorBlockSymbolVas(
             module, funcTextStart, sectionVa, symbolVa,
+            "macho::encodeExec", reporter)) {
+        return {};
+    }
+    // P69 fold 3d (D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL, the Mach-O
+    // neighbour): each name the document states the image defines
+    // (`__mh_execute_header`, `___dso_handle`) takes the address of the
+    // image's own mach header -- file offset 0 of __TEXT, which maps it at
+    // __TEXT's vmaddr, `im.pageZeroSize`. ✔MEASURED (probe-reference-cc run
+    // 20261104-220054-21df78f8, Apple clang 21 + ld64, arm64 and x86_64): an
+    // executable reads MH_MAGIC_64 through both names.
+    if (!link::format::addImageDefinedSymbolVas(
+            module.imageDefinedSymbols, im.pageZeroSize, symbolVa,
             "macho::encodeExec", reporter)) {
         return {};
     }
@@ -3584,8 +3811,11 @@ encodeExecDynamic(AssembledModule const&    module,
     // executable recording ONE `LC_LOAD_DYLIB` — the second library's symbols
     // absent at load — while the ELF control on the identical shape recorded
     // two correct `DT_NEEDED` entries. The document now declares the identity as
-    // a function of the artifact (`${artifactFileName}`), which is also what
-    // ld64 does when no `-install_name` is given: the output path.
+    // a function of the artifact (`${artifactFileName}`) under `@rpath/` — what
+    // ld64 records under `-install_name @rpath/<name>`, and NOT its flagless
+    // default (the -o path exactly as given, ✔MEASURED P69 fold 3d), which a
+    // build of any target on any host would fill with a directory no Mac
+    // loads from; the documents' `$installNameComment` states the decision.
     //
     // ★ RESOLVED ONCE INTO A LOCAL, and that is load-bearing rather than tidy.
     // The name is read TWICE below — once to SIZE the LC_ID_DYLIB command and
@@ -3665,14 +3895,6 @@ encodeExecDynamic(AssembledModule const&    module,
     // outer `encode()` (covers both encodeExec + encodeExecDynamic
     // paths uniformly). Reaching this point means the schema set
     // useChainedFixups=false → legacy LC_DYLD_INFO_ONLY path.
-    if (module.functions.empty()) {
-        emit(reporter, DiagnosticCode::K_SymbolUndefined,
-             "macho::encodeExecDynamic: zero functions -- an "
-             "MH_EXECUTE needs at least one entry function, and an "
-             "MH_DYLIB without code has nothing to export "
-             "(D-LK3-3; mirrors the PE Dll Text-row rule).");
-        return {};
-    }
     // VM segment page size is config-driven (`image.segmentPageSize`):
     // 4 KiB x86_64-darwin / 16 KiB (0x4000) arm64-darwin. Apple Silicon
     // rejects 4 KiB-aligned segments with EBADMACHO. validate() proves
@@ -3822,12 +4044,8 @@ encodeExecDynamic(AssembledModule const&    module,
         funcTextStart.push_back(textBody.size());
         textBody.insert(textBody.end(), fn.bytes.begin(), fn.bytes.end());
     }
-    if (textBody.empty()) {
-        emit(reporter, DiagnosticCode::K_SymbolUndefined,
-             "macho::encodeExecDynamic: every AssembledFunction "
-             "contributed zero bytes — `__text` is empty.");
-        return {};
-    }
+    // (Whether this image may hold no instruction was `macho::encode`'s first question: an MH_DYLIB of data alone
+    // reaches here with `textBody` empty, and its `__text` is then 0 bytes, as ld64's is.)
 
     // ── (c.5) __TEXT,__eh_frame — the DWARF call-frame table ─────
     //
@@ -3872,9 +4090,15 @@ encodeExecDynamic(AssembledModule const&    module,
     std::vector<std::optional<CfiFunction>> perFuncCfi;
     perFuncCfi.reserve(module.functions.size());
     for (auto const& fn : module.functions) perFuncCfi.push_back(fn.cfi);
+    // P69 fold 3d: each function's handler -- its CIE names the routine, its
+    // FDE the data area; both fields are filled once every address is known,
+    // after the relocations (the `fillEhFrameHandlerFields` call below). The
+    // personality field is direct pc-relative: an image's own routine, or an
+    // import's `__stubs` entry.
+    auto const perFuncHandler = link::format::ehFrameHandlersOf(module.functions);
     auto ehFrameOpt = link::format::buildEhFrame(
         perFuncCfi, link::format::dwarfRegisterMappingOf(targetSchema),
-        kMachO64AddressSize, reporter);
+        kMachO64AddressBytes, reporter, perFuncHandler);
     // Already reported by the builder, naming the register it could not
     // describe — a second diagnostic here would only dilute it. Never
     // continue without the table: an image that silently ships without
@@ -4460,7 +4684,7 @@ encodeExecDynamic(AssembledModule const&    module,
         hasEhFrame
             ? alignUp(hasConst ? constSectionVa + constSize
                                : stubsVa + stubsBytes,
-                      kMachO64AddressSize)
+                      kMachO64AddressBytes)
             : 0;
     std::uint64_t const textEndVaEarly =
         hasEhFrame ? ehFrameSectionVa + ehFrameSize
@@ -4688,6 +4912,17 @@ encodeExecDynamic(AssembledModule const&    module,
             "macho::encodeExecDynamic", reporter)) {
         return {};
     }
+    // P69 fold 3d: each image-defined name takes the address of the image's
+    // own mach header, at __TEXT's vmaddr (`im.pageZeroSize`; 0 in the base-0
+    // dylib, whose addresses here are image offsets) -- `__mh_execute_header`
+    // in an executable, `__mh_dylib_header` in a dylib, `___dso_handle` in
+    // both, as each document states. ✔MEASURED (run 20261104-220054-21df78f8):
+    // ld64 defines each in its own flavor only.
+    if (!link::format::addImageDefinedSymbolVas(
+            module.imageDefinedSymbols, im.pageZeroSize, symbolVa,
+            "macho::encodeExecDynamic", reporter)) {
+        return {};
+    }
 
     // ── MH_DYLIB export trie (c153, D-LK3-3 — the c150 ET_DYN
     // export-set mirror): every externally-visible DEFINED symbol —
@@ -4894,7 +5129,7 @@ encodeExecDynamic(AssembledModule const&    module,
     if (hasConst
         && !link::format::applyDataItemRelocations(
                constLayout.bytes, module.dataItems, constLayout, constSectionVa,
-               symbolVa, targetSchema, "macho::encodeExecDynamic", reporter,
+               symbolVa, targetSchema, "macho::encodeExecDynamic", kMachO64AddressBytes, reporter,
                &constRebaseSiteVas)) {
         return {};
     }
@@ -4918,7 +5153,7 @@ encodeExecDynamic(AssembledModule const&    module,
     if (hasData
         && !link::format::applyDataItemRelocations(
                dataLayout.bytes, module.dataItems, dataLayout, dataSecVa,
-               symbolVa, targetSchema, "macho::encodeExecDynamic", reporter,
+               symbolVa, targetSchema, "macho::encodeExecDynamic", kMachO64AddressBytes, reporter,
                &dataRebaseSiteVas)) {
         return {};
     }
@@ -5236,7 +5471,7 @@ encodeExecDynamic(AssembledModule const&    module,
     //     the real resolution comes from the weak-bind stream. Making this
     //     helper fail loud on a miss would REFUSE the shape that is shipped and
     //     run-witnessed on Apple Silicon.
-    //   * THE TLV BOOTSTRAP BIND, which asks for `kTlvBootstrapLibrary` by name.
+    //   * THE TLV BOOTSTRAP BIND, which asks for its role's image by name.
     //     Here 0 means the library is genuinely ABSENT from `image.loadDylibs`,
     //     which is neither correct nor guardable beforehand — so that site tests
     //     the result and emits `K_SymbolUndefined` rather than binding it.
@@ -5463,15 +5698,44 @@ encodeExecDynamic(AssembledModule const&    module,
         // it. A wrong/missing bind = a `blr` through garbage = a Mac crash
         // invisible to any non-bind-decoding pin, so a test decodes this stream.
         if (hasTvars) {
-            std::uint32_t const tlvOrd =
-                dylibOrdinal(std::string{kTlvBootstrapLibrary});
+            // The routine and the ROLE of its image are the format's
+            // (`tlsAccess.bootstrap`); the image is the role table's answer --
+            // the family's, for a flavour whose own table does not declare the
+            // role (the dylib's).
+            auto const& tls = fmt.tlsAccess();
+            if (!tls.has_value() || tls->bootstrapMangledName.empty()
+                || tls->bootstrapRole == RuntimeLibraryRole::None) {
+                emit(reporter, DiagnosticCode::K_FormatLacksThreadLocalSupport,
+                     std::format("macho::encodeExecDynamic: object format '{}' "
+                                 "declares no 'tlsAccess.bootstrap' -- the routine "
+                                 "each TLV descriptor's word0 is bound to -- so its "
+                                 "{} thread-local descriptor(s) cannot be bound.",
+                                 fmt.name(), numTlsDescriptors));
+                return {};
+            }
+            std::string roleRefusal;
+            FormatRuntimeLibraryRoleResolver const roles{fmt};
+            RuntimeLibraryBinding const* const bootstrapRow =
+                roles.rowForRole(tls->bootstrapRole, roleRefusal);
+            if (bootstrapRow == nullptr || bootstrapRow->image.empty()) {
+                emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                     std::format("macho::encodeExecDynamic: the TLV bootstrap '{}' "
+                                 "is exported by the runtime-library role '{}', which "
+                                 "object format '{}' and its family answer with no "
+                                 "image{}",
+                                 tls->bootstrapMangledName,
+                                 runtimeLibraryRoleName(tls->bootstrapRole), fmt.name(),
+                                 roleRefusal.empty() ? std::string{"."}
+                                                     : " (" + roleRefusal + ")."));
+                return {};
+            }
+            std::uint32_t const tlvOrd = dylibOrdinal(bootstrapRow->image);
             if (tlvOrd == 0) {
                 emit(reporter, DiagnosticCode::K_SymbolUndefined,
                      std::format("macho::encodeExecDynamic: the TLV bootstrap "
-                                 "library '{}' is not in image.loadDylibs — "
-                                 "cannot bind __tlv_bootstrap "
-                                 "(D-CSUBSET-THREAD-LOCAL).",
-                                 kTlvBootstrapLibrary));
+                                 "library '{}' is not in image.loadDylibs -- "
+                                 "cannot bind {}.",
+                                 bootstrapRow->image, tls->bootstrapMangledName));
                 return {};
             }
             std::uint64_t const tvarsOffsetInSeg = tvarsVa - dataSegVaEarly;
@@ -5485,7 +5749,7 @@ encodeExecDynamic(AssembledModule const&    module,
             }
             dyldBindBlob.push_back(static_cast<std::uint8_t>(
                 BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | 0));
-            for (char c : kTlvBootstrapSymbol)
+            for (char c : tls->bootstrapMangledName)
                 dyldBindBlob.push_back(static_cast<std::uint8_t>(c));
             dyldBindBlob.push_back(0);  // NUL terminator
             dyldBindBlob.push_back(BIND_OPCODE_SET_TYPE_IMM | BIND_TYPE_POINTER);
@@ -6123,7 +6387,7 @@ encodeExecDynamic(AssembledModule const&    module,
     // follows without complaint. Assert the two independent
     // derivations (the EARLY VA chain, the LATE file chain) agree.
     std::uint64_t const ehFrameFileOff =
-        hasEhFrame ? alignUp(constEnd, kMachO64AddressSize) : constEnd;
+        hasEhFrame ? alignUp(constEnd, kMachO64AddressBytes) : constEnd;
     std::uint64_t const ehFrameEnd =
         hasEhFrame ? (ehFrameFileOff + ehFrameSize) : constEnd;
     if (hasEhFrame
@@ -6152,6 +6416,14 @@ encodeExecDynamic(AssembledModule const&    module,
         link::format::applyEhFramePcRel(
             ehFrame, ehFrameSectionVa,
             [&](std::size_t i) { return sectionVa + funcTextStart[i]; });
+        // P69 fold 3d: the handler fields -- each names an address `symbolVa`
+        // holds (a routine, an import's stub, a data area's item). A
+        // thread-local's entry there is its descriptor, never an address.
+        if (!link::format::fillEhFrameHandlerFields(ehFrame, ehFrameSectionVa, module, symbolVa,
+                                                    tlsDataSymbols, "macho::encodeExecDynamic",
+                                                    reporter)) {
+            return {};
+        }
     }
 
     // __got lives in __DATA_CONST — separate segment, separate page.
@@ -6889,7 +7161,7 @@ encodeExecDynamic(AssembledModule const&    module,
         appendU64LE(bytes, ehFrameSize);
         appendU32LE(bytes, static_cast<std::uint32_t>(ehFrameFileOff));
         appendU32LE(bytes, static_cast<std::uint32_t>(
-                               std::countr_zero(kMachO64AddressSize)));
+                               std::countr_zero(kMachO64AddressBytes)));
         appendU32LE(bytes, 0);                 // reloff
         appendU32LE(bytes, 0);                 // nreloc
         appendU32LE(bytes, 0);                 // flags = S_REGULAR

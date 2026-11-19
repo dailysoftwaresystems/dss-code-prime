@@ -1,0 +1,61 @@
+{
+  "$comment": "P69 (lane lm, D-LINK-OBJECT-READERS-DROP-INTERIOR-SYMBOL-OFFSET): a DSS STATIC LIBRARY whose code addresses its own interior — a dense 12-case switch (a jump table: one abs64 slot per case, each naming a block label inside the function) and a computed goto (block addresses taken by the code) — linked into a program by --resolve-library on all five pairs, so every reference crosses the pair's relocatable-object READER. DSS's COFF and Mach-O writers name each such block with an interior label (class STATIC type 0 / N_ALT_ENTRY), and the two readers kept the label as the relocation target, which no atom owns and the linker's compound index never declares: ✔MEASURED before the fix, pe64 and macho64-arm64 refused the link with K_SymbolUndefined once per jump-table slot (12) while elf64-x86_64, whose reader already rebound a body-less section-defined target to its containing atom, linked and ran. Now all three readers rebind through one shared rule (link/format/section_relative_target.hpp). The sums are arithmetic: lib_switch over k = -1..12 is 100+...+111 plus two defaults of -1 = 1264; lib_computed_goto over k = 0..5 is 7+8+9+7+8+9 = 48.",
+  "language": "c",
+  "$commentForbidDiagnostics": "P69: this example holds a value-returning function whose last statement is not a plain `return` (found by a mechanical scan of the corpus for exactly that shape), so the function is complete only because DSS SEES that control never arrives at its closing brace. Until P69 losing that sight REFUSED the compile. Under C it no longer does: C23 6.9.2p13 accepts a non-void function whose end is reached, so the compile succeeds with the warning H_NonVoidFunctionEndReachable and the program may run unchanged. This key keeps the red: the arm fails when that code is reported, in both runners, where the exit code could not see the regression.",
+  "forbidDiagnostics": ["H_NonVoidFunctionEndReachable"],
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "switch: 1264 goto: 48\r\n",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"],
+      "dependsOn": [
+        { "sources": ["lib.c"], "spec": "x86_64:pe64-x86_64-windows-staticlib", "artifact": "lib.lib" }
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "expectedStdout": "switch: 1264 goto: 48\n",
+      "dependsOn": [
+        { "sources": ["lib.c"], "spec": "x86_64:elf64-x86_64-linux-staticlib", "artifact": "lib.a" }
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "expectedStdout": "switch: 1264 goto: 48\n",
+      "dependsOn": [
+        { "sources": ["lib.c"], "spec": "arm64:elf64-aarch64-linux-staticlib", "artifact": "lib.a" }
+      ]
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": "",
+      "expectedStdout": "switch: 1264 goto: 48\n",
+      "dependsOn": [
+        { "sources": ["lib.c"], "spec": "arm64:macho64-arm64-darwin-staticlib", "artifact": "lib.a" }
+      ]
+    },
+    {
+      "spec": "x86_64:macho64-x86_64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": "",
+      "expectedStdout": "switch: 1264 goto: 48\n",
+      "dependsOn": [
+        { "sources": ["lib.c"], "spec": "x86_64:macho64-x86_64-darwin-staticlib", "artifact": "lib.a" }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

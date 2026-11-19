@@ -1,0 +1,1 @@
+    return parseConfigDocument(jsonText, ConfigNestingLimit{static_cast<std::size_t>(-1), "no limit"});

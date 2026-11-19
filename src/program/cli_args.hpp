@@ -512,9 +512,14 @@ enum class CliArgsError : std::uint8_t {
 // the diagnostic message. The CLI parser does NOT emit diagnostics
 // directly (it predates Program::run's reporter); the caller
 // formats the message from this struct.
+//
+// THE WALK NAMES EVERY UNIT IT REFUSES (P69 H6c2): `kind` and `detail` are the FIRST refused unit's, and `also` holds
+// every later one, in argv order -- so one run names every malformed argument, and a reader of the first reads what
+// it always read.
 struct DSS_EXPORT CliArgsErrorInfo {
-    CliArgsError kind = CliArgsError::UnknownFlag;
-    std::string  detail;
+    CliArgsError                  kind = CliArgsError::UnknownFlag;
+    std::string                   detail;
+    std::vector<CliArgsErrorInfo> also;
 };
 
 // Parse `argc`/`argv` into a structured `CliArgs`. The `argv[0]`

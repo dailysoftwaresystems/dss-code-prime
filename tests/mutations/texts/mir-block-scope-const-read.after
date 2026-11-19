@@ -1,0 +1,3 @@
+            if (hir.kind(n) != HirKind::VarDecl || n.valid()) continue;
+            SymbolId const sym = hir.varDeclSymbol(n);
+            std::optional<HirNodeId> const initN = hir.varDeclInit(n);

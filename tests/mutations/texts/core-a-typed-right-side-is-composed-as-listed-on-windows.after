@@ -1,0 +1,2 @@
+    return HostPathAccess::made(right, below(HostPathAccess::reference(*this, Use::Container), r),
+                                below(HostPathAccess::reference(*this, Use::Container), r), Origin::Composed);

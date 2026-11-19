@@ -18,6 +18,8 @@
 //
 // Runs natively on the x86_64-Linux CI leg.
 
+#include <stdarg.h>
+
 struct Odd { long a; long b; int c; };   // 20B -> MEMORY class (roundUp(20,8)=24)
 
 long combine(int n, ...) {

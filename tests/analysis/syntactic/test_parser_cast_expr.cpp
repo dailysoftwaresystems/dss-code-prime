@@ -7,9 +7,12 @@
 //   rule 1 — non-lone-identifier type forms commit unconditionally;
 //   rule 2 — a binder-sketch TYPE hit commits;
 //   rule 3 — a binder-sketch VALUE hit rolls back (shadowing-aware);
-//   rule 4 — an UNKNOWN name commits iff the follower token is not an
-//            infix/postfix/ternary operator, else rolls back AND
-//            records an AmbiguousTypeNameCandidate on the ParseResult.
+//   rule 4 — an UNKNOWN name: castExpr's guard is `requireKnownType`, so the
+//            cast reading is refused whatever follows and the value reading
+//            is taken. The refusal is recorded (`UnknownNameRefusal`); when the
+//            value reading then fails at a token the refused probe had read,
+//            the parser names the identifier FIRST (S_UndeclaredIdentifier at
+//            it) and the error second — the references' order.
 //
 // Every shape assertion pins the EXACT subtree nesting via
 // `prettyPrintSubtree` (the house pattern from test_parser_c_smoke)
@@ -18,6 +21,7 @@
 #include "analysis/syntactic/parser.hpp"
 #include "core/types/diagnostic_budget.hpp"
 #include "core/types/grammar_schema.hpp"
+#include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
 #include "core/types/tree.hpp"
 #include "core/types/tree_cursor.hpp"
@@ -149,7 +153,6 @@ TEST(ParserCastExpr, PointerCastParses) {
               "  rule:castOperand\n"
               "    rule:operand\n"
               "      tok:\"p\"\n");
-    EXPECT_TRUE(r.typeNameCandidates.empty());
 }
 
 // `(struct S*)q` — struct-tag type base.
@@ -333,25 +336,20 @@ TEST(ParserCastExpr, PlainParenStaysParenExpr) {
     ASSERT_FALSE(t.diagnostics().hasErrors());
     EXPECT_TRUE(findFirstNodeWithRule(t, "parenExpr").valid());
     EXPECT_FALSE(findFirstNodeWithRule(t, "castExpr").valid());
-    EXPECT_TRUE(r.typeNameCandidates.empty());
 }
 
 // `(a) + b` — c12 made `+` a PREFIX operator too (unary plus), so `+b` can now
 // start a cast operand: `(a)(+b)` is structurally viable. Exactly like the
 // `(q)-x` precedent above, the value reading (`(a) + b`) still wins (rolls back
-// to parenExpr + add, no committed castExpr because `a` isn't a known type), but
-// the speculation records `a` as a type-name candidate for the cross-file oracle.
-// (Before unary `+` existed this recorded NO candidate — `+` was binary-only.)
-TEST(ParserCastExpr, ParenPlusStaysValueReadingButRecordsCandidate) {
+// to parenExpr + add, no committed castExpr because `a` isn't a known type). The
+// parse succeeds, so the refusal names nothing here: the semantic tier names `a`.
+TEST(ParserCastExpr, ParenPlusStaysValueReading) {
     auto r = parseC("int main() { return (a) + b; }");
     auto const& t = r.tree;
     ASSERT_FALSE(t.diagnostics().hasErrors());
     EXPECT_TRUE(findFirstNodeWithRule(t, "parenExpr").valid());
     EXPECT_TRUE(findFirstNodeWithRule(t, "binaryExpr").valid());
     EXPECT_FALSE(findFirstNodeWithRule(t, "castExpr").valid());
-    ASSERT_EQ(r.typeNameCandidates.size(), 1u);
-    EXPECT_EQ(r.typeNameCandidates[0].name, "a");
-    EXPECT_EQ(t.source().slice(r.typeNameCandidates[0].span), "a");
 }
 
 // A cast operand long enough to dwarf the OLD 8-lookahead probe budget
@@ -392,7 +390,6 @@ TEST(ParserCastExpr, TypedefNameCastCommits) {
               "      tok:\"-\"\n"
               "      rule:operand\n"
               "        tok:\"x\"\n");
-    EXPECT_TRUE(r.typeNameCandidates.empty());
 }
 
 // Rule 3: a local VARIABLE of the same shape is KNOWN VALUE → `(a)-b`
@@ -417,34 +414,38 @@ TEST(ParserCastExpr, KnownValueStaysSubtraction) {
               "  tok:\"-\"\n"
               "  rule:operand\n"
               "    tok:\"b\"\n");
-    // A KNOWN value is not ambiguous — no candidate.
-    EXPECT_TRUE(r.typeNameCandidates.empty());
+    // A KNOWN value is no refusal: the sketch knows it.
 }
 
 // Rule 4 (operator follower): an UNKNOWN lone identifier followed by an
-// operator-viable token rolls back to the value reading AND records the
-// candidate for the cross-file oracle.
-TEST(ParserCastExpr, UnknownNameWithOperatorFollowerRecordsCandidate) {
+// operator-viable token takes the value reading; the parse succeeds, so the
+// refusal names nothing (the semantic tier names `q`).
+TEST(ParserCastExpr, UnknownNameWithOperatorFollowerKeepsTheValueReading) {
     auto r = parseC("int main() { return (q)-x; }");
     auto const& t = r.tree;
     ASSERT_FALSE(t.diagnostics().hasErrors());
     EXPECT_FALSE(findFirstNodeWithRule(t, "castExpr").valid());
     EXPECT_TRUE(findFirstNodeWithRule(t, "parenExpr").valid());
-    ASSERT_EQ(r.typeNameCandidates.size(), 1u);
-    EXPECT_EQ(r.typeNameCandidates[0].name, "q");
-    // The span must point at the identifier `q` itself.
-    EXPECT_EQ(t.source().slice(r.typeNameCandidates[0].span), "q");
 }
 
-// Rule 4 (non-operator follower): `(q) z` — the value reading could not
-// continue (`z` after `(q)` is no operator), so the CAST is the only
-// viable parse and commits; semantic later diagnoses if `q` isn't a type.
-TEST(ParserCastExpr, UnknownNameWithNonOperatorFollowerCommitsCast) {
+// Rule 4 (non-operator follower): `(q) z` — the cast reading is refused (the sketch
+// knows no `q`: nothing declares it), the value reading `(q)` cannot continue at `z`,
+// and the parser names the refused identifier FIRST, then the error at `z` — gcc's
+// pair (MEASURED 2026-11-04, probe f01: gcc 13.3.0 "'q' undeclared" at 1:15, then
+// "expected ';' before 'z'" at 1:17; clang 18.1.3 names `q` only; cl C2065 'q', C2146
+// before 'z', C2065 'z'). Never a committed cast.
+TEST(ParserCastExpr, UnknownNameWithNonOperatorFollowerIsNamedBeforeTheFollowersError) {
     auto r = parseC("int main() { (q) z; }");
     auto const& t = r.tree;
-    ASSERT_FALSE(t.diagnostics().hasErrors());
-    EXPECT_TRUE(findFirstNodeWithRule(t, "castExpr").valid());
-    EXPECT_TRUE(r.typeNameCandidates.empty());
+    EXPECT_FALSE(findFirstNodeWithRule(t, "castExpr").valid());
+    auto const all = t.diagnostics().all();
+    ASSERT_EQ(all.size(), 2u);
+    EXPECT_EQ(all[0].code, DiagnosticCode::S_UndeclaredIdentifier);
+    EXPECT_EQ(all[0].actual, "q");
+    EXPECT_EQ(t.source().slice(all[0].span), "q") << "named at the identifier itself";
+    EXPECT_NE(all[1].code, DiagnosticCode::S_UndeclaredIdentifier);
+    EXPECT_EQ(all[1].severity, DiagnosticSeverity::Error);
+    EXPECT_EQ(t.source().slice(all[1].span), "z") << "then the follower's error, at `z`";
 }
 
 // `(T)(x)` cast-vs-call, type direction: T is a typedef → cast of the
@@ -493,9 +494,11 @@ TEST(ParserCastExpr, LocalValueShadowsFileScopeTypedef) {
     EXPECT_TRUE(findFirstNodeWithRule(t, "binaryExpr").valid());
 }
 
-// Param shadowing: a parameter binds into the FUNCTION's scope
-// (funcDefTail opens one scope over params + body), so a param named T
-// shadows the file-scope typedef INSIDE the body.
+// Param shadowing: a parameter binds into its parameter list's prototype
+// scope, and a DEFINITION's own parameters are carried into the scope its
+// declaration opens (c's topLevelDecl / externDecl) when its body opens
+// (P69 L2a2), so a param named T shadows the file-scope typedef INSIDE the
+// body.
 TEST(ParserCastExpr, ParamShadowsFileScopeTypedefInsideBody) {
     auto r = parseC(
         "typedef int T;\n"
@@ -519,7 +522,7 @@ TEST(ParserCastExpr, ShadowDiesWithItsScope) {
 
 // Declare-before-use (C ordering): a typedef AFTER the use site is not
 // visible at the use — `(T)-1` before the typedef line reads T as
-// unknown, follower `-` is an operator → value reading + candidate.
+// unknown, follower `-` is an operator → the value reading.
 TEST(ParserCastExpr, TypedefAfterUseSiteIsNotVisible) {
     auto r = parseC(
         "int main() { return (T)-1; }\n"
@@ -527,42 +530,227 @@ TEST(ParserCastExpr, TypedefAfterUseSiteIsNotVisible) {
     auto const& t = r.tree;
     ASSERT_FALSE(t.diagnostics().hasErrors());
     EXPECT_FALSE(findFirstNodeWithRule(t, "castExpr").valid());
-    ASSERT_EQ(r.typeNameCandidates.size(), 1u);
-    EXPECT_EQ(r.typeNameCandidates[0].name, "T");
 }
 
-// ── ParseResult sidecars ────────────────────────────────────────────────
+// ── what the sketch knows ────────────────────────────────────────────────
 
-// The global-scope TYPE export surface: typedefs + struct/union/enum
-// tags at file scope, in binding order. (The CU oracle harvests this.)
-TEST(ParserCastExpr, GlobalTypeNamesExported) {
+// P69 L2 (lane `lm`): a struct/union/enum TAG is no type name — it lives in the tag
+// name space (C 6.2.3) and never makes its spelling one, so after the four tag
+// declarations only the typedef `MyT` reads `( name )` as a cast; `(S)`, `(U)` and
+// `(E)` keep the value reading (an operator follows, so each parses; the analysis
+// refuses the undeclared names).
+TEST(ParserCastExpr, ATagNeverMakesItsSpellingATypeName) {
     auto r = parseC(
         "typedef int MyT;\n"
         "struct S { int x; };\n"
+        "union U { int y; };\n"
+        "enum E { EA };\n"
         "int g;\n"
-        "int main() { return 0; }");
+        "int main() { return (MyT)-1 + (S)-1 + (U)-1 + (E)-1; }");
     ASSERT_FALSE(r.tree.diagnostics().hasErrors());
-    ASSERT_EQ(r.globalTypeNames.size(), 2u);
-    EXPECT_EQ(r.globalTypeNames[0], "MyT");
-    EXPECT_EQ(r.globalTypeNames[1], "S");
+    EXPECT_EQ(countNodesWithRule(r.tree, "castExpr"), 1u)
+        << "only the typedef MyT is a type name; a tag is none";
+    EXPECT_EQ(countNodesWithRule(r.tree, "parenExpr"), 3u);
 }
 
-// Seeding (the oracle's reparse channel): the SAME ambiguous source that
-// records a candidate above commits the CAST when the name is seeded as
-// a global type — this is the parser half of the A3 cross-file path.
-TEST(ParserCastExpr, SeededTypeNameFlipsCandidateSiteToCast) {
+// ── P69 L2 (lane `lm`): WHICH NAME THE TRIAGE SEES ──────────────────────────
+// The type-name triage asks the binder sketch whether `(name)` opens a type name.
+// Two readings it gave wrongly, both MEASURED at eb6f22a3 (pe64, images run
+// natively) against gcc 13.3.0 and clang 18.1.3 (gnu2x and c2x -pedantic-errors,
+// built and run): a struct/union/enum TAG answered as an ordinary type (C 6.2.3
+// gives tags their own name space), so a tag newer than a function or an object of
+// its spelling turned `(name)` into a cast — `int g(int); struct g {…}; (g)(2)` and
+// `int T = 44; enum T {A = 2}; (T) - A` were refused, `typedef int T; … int T = 44;
+// { struct T {…}; return (T) - 2; }` RAN -2 (references: 42, every one); and a
+// declarator's name was bound only at the end of its DECLARATION, while C 6.2.1p7
+// starts its scope at the end of its DECLARATOR — `int T = 44, y = (T) - 2;` RAN -2
+// and `typedef char T; … int T = sizeof(T);` RAN 1 (references: 42 and sizeof(int)).
+// A structure MEMBER was recorded as an ordinary value likewise: `typedef int P;
+// struct S { int P; char a[(P) 42]; };` was refused P_UnexpectedToken at `42`
+// (MEASURED on this lane's tree; both references build it).
+// The sketch now records ordinary identifiers only: neither a tag nor a member.
+// RED-ON-DISABLE: a tag row's name recorded → the tag rows; a member row's name
+// recorded → the member row; the slot declarator's record skipped → the declarator
+// rows of the next case. The controls hold either way: a use BEFORE the object's
+// declarator still reads the typedef. The two rows inside a tag's own body are
+// REGRESSION pins: HEAD built and ran both (✔MEASURED, exit 42) even while it bound
+// the tag there as an ordinary type.
+TEST(ParserCastExpr, ATagNeverAnswersTheTypeNameTriage) {
+    struct Row { char const* what; char const* src; std::size_t casts; };
+    Row const rows[] = {
+        {"a function, then a tag of its spelling: `(g)(2)` is a call",
+         "int g(int v) { return v + 40; }\nstruct g { int a; };\n"
+         "int main(void) { return (g)(2); }\n", 0},
+        {"an object hides the typedef; a newer inner TAG changes nothing",
+         "typedef int T;\nint main(void) { int T = 44; { struct T { int a; }; "
+         "return (T) - 2; } }\n", 0},
+        {"an object, then an ENUM TAG of its spelling",
+         "int main(void) { int T = 44; enum T { A = 2 }; return (T) - A; }\n", 0},
+        {"a tag defined inside the operand: only the operand's own cast",
+         "int g(void *p) { return p ? 1 : 42; }\n"
+         "int main(void) { return (g)((struct g { int a; } *)0); }\n", 1},
+        // Inside its own body the tag is declared (`struct g *next;` works), and still
+        // no ordinary identifier: `(g)` there is the function (both references: 42).
+        {"inside its own body a tag answers no ordinary lookup: `sizeof (g)(2)` is a call",
+         "int g(int v) { return v + 40; }\nstruct g { int a[sizeof (g)(2)]; };\n", 0},
+        {"... and where a cast could parse: `sizeof ((g)(2))` is a call",
+         "int g(int v) { return v + 40; }\nstruct g { int a[sizeof ((g)(2))]; };\n", 0},
+        // A structure MEMBER is its structure's own name space (C 6.2.3) as a tag is
+        // its own: `(P)` in the next member's bound casts through the typedef.
+        {"a member spelled like the typedef: `(P) 42` is a cast",
+         "typedef int P;\nstruct S { int P; char a[(P) 42]; };\n", 1},
+        // CONTROL: a typedef with a tag of its spelling, in both orders, is a type.
+        {"a tag, then a typedef of its spelling: `(T)(x)` is a cast",
+         "struct T { int a; };\ntypedef int T;\n"
+         "int main(void) { T x = 40; return (T)(x); }\n", 1},
+        {"a typedef, then a tag of its spelling: `(T)(x)` is a cast",
+         "typedef int T;\nstruct T { int a; };\n"
+         "int main(void) { T x = 40; return (T)(x); }\n", 1},
+    };
+    for (Row const& row : rows) {
+        auto r = parseC(row.src);
+        EXPECT_FALSE(r.tree.diagnostics().hasErrors()) << row.what;
+        EXPECT_EQ(countNodesWithRule(r.tree, "castExpr"), row.casts) << row.what;
+    }
+}
+
+TEST(ParserCastExpr, ADeclaratorsNameIsInScopeFromTheEndOfItsDeclarator) {
+    struct Row { char const* what; char const* src; std::size_t casts; std::size_t sizeofTypes; };
+    Row const rows[] = {
+        {"the next declarator of the same declaration sees the object",
+         "typedef int T;\nint main(void) { int T = 44, y = (T) - 2; return y; }\n", 0, 0},
+        {"its own initializer sees the object",
+         "typedef char T;\nint main(void) { int T = sizeof(T); return T; }\n", 0, 0},
+        {"a typedef's next declarator sees the typedef",
+         "typedef int T, U[sizeof(T) * 10 + 2];\nint main(void) { return 0; }\n", 0, 1},
+        {"a parameter is in scope in the body",
+         "typedef int T;\nint f(int T) { return (T) - 2; }\n", 0, 0},
+        {"a block-scope function declaration hides the typedef",
+         "typedef int T;\nint main(void) { int T(int); return (T)(2); }\n", 0, 0},
+        // CONTROLS: a use BEFORE the object's declarator reads the typedef.
+        {"a use before the object's declaration is the typedef's",
+         "typedef int T;\nint main(void) { int y = (T) - 2; int T = 44; return y + T; }\n",
+         1, 0},
+        {"a use inside the object's own declarator is the typedef's",
+         "typedef int T;\nint main(void) { int T[sizeof(T)]; return 0; }\n", 0, 1},
+    };
+    for (Row const& row : rows) {
+        auto r = parseC(row.src);
+        EXPECT_FALSE(r.tree.diagnostics().hasErrors()) << row.what;
+        EXPECT_EQ(countNodesWithRule(r.tree, "castExpr"), row.casts) << row.what;
+        EXPECT_EQ(countNodesWithRule(r.tree, "sizeofType"), row.sizeofTypes) << row.what;
+    }
+}
+
+// P69 L2a2 (the L2a review's N9): a PARAMETER of a function declarator that is not a
+// definition's own has function prototype scope (C 6.2.1p4); past its declarator the typedef
+// it shadowed is a type again, so `(T)(x)` is a cast. The sketch bound such a parameter into
+// the enclosing block, and `(T)(x)` parsed as a call. A definition's own parameter reaches its
+// body (the control rows). ✔MEASURED 2026-10-28 (WSL gcc 13.3.0 / clang 18.1.3, gnu2x and c2x
+// -pedantic-errors): every cast row's program exits 42; the own-parameter call is refused.
+TEST(ParserCastExpr, APrototypeParametersScopeEndsWithItsDeclarator) {
+    struct Row { char const* what; char const* src; std::size_t casts; };
+    Row const rows[] = {
+        {"a function-pointer object's parameter",
+         "typedef int T;\nint main(void) { int (*fp)(int T) = 0; int x = 42; (void)fp; "
+         "return (T)(x); }\n", 2},
+        {"a block-scope prototype's parameter",
+         "typedef int T;\nint main(void) { int f(int T); int x = 42; return (T)(x); }\n", 1},
+        {"a block-scope typedef's parameter",
+         "typedef int T;\nint main(void) { typedef int (*F)(int T); F f = 0; int x = 42; "
+         "(void)f; return (T)(x); }\n", 2},
+        {"a cast's type name's parameter",
+         "typedef int T;\nint main(void) { (void)(int (*)(int T))0; int x = 42; "
+         "return (T)(x); }\n", 3},
+        {"a file-scope prototype's parameter, in the next declarator",
+         "typedef int T;\nint f(int T), y = sizeof((T)(1));\n", 1},
+        {"a definition's RETURNED function type's parameter, in its body",
+         "typedef int T;\nstatic int h(int t) { return t; }\n"
+         "static int (*g(int a))(int T) { return (a == (T)(a)) ? h : 0; }\n", 1},
+        // CONTROLS: a definition's OWN parameter reaches its body, in either spelling.
+        {"a definition's own parameter, in its body",
+         "typedef int T;\nint f(int T, int x) { return (T)(x); }\n", 0},
+        {"a parenthesised definition's own parameter, in its body",
+         "typedef int T;\nint (f)(int T, int x) { return (T)(x); }\n", 0},
+    };
+    for (Row const& row : rows) {
+        auto r = parseC(row.src);
+        EXPECT_FALSE(r.tree.diagnostics().hasErrors()) << row.what;
+        EXPECT_EQ(countNodesWithRule(r.tree, "castExpr"), row.casts) << row.what;
+    }
+}
+
+// ── P69 L2b1 (lane `lm`, the L2a2 review's A1): A DEFINITION'S OWN PARAMETERS SURVIVE THE
+// PARAMETER LISTS OF THE TYPE IT RETURNS. A function returning a function pointer writes its
+// own list INSIDE its declarator and the returned type's lists AFTER it; each `param` row of a
+// returned list ended its declarator and its row by dropping every list the sketch had noted, the
+// definition's own included, so its body saw none of its parameters and `(T)(x)` there was a cast
+// through the file-scope typedef. ✔MEASURED 2026-11-03 (probe-reference-cc run
+// 20261103-200559-43e50237, gcc 13.3.0 and clang 18.1.3, default and -std=c2x -pedantic-errors,
+// built and run): every shape below with `(T) - 1` in the body exits 42 — the parameter, never the
+// typedef. THE UNIVERSE: the returned list unnamed, named or `(void)` × one or two levels of
+// returned function pointers × a DEFINITION (its own `T` is the body's: `(T)(x)` is a call, no
+// cast) and a DECLARATION (its own list ends with its declarator: `(T)(1)` after it is a cast),
+// and the `signal` shape (a function-pointer PARAMETER beside a returned function pointer).
+TEST(ParserCastExpr, ADefinitionsOwnParametersSurviveTheListsOfTheTypeItReturns) {
+    struct Shape { char const* what; char const* head; char const* tail; };
+    // `head` + "g(int T, int x)" + `tail` is the declarator; the definition's own list is g's.
+    Shape const shapes[] = {
+        {"one level, the returned list unnamed", "int (*", ")(int)"},
+        {"one level, the returned list named", "int (*", ")(int u)"},
+        {"one level, the returned list (void)", "void (*", ")(void)"},
+        {"two levels, unnamed", "int (*(*", ")(int))(int)"},
+        {"two levels, named", "int (*(*", ")(int u))(int v)"},
+        {"two levels, (void)", "void (*(*", ")(void))(void)"},
+    };
+    for (Shape const& s : shapes) {
+        std::string const decl = std::string{s.head} + "g(int T, int x)" + s.tail;
+        std::string const def = "typedef int T;\nstatic " + decl
+                                + " { int y = (T)(x); (void)y; return 0; }\n";
+        auto rd = parseC(def);
+        EXPECT_FALSE(rd.tree.diagnostics().hasErrors()) << "definition, " << s.what;
+        // (void)y is the one cast; `(T)(x)` is a call of the parameter.
+        EXPECT_EQ(countNodesWithRule(rd.tree, "castExpr"), 1u) << "definition, " << s.what << "\n" << def;
+        std::string const dcl = "typedef int T;\nstatic " + decl + ";\nint y = sizeof((T)(1));\n";
+        auto rc = parseC(dcl);
+        EXPECT_FALSE(rc.tree.diagnostics().hasErrors()) << "declaration, " << s.what;
+        EXPECT_EQ(countNodesWithRule(rc.tree, "castExpr"), 1u) << "declaration, " << s.what << "\n" << dcl;
+    }
+    // The `signal` shape: a function-pointer parameter's own list closes inside g's list.
+    auto rs = parseC("typedef int T;\nstatic void (*s(int T, void (*fn)(int), int x))(int) "
+                     "{ int y = (T)(x); (void)y; return fn; }\n");
+    EXPECT_FALSE(rs.tree.diagnostics().hasErrors());
+    EXPECT_EQ(countNodesWithRule(rs.tree, "castExpr"), 1u) << "the signal shape";
+    // P69 L2b2: the definition's NAME in parentheses — its derivation is read one level out, past
+    // the group (`int (g)(…)`, and the same returning a function pointer), and its own list is still
+    // the body's: with `(T) - 1 + x` in the body, gcc 13.3.0, clang 18.1.3 (default and -std=c2x
+    // -pedantic-errors) and cl 19.51 (default and /std:c17) build both and run them to 42, the
+    // parameter read (✔MEASURED 2026-11-04, probe-reference-cc runs 20261104-215531-bc2bac6c and
+    // 20261104-215610-41d2ffbb).
+    for (char const* src :
+         {"typedef int T;\nstatic int (g)(int T, int x) { int y = (T)(x); (void)y; return 0; }\n",
+          "typedef int T;\nstatic int (*(g)(int T, int x))(int) { int y = (T)(x); (void)y; return 0; }\n"}) {
+        auto rp = parseC(src);
+        EXPECT_FALSE(rp.tree.diagnostics().hasErrors()) << src;
+        EXPECT_EQ(countNodesWithRule(rp.tree, "castExpr"), 1u) << "a parenthesised name\n" << src;
+    }
+}
+
+// Seeding (the shipped descriptors' typedef channel, ParserConfig::
+// seedGlobalTypeNames): the SAME source whose unknown name is refused as a
+// type above commits the CAST when the name is seeded as a global type.
+TEST(ParserCastExpr, SeededTypeNameFlipsTheRefusedSiteToCast) {
     ParserConfig cfg;
     cfg.seedGlobalTypeNames.push_back("q");
     auto r = parseC("int main() { return (q)-x; }", std::move(cfg));
     auto const& t = r.tree;
     ASSERT_FALSE(t.diagnostics().hasErrors());
     EXPECT_TRUE(findFirstNodeWithRule(t, "castExpr").valid());
-    EXPECT_TRUE(r.typeNameCandidates.empty());
 }
 
-// A toy-grammar parse (no `semantics.declarations`) exports nothing and
-// records nothing — the binder sketch is inert for binder-less languages.
-TEST(ParserCastExpr, BinderlessLanguageHasEmptySidecars) {
+// A toy-grammar parse (no `semantics.declarations`) asks the binder sketch
+// nothing — the sketch is inert for binder-less languages.
+TEST(ParserCastExpr, BinderlessLanguageAsksTheSketchNothing) {
     auto loaded = GrammarSchema::loadShipped("toy");
     ASSERT_TRUE(loaded.has_value());
     auto schema = *loaded;
@@ -573,44 +761,122 @@ TEST(ParserCastExpr, BinderlessLanguageHasEmptySidecars) {
              DiagnosticBudget::libraryDefault(), {},
              std::move(lexDiags)};
     auto r = std::move(p).parse();
-    EXPECT_TRUE(r.typeNameCandidates.empty());
-    EXPECT_TRUE(r.globalTypeNames.empty());
+    EXPECT_EQ(r.sketchWorkCount, 0u);
+}
+
+// ── the unknown-name refusal, READ (P69 L2b2, rulings 512 / 513 / 516) ───────
+//
+// A refusal is a lone name the cast's triage refused as a type because the binder sketch
+// knows nothing of it. The parser names it — S_UndeclaredIdentifier at the name, once,
+// before the error — exactly when the reading taken instead fails at a token the refused
+// probe had read. Every pin below varies one thing against `UnknownNameWithNonOperator…`.
+namespace {
+[[nodiscard]] std::size_t countUndeclared(Tree const& t) {
+    std::size_t n = 0;
+    for (auto const& d : t.diagnostics().all())
+        if (d.code == DiagnosticCode::S_UndeclaredIdentifier) ++n;
+    return n;
+}
+}  // namespace
+
+// The refusal of the inner site, recorded under an outer probe that rolls back and again
+// in the reading that wins, is ONE record: named once.
+TEST(ParserCastExpr, ANestedRefusalIsNamedOnce) {
+    auto r = parseC("int main() { return ((q) z); }");
+    auto const& t = r.tree;
+    ASSERT_TRUE(t.diagnostics().hasErrors());
+    EXPECT_EQ(countUndeclared(t), 1u);
+    auto const all = t.diagnostics().all();
+    ASSERT_FALSE(all.empty());
+    EXPECT_EQ(all[0].code, DiagnosticCode::S_UndeclaredIdentifier);
+    EXPECT_EQ(all[0].actual, "q");
+}
+
+// The window ends at the type name's FOLLOWER. An operator follower continues the value
+// reading, so an error after it is the operand's, never the refused type's: `(q)-x z`
+// fails at `z`, past the follower `-`, and names nothing — the climb chain `(q)-x-y z`
+// alike (the semantic tier, which names `q`, does not run on a tree that failed to parse).
+TEST(ParserCastExpr, AnOperatorFollowersRefusalIsNeverNamed) {
+    for (char const* src : {"int main() { return (q)-x z; }",
+                            "int main() { return (q)-x-y z; }",
+                            "int main() { return ((q)-x z); }"}) {
+        auto r = parseC(src);
+        auto const& t = r.tree;
+        ASSERT_TRUE(t.diagnostics().hasErrors()) << src;
+        EXPECT_EQ(countUndeclared(t), 0u) << src;
+        auto const all = t.diagnostics().all();
+        ASSERT_FALSE(all.empty()) << src;
+        EXPECT_EQ(t.source().slice(all[0].span), "z") << src;
+    }
+}
+
+// Two statements, each failing at its own follower: each names its own identifier, before
+// its own error.
+TEST(ParserCastExpr, TwoFailingSitesNameTwoNames) {
+    auto r = parseC("int main() { (q) z; (r) w; }");
+    auto const& t = r.tree;
+    auto const all = t.diagnostics().all();
+    ASSERT_EQ(all.size(), 4u);
+    EXPECT_EQ(all[0].code, DiagnosticCode::S_UndeclaredIdentifier);
+    EXPECT_EQ(all[0].actual, "q");
+    EXPECT_EQ(t.source().slice(all[1].span), "z");
+    EXPECT_EQ(all[2].code, DiagnosticCode::S_UndeclaredIdentifier);
+    EXPECT_EQ(all[2].actual, "r");
+    EXPECT_EQ(t.source().slice(all[3].span), "w");
+}
+
+// A name the sketch KNOWS is no refusal, whatever it is — a value of the source's own, a
+// builtin function (`semantics.builtinFunctions`), a predefined identifier, a library
+// builtin (`semantics.libraryBuiltins`), a seeded descriptor value: the follower's error
+// only, as gcc and clang give it (MEASURED 2026-11-04, probes b08/b09: `(__func__)42;` and
+// `(__builtin_expect)42;` "expected ';'" alone on gcc 13.3.0 and clang 18.1.3).
+TEST(ParserCastExpr, AKnownNameIsNeverNamedUndeclared) {
+    for (char const* src : {
+             "int main() { int v; (v) z; }",
+             "int main() { (__builtin_expect)42; }",
+             "int f(void) { (__func__)42; return 0; }",
+             "int main() { (__builtin_memcpy)42; }",
+         }) {
+        auto r = parseC(src);
+        auto const& t = r.tree;
+        ASSERT_TRUE(t.diagnostics().hasErrors()) << src;
+        EXPECT_EQ(countUndeclared(t), 0u) << src;
+    }
+    ParserConfig cfg;
+    cfg.seedGlobalValueNames.push_back("q");
+    auto r = parseC("int main() { (q) z; }", std::move(cfg));
+    ASSERT_TRUE(r.tree.diagnostics().hasErrors());
+    EXPECT_EQ(countUndeclared(r.tree), 0u) << "a seeded descriptor value is a known name";
 }
 
 // ── speculation rollback hygiene ────────────────────────────────────────
 
-// A candidate recorded inside an ENCLOSING probe that itself rolls back
+// A refusal recorded inside an ENCLOSING probe that itself rolls back
 // must not leak twice: `((q)-x)` probes parenExpr around the inner
-// ambiguous site; the inner candidate is recorded, the outer parenExpr
+// ambiguous site; the inner refusal is recorded, the outer parenExpr
 // probe COMMITS, and the Pratt walker climbs the surrounding chain
 // (wrap-in-place — the primary is never re-parsed) — the net result
-// must be EXACTLY ONE candidate for `q`, not a duplicate per probe.
+// must be EXACTLY ONE refusal for `q`, not a duplicate per probe — read
+// where the reader can see it, `ANestedRefusalIsNamedOnce` below.
 // (This pins the probe snapshot/restore + record-after-rollback
 // interplay; a leak would double-count.)
-TEST(ParserCastExpr, NestedProbesYieldExactlyOneCandidate) {
+TEST(ParserCastExpr, NestedProbesParseTheValueReading) {
     auto r = parseC("int main() { return ((q)-x); }");
     ASSERT_FALSE(r.tree.diagnostics().hasErrors());
-    ASSERT_EQ(r.typeNameCandidates.size(), 1u);
-    EXPECT_EQ(r.typeNameCandidates[0].name, "q");
 }
 
 // Same hygiene across a climb chain: `(q)-x-y` builds two binary wraps
 // above the `(q)` primary (wrap-in-place — the ambiguous site is
-// parsed exactly once) — still exactly one candidate.
-TEST(ParserCastExpr, ClimbChainDoesNotDuplicateCandidates) {
+// parsed exactly once) — still exactly one refusal (named nowhere: `AnOperatorFollowersRefusalIsNeverNamed`).
+TEST(ParserCastExpr, ClimbChainParsesTheValueReading) {
     auto r = parseC("int main() { return (q)-x-y; }");
     ASSERT_FALSE(r.tree.diagnostics().hasErrors());
-    ASSERT_EQ(r.typeNameCandidates.size(), 1u);
-    EXPECT_EQ(r.typeNameCandidates[0].name, "q");
 }
 
-// Two genuinely distinct ambiguous sites stay two candidates.
-TEST(ParserCastExpr, TwoDistinctSitesRecordTwoCandidates) {
+// Two genuinely distinct ambiguous sites (`TwoFailingSitesNameTwoNames`).
+TEST(ParserCastExpr, TwoDistinctSitesParseTheValueReading) {
     auto r = parseC("int main() { return (q)-x + (r)-y; }");
     ASSERT_FALSE(r.tree.diagnostics().hasErrors());
-    ASSERT_EQ(r.typeNameCandidates.size(), 2u);
-    EXPECT_EQ(r.typeNameCandidates[0].name, "q");
-    EXPECT_EQ(r.typeNameCandidates[1].name, "r");
 }
 
 // Rolled-back probes leak no BINDINGS either: a failed castExpr probe
@@ -625,7 +891,6 @@ TEST(ParserCastExpr, RolledBackProbeLeaksNoSketchState) {
     ASSERT_FALSE(t.diagnostics().hasErrors());
     EXPECT_FALSE(findFirstNodeWithRule(t, "castExpr").valid());
     EXPECT_EQ(countNodesWithRule(t, "parenExpr"), 2u);
-    EXPECT_TRUE(r.typeNameCandidates.empty());
 }
 
 // ── D-PARSE-DEEP-NEST-RECURSION-MEMORY: SF-2 speculation-rollback-at-depth ──
@@ -644,7 +909,7 @@ TEST(ParserCastExpr, RolledBackProbeLeaksNoSketchState) {
 // — the `SpeculationProbe` restores the builder/walker/tokens (and truncates
 // the expression work-stack + depth counter back to the pre-probe state). A
 // broken restore would mis-parse the value reading, drop the deep nesting, or
-// leak a candidate.
+// leak a refusal.
 //
 // SCOPE NOTE: this proves the FLAT-descent-under-speculation interaction is
 // correct end-to-end. It is NOT red-on-disable for the work-stack `.resize()`
@@ -681,12 +946,6 @@ TEST(ParserCastExpr, DeepSpeculativeCastRollsBackAndResumesCorrectly) {
     // level (stale/leaked work-stack frame) would change this count.
     EXPECT_EQ(countNodesWithRule(t, "parenExpr"),
               static_cast<std::size_t>(kDepth + 1));
-
-    // The rolled-back ambiguous site recorded EXACTLY ONE candidate for `q`
-    // (no leak, no double-count) — the work-stack restore left the sketch
-    // delta clean.
-    ASSERT_EQ(r.typeNameCandidates.size(), 1u);
-    EXPECT_EQ(r.typeNameCandidates[0].name, "q");
 
     // The tokens AFTER the rollback parsed correctly: the trailing `-z` closes
     // a left-assoc subtraction chain over the (deep) value reading. Two `-`
@@ -737,6 +996,9 @@ TEST(ParserCastExpr, AbstractFnPtrCastExactShape) {
               "            rule:declHeadForParam\n"
               "              rule:typeSpecifierSeq\n"
               "                tok:\"void\"\n"
+              // P69 (lane `cs`, fold f26e): a parameter's END-OF-SPECIFIERS position, the
+              // possibly-empty run a declaration's head carries too (c.lang.json `param`).
+              "            rule:declAttrRun\n"
               "        tok:\")\"\n"
               "  tok:\")\"\n"
               "  rule:castOperand\n"
@@ -761,7 +1023,9 @@ TEST(ParserCastExpr, AbstractFnPtrCastWithIntParamParses) {
                           "    rule:abstractDirectDeclarator\n"
                           "      rule:parenDeclarator\n"),
               std::string::npos) << pretty;
+    // The parameter's `int`, then its (empty) end-of-specifiers run (P69 fold f26e), then `)`.
     EXPECT_NE(pretty.find("tok:\"int\"\n"
+                          "            rule:declAttrRun\n"
                           "        tok:\")\"\n"),
               std::string::npos) << pretty;
 }
@@ -796,6 +1060,7 @@ TEST(ParserCastExpr, AbstractFnPtrSizeofExactShape) {
               "            rule:declHeadForParam\n"
               "              rule:typeSpecifierSeq\n"
               "                tok:\"void\"\n"
+              "            rule:declAttrRun\n"
               "        tok:\")\"\n"
               "  tok:\")\"\n");
 }
@@ -827,7 +1092,7 @@ TEST(ParserCastExpr, AbstractFnPtrCompoundLiteralParses) {
 TEST(ParserCastExpr, AbstractFnPtrVaArgParses) {
     auto r = parseC(
         "int f(int n, ...) {\n"
-        "  return va_arg(n, int(*)(void)) != 0;\n"
+        "  return __builtin_va_arg(n, int(*)(void)) != 0;\n"
         "}\n");
     auto const& t = r.tree;
     ASSERT_FALSE(t.diagnostics().hasErrors());
@@ -889,8 +1154,6 @@ TEST(ParserCastExpr, ParenMultiplicationIsNotAnAbstractCast) {
     EXPECT_FALSE(findFirstNodeWithRule(t, "castExpr").valid())
         << "(c * c) must parse as a multiplication, never a cast";
     EXPECT_TRUE(findFirstNodeWithRule(t, "binaryExpr").valid());
-    EXPECT_TRUE(r.typeNameCandidates.empty())
-        << "a known-value parenthesized product records no type-name candidate";
 }
 
 // REGRESSION (the c26 array-base hazard): `sizeof(b[0])` is the VALUE form (an
@@ -1052,5 +1315,154 @@ TEST(ParserCastExpr, PostStarSwapKeepsExistingCastsParsing) {
         ASSERT_FALSE(r.tree.diagnostics().hasErrors()) << "(volatile u32 **)p";
         EXPECT_TRUE(findFirstNodeWithRule(r.tree, "castExpr").valid());
     }
+}
+
+
+// ── A COMMITTED TYPE READING THAT FAILS IS THE SITE'S ANSWER (batch B) ──────
+//
+// ★★★ Once a site's guarded TYPE reading has committed (its type child closed
+// as a type: a keyword base, or a name the sketch knows as a type) and then
+// failed, the program is that type reading, wrong — never the site's VALUE
+// reading (`"valueReading": true` in the grammar: exprStmt, expression,
+// parenExpr, sizeofValue, alignofValue, typeofValue, assignmentExpr). So a
+// value reading is not tried after it, the final descent takes none, and the
+// depth-0 replay is the declared-LAST committed candidate, as the structural
+// fallback is. A type reading that did NOT commit leaves every candidate to be
+// tried, value readings included. Each row's position is the one gcc, clang
+// and cl report (clang's column, gcc's token): before this the replay read
+// `(int)` as a parenthesised `int` and refused at `int`, a position no
+// reference names, and `sizeof((T))` compiled.
+namespace {
+struct BatchBRow {
+    char const* what;
+    char const* source;
+    char const* firstErrorAt;             // nullptr: the row parses clean
+    char const* thenAt = nullptr;         // the second error's text, where the row states one
+};
+}  // namespace
+
+TEST(ParserCastExpr, AFailedCommittedTypeReadingIsTheSitesAnswer) {
+    BatchBRow const rows[] = {
+        // A valid declaration whose FIRST guarded candidate commits and fails:
+        // the type readings after it are still tried; only value readings are not.
+        {"a qualified typedef declaration",
+         "typedef int T;\nint main(void) { const T x = 1; return x; }\n", nullptr},
+        // The committed reading's own error. ✔MEASURED 2026-11-13 (probes/l2b2bB; linux
+        // host run 20261113-210608-54e345ab, windows run host 20261113-210625-50556da7):
+        // gcc 13.3.0 and clang 18.1.3 "expected expression" at `;`, cl C2059 at `;`;
+        // `T (x) + 1;` — gcc "expected '=', ',', ';' … before '+'", cl C2143 "missing ';'
+        // before '+'" (clang at the end of the declarator just before it); `const T x = 1;`
+        // compiles on all three. (`typeNameBareEmptyDecl` reads `T` first and its follower
+        // refuses it: a follower's refusal is no committed failure, so only `identVarDecl`
+        // commits and fails here.)
+        {"a declaration missing its initializer",
+         "typedef int T;\nint main(void) { T x = ; return 0; }\n", ";"},
+        {"a declaration whose parenthesised declarator is followed by an operator",
+         "typedef int T;\nint main(void) { T (x) + 1; return 0; }\n", "+"},
+        // q04-q07 (gcc 13.3.0, clang 18.1.3, cl 19.51: "expected expression" at
+        // the inner `)`). TWO candidates commit on `(int)` and fail — compoundLiteralExpr
+        // (declared first) and castExpr — and the DECLARED-LAST, castExpr, is replayed: its
+        // operand's error at the inner `)`, where every reference puts it.
+        {"q04 a value-star cast inside a cast",
+         "int main(void) { int v = 1; return (int)(v *)0; }\n", ")"},
+        {"q05 a value-star sizeof inside a cast",
+         "int main(void) { int v = 1; return (int)sizeof(v *); }\n", ")"},
+        {"q06 a value-star cast two casts deep",
+         "int main(void) { int v = 1; return (int)(long)(v *)0; }\n", ")"},
+        // q07: and `U` undeclared — gcc and cl name `U` FIRST, then the inner `)`; clang
+        // the `)` first (probes l2b2tq, ruling 523: gcc's order where they split). DSS
+        // names U, then the `)` (✔MEASURED, compile-and-keep l2b2g7-dss-1, macos-arm64-debug).
+        {"q07 an unknown-star cast inside a cast",
+         "int main(void) { return (int)(U *)0; }\n", "U", ")"},
+        // n02: every reference refuses at the token after the cast `(T)`.
+        {"a parenthesised typedef name as sizeof's operand",
+         "typedef int T;\nint main(void) { return (int)sizeof((T)); }\n", ")"},
+    };
+    for (BatchBRow const& r : rows) {
+        SCOPED_TRACE(r.what);
+        auto res = parseC(r.source);
+        auto const& t = res.tree;
+        if (r.firstErrorAt == nullptr) {
+            EXPECT_FALSE(t.diagnostics().hasErrors());
+            continue;
+        }
+        auto const all = t.diagnostics().all();
+        ASSERT_FALSE(all.empty()) << "the row parsed clean";
+        EXPECT_EQ(all[0].severity, DiagnosticSeverity::Error);
+        EXPECT_EQ(t.source().slice(all[0].span), r.firstErrorAt);
+        if (r.thenAt != nullptr) {
+            ASSERT_GE(all.size(), 2u) << "the row's second error is missing";
+            EXPECT_EQ(t.source().slice(all[1].span), r.thenAt);
+        }
+    }
+}
+
+// A guarded type reading that did NOT commit (its type child is a known VALUE),
+// or one its FOLLOWER refused after it read clean (`notFollowedBy`: `sizeof ( T )`
+// and `_Alignof ( T )` before `{` are the operator over a compound literal's VALUE,
+// C 6.5.2.5), leaves the value readings to be tried: each of these parses clean.
+TEST(ParserCastExpr, AnUncommittedTypeReadingLeavesEveryCandidateToBeTried) {
+    for (char const* src : {
+             "int main(void) { int v = 2, p = 3; v * p; return 0; }\n",
+             "int main(void) { int v = 2; return (v) + 1; }\n",
+             "int main(void) { int v = 2; return (int)sizeof(v); }\n",
+             "int main(void) { int v = 2; return (int)sizeof((v)); }\n",
+             "int main(void) { return (int)sizeof (int[]){ 1, 2 }; }\n",
+             "int main(void) { return (int)_Alignof (int[]){ 1, 2 }; }\n",
+         }) {
+        SCOPED_TRACE(src);
+        auto res = parseC(src);
+        EXPECT_FALSE(res.tree.diagnostics().hasErrors());
+    }
+}
+
+// The `valueReading` shape key is a boolean, and never sits beside a type guard
+// on one shape: a value reading carries no type guard, and a shape holding both
+// would be a type reading the parser skips after another candidate's committed
+// type reading failed. Both are refused loud at load (C_UnknownShape, the
+// message naming the key); the control loads and answers `isValueReading`.
+TEST(ParserCastExpr, AValueReadingIsABooleanShapeKeyWithNoTypeGuard) {
+    auto const doc = [](std::string_view vdeclExtra) {
+        return std::string{R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": {
+        "root":     { "sequence": [ "Semi" ] },
+        "typeName": { "sequence": [ "Identifier" ] },
+        "vdecl":    { "sequence": [ "typeName", "Identifier", "Semi" ])JSON"}
+            + std::string{vdeclExtra} + R"JSON( }
+      },
+      "semantics": { "identifierToken": "Identifier" }
+    })JSON";
+    };
+    struct Refused {
+        char const* what;
+        char const* extra;
+        char const* says;
+    };
+    Refused const refused[] = {
+        {"a value that is not a boolean", R"(, "valueReading": 5)",
+         "'valueReading' must be a boolean"},
+        {"a value reading beside a type guard",
+         R"(, "valueReading": true, "commitRequiresTypeName": "typeName")",
+         "'valueReading' and 'commitRequiresTypeName' are mutually exclusive"},
+    };
+    for (Refused const& r : refused) {
+        SCOPED_TRACE(r.what);
+        auto loaded = GrammarSchema::loadFromText(doc(r.extra));
+        ASSERT_FALSE(loaded.has_value()) << "the shape loaded";
+        bool said = false;
+        for (auto const& d : loaded.error()) {
+            said = said || (d.code == DiagnosticCode::C_UnknownShape
+                            && d.message.find(r.says) != std::string::npos);
+        }
+        EXPECT_TRUE(said) << "refused, but not as C_UnknownShape naming the key";
+    }
+    auto ok = GrammarSchema::loadFromText(doc(R"(, "valueReading": true)"));
+    ASSERT_TRUE(ok.has_value()) << "a value reading with no type guard is refused";
+    auto const& schema = *ok;
+    EXPECT_TRUE(schema->isValueReading(schema->rules().find("vdecl")));
+    EXPECT_FALSE(schema->isValueReading(schema->rules().find("typeName")));
 }
 

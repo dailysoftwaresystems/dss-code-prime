@@ -229,7 +229,7 @@ lowerAsmTextWithTarget(nlohmann::json const& doc, std::string_view source,
 
     run->module = lowerAsmTextToLir(
         run->unit->trees()[0], *run->grammar, *run->target,
-        run->grammar->assembly().entryLabels, run->reporter, formatKind);
+        run->grammar->assembly().entryLabelNames(), run->reporter, formatKind);
     return run;
 }
 

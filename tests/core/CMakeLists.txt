@@ -2,6 +2,8 @@
 # parallelize and pinpoint failures.
 
 dss_add_test(NAME core/test_strong_ids          SOURCES test_strong_ids.cpp)
+# The one rule of a fresh SymbolId (core/types/symbol_id_cursor.hpp): the counting cursor and the index rule.
+dss_add_test(NAME core/test_symbol_id_cursor    SOURCES test_symbol_id_cursor.cpp)
 dss_add_test(NAME core/test_source_span         SOURCES test_source_span.cpp)
 dss_add_test(NAME core/test_source_buffer       SOURCES test_source_buffer.cpp)
 dss_add_test(NAME core/test_token               SOURCES test_token.cpp)
@@ -26,6 +28,9 @@ dss_add_test(NAME core/test_diagnostic_reporter SOURCES test_diagnostic_reporter
 dss_add_test(NAME core/test_diagnostic_budget_threading SOURCES test_diagnostic_budget_threading.cpp)
 dss_add_test(NAME core/test_unsuppressable_codes SOURCES test_unsuppressable_codes.cpp)
 dss_add_test(NAME core/test_header_name_matching SOURCES test_header_name_matching.cpp)
+# The one case table of what a walk of a tree leaves out is JSON (tests/test_support/tree_ignores_cases.json),
+# read by this binary and by owning-tree.py's self-test alike.
+target_link_libraries(dss_core_test_header_name_matching PRIVATE nlohmann_json::nlohmann_json)
 # D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED: a header named from a ROOT
 # resolves where it points, in every spelling of that root. Its multi-separator
 # arm SKIPS LOUDLY AND BY NAME where no UNC spelling is reachable -- an
@@ -33,6 +38,10 @@ dss_add_test(NAME core/test_header_name_matching SOURCES test_header_name_matchi
 dss_add_test(NAME core/test_include_path_rooted_resolution
              SOURCES test_include_path_rooted_resolution.cpp)
 dss_add_test(NAME core/test_grammar_schema      SOURCES test_grammar_schema.cpp)
+# P69 L2b2: `semantics.variadic.vaListTypeNames` is required, non-empty and names
+# each spelling once; the shipped c document binds `__builtin_va_list` only.
+dss_add_test(NAME core/test_va_list_type_names_block
+             SOURCES test_va_list_type_names_block.cpp)
 # Plan 15 CFI slice (D-UNWIND-NO-EH-FRAME-ANY-LANGUAGE-ON-ELF-OR-MACHO): the
 # shared PC-keyed unwind representation -- per-PC state, the remember/restore
 # stack, and the malformed-stream refusals every format writer relies on.
@@ -62,6 +71,9 @@ dss_add_test(NAME core/test_number_decode       SOURCES test_number_decode.cpp)
 dss_add_test(NAME core/test_bit_int_value       SOURCES test_bit_int_value.cpp)
 dss_add_test(NAME core/test_wide_float_value    SOURCES test_wide_float_value.cpp)
 dss_add_test(NAME core/test_tree_builder        SOURCES test_tree_builder.cpp)
+# P69 L2b2 (lane `lm`): the scope chain holds what can be read, not every scope ever pushed. Its own
+# binary: a defective drop makes the serial check abort, so its cases assert sizes first. See its header.
+dss_add_test(NAME core/test_scope_chain_marks   SOURCES test_scope_chain_marks.cpp)
 dss_add_test(NAME core/test_tree_cursor         SOURCES test_tree_cursor.cpp)
 dss_add_test(NAME core/test_tree_node           SOURCES test_tree_node.cpp)
 dss_add_test(NAME core/test_tree                SOURCES test_tree.cpp)
@@ -158,6 +170,14 @@ dss_add_test(NAME core/substrate/test_large_stack_call  SOURCES substrate/test_l
 dss_add_test(NAME core/substrate/test_stack_sized_thread SOURCES substrate/test_stack_sized_thread.cpp)
 dss_add_test(NAME core/substrate/test_relocation_table  SOURCES substrate/test_relocation_table.cpp)
 target_link_libraries(dss_core_substrate_test_relocation_table PRIVATE nlohmann_json::nlohmann_json)
+# A walk's bound is the size of what it walks (`substrate::WalkSteps`, cycle P69 L2): trees of any depth and
+# width finish, a synthesized cycle stops each walk shape loud, naming the walk.
+dss_add_test(NAME core/substrate/test_walk_steps        SOURCES substrate/test_walk_steps.cpp)
+# A monotone fixpoint's bound is its lattice's height (`substrate::FixpointPasses`, cycle P69 L2): far
+# past the old 10000 passes it finishes, the bound is exact, a pass that takes a bit back stops loud.
+dss_add_test(NAME core/substrate/test_fixpoint_passes   SOURCES substrate/test_fixpoint_passes.cpp)
+# One retry, bounded by its caller and loud when it runs out (`substrate::retryUpTo`, cycle P69 L2).
+dss_add_test(NAME core/substrate/test_bounded_retry     SOURCES substrate/test_bounded_retry.cpp)
 # The process-spawn substrate (src/core/substrate/process_spawn.{hpp,cpp}) — the
 # compiler's FIRST process creation, and the home of the "NO SHELL, EVER"
 # contract every `{"run": [...]}` build step and every `git` invocation rides on.
@@ -174,6 +194,57 @@ if(WIN32)
     # shell32 and MinGW's default set is a toolchain detail, so name it.
     target_link_libraries(dss_core_substrate_test_process_spawn PRIVATE shell32)
 endif()
+# The kind of a directory entry, and the walk and the removal that ask it
+# (src/core/substrate/path_identity.{hpp,cpp}): every link these cases read is made by the OS
+# (tests/test_support/os_link.hpp), so they run on the MinGW build -- whose library can neither make
+# a link nor see one -- as on every other.
+dss_add_test(NAME core/substrate/test_directory_tree    SOURCES substrate/test_directory_tree.cpp)
+# THE TYPED HOST PATH HOME'S UNIVERSE: one case per cell of the product the home's own vocabulary generates
+# (substrate/host_path_universe.hpp: origin x use x root shape x name edge x position x drive), each judged by
+# the host's own answer -- the reference rule over every cell, the operations over the witness cells, totality.
+dss_add_test(NAME core/substrate/test_host_path_universe SOURCES substrate/test_host_path_universe.cpp)
+# THE SOURCE GUARD of the substrate's filesystem questions: no std::filesystem question whose answer depends on
+# how a link is read, in src/ outside src/core/substrate/ or in integrated_tests/ (the guard's header states
+# the class, the forms it refuses and why).
+dss_add_test(NAME core/test_filesystem_queries_guard    SOURCES test_filesystem_queries_guard.cpp)
+# `repo-guard`, DECLARED beside its registration: what it judges is the SOURCE TREE, the same bytes on every
+# leg, so an indirect leg re-reading it learns nothing -- the ruling the label exists for (stated where the
+# top-level CMakeLists sums the declarations). The mutation sweep starts the binary itself and asks no label.
+dss_label_repo_guard(core/test_filesystem_queries_guard)
+# THE ENGINE GUARD of the linear scanners: no C++ source under src/, tests/ or integrated_tests/ includes <regex>
+# or names its vocabulary (the guard's header states the class: a regex executor's stack depth follows its input).
+dss_add_test(NAME core/test_no_regex_guard SOURCES test_no_regex_guard.cpp)
+# `repo-guard`, DECLARED beside its registration: what it judges is the SOURCE TREE, the same bytes on every leg.
+dss_label_repo_guard(core/test_no_regex_guard)
+# THE SOURCE GUARD of a fresh SymbolId (P69 fold f26d, review-csf26c2 N9): no source under src/ but
+# src/core/types/symbol_id_cursor.hpp makes one from arithmetic, a counter or a size (the guard's header
+# states the forms it refuses). `repo-guard`, as the filesystem guard above: it judges the source tree.
+dss_add_test(NAME core/test_symbol_id_mints_guard    SOURCES test_symbol_id_mints_guard.cpp)
+dss_label_repo_guard(core/test_symbol_id_mints_guard)
+# P69 f26d (lane `cs`): the ONE rendering of source text inside a diagnostic
+# (core/types/diagnostic_quote.hpp) — one line, cut past the configuration's limit at a character
+# boundary with an ellipsis, a short text whole — and its repo guard: every message statement of the
+# files whose diagnostics quote source text quotes through it.
+dss_add_test(NAME core/test_diagnostic_quote       SOURCES test_diagnostic_quote.cpp)
+dss_add_test(NAME core/test_diagnostic_quote_guard SOURCES test_diagnostic_quote_guard.cpp)
+dss_label_repo_guard(core/test_diagnostic_quote_guard)
+# Its limit's configure-time read (cmake/DssConfigureTimeCount.cmake) refuses by name a missing document,
+# bytes that are not JSON, a top level that is not an object, no `quotedSourceTextLimit`, and one that is not
+# a positive whole number — each case the reader alone in script mode, with two controls (the nesting
+# limit's own refusals, core/config_nesting_limit_configure_refusals, go through the same reader).
+add_test(NAME core/diagnostic_quote_limit_configure_refusals
+         COMMAND ${CMAKE_COMMAND}
+                 -D "DSS_REPO_ROOT=${CMAKE_SOURCE_DIR}"
+                 -D "DSS_SCRATCH=${CMAKE_CURRENT_BINARY_DIR}/diagnostic_quote_limit_refusals"
+                 -D "KEY=quotedSourceTextLimit"
+                 -D "SUBJECT=the diagnostics' quoted-source-text limit"
+                 -D "UNIT=bytes"
+                 -D "SHIPPED=src/dss-config/configure-time/diagnostics.json"
+                 -P "${CMAKE_CURRENT_SOURCE_DIR}/test_configure_time_count_refusals.cmake")
+# P69 f26d (lane `cs`, rulings 617 and 621): the ONE spelling of a type in a language's diagnostic —
+# the document's `semantics.typeSpelling` table loaded complete or refused, every shipped language with
+# types declaring one, a second language's own words, and the c document over every type form.
+dss_add_test(NAME core/test_type_spelling       SOURCES test_type_spelling.cpp)
 target_include_directories(dss_core_substrate_test_arena_tag       PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(dss_core_substrate_test_arena_container PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(dss_core_substrate_test_arena_attribute PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -415,6 +486,9 @@ target_link_libraries(dss_core_test_target_register_class_pair_ops
 # *** The target-loader pin READS the shipped arm64 document and mutates the
 #     bytes IN MEMORY (the `test_target_register_class_pair_ops` precedent);
 #     nothing under src/dss-config/ is written.
+# A shape that reaches itself before consuming a token is refused (C_CircularShape), and the
+# loader's fixpoints converge however many passes a grammar asks (cycle P69 L2).
+dss_add_test(NAME core/test_grammar_left_recursion SOURCES test_grammar_left_recursion.cpp)
 dss_add_test(NAME core/test_config_document_parse
              SOURCES test_config_document_parse.cpp)
 target_link_libraries(dss_core_test_config_document_parse
@@ -447,3 +521,20 @@ dss_add_test(NAME core/test_checkpoint_cost
 if(WIN32)
     target_link_libraries(dss_core_test_checkpoint_cost PRIVATE psapi)
 endif()
+
+# P69 (lane lm — M3 of D-C-FLOAT-H-AND-FLOAT-PREDEFINES-MISSING): C's floating
+# characteristics from ONE owner per representation (core/types/float_format.hpp) —
+# every characteristic computed from the table's primary facts and pinned against the
+# standard's values, the host's std::numeric_limits and the hex spellings parsed back;
+# WideFloatValue and floatKindInfo derive from it.
+dss_add_test(NAME core/test_float_format SOURCES test_float_format.cpp)
+
+# P69 L2 (lane `lm`): the configure-time read of the config documents' nesting limit
+# (cmake/DssConfigNestingLimit.cmake) refuses by name a missing document, bytes that are not
+# JSON, a top level that is not an object, no `maxNesting`, and one that is not a positive whole
+# number — each case the reader alone in script mode over a planted document, with two controls.
+add_test(NAME core/config_nesting_limit_configure_refusals
+         COMMAND ${CMAKE_COMMAND}
+                 -D "DSS_REPO_ROOT=${CMAKE_SOURCE_DIR}"
+                 -D "DSS_SCRATCH=${CMAKE_CURRENT_BINARY_DIR}/config_nesting_limit_refusals"
+                 -P "${CMAKE_CURRENT_SOURCE_DIR}/test_config_nesting_limit_refusals.cmake")

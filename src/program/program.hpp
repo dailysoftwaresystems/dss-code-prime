@@ -8,6 +8,7 @@
 // is already this tier's manifest vocabulary and `program.cpp` includes it.
 #include "core/types/project_config.hpp"
 #include "core/types/project_sources.hpp"   // ManifestSourceSettings
+#include "core/types/symbol_attrs.hpp"      // SymbolVisibility (setArchiveDefinitionVisibility)
 #include "opt/optimizer.hpp"
 #include "program/cli_args.hpp"      // CompileConfig
 #include "program/input_resolver.hpp"
@@ -626,6 +627,21 @@ public:
     [[nodiscard]] std::vector<std::string> const&
     runpaths() const noexcept { return runpaths_; }
 
+    /// D-LK-PE-DLL-EXPORTS-THE-SHIPPED-RUNTIME-IT-LINKS: the visibility a
+    /// STATIC-ARCHIVE build gives EVERY external definition it compiles — the
+    /// archive's own declaration, as libgcc.a's build hides every global its
+    /// members define. nullopt (the default) ⇒ each definition keeps what its
+    /// source declared. No CLI
+    /// or manifest surface: the one setter is the nested build that
+    /// materialises a shipped runtime archive. See
+    /// `CompileOptions::archiveDefinitionVisibility` for the contract, and for
+    /// why it is applied after the optimizer.
+    void setArchiveDefinitionVisibility(std::optional<SymbolVisibility> v) noexcept {
+        archiveDefinitionVisibility_ = v;
+    }
+    [[nodiscard]] std::optional<SymbolVisibility>
+    archiveDefinitionVisibility() const noexcept { return archiveDefinitionVisibility_; }
+
 private:
     std::optional<std::filesystem::path>   outputDir_;
     std::optional<std::string>             artifactName_;             // D-AP2-OUTPUT-ROUTING: project binary base name (nullopt = source stem)
@@ -659,6 +675,9 @@ private:
     // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: manifest `runpaths` + CLI --rpath
     // (empty = the image records none).
     std::vector<std::string>               runpaths_;
+    // D-LK-PE-DLL-EXPORTS-THE-SHIPPED-RUNTIME-IT-LINKS: nullopt = each archive
+    // member definition keeps its declared visibility.
+    std::optional<SymbolVisibility>        archiveDefinitionVisibility_;
     /// `--emit-hir`: the buffer `compileOneTarget` renders the `.dsshir` text
     /// into instead of compiling. Set ONLY by `emitHirText`, for the duration of
     /// that one call, and cleared on the way out — a compiling entry point must

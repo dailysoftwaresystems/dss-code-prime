@@ -3,9 +3,13 @@
 #include "asm/asm_local_labels.hpp"
 #include "asm/asm_template_to_lir.hpp"
 #include "asm/asm_variant_elect.hpp"
+#include "core/types/diagnostic_quote.hpp"  // quotedSourceText: the ONE rendering of source text in a diagnostic
 #include "core/types/assembly_config.hpp"
 #include "lir/lir_node.hpp"
 #include "lir/lir_reg.hpp"
+#include "core/types/symbol_id_cursor.hpp"   // the one rule of a fresh SymbolId (P69 f26d, N9)
+#include <cstdio>
+#include <cstdlib>
 
 #include <algorithm>
 #include <array>
@@ -109,7 +113,6 @@ public:
         AsmTextModule out;
         out.lir                 = std::move(builder_).finish();
         out.symbols             = std::move(symbols_);
-        out.userEntrySymbol     = userEntry_;
         out.externImports       = std::move(externs_);
         out.dataItems           = std::move(dataItems_);
         out.blockSymbolBindings = std::move(blockSymbolBindings_);
@@ -359,9 +362,10 @@ public:
         if (hit.kind == LabelLookup::NotALabel) {
             sink_.fail(at,
                  std::format("'{}' branches to '{}', which this file defines no "
-                             "label for — a branch out of the translation unit "
-                             "is a relocation this build does not reach from "
-                             "assembly yet{}", mnemonic, symbol,
+                             "label for — a branch out of the function is a "
+                             "TAIL branch to that symbol, and this target "
+                             "declares no opcode this spelling names that "
+                             "branches to a symbol{}", mnemonic, symbol,
                              sink_.pairSuffix()));
             return std::nullopt;
         }
@@ -376,6 +380,20 @@ public:
             return std::nullopt;
         }
         return L.block;
+    }
+
+    // ★ A BRANCH LEAVES THE FUNCTION when its target is a function ENTRY of
+    // this file (another function's, or this one's own) or a name the file does
+    // not define -- the two targets gas relocates a `jmp` against. A block of
+    // the open function stays a branch; a local reference that resolves to
+    // nothing, a data label and a block of ANOTHER function are no ways out,
+    // and `resolveBranchTarget` keeps refusing each by name.
+    [[nodiscard]] bool branchLeavesTheFunction(std::string const& symbol,
+                                               NodeId at) const override {
+        LabelHit const hit = lookupLabel(symbol, at);
+        if (hit.kind == LabelLookup::NotALabel) return true;
+        if (hit.kind != LabelLookup::Found) return false;
+        return labels_[hit.index].isEntry;
     }
 
     [[nodiscard]] std::optional<LirOperand>
@@ -1131,7 +1149,7 @@ private:
                              "place data somewhere the source did not ask for, "
                              "with no diagnostic{}",
                              spelling, operands.size(),
-                             tree_.text(operands[1]), sink_.pairSuffix()));
+                             quotedSourceText(tree_.text(operands[1])), sink_.pairSuffix()));
             return nullptr;
         }
         std::string_view const introducer = tree_.text(kids[0]);
@@ -1144,7 +1162,7 @@ private:
                              "DIFFERENT sections — an undotted name creates a "
                              "section of exactly that name with no allocation "
                              "flag — so they are not synonyms{}",
-                             spelling, introducer, tree_.text(operands[0]),
+                             spelling, introducer, quotedSourceText(tree_.text(operands[0])),
                              sink_.pairSuffix()));
             return nullptr;
         }
@@ -1298,15 +1316,21 @@ private:
     // somewhere that is not the label, with nothing to notice. They are
     // excluded by NAMING THE PROPERTY, never by trusting that the right row
     // happens to be declared first.
+    //
+    // ★ P69 fold 3c: THIS SCAN READ NO FORMULA, AND ON arm64 THAT WAS A
+    // MISCOMPILE. Every non-Linear arm64 row is 4 bytes and not pc-relative by
+    // its row, so `.long main` took `call26` — the first such row — and became
+    // R_AARCH64_CALL26 in `.rela.data` (✔MEASURED 2026-10-20), a branch
+    // displacement ORed into a data word at link. And since `fieldRange` a
+    // width can carry several absolute rows (x86_64: `abs32`, `abs32s`,
+    // `addr32`). The slot's row is now `addressSlotRelocationKind`'s answer —
+    // Linear, absolute, by RANGE — the one rule the linker's pointer-slot scan
+    // asks too.
     [[nodiscard]] std::optional<RelocationKind>
     absoluteRelocKind(std::uint32_t widthBytes) const {
-        for (auto const& r : target_.relocations()) {
-            if (r.widthBytes == widthBytes && !r.pcRelative && !r.tls
-                && !r.imageRelative) {
-                return r.kind;
-            }
-        }
-        return std::nullopt;
+        if (widthBytes > 8) return std::nullopt;
+        return addressSlotRelocationKind(target_.relocations(),
+                                         static_cast<std::uint8_t>(widthBytes));
     }
 
     // Reserve a symbol-valued slot in data item `itemIdx` and record the
@@ -1325,12 +1349,14 @@ private:
             sink_.fail(operand.node,
                  std::format("'.{}' names '{}', which needs an ABSOLUTE "
                              "{}-byte relocation to write that address at link "
-                             "time, and this target declares none (its "
-                             "relocations are matched by the width/pc-relative "
-                             "FORMULA, never by name). Emitting the slot "
-                             "without one would store whatever the address "
-                             "happened to be at compile time{}",
-                             spelling, operand.symbol, unitBytes,
+                             "time, and target '{}' declares none: a Linear, "
+                             "absolute row of that width, neither thread-local "
+                             "nor image-relative, whose range holds every "
+                             "address (rows are matched by these properties, "
+                             "never by name). Emitting the slot without one "
+                             "would store whatever the address happened to be "
+                             "at compile time{}",
+                             spelling, operand.symbol, unitBytes, target_.name(),
                              sink_.pairSuffix()));
             return false;
         }
@@ -2576,31 +2602,25 @@ private:
                              ? SymbolBinding::Global
                              : SymbolBinding::Local;
         sym.visibility = SymbolVisibility::Default;
-        // ★ THE ENTRY MUST BE EXPORTED, AND THAT IS NOW ENFORCED RATHER THAN
-        // ONLY DOCUMENTED. The previous code elected on NAME alone while its
-        // header comment promised a `.globl`-exported label; the two disagreed,
-        // and the disagreement had a cost — a `main:` without `.globl` would be
-        // elected here and then emitted with LOCAL linkage, which is exactly
-        // the "entry symbol is local, link failure points nowhere near the
-        // cause" failure the dialect's own `.globl` note warns about. Refusing
-        // is the only arm with no silent path: leaving `userEntrySymbol` unset
-        // instead would send the trampoline to whatever landed at functions[0].
-        if (std::ranges::find(entryNames_, entry.name) != entryNames_.end()) {
-            if (sym.binding != SymbolBinding::Global) {
-                sink_.fail(entry.at,
-                     std::format("label '{}' is one of this build's "
-                                 "program-entry names but is not exported — an "
-                                 "entry symbol with local linkage is invisible "
-                                 "to the linker's entry resolution. Add this "
-                                 "dialect's global-symbol directive ({}) for "
-                                 "it{}",
-                                 entry.name,
-                                 cfg_.spellingsForVerb(
-                                     AsmDirectiveVerb::GlobalSymbol),
-                                 sink_.pairSuffix()));
-            } else if (!userEntry_.has_value()) {
-                userEntry_ = entry.symbol;
-            }
+        // ★ AN ENTRY-NAMED LABEL MUST BE EXPORTED. The election reads the
+        // unit's EXPORTED functions (`collectObjectEntryCandidates`, as it reads
+        // an object's), so a `main:` without `.globl` would be no candidate and
+        // the build would be refused as having no entry -- naming the missing
+        // entry, not the missing directive. The cause is this label's, so it is
+        // refused here, by name. Nothing here elects (P69 fold 3e).
+        if (std::ranges::find(entryNames_, entry.name) != entryNames_.end()
+            && sym.binding != SymbolBinding::Global) {
+            sink_.fail(entry.at,
+                 std::format("label '{}' is one of this build's "
+                             "program-entry names but is not exported — an "
+                             "entry symbol with local linkage is invisible "
+                             "to the linker's entry resolution. Add this "
+                             "dialect's global-symbol directive ({}) for "
+                             "it{}",
+                             entry.name,
+                             cfg_.spellingsForVerb(
+                                 AsmDirectiveVerb::GlobalSymbol),
+                             sink_.pairSuffix()));
         }
         symbols_.push_back(std::move(sym));
         openFunctionLabel_ = kNoLabel;
@@ -2925,8 +2945,10 @@ private:
     // exactly what makes it a booby trap rather than a bug. The first consumer
     // to write `if (sym.valid())` would silently drop function 0, and nothing
     // in the output would show it. D-ASM-FIRST-FUNCTION-TAKES-SYMBOLID-ZERO.
-    [[nodiscard]] SymbolId mintSymbol() noexcept {
-        return SymbolId{nextSymbolId_++};
+    [[nodiscard]] SymbolId mintSymbol() {
+        // The home's ABORT door (P69 f26e, B1): from 1, the reserved value stepped over, exhaustion fatal by
+        // name -- it wrapped onto 0, the invalid id.
+        return AbortingSymbolIds{symbolIds_, "the text"}.take("asm_text_to_lir");
     }
 
     // One `ModuleSymbol` per DATA label, so the linker can match it across CUs
@@ -3005,7 +3027,6 @@ private:
     // file mint identical SymbolIds and emit identical bytes.
     std::vector<ExternImport>                    externs_;
     std::unordered_map<std::string, std::size_t> externIndex_;
-    std::optional<SymbolId>                     userEntry_;
     // Data items in SOURCE order, plus the section state each pass tracks. A
     // nullopt section means TEXT — the default a `.s` starts in.
     std::vector<AssembledData>                  dataItems_;
@@ -3026,7 +3047,7 @@ private:
     std::optional<DataSectionKind>              scanSection_;
     std::optional<DataSectionKind>              emitSection_;
     std::size_t                                 openDataItem_      = kNoLabel;
-    std::uint32_t                               nextSymbolId_      = 1;
+    SymbolIdEnd                                 symbolIds_;   // `mintSymbol`'s space, from 1
     std::size_t                                 functionCount_     = 0;
     std::size_t                                 openFunctionLabel_ = kNoLabel;
     std::size_t                                 openBlockLabel_    = kNoLabel;

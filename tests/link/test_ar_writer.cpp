@@ -291,6 +291,44 @@ TEST(ArWriter, CoffLibRoundTripsThroughC161Reader) {
     EXPECT_EQ(arch->symbols[0].memberOffset, arch->members[0].headerOffset);
 }
 
+// ★ THE COFF INDEX KEEPS MEMBER ORDER AMONG EQUAL NAMES (P69 fold 3f, lane `xa`). Two members that export
+// one name tie in the 2nd linker member's name sort, and the entry that comes first for a name is the
+// member a linker pulls. std::sort is not stable past a library's small-range cutoff, so the tie was the
+// library's; the writer breaks it by the 1st armap's position -- the members' own order. Forty members
+// export `dup` and one name of their own each: eighty entries, past every library's insertion-sort cutoff.
+TEST(ArWriter, TheCoffIndexKeepsMemberOrderAmongEqualNames) {
+    constexpr std::size_t kMembers = 40;
+    std::vector<ArMemberInput> members;
+    for (std::size_t i = 0; i < kMembers; ++i) {
+        std::string const tag = (i < 10 ? "0" : "") + std::to_string(i);
+        members.push_back(ArMemberInput{"m" + tag + ".o", std::vector<std::uint8_t>(2, 0x11u),
+                                        {"dup", "own" + tag}});
+    }
+    DiagnosticReporter rep;
+    auto lib = writeArArchive(std::span<ArMemberInput const>{members}, rep,
+                              dss::link::format::ArArchiveFlavor::Coff);
+    ASSERT_EQ(rep.errorCount(), 0u);
+
+    // The 2nd linker member follows the 1st "/" armap (its header at 8, its size field at 8 + 48, its
+    // payload padded to an even length).
+    std::size_t const armapSize = std::stoul(field(lib, 8 + 48, 10));
+    std::size_t const k2nd = 8 + 60 + armapSize + (armapSize % 2);
+    ASSERT_EQ(field(lib, k2nd, 16), "/");
+    std::size_t const p = k2nd + 60;
+    ASSERT_EQ(readU32LE(lib, p), kMembers);                          // memberCount
+    std::size_t const counts = p + 4 + 4 * kMembers;
+    ASSERT_EQ(readU32LE(lib, counts), 2 * kMembers);                 // symbolCount
+    std::size_t const indices = counts + 4;
+    std::size_t const names = indices + 2 * 2 * kMembers;
+    ASSERT_EQ(std::string(reinterpret_cast<char const*>(&lib[names]), 4), std::string("dup\0", 4))
+        << "`dup` sorts first";
+    // The first forty entries are `dup`'s, one per member, in the members' order (1-based).
+    for (std::size_t i = 0; i < kMembers; ++i) {
+        EXPECT_EQ(readU16LE(lib, indices + 2 * i), i + 1)
+            << "entry " << i << " of `dup` names the members out of their order";
+    }
+}
+
 TEST(ArWriter, WrongEndianArmapCountBreaksRoundTrip_RedOnDisable) {
     // The BE armap count is load-bearing: emit it little-endian and the c161
     // reader reads a bogus huge count whose offset array overruns the armap.
@@ -395,6 +433,37 @@ TEST(ArWriter, RejectsEmptyExportedSymbolName) {
     for (auto const& d : rep.all())
         if (d.code == DiagnosticCode::K_ArchiveMemberNameInvalid) saw = true;
     EXPECT_TRUE(saw);
+}
+
+// EVERY member is validated, and each of its defects reported, before the write fails (`dss::substrate::runEveryUnit`,
+// the several-unit class's one home; site (m) of the orchestrator's ledger 568, P69 fold 3e): every member invalid --
+// an empty name, a framing byte, an empty exported symbol, a NUL in one -- is four refusals; a valid member, an invalid
+// one and a valid one after it is one; neither writes a byte. On both flavours.
+TEST(ArWriter, EveryMemberIsValidatedBeforeTheWriteFails) {
+    for (auto const flavor : {dss::link::format::ArArchiveFlavor::SysV, dss::link::format::ArArchiveFlavor::Coff}) {
+        for (bool const mixed : {false, true}) {
+            SCOPED_TRACE(std::string{flavor == dss::link::format::ArArchiveFlavor::Coff ? "coff" : "sysv"}
+                         + (mixed ? " / valid, invalid, valid" : " / every member invalid"));
+            std::vector<ArMemberInput> members;
+            if (mixed) {
+                members = {{"first.o", {0x00u}, {"first"}}, {"bad/second.o", {0x00u}, {"second"}},
+                           {"third.o", {0x00u}, {"third"}}};
+            } else {
+                members = {{"", {0x00u}, {}},
+                           {"bad/second.o", {0x00u}, {}},
+                           {"third.o", {0x00u}, {""}},
+                           {"fourth.o", {0x00u}, {std::string{"four\0th", 7}}}};
+            }
+            DiagnosticReporter rep;
+            auto const ar = writeArArchive(std::span<ArMemberInput const>{members}, rep, flavor);
+            EXPECT_TRUE(ar.empty()) << "an archive of an invalid member was written";
+            std::size_t refused = 0;
+            for (auto const& d : rep.all()) {
+                if (d.code == DiagnosticCode::K_ArchiveMemberNameInvalid) ++refused;
+            }
+            EXPECT_EQ(refused, mixed ? 1u : 4u) << "a member's defect was not reported, or was reported twice";
+        }
+    }
 }
 
 // -- End-to-end through the shipped pipeline composition ----------------------

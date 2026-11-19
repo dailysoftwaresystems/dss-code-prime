@@ -1,0 +1,2 @@
+    bool const everyHeaderRead = substrate::runEveryUnit(
+        std::min<std::size_t>(headers.size(), 1),

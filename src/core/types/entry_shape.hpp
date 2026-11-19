@@ -101,13 +101,19 @@ enum class EntryParamShape : std::uint8_t {
     I32        = 1,  // `int`            — C23 requires main's argc to be int
     PtrPtrChar = 2,  // `char**`         — ptr → ptr → char/i8
     PtrPtrU16  = 3,  // `wchar_t**` on a 16-bit-wchar platform (ptr → ptr → u16)
+    PtrOpaque  = 4,  // a pointer to void, a struct or a union — a handle (`HINSTANCE`)
+    PtrChar    = 5,  // `char*`          — ptr → char/i8 (WinMain's command line)
+    PtrU16     = 6,  // a pointer to a 16-bit unsigned (wWinMain's command line)
 };
 
-inline constexpr EnumNameTable<EntryParamShape, 4> kEntryParamShapeTable{{{
+inline constexpr EnumNameTable<EntryParamShape, 7> kEntryParamShapeTable{{{
     { EntryParamShape::None,       "none"         },
     { EntryParamShape::I32,        "i32"          },
     { EntryParamShape::PtrPtrChar, "ptr-ptr-char" },
     { EntryParamShape::PtrPtrU16,  "ptr-ptr-u16"  },
+    { EntryParamShape::PtrOpaque,  "ptr-opaque"   },
+    { EntryParamShape::PtrChar,    "ptr-char"     },
+    { EntryParamShape::PtrU16,     "ptr-u16"      },
 }}};
 
 // Well-formedness of the table itself: no empty spelling, no duplicate
@@ -129,7 +135,7 @@ entryParamShapeFromName(std::string_view s) noexcept {
 // A loader's "accepted: …" half renders THIS, never a retyped list: the
 // retyped one advertises whatever the enum looked like on the day it was
 // typed (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET). The
-// `3` is checked by `namesWhere` at compile time.
+// `6` is checked by `namesWhere` at compile time.
 //
 // ★ AND THE `+ 1` BELOW IS THE OTHER HALF OF THAT CHECK, NOT DECORATION.
 // D-CORE-NAMESWHERE-LITERAL-COUNT-IS-BLIND-TO-A-SECOND-SENTINEL:
@@ -150,7 +156,7 @@ isDeclarableEntryParamShape(EntryParamShape p) noexcept {
     return p != EntryParamShape::None;
 }
 inline constexpr auto kDeclarableEntryParamShapeNames =
-    namesWhere<3>(kEntryParamShapeTable, isDeclarableEntryParamShape);
+    namesWhere<6>(kEntryParamShapeTable, isDeclarableEntryParamShape);
 static_assert(kEntryParamShapeTable.rows.size()
                   == kDeclarableEntryParamShapeNames.size() + 1,
               "kEntryParamShapeTable must have exactly ONE undeclarable row "
@@ -222,6 +228,8 @@ enum class EntryMaterialization : std::uint8_t {
     ArgcArgvEnvp      = 3,  // materialize (argc, narrow argv, narrow envp)
     ArgcWargvWenvp    = 4,  // materialize (argc, wide argv, wide envp) — MSVC's 3-param wmain
     ArgcArgvEnvpApple = 5,  // materialize (argc, argv, envp, apple) — Darwin's LC_MAIN delivery
+    InstancePrevCmdlineShow  = 6,  // (module instance, null, narrow command line, show) — WinMain
+    InstancePrevWcmdlineShow = 7,  // the same with the WIDE command line — wWinMain
 };
 
 // ⚠ `None` IS A REAL, DECLARABLE VERB ON THIS ENUM, unlike the sibling
@@ -232,7 +240,7 @@ enum class EntryMaterialization : std::uint8_t {
 // `EntryFunctionShape` looks like a legal no-arg row, which is why
 // `EntryFunctionShape::returns` carries the sentinel duty for the struct as a
 // whole.
-inline constexpr EnumNameTable<EntryMaterialization, 6>
+inline constexpr EnumNameTable<EntryMaterialization, 8>
 kEntryMaterializationTable{{{
     { EntryMaterialization::None,              "none"                 },
     { EntryMaterialization::ArgcArgv,          "argc-argv"            },
@@ -240,6 +248,8 @@ kEntryMaterializationTable{{{
     { EntryMaterialization::ArgcArgvEnvp,      "argc-argv-envp"       },
     { EntryMaterialization::ArgcWargvWenvp,    "argc-wargv-wenvp"     },
     { EntryMaterialization::ArgcArgvEnvpApple, "argc-argv-envp-apple" },
+    { EntryMaterialization::InstancePrevCmdlineShow,  "instance-prev-cmdline-show"  },
+    { EntryMaterialization::InstancePrevWcmdlineShow, "instance-prev-wcmdline-show" },
 }}};
 
 // Well-formedness of the table itself: no empty spelling, no duplicate
@@ -258,59 +268,197 @@ entryMaterializationFromName(std::string_view s) noexcept {
 
 // ── WHAT EACH VERB MATERIALIZES — THE ONE OWNER ──────────────────────────────
 //
-// The parameter shapes a verb's emitter hands the entry, in order. Three readers,
-// ONE table:
+// The SLOTS a verb's emitter hands the entry, in order: each slot's parameter
+// SHAPE (what the language row's signature must spell there) and the argument
+// VALUE the startup puts there (what the format's mechanism must produce for it).
+// Every reader derives from this one table:
 //   * the language loader's VERB ⟺ SIGNATURE coherence check (an `entryFunctions`
-//     row whose signature is not exactly its verb's list is refused at load);
-//   * the synthesized pre-main inits (`realizeEntryShape`), which read WIDE vs
-//     NARROW off the second shape and whether an environment is passed off the
-//     count, instead of re-classifying the verb;
+//     row whose signature is not exactly its verb's shapes is refused at load);
+//   * the format's validate(), which asks of every declared verb whether its
+//     `processArgs` mechanism produces each slot's VALUE;
+//   * the synthesized pre-main inits (`realizeEntryShape`), which fetch each
+//     slot's value by what it IS, never by where it sits;
 //   * the entry trampoline, which saves across the static initializers exactly
 //     the argument registers a loader-delivered entry form fills (the LARGEST
 //     count among the format's own `entryVerbs`, on a format whose loader puts
 //     the arguments in registers).
+// ★ THE VALUE COLUMN IS WHY THIS TABLE IS NOT A LIST OF SHAPES (P69 fold 3f, lane
+// `xa`, the GUI startups). It used to be one, and three readers recovered meaning
+// from POSITIONS and COUNTS: "wide" was the second shape, "passes an environment"
+// was "three or more", and a `processArgs` mechanism was said to produce "at most
+// three values". WinMain's four values -- the module instance, the previous
+// instance, the command line, the show-window value -- would have read as an
+// environment and been refused as a fourth vector. A meaning is now READ, per slot.
 // A new verb that forgets its row here is a compile error (the switch has no
 // `default:`), never a permissive empty list.
-inline constexpr std::array<EntryParamShape, 2> kEntryVerbArgcArgvParams{
-    EntryParamShape::I32, EntryParamShape::PtrPtrChar};
-inline constexpr std::array<EntryParamShape, 2> kEntryVerbArgcWargvParams{
-    EntryParamShape::I32, EntryParamShape::PtrPtrU16};
-inline constexpr std::array<EntryParamShape, 3> kEntryVerbArgcArgvEnvpParams{
-    EntryParamShape::I32, EntryParamShape::PtrPtrChar, EntryParamShape::PtrPtrChar};
-inline constexpr std::array<EntryParamShape, 3> kEntryVerbArgcWargvWenvpParams{
-    EntryParamShape::I32, EntryParamShape::PtrPtrU16, EntryParamShape::PtrPtrU16};
+
+// What the startup puts in one slot.
+enum class EntryArgumentValue : std::uint8_t {
+    ArgumentCount        = 0,  // argc
+    NarrowArgumentVector = 1,  // argv, narrow strings
+    WideArgumentVector   = 2,  // argv, wide strings (MSVC's `wmain`)
+    NarrowEnvironment    = 3,  // envp, narrow strings
+    WideEnvironment      = 4,  // envp, wide strings
+    AppleVector          = 5,  // Darwin's fourth vector (`executable_path=…` first)
+    ModuleInstance       = 6,  // the image's own module handle (WinMain's first)
+    PreviousInstance     = 7,  // always null: the Win32 contract since 32-bit Windows
+    NarrowCommandLine    = 8,  // the command line past the program's name, narrow
+    WideCommandLine      = 9,  // the same, wide (`wWinMain`)
+    ShowWindow           = 10, // how the program's first window is to be shown
+};
+
+inline constexpr EnumNameTable<EntryArgumentValue, 11> kEntryArgumentValueTable{{{
+    { EntryArgumentValue::ArgumentCount,        "argument count"                 },
+    { EntryArgumentValue::NarrowArgumentVector, "narrow argument vector"         },
+    { EntryArgumentValue::WideArgumentVector,   "wide argument vector"           },
+    { EntryArgumentValue::NarrowEnvironment,    "narrow environment"             },
+    { EntryArgumentValue::WideEnvironment,      "wide environment"               },
+    { EntryArgumentValue::AppleVector,          "apple vector"                   },
+    { EntryArgumentValue::ModuleInstance,       "module instance"                },
+    { EntryArgumentValue::PreviousInstance,     "previous instance"              },
+    { EntryArgumentValue::NarrowCommandLine,    "narrow command line"            },
+    { EntryArgumentValue::WideCommandLine,      "wide command line"              },
+    { EntryArgumentValue::ShowWindow,           "show-window value"              },
+}}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kEntryArgumentValueTable);
+
+[[nodiscard]] constexpr std::string_view
+entryArgumentValueName(EntryArgumentValue v) noexcept {
+    return kEntryArgumentValueTable.name(v);
+}
+
+// One slot: the shape the language row spells there, the value the startup puts there.
+struct EntryVerbSlot {
+    EntryParamShape    shape;
+    EntryArgumentValue value;
+};
+
+inline constexpr std::array<EntryVerbSlot, 2> kEntryVerbArgcArgvSlots{{
+    {EntryParamShape::I32,        EntryArgumentValue::ArgumentCount},
+    {EntryParamShape::PtrPtrChar, EntryArgumentValue::NarrowArgumentVector}}};
+inline constexpr std::array<EntryVerbSlot, 2> kEntryVerbArgcWargvSlots{{
+    {EntryParamShape::I32,        EntryArgumentValue::ArgumentCount},
+    {EntryParamShape::PtrPtrU16,  EntryArgumentValue::WideArgumentVector}}};
+inline constexpr std::array<EntryVerbSlot, 3> kEntryVerbArgcArgvEnvpSlots{{
+    {EntryParamShape::I32,        EntryArgumentValue::ArgumentCount},
+    {EntryParamShape::PtrPtrChar, EntryArgumentValue::NarrowArgumentVector},
+    {EntryParamShape::PtrPtrChar, EntryArgumentValue::NarrowEnvironment}}};
+inline constexpr std::array<EntryVerbSlot, 3> kEntryVerbArgcWargvWenvpSlots{{
+    {EntryParamShape::I32,        EntryArgumentValue::ArgumentCount},
+    {EntryParamShape::PtrPtrU16,  EntryArgumentValue::WideArgumentVector},
+    {EntryParamShape::PtrPtrU16,  EntryArgumentValue::WideEnvironment}}};
 // Darwin's fourth value, `apple`, is a NULL-terminated vector of C strings
 // (`executable_path=…` first) — the same shape as argv and envp.
-inline constexpr std::array<EntryParamShape, 4> kEntryVerbArgcArgvEnvpAppleParams{
-    EntryParamShape::I32, EntryParamShape::PtrPtrChar, EntryParamShape::PtrPtrChar,
-    EntryParamShape::PtrPtrChar};
+inline constexpr std::array<EntryVerbSlot, 4> kEntryVerbArgcArgvEnvpAppleSlots{{
+    {EntryParamShape::I32,        EntryArgumentValue::ArgumentCount},
+    {EntryParamShape::PtrPtrChar, EntryArgumentValue::NarrowArgumentVector},
+    {EntryParamShape::PtrPtrChar, EntryArgumentValue::NarrowEnvironment},
+    {EntryParamShape::PtrPtrChar, EntryArgumentValue::AppleVector}}};
+// `int WinMain(HINSTANCE, HINSTANCE, LPSTR, int)` / `wWinMain(…, LPWSTR, int)`:
+// what the C runtime's GUI startups (WinMainCRTStartup, wWinMainCRTStartup) hand it.
+inline constexpr std::array<EntryVerbSlot, 4> kEntryVerbInstancePrevCmdlineShowSlots{{
+    {EntryParamShape::PtrOpaque,  EntryArgumentValue::ModuleInstance},
+    {EntryParamShape::PtrOpaque,  EntryArgumentValue::PreviousInstance},
+    {EntryParamShape::PtrChar,    EntryArgumentValue::NarrowCommandLine},
+    {EntryParamShape::I32,        EntryArgumentValue::ShowWindow}}};
+inline constexpr std::array<EntryVerbSlot, 4> kEntryVerbInstancePrevWcmdlineShowSlots{{
+    {EntryParamShape::PtrOpaque,  EntryArgumentValue::ModuleInstance},
+    {EntryParamShape::PtrOpaque,  EntryArgumentValue::PreviousInstance},
+    {EntryParamShape::PtrU16,     EntryArgumentValue::WideCommandLine},
+    {EntryParamShape::I32,        EntryArgumentValue::ShowWindow}}};
 
-[[nodiscard]] constexpr std::span<EntryParamShape const>
-entryVerbParams(EntryMaterialization m) noexcept {
+[[nodiscard]] constexpr std::span<EntryVerbSlot const>
+entryVerbSlots(EntryMaterialization m) noexcept {
     switch (m) {
-    case EntryMaterialization::None:              return {};
-    case EntryMaterialization::ArgcArgv:          return kEntryVerbArgcArgvParams;
-    case EntryMaterialization::ArgcWargv:         return kEntryVerbArgcWargvParams;
-    case EntryMaterialization::ArgcArgvEnvp:      return kEntryVerbArgcArgvEnvpParams;
-    case EntryMaterialization::ArgcWargvWenvp:    return kEntryVerbArgcWargvWenvpParams;
-    case EntryMaterialization::ArgcArgvEnvpApple: return kEntryVerbArgcArgvEnvpAppleParams;
+    case EntryMaterialization::None:                     return {};
+    case EntryMaterialization::ArgcArgv:                 return kEntryVerbArgcArgvSlots;
+    case EntryMaterialization::ArgcWargv:                return kEntryVerbArgcWargvSlots;
+    case EntryMaterialization::ArgcArgvEnvp:             return kEntryVerbArgcArgvEnvpSlots;
+    case EntryMaterialization::ArgcWargvWenvp:           return kEntryVerbArgcWargvWenvpSlots;
+    case EntryMaterialization::ArgcArgvEnvpApple:        return kEntryVerbArgcArgvEnvpAppleSlots;
+    case EntryMaterialization::InstancePrevCmdlineShow:  return kEntryVerbInstancePrevCmdlineShowSlots;
+    case EntryMaterialization::InstancePrevWcmdlineShow: return kEntryVerbInstancePrevWcmdlineShowSlots;
     }
     return {};
 }
 
-// Derived views of the table, never a second classification of the verb.
+// The shapes of a verb's slots, in order — the language row's parameter list. The
+// table above is their one owner; these are its projection, built at compile time.
+template <std::size_t N>
+[[nodiscard]] constexpr std::array<EntryParamShape, N>
+entryShapesOf(std::array<EntryVerbSlot, N> const& slots) noexcept {
+    std::array<EntryParamShape, N> out{};
+    for (std::size_t i = 0; i < N; ++i) out[i] = slots[i].shape;
+    return out;
+}
+inline constexpr auto kEntryVerbArgcArgvParams          = entryShapesOf(kEntryVerbArgcArgvSlots);
+inline constexpr auto kEntryVerbArgcWargvParams         = entryShapesOf(kEntryVerbArgcWargvSlots);
+inline constexpr auto kEntryVerbArgcArgvEnvpParams      = entryShapesOf(kEntryVerbArgcArgvEnvpSlots);
+inline constexpr auto kEntryVerbArgcWargvWenvpParams    = entryShapesOf(kEntryVerbArgcWargvWenvpSlots);
+inline constexpr auto kEntryVerbArgcArgvEnvpAppleParams = entryShapesOf(kEntryVerbArgcArgvEnvpAppleSlots);
+inline constexpr auto kEntryVerbInstancePrevCmdlineShowParams =
+    entryShapesOf(kEntryVerbInstancePrevCmdlineShowSlots);
+inline constexpr auto kEntryVerbInstancePrevWcmdlineShowParams =
+    entryShapesOf(kEntryVerbInstancePrevWcmdlineShowSlots);
+
+[[nodiscard]] constexpr std::span<EntryParamShape const>
+entryVerbParams(EntryMaterialization m) noexcept {
+    switch (m) {
+    case EntryMaterialization::None:                     return {};
+    case EntryMaterialization::ArgcArgv:                 return kEntryVerbArgcArgvParams;
+    case EntryMaterialization::ArgcWargv:                return kEntryVerbArgcWargvParams;
+    case EntryMaterialization::ArgcArgvEnvp:             return kEntryVerbArgcArgvEnvpParams;
+    case EntryMaterialization::ArgcWargvWenvp:           return kEntryVerbArgcWargvWenvpParams;
+    case EntryMaterialization::ArgcArgvEnvpApple:        return kEntryVerbArgcArgvEnvpAppleParams;
+    case EntryMaterialization::InstancePrevCmdlineShow:  return kEntryVerbInstancePrevCmdlineShowParams;
+    case EntryMaterialization::InstancePrevWcmdlineShow: return kEntryVerbInstancePrevWcmdlineShowParams;
+    }
+    return {};
+}
+
+// Derived views of the table, each a question about the slots' VALUES — never a
+// position or a count read as a meaning.
+[[nodiscard]] constexpr bool
+entryVerbHands(EntryMaterialization m, EntryArgumentValue v) noexcept {
+    for (EntryVerbSlot const& s : entryVerbSlots(m)) {
+        if (s.value == v) return true;
+    }
+    return false;
+}
 [[nodiscard]] constexpr bool entryVerbIsWide(EntryMaterialization m) noexcept {
-    auto const p = entryVerbParams(m);
-    return p.size() >= 2 && p[1] == EntryParamShape::PtrPtrU16;
+    return entryVerbHands(m, EntryArgumentValue::WideArgumentVector)
+        || entryVerbHands(m, EntryArgumentValue::WideEnvironment)
+        || entryVerbHands(m, EntryArgumentValue::WideCommandLine);
 }
 [[nodiscard]] constexpr bool entryVerbPassesEnvironment(EntryMaterialization m) noexcept {
-    return entryVerbParams(m).size() >= 3;
+    return entryVerbHands(m, EntryArgumentValue::NarrowEnvironment)
+        || entryVerbHands(m, EntryArgumentValue::WideEnvironment);
+}
+[[nodiscard]] constexpr bool entryVerbPassesArgumentVector(EntryMaterialization m) noexcept {
+    return entryVerbHands(m, EntryArgumentValue::NarrowArgumentVector)
+        || entryVerbHands(m, EntryArgumentValue::WideArgumentVector);
+}
+[[nodiscard]] constexpr bool entryVerbPassesWinMainArguments(EntryMaterialization m) noexcept {
+    return entryVerbHands(m, EntryArgumentValue::ModuleInstance)
+        || entryVerbHands(m, EntryArgumentValue::NarrowCommandLine)
+        || entryVerbHands(m, EntryArgumentValue::WideCommandLine)
+        || entryVerbHands(m, EntryArgumentValue::ShowWindow);
 }
 
 static_assert(entryVerbParams(EntryMaterialization::None).empty());
 static_assert(entryVerbParams(EntryMaterialization::ArgcArgvEnvpApple).size() == 4);
 static_assert(entryVerbIsWide(EntryMaterialization::ArgcWargvWenvp)
               && !entryVerbIsWide(EntryMaterialization::ArgcArgvEnvp));
+static_assert(entryVerbIsWide(EntryMaterialization::InstancePrevWcmdlineShow)
+              && !entryVerbIsWide(EntryMaterialization::InstancePrevCmdlineShow));
+static_assert(!entryVerbPassesEnvironment(EntryMaterialization::InstancePrevCmdlineShow)
+              && entryVerbPassesEnvironment(EntryMaterialization::ArgcWargvWenvp));
+static_assert(!entryVerbPassesArgumentVector(EntryMaterialization::InstancePrevWcmdlineShow)
+              && entryVerbPassesWinMainArguments(EntryMaterialization::InstancePrevWcmdlineShow));
 
 // One declared entry row: the NAME the source language spells this entry with,
 // the signature that spelling must have, and the verb that realizes it.

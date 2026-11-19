@@ -1,0 +1,3 @@
+    std::vector<WhenSpec> symbolArchEntries;
+    std::vector<std::string> shippedSourceFormats;   // M44b
+};

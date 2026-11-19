@@ -1,0 +1,1 @@
+    bool const same = firstPath.lexically_normal() == secondPath.lexically_normal();

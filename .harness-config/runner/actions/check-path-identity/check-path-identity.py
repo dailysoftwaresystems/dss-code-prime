@@ -32,7 +32,11 @@ without a decision" gate rather than a claim that path code is rare. Rule 2
 below is what actually watches the existing 50.
 
 RULE 2 (secondary, and yes it IS an enumeration): a RESOLUTION call outside
-`core/substrate/path_identity.cpp`. It is a net under the net -- to bypass both
+`core/substrate/path_identity.cpp`, with NO grant anywhere else (P69 H6b, F4: the
+OS's own spelling -- GetFullPathNameW -- lives inside the chokepoint; the header-only
+second home H6 gave it exported the resolution under names this rule did not list,
+and its premise, "integrated_tests links no DSS library", was false: it compiles
+path_identity.cpp and carries src/ on its include path). It is a net under the net -- to bypass both
 you would have to already be on the allowlist AND use a spelling nobody listed,
 and rule 1 is what makes the allowlist the thing you have to edit.
 
@@ -44,10 +48,10 @@ and it flattened block comments -- its reading of code differed from the owner's
 107 of the 503 files it scans (a `'"'` opened a string that hid the code after it;
 14 src files hold one) -- while no verdict differed; the switch changed none.
 
-Usage:
-    python .harness-config/runner/actions/check-path-identity/check-path-identity.py            # check
-    python .harness-config/runner/actions/check-path-identity/check-path-identity.py --selftest # prove the matcher detects
-    python .harness-config/runner/actions/check-path-identity/check-path-identity.py --regen    # reprint the allowlist
+Usage -- each a step of the action, the program's own flag after the `#`:
+    dssharness run check-path-identity                           # check, then the self-test
+    dssharness run check-path-identity --manual-step self-test   # --selftest: prove the matcher detects
+    dssharness run check-path-identity --manual-step reprint     # --reprint: PRINT the allowlist it would hold
 """
 from __future__ import annotations
 
@@ -106,6 +110,15 @@ SRC = REPO / "src"
 # The ONE file allowed to resolve paths. Everything else asks it.
 CHOKEPOINT = "core/substrate/path_identity.cpp"
 
+# ★ NO OS SIDE OUTSIDE IT (P69 H6b, F4). The OS's own spelling of a plain Windows
+# path -- GetFullPathNameW, the resolution every Win32 call applies before the NT
+# namespace sees a spelling -- is asked INSIDE the chokepoint; every other file
+# takes the chokepoint's exports (extendedLengthSpelling, applicationNameSpelling,
+# containerSpelling, containingDirectory). H6 granted a header-only second home the
+# one call, and the review measured the grant bypassed by name: the header exported
+# the resolution as three functions rule 2 did not list, called from
+# process_spawn.cpp. A grant per call cannot see a wrapper; one home can.
+
 # Resolution spellings for rule 2. Deliberately NOT the primary guarantee --
 # see the module docstring on why an enumeration cannot be one.
 RESOLUTION_CALLS = (
@@ -134,16 +147,25 @@ RESOLUTION_EXEMPT = frozenset({
     "core/types/config_path_walk.cpp",
 })
 
+
+def refused_calls(r: str, code: str) -> list[str]:
+    """Rule 2 for one file: the resolution calls `code` (comments and strings
+    already stripped) makes that the file `r` is not granted."""
+    if r == CHOKEPOINT or r in RESOLUTION_EXEMPT:
+        return []
+    return [call for call in RESOLUTION_CALLS if call in code]
+
 # Files that legitimately touch <filesystem> today. Generated from the tree with
-# --regen; a NEW entry is a decision, which is the entire point.
+# --reprint; a NEW entry is a decision, which is the entire point.
 ALLOWLIST = frozenset("""
 analysis/compilation_unit/compilation_unit.cpp
 analysis/compilation_unit/compilation_unit.hpp
 analysis/compilation_unit/import_resolver.hpp
 analysis/preprocess/preprocessor.hpp
 analysis/semantic/semantic_analyzer.cpp
-core/substrate/checked_file_read.cpp
 core/substrate/checked_file_read.hpp
+core/substrate/host_path.hpp
+core/substrate/host_path_access.hpp
 core/substrate/path_identity.hpp
 core/substrate/process_spawn.hpp
 core/types/config_path_walk.hpp
@@ -245,18 +267,17 @@ def scan() -> list[str]:
             )
 
         # Rule 2 — the net under the net.
-        if r != CHOKEPOINT and r not in RESOLUTION_EXEMPT:
-            for call in RESOLUTION_CALLS:
-                if call in code:
-                    problems.append(
-                        f"{r}: calls `{call}` outside the one canonicalizer "
-                        f"({CHOKEPOINT}).\n"
-                        f"    A second resolver is a second owner of one fact, "
-                        f"and the two disagree silently — which is precisely "
-                        f"how 8.3 short names split every path key in the "
-                        f"compiler while every test stayed green. Call "
-                        f"core::PathIdentity::of() / canonicalIdentityKey()."
-                    )
+        for call in refused_calls(r, code):
+            problems.append(
+                f"{r}: calls `{call}` outside the one canonicalizer "
+                f"({CHOKEPOINT}, which alone asks the OS how a path "
+                f"resolves).\n"
+                f"    A second resolver is a second owner of one fact, "
+                f"and the two disagree silently — which is precisely "
+                f"how 8.3 short names split every path key in the "
+                f"compiler while every test stayed green. Call "
+                f"core::PathIdentity::of() / canonicalIdentityKey()."
+            )
     return problems
 
 
@@ -287,16 +308,28 @@ def selftest() -> int:
         failures.append("a RAW string's body was treated as a call (the private copy's reading)")
     if strip_comments_and_strings.__module__ != "_no_abort_in_tests":
         failures.append("the comment/string scanner is not the SHARED one")
+    # The OS's own resolution is the chokepoint's alone (P69 H6b, F4): asked there
+    # it passes; asked in the substrate beside it -- the header H6 granted it, the
+    # spawner that called that header's wrappers -- it is refused like anywhere else.
+    full_path_call = "DWORD n = ::GetFullPathNameW(p, 0, nullptr, nullptr);\n"
+    if refused_calls(CHOKEPOINT, strip_comments_and_strings(full_path_call)):
+        failures.append("the chokepoint was refused the OS's own resolution")
+    if refused_calls("core/substrate/os_path_spelling.hpp",
+                     strip_comments_and_strings(full_path_call)) != ["GetFullPathName"]:
+        failures.append("GetFullPathName in a header beside the chokepoint was not refused (a second home)")
+    if refused_calls("core/substrate/process_spawn.cpp",
+                     strip_comments_and_strings(full_path_call)) != ["GetFullPathName"]:
+        failures.append("GetFullPathName in the spawner, outside the chokepoint, was not refused")
 
     for f in failures:
         print(f"SELFTEST FAIL: {f}")
     if failures:
         return 1
-    print("check-path-identity selftest: OK (7 controls)")
+    print("check-path-identity selftest: OK (10 controls)")
     return 0
 
 
-def regen() -> int:
+def reprint() -> int:
     hits = []
     for p in sorted(SRC.rglob("*")):
         if p.suffix not in (".cpp", ".hpp", ".h", ".cc"):
@@ -313,8 +346,8 @@ def regen() -> int:
 def main() -> int:
     if "--selftest" in sys.argv:
         return selftest()
-    if "--regen" in sys.argv:
-        return regen()
+    if "--reprint" in sys.argv:
+        return reprint()
     problems = scan()
     if problems:
         print(f"check-path-identity: {len(problems)} problem(s)\n")

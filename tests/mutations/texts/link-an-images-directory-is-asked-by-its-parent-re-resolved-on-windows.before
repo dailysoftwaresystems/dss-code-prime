@@ -1,0 +1,3 @@
+    if (core::HostPath const level = core::containingDirectory(path); !parent.empty() && !level.empty()) {
+        std::error_code ec;
+        bool const exists = core::reachedKind(level, core::Use::Container, ec) != core::EntryKind::Absent;

@@ -23,7 +23,22 @@ cmake_minimum_required(VERSION 3.28)
 
 enable_testing()
 
-add_executable(integrated_tests runner.cpp)
+# ★ ONE HOST-SUBSTRATE UNIT IS COMPILED IN, AND NO DSS LIBRARY IS LINKED. The
+# runner drives the compiler as a SUBPROCESS and links none of it; but walking a
+# tree without following a link, and removing one the same way, is a host
+# question it shares with the compiler, and the two copies it kept answered it
+# differently by toolchain: libstdc++ on Windows cannot tell a link from what it
+# reaches, so the runner's own removal, built with MinGW, emptied a link's target
+# (✔MEASURED 2026-10-20; src/core/substrate/path_identity.hpp states it). So the
+# substrate's one unit -- standard library and OS calls only -- is compiled here
+# beside the runner, its header reached through `src/`, and nothing else of the
+# compiler comes with it. ★ AND THE SPAWN'S UNIT (P69 H6c): the harness starts an
+# image through the substrate's one image start (`startImageInheriting`, Windows),
+# whose form of the image is the spawn's own -- process_spawn.cpp, likewise standard
+# library and OS calls only, over the same home.
+add_executable(integrated_tests runner.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/substrate/path_identity.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/substrate/process_spawn.cpp)
 target_link_libraries(integrated_tests
     PRIVATE
         nlohmann_json::nlohmann_json
@@ -31,6 +46,7 @@ target_link_libraries(integrated_tests
 target_include_directories(integrated_tests
     PRIVATE
         ${CMAKE_SOURCE_DIR}/tests/test_support
+        ${CMAKE_SOURCE_DIR}/src
 )
 # Same repo root the `tests/` targets bake in (tests/CMakeLists.txt,
 # dss_add_test), so `tests/test_support/repo_root.hpp` resolves here too.
@@ -250,7 +266,7 @@ dss_strict_arm_verdicts(integrated_tests/coverage-boundary)
 # ⚠ REGISTERED HERE AND NOT IN THAT MODULE, ON PURPOSE. A pin living inside the
 # mechanism it pins disappears with it, and deleting the module's `include()` is
 # the first way the mechanism can be lost — here, that deletion reds this entry.
-find_package(Python3 COMPONENTS Interpreter REQUIRED)
+include("${CMAKE_SOURCE_DIR}/cmake/DssPython.cmake")  # the repository's Python floor, never an alias
 add_test(NAME ctest/entry-budgets
          COMMAND ${Python3_EXECUTABLE} "${CMAKE_SOURCE_DIR}/cmake/DssTestBudgetsCheck.py"
                  --build-dir "${CMAKE_BINARY_DIR}"

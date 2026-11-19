@@ -37,6 +37,7 @@
 #include "mir/mir_opcode.hpp"
 #include "mutate_target_schema.hpp"
 #include "synthetic_fn.hpp"
+#include "first_convention.hpp"   // dss::test::kFirstConventionOfTheTarget -- the convention a test states
 
 #include <gtest/gtest.h>
 
@@ -81,7 +82,7 @@ lowerFcmpShape(TargetSchema const& schema, MirOpcode pred,
             mb.addReturn(r);
         });
     DiagnosticReporter rep;
-    auto const result = lowerToLir(syn.mir, schema, syn.interner, rep);
+    auto const result = lowerToLir(syn.mir, schema, syn.interner, rep, dss::test::kFirstConventionOfTheTarget);
     if (!result.ok) return out;
     auto const argOp   = schema.opcodeByMnemonic("arg");
     auto const fcmpOp  = schema.opcodeByMnemonic("fcmp");
@@ -378,7 +379,7 @@ TEST(FcmpLowering, F16OperandsFailLoudViaTheWidthGuard) {
                                     in.primitive(TypeKind::Bool)));
         });
     DiagnosticReporter rep;
-    auto const result = lowerToLir(syn.mir, **schema, syn.interner, rep);
+    auto const result = lowerToLir(syn.mir, **schema, syn.interner, rep, dss::test::kFirstConventionOfTheTarget);
     EXPECT_FALSE(result.ok);
     bool saw = false;
     for (auto const& d : rep.all()) {
@@ -413,7 +414,7 @@ TEST(FcmpLowering, UnorderedRelationalPredicatesFailLoud) {
                                         in.primitive(TypeKind::Bool)));
             });
         DiagnosticReporter rep;
-        auto const result = lowerToLir(syn.mir, **schema, syn.interner, rep);
+        auto const result = lowerToLir(syn.mir, **schema, syn.interner, rep, dss::test::kFirstConventionOfTheTarget);
         EXPECT_FALSE(result.ok)
             << "predicate ordinal " << static_cast<int>(pred)
             << " must fail loud (no realization)";
@@ -461,7 +462,7 @@ lowerBranchShape(TargetSchema const& schema, MirOpcode pred) {
     BranchShape out;
     auto syn = buildFcmpBranchFn(pred);
     DiagnosticReporter rep;
-    auto const result = lowerToLir(syn.mir, schema, syn.interner, rep);
+    auto const result = lowerToLir(syn.mir, schema, syn.interner, rep, dss::test::kFirstConventionOfTheTarget);
     if (!result.ok) return out;
     auto const jccOp  = schema.opcodeByMnemonic("jcc");
     auto const fcmpOp = schema.opcodeByMnemonic("fcmp");
@@ -637,7 +638,7 @@ TEST(FcmpLowering, StripFogtNibbleFailsLoud) {
                                     in.primitive(TypeKind::Bool)));
         });
     DiagnosticReporter rep;
-    auto const result = lowerToLir(syn.mir, **mutated, syn.interner, rep);
+    auto const result = lowerToLir(syn.mir, **mutated, syn.interner, rep, dss::test::kFirstConventionOfTheTarget);
     EXPECT_FALSE(result.ok);
     bool saw = false;
     for (auto const& d : rep.all()) {

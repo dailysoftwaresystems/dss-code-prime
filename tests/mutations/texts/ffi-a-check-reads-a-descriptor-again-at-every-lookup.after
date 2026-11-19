@@ -1,0 +1,1 @@
+                    ++cacheStats().scopeHits;   // the arm: counted, then read again

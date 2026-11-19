@@ -1,0 +1,1 @@
+    if (err != NULL && err != INVALID_HANDLE_VALUE) WriteFile(err, kSmashed, (DWORD)(sizeof kSmashed - 1u), &written, NULL);

@@ -2,6 +2,7 @@
 
 #include "analysis/compilation_unit/compilation_unit.hpp"  // predefinedTypeFactsFor — the pair's `type-size` facts, one computation
 #include "analysis/preprocess/preprocessor.hpp"   // mergePredefinedMacros — THE owner
+#include "core/substrate/every_unit.hpp"     // runEveryUnit -- every target before the dump fails
 #include "core/substrate/path_identity.hpp"  // genericSpelling — the UNC-safe path spelling
 #include "core/types/config_path_walk.hpp"   // resolveSystemDirs — THE owner of the shippedLibDirs walk;
                                              // configRootOfShippedDocument — THE inverse of its composition
@@ -19,6 +20,7 @@
 #include <filesystem>
 #include <ostream>
 #include <span>
+#include <streambuf>
 #include <system_error>
 #include <utility>
 #include <string>
@@ -55,6 +57,34 @@ void emitLoud(std::ostream& err, DiagnosticCode code, std::string_view message) 
     err << severityName(DiagnosticSeverity::Error) << '['
         << diagnosticCodeName(code) << "]: " << message << '\n';
 }
+
+// THE NET'S COUNT for a step that reports on a STREAM, never a counted reporter (above, "WHY NOT A
+// DiagnosticReporter"): the lines it says through `stream`, every byte forwarded to the dump's own error stream
+// unchanged. The several-unit net (`substrate::namingSilentFailures`) reads it before and after each target's step, so
+// a target that fails having said nothing is named (P69 H6c2, site 15).
+class LinesSaid final : public std::streambuf {
+public:
+    explicit LinesSaid(std::ostream& to) : to_{*to.rdbuf()} {}
+    LinesSaid(LinesSaid const&)            = delete;
+    LinesSaid& operator=(LinesSaid const&) = delete;
+    [[nodiscard]] std::size_t lines() const noexcept { return lines_; }
+    std::ostream              stream{this};
+
+private:
+    int_type overflow(int_type c) override {
+        if (traits_type::eq_int_type(c, traits_type::eof())) return traits_type::not_eof(c);
+        if (traits_type::to_char_type(c) == '\n') ++lines_;
+        return to_.sputc(traits_type::to_char_type(c));
+    }
+    std::streamsize xsputn(char const* s, std::streamsize n) override {
+        lines_ += static_cast<std::size_t>(std::count(s, s + n, '\n'));
+        return to_.sputn(s, n);
+    }
+    int sync() override { return to_.pubsync(); }
+
+    std::streambuf& to_;
+    std::size_t     lines_ = 0;
+};
 
 // Print a config document's own diagnostics verbatim, severity preserved.
 //
@@ -165,11 +195,13 @@ void appendLine(std::string&          out,
         case PredefinedMacroKind::TypeName:
         case PredefinedMacroKind::TypeLimit:
         case PredefinedMacroKind::TypeSuffix:
+        case PredefinedMacroKind::TypeFormat:
             // P68 round 9: the spelling, the spelled limit or the suffix the
             // merge REALIZED for this (language × pair) — printed as the text
             // the preprocessor will see (a `type-suffix` may be EMPTY, as
             // `__INT8_C_SUFFIX__` is under every reference); the kind beside it
-            // says the value was derived from a type, not declared.
+            // says the value was derived from a type, not declared. P69: and a
+            // `type-format` row's format string literal (`"ld"`), the same way.
             return pm.value;
         case PredefinedMacroKind::Date:
             // Quoted exactly as the materializer quotes it, so the dumped
@@ -380,7 +412,8 @@ renderPredefinedMacroDump(PredefinedMacroDumpRequest const& req) {
     //   · a FUNCTION-LIKE config predefine is lowered to a "<built-in>" prologue
     //     `#define`, i.e. an ORDINARY macro, so the `--define` hits C 6.10.3p2
     //     instead → `P0014` ("incompatible redefinition"). Confirmed with
-    //     `--define __declspec=z`.
+    //     `--define __declspec=z` while that name was a function-like predefine
+    //     (the function-like one on pe is `_declspec` since).
     // Reproducing that two-route decision here would be a SECOND owner of it, and
     // the routes differ by a property (`isFunctionLike`) whose consequences live in
     // the directive handler. So the note reports the CONDITION and names the rules;
@@ -523,7 +556,17 @@ int dumpPredefinedMacros(CliArgs const& args, std::ostream& out,
     // not leave targets 1..N-1 on stdout looking complete.
     std::vector<std::string> sections;
     sections.reserve(args.targets.size());
-    for (std::string const& spec : args.targets) {
+    // ★ EVERY TARGET'S SECTION IS RENDERED BEFORE THE DUMP FAILS
+    // (`substrate::runEveryUnit`; site (k) of the orchestrator's ledger 568, P69
+    // fold 3e): a target that fails says why, and the targets after it are still
+    // rendered and checked -- then nothing is printed, by the rule above.
+    // Netted (P69 H6c2, site 15): a target whose step failed having said nothing is named, on the dump's stream.
+    LinesSaid  said{err};
+    bool const everySectionRendered = substrate::runEveryUnit(
+        args.targets.size(),
+        substrate::namingSilentFailures(
+            [&, &err = said.stream](std::size_t t) {
+        std::string const& spec = args.targets[t];
         auto parsed = TargetSpec::parse(spec);
         if (!parsed) {
             emitLoud(err, DiagnosticCode::D_InvalidTargetSpec,
@@ -531,7 +574,7 @@ int dumpPredefinedMacros(CliArgs const& args, std::ostream& out,
                      "'<targetName>:<formatName>' spec ("
                      + std::string{targetSpecErrorName(parsed.error())}
                      + ") — e.g. x86_64:elf64-x86_64-linux-exec.");
-            return 1;
+            return false;
         }
         auto targetR = TargetSchema::loadShipped(parsed->targetName);
         if (!targetR.has_value()) {
@@ -541,7 +584,7 @@ int dumpPredefinedMacros(CliArgs const& args, std::ostream& out,
                             + "' could not be loaded — the reason is in the configuration diagnostic(s) above (config: "
                               "src/dss-config/targets/" + parsed->targetName
                             + ".target.json).");
-            return 1;
+            return false;
         }
         auto formatR = ObjectFormatSchema::loadShipped(parsed->formatName);
         if (!formatR.has_value()) {
@@ -552,7 +595,7 @@ int dumpPredefinedMacros(CliArgs const& args, std::ostream& out,
                               "src/dss-config/object-formats/"
                             + parsed->formatName
                             + ".format.json).");
-            return 1;
+            return false;
         }
         PredefinedMacroDumpRequest req;
         req.languageName   = args.languageName;
@@ -599,9 +642,9 @@ int dumpPredefinedMacros(CliArgs const& args, std::ostream& out,
         // same reason the collision arm below prints nothing partial.
         //
         // The search path is the LANGUAGE's own `semantics.shippedLibDirs`,
-        // resolved by `resolveSystemDirs` — the SAME call the compile path makes
-        // (through `applySystemDirs`), so the dump reads the same corpus the
-        // compile would.
+        // resolved by `resolveSystemDirs` — the SAME call every unit the compile
+        // path builds makes at construction (`UnitBuilder`), so the dump reads the
+        // same corpus the compile would.
         //
         // ⚠ THIS USED TO BE A PRIVATE COPY OF THAT WALK, and "the same
         // resolution" was a claim in a comment rather than a shared call —
@@ -633,7 +676,7 @@ int dumpPredefinedMacros(CliArgs const& args, std::ostream& out,
                 for (auto const& d : reqRep.all()) {
                     emitLoud(err, d.code, "[target=" + spec + "] " + d.actual);
                 }
-                return 1;
+                return false;
             }
         }
 
@@ -646,10 +689,18 @@ int dumpPredefinedMacros(CliArgs const& args, std::ostream& out,
                 emitLoud(err, DiagnosticCode::C_ConflictingPredefinedMacro,
                          "[target=" + spec + "] " + msg);
             }
-            return 1;
+            return false;
         }
         sections.push_back(std::move(*rendered));
-    }
+        return true;
+            },
+            [&said] { return said.lines(); },
+            [&](std::size_t t) {
+                emitLoud(err, DiagnosticCode::D_CompileUnitNullNoDiagnostic,
+                         "internal: the dump's step failed --target '" + args.targets[t]
+                             + "' without saying why -- substrate-contract violation: a failing step must say why");
+            }));
+    if (!everySectionRendered) return 1;
 
     for (std::string const& s : sections) out << s;
     return 0;

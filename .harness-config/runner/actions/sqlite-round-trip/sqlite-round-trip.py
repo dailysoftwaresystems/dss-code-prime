@@ -48,17 +48,16 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # USAGE
 #
-#   # on the BUILD host, right after the sqlite driver (build_and_test.py) produced OUT_DIR:
-#   sqlite-round-trip.py pack --out-dir <OUT_DIR> --leg pe64-x86_64 \
-#       --built-on wsl-x86_64 --sqlite-header <BLD>/sqlite3.h \
-#       --sqlite-sha <upstream sha> --dss-sha <compiler sha> --dest <payload dir>
-#
-#   # ... carry <payload dir> to the target machine with the appropriate carriage ...
-#
-#   # on the TARGET host:
-#   sqlite-round-trip.py verify --payload <payload dir>
-#   sqlite-round-trip.py run --payload <payload dir> --workdir <scratch> \
-#       --ran-on windows --json <result.json>
+#   # on the BUILD leg, right after the sqlite driver (build_and_test.py) produced OUT_DIR there:
+#   dssharness run sqlite-round-trip --legs <build leg> --manual-step pack --input outDir=<OUT_DIR> \
+#       --input sqliteLeg=pe64-x86_64 --input legSpec=x86_64:pe64-x86_64 --input sqliteHeader=<BLD>/sqlite3.h
+#   # ... the payload is that run's KEPT output; carry it, verified file by file as it lands:
+#   dssharness sync --artifact <that run id>
+#   # on the TARGET leg (the payload's tree path is the kept output's path in that run):
+#   dssharness run sqlite-round-trip --legs <target leg> --input payload=<its tree path> \
+#       --input testFiles=<a .test file>[,...]
+#   (`verify` retired on 2026-09-30: the carry verifies each file on arrival and `run` re-verifies the
+#   payload's own hashes before any arm.)
 #
 # EXIT CODES (the same on every host, so a caller can branch on them):
 #   0  every requested arm passed
@@ -78,6 +77,7 @@ import re
 import shutil
 import subprocess
 import sys
+sys.dont_write_bytecode = True  # this program loads owning-tree.py by path: no __pycache__ beside an action
 import time
 from pathlib import Path
 
@@ -193,7 +193,7 @@ def pick_executable(d: Path, stems: "list[str]") -> Path:
 # ── pack ─────────────────────────────────────────────────────────────────────
 
 def cmd_pack(a: argparse.Namespace) -> int:
-    out_dir = Path(a.out_dir).resolve()
+    out_dir = Path(a.harness_out_dir).resolve()
     leg_dir = out_dir / a.leg
     if not leg_dir.is_dir():
         die("no leg directory %s -- is '%s' a leg this host built?" % (leg_dir, a.leg))
@@ -318,13 +318,6 @@ def verify_payload(payload: Path) -> dict:
     for k in extra:
         sys.stderr.write("  note: %s arrived but was not in the manifest (ignored)\n" % k)
     return m
-
-
-def cmd_verify(a: argparse.Namespace) -> int:
-    m = verify_payload(Path(a.payload).resolve())
-    print("payload VERIFIES: %d file(s), leg %s built on %s, sqlite %s"
-          % (len(m["files"]), m["leg"], m["builtOn"], m["expectVersion"]))
-    return 0
 
 
 # ── run ──────────────────────────────────────────────────────────────────────
@@ -512,49 +505,95 @@ def cmd_run(a: argparse.Namespace) -> int:
     return rc_overall
 
 
+def _flag(value):
+    """`true` / `false` -- how a harness step hands a flag over; anything else is refused, named."""
+    v = str(value).strip().lower()
+    if v not in ("true", "false"):
+        raise argparse.ArgumentTypeError("%r is neither true nor false" % value)
+    return v == "true"
+
+
+_PATH_TYPES_OWNER = []
+
+
+def _path_types():
+    """owning-tree, loaded ONCE by path from the actions directory (a hyphen is no module name): its argparse kinds --
+    `read_path_arg`, `written_path_arg`, `path_part_arg`, `text_arg`, `option_text_arg` and `command_words_arg` --
+    are the `type=` every argument of this program that takes a value declares. What each refuses is said there once;
+    check-scripts-index's clause 14 asks one of them of every such argument. It FAILS LOUD when owning-tree is
+    absent."""
+    if not _PATH_TYPES_OWNER:
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "owning-tree", "owning-tree.py")
+        if not os.path.isfile(path):
+            raise SystemExit("sqlite-round-trip: cannot find %s -- what a path type refuses is said there and "
+                             "nowhere else" % path)
+        spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _PATH_TYPES_OWNER.append(mod)
+    return _PATH_TYPES_OWNER[0]
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="sqlite-round-trip.py")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     q = sub.add_parser("pack", help="collect a leg's artefacts into a verifiable payload")
-    q.add_argument("--out-dir", required=True, help="the harness OUT_DIR on the BUILD host")
-    q.add_argument("--leg", required=True)
+    q.add_argument("--out-dir", dest="harness_out_dir", required=True,
+                   help="the harness OUT_DIR on the BUILD host, read for the leg's artefacts",
+                   type=_path_types().read_path_arg("--out-dir"))
+    q.add_argument("--leg", required=True, type=_path_types().path_part_arg("--leg"))
     q.add_argument("--leg-spec", required=True, metavar="ARCH:FORMAT",
-                   help="the leg's spec; its FORMAT half names the artefact directory")
-    q.add_argument("--built-on", required=True, help="a label for the build host")
+                   help="the leg's spec; its FORMAT half names the artefact directory",
+                   type=_path_types().path_part_arg("--leg-spec"))
+    q.add_argument("--built-on", required=True, help="a label for the build host",
+                   type=_path_types().text_arg("--built-on"))
     q.add_argument("--sqlite-header", required=True,
-                   help="the staged sqlite3.h the artefacts were built against")
+                   help="the staged sqlite3.h the artefacts were built against",
+                   type=_path_types().read_path_arg("--sqlite-header"))
     q.add_argument("--tcl-script-dir", default="",
-                   help="the leg's staged Tcl script library (harness-libs/<leg>/tcl8.6)")
-    q.add_argument("--sqlite-sha", default="", help="upstream sqlite commit -- a corpus number without it is meaningless")
-    q.add_argument("--dss-sha", default="")
-    q.add_argument("--dest", required=True)
+                   help="the leg's staged Tcl script library (harness-libs/<leg>/tcl8.6)",
+                   type=_path_types().read_path_arg("--tcl-script-dir", empty_means_absent=True))
+    q.add_argument("--sqlite-sha", default="", type=_path_types().text_arg("--sqlite-sha"),
+                   help="upstream sqlite commit -- a corpus number without it is meaningless")
+    q.add_argument("--dss-sha", default="", type=_path_types().text_arg("--dss-sha"))
+    q.add_argument("--dest", required=True, type=_path_types().written_path_arg("--dest"))
     q.set_defaults(fn=cmd_pack)
 
-    q = sub.add_parser("verify", help="re-hash an arrived payload")
-    q.add_argument("--payload", required=True)
-    q.set_defaults(fn=cmd_verify)
-
     q = sub.add_parser("run", help="execute a carried payload on THIS host")
-    q.add_argument("--payload", required=True)
-    q.add_argument("--workdir", required=True)
-    q.add_argument("--ran-on", required=True)
-    q.add_argument("--launcher", action="append", default=[], metavar="TOKEN",
-                   help="use the =FORM (--launcher=-x86_64): a launcher token may lead with a dash")
-    q.add_argument("--env", action="append", default=[], metavar="NAME=VALUE")
-    q.add_argument("--tcl-library", default="")
-    q.add_argument("--cli-smoke", default="")
-    q.add_argument("--cli-target", default="")
-    q.add_argument("--test-file", action="append", default=[], metavar="PATH",
-                   help="repeatable; each upstream .test file gets its OWN fresh run directory")
-    q.add_argument("--testdir-seed", default="")
-    q.add_argument("--skip-cli", action="store_true")
-    q.add_argument("--skip-units", action="store_true")
+    q.add_argument("--payload", required=True, type=_path_types().read_path_arg("--payload"))
+    q.add_argument("--workdir", required=True, type=_path_types().written_path_arg("--workdir"))
+    q.add_argument("--ran-on", required=True, type=_path_types().text_arg("--ran-on"))
+    q.add_argument("--launcher", action="append", default=[], metavar="TOKEN[,TOKEN...]",
+                   help="use the =FORM (--launcher=-x86_64): a launcher token may lead with a dash; "
+                        "several tokens comma-separated, in order", type=_path_types().command_words_arg("--launcher"))
+    q.add_argument("--env", action="append", default=[], metavar="NAME=VALUE[;NAME=VALUE...]",
+                   type=_path_types().text_arg("--env"))
+    q.add_argument("--tcl-library", default="", type=_path_types().text_arg("--tcl-library"))
+    q.add_argument("--cli-smoke", default="", type=_path_types().read_path_arg("--cli-smoke", empty_means_absent=True))
+    q.add_argument("--cli-target", default="", type=_path_types().text_arg("--cli-target"))
+    q.add_argument("--test-file", action="append", default=[], metavar="PATH[,PATH...]",
+                   help="repeatable, or comma-separated; each upstream .test file gets its OWN "
+                        "fresh run directory",
+                   type=_path_types().read_path_arg("--test-file", empty_means_absent=True))
+    q.add_argument("--testdir-seed", default="",
+                   type=_path_types().read_path_arg("--testdir-seed", empty_means_absent=True))
+    q.add_argument("--skip-cli", type=_path_types().text_arg("--skip-cli", then=_flag), nargs="?", const=True,
+                   default=False)
+    q.add_argument("--skip-units", type=_path_types().text_arg("--skip-units", then=_flag), nargs="?", const=True,
+                   default=False)
     q.add_argument("--timeout", type=int, default=3600)
-    q.add_argument("--json", default="")
+    q.add_argument("--json", default=None, type=_path_types().written_path_arg("--json"))
     q.set_defaults(fn=cmd_run)
 
     a = p.parse_args(argv)
+    if a.cmd == "run":
+        # ★ ONE VALUE CARRIES A LIST (2026-09-30): a harness step hands each input over whole, so launcher
+        # tokens and test files arrive comma-separated and env items `;`-separated; an empty value is none.
+        a.launcher = [t for given in a.launcher for t in given.split(",") if t]
+        a.env = [e.strip() for given in a.env for e in given.split(";") if e.strip()]
+        a.test_file = [f.strip() for given in a.test_file for f in given.split(",") if f.strip()]
     return a.fn(a)
 
 

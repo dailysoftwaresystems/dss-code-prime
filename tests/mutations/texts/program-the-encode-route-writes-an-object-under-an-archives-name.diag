@@ -1,0 +1,1 @@
+a static-archive document writes an `ar` archive, never a bare object under its name

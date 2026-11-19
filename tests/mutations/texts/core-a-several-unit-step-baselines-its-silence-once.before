@@ -1,0 +1,2 @@
+            onSilentFailure = std::forward<OnSilentFailure>(onSilentFailure)](std::size_t i) mutable -> bool {
+        std::size_t const reported = errorCount();

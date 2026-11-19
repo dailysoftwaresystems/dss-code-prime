@@ -884,7 +884,11 @@ AssembledModule assemble(Lir const&                 lir,
                                           patch.island});
         }
         if (!newSites.empty()) {
-            std::sort(newSites.begin(), newSites.end(), siteKeyLess);
+            // STABLE, so the site std::unique keeps of an equal run is the FIRST
+            // the patches asked for (their order is the function's own). An
+            // unstable sort let the host's library pick it among equals, and an
+            // equal key does not promise an equal body.
+            std::stable_sort(newSites.begin(), newSites.end(), siteKeyLess);
             newSites.erase(
                 std::unique(newSites.begin(), newSites.end(),
                             [&](IslandSite const& a, IslandSite const& b) {
@@ -1324,10 +1328,20 @@ bool validateInputSectionUnits(AssembledModule const& module,
         dataUnits[d.inputSection->section].push_back(DataMember{
             d.inputSection->offset, d.sizeInSection(), i, d.section});
     }
-    for (auto& [unit, members] : dataUnits) {
+    // In ascending unit, and each unit's members by (offset, item index): both
+    // orders decide which refusal is reported first and which two items it
+    // names, so both are the module's data. `dataUnits` is an unordered_map, and
+    // walking it directly reported a several-unit refusal in the host library's
+    // hash order.
+    std::vector<std::uint32_t> unitOrder;
+    unitOrder.reserve(dataUnits.size());
+    for (auto const& [unit, members] : dataUnits) unitOrder.push_back(unit);
+    std::sort(unitOrder.begin(), unitOrder.end());
+    for (std::uint32_t const unit : unitOrder) {
+        auto& members = dataUnits.at(unit);
         std::sort(members.begin(), members.end(),
                   [](DataMember const& a, DataMember const& b) {
-                      return a.offset < b.offset;
+                      return a.offset != b.offset ? a.offset < b.offset : a.index < b.index;
                   });
         for (std::size_t k = 0; k < members.size(); ++k) {
             if (members[k].kind != members.front().kind) {
@@ -1793,7 +1807,7 @@ decodeScalarLiteralBits(MirLiteralValue const& v, TypeKind k) noexcept {
 
 // ── D-CSUBSET-BITINT-DATA-GLOBAL: the SOLE `_BitInt(N)` STATIC-IMAGE producer ──
 //
-// A `_BitInt(N)` object occupies `sizeOfScalarOrBitInt` bytes and carries only N
+// A `_BitInt(N)` object occupies its `computeLayout` size and carries only N
 // value bits (C23 6.2.6.2). Its image is therefore WIDER than the `std::uint64_t`
 // `decodeScalarLiteralBits` returns whenever N > 64, which is why that chokepoint
 // cannot carry one and why this producer exists beside it rather than inside it.
@@ -1949,7 +1963,7 @@ bitIntLiteralValue(MirLiteralValue const& v, TypeInterner const& in, TypeId ty,
 
 [[nodiscard]] std::optional<std::vector<std::uint8_t>>
 encodeBitIntImage(MirLiteralValue const& v, TypeInterner const& in, TypeId ty,
-                  DataModel dm, EncodeFailure& why) {
+                  AggregateLayoutParams const& lp, DataModel dm, EncodeFailure& why) {
     auto const valOpt = bitIntLiteralValue(v, in, ty, why);
     if (!valOpt.has_value()) return std::nullopt;   // `why` already written
     BitIntValue const& val   = *valOpt;
@@ -1960,11 +1974,13 @@ encodeBitIntImage(MirLiteralValue const& v, TypeInterner const& in, TypeId ty,
     // it, and asking the interner a second time is how a producer grows a second
     // opinion about a value it was handed. `val.paddingByte()` below is the only
     // consumer that ever needed it.
-    // The width comes from `sizeOfScalarOrBitInt` — the TypeId-aware companion to
-    // `scalarByteSize`, which is the layout authority's OWN size ladder and the one
-    // this file's callers are documented to use for a data-global leaf. Not
-    // re-derived here: a second ladder is a second ABI.
-    auto const wOpt = sizeOfScalarOrBitInt(in, ty, dm);
+    // The width comes from `computeLayout` — the layout authority's ONE size ladder,
+    // the target's `bitPreciseChunk` included. Not re-derived here: a second ladder is
+    // a second ABI (the TypeId-aware size ladder P69 fold f26d deleted was one, answering
+    // the x86-64 psABI's chunk on arm64 too).
+    auto const layOpt = computeLayout(ty, in, lp, dm);
+    std::optional<std::uint64_t> const wOpt =
+        layOpt.has_value() ? std::optional<std::uint64_t>{layOpt->size} : std::nullopt;
     if (!wOpt.has_value() || *wOpt == 0) {
         why.set(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
                 std::format("`_BitInt({})` has no computable container size "
@@ -2070,8 +2086,10 @@ encodeBitIntImage(MirLiteralValue const& v, TypeInterner const& in, TypeId ty,
 // cst_to_hir.cpp ConstructAggregate):
 //   * struct — one value field per type field (omitted slots are synthetic
 //     zero-fills) → `agg.fields[i]` ↔ field `i` at `fieldOffsets[i]`.
-//   * union  — a brace-init sets the FIRST member only → a 1-field value →
-//     field 0 ↔ member 0 at offset 0; the union's remaining bytes stay zero.
+//   * union  — an initializer sets ONE member, the one it designates (C
+//     6.7.9p17; the first when it designates none) → a 1-field value that NAMES
+//     its member (`agg.unionMember`) → field 0 ↔ member `m` at `fieldOffsets[m]`
+//     (0 for every union member); the union's remaining bytes stay zero.
 //   * array  — `agg.fields[i]` ↔ element `i` at `base + i*elemStride`; a
 //     short initializer leaves the trailing elements zero.
 //
@@ -2176,7 +2194,8 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
         // performs exactly one encode at `fieldOffsets[0] == 0` into a `buf` the
         // caller pre-zeroed to the layout size. Nothing can be lost. Without this
         // route the truthful predicate would refuse `static union U u = {1};`, which
-        // gcc, clang and MSVC all accept.
+        // gcc, clang and MSVC all accept. (That one encode is at the member the
+        // value NAMES — `fieldOffsets[m]`, also 0 — see the pairing below.)
         //
         // ⚠ THE ONE-CHILD PREMISE IS ASSERTED, NOT ASSUMED — see the MIR twin's note
         // for the three-guarantee measurement (both HIR producers plus
@@ -2211,6 +2230,36 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
         auto const ops = in.operands(ty);
         if (ops.size() != lay->fieldOffsets.size()) return false;
         if (agg.fields.size() > ops.size()) return false;   // too many inits → fail loud
+        // ★ D-C-A-STATIC-UNION-INITIALIZED-THROUGH-A-LATER-MEMBER-IS-NOT-ENCODED (P69, lane
+        // `cs`): WHICH MEMBER a union's one field initializes is the VALUE's fact, never
+        // the field's position. This arm used to pair field 0 with member 0 for a union
+        // too, so `static union { int i; float f; } u = { .f = 42.0f };` encoded the
+        // float against `int` and was refused, and `static union { char c; int i; } u =
+        // { .i = 0x01020304 };` was stored through the char member's ONE byte — a
+        // silent wrong image (✔MEASURED, gcc, clang, mingw-w64 gcc and MSVC run both 42).
+        // A union value with a field must name its member, and the member must be one
+        // the union has; every producer names it (the constant evaluator and
+        // `tryClassifyAggregateConst` from the union `ConstructAggregate`'s payload, the
+        // `.dssir` reader from `agg member N`), so either refusal is an upstream defect
+        // surfacing here — loudly, never as a guess at member 0.
+        std::size_t unionMember = 0;
+        if (isUnion && !agg.fields.empty()) {
+            if (!agg.unionMember.has_value()) {
+                why.set(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
+                        "a union's static initializer value names no member — the encoder "
+                        "cannot tell which member its one field initializes (C 6.7.9p17 lets "
+                        "it designate any), and member 0 would be a guess");
+                return false;
+            }
+            if (*agg.unionMember >= ops.size()) {
+                why.set(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
+                        std::format("a union's static initializer value names member {} of "
+                                    "a union with {} member(s)",
+                                    *agg.unionMember, ops.size()));
+                return false;
+            }
+            unionMember = *agg.unionMember;
+        }
         // FC8 D-CSUBSET-BITFIELD-INIT: a struct/union WITH bit-fields packs each
         // bit-field's value into its allocation unit (`buf` is pre-zeroed, so the
         // OR is correct + leaves un-covered bits / omitted fields at 0). Fields
@@ -2219,26 +2268,32 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
         // bit-fields (`unitBytes == 0`) recurse normally. `bitFields` non-empty
         // ⇔ the struct has a bit-field (the layout authority's invariant); the
         // byte path below is byte-identical for a bit-field-free composite.
+        //
+        // `i` walks the VALUE's fields and `m` names the TYPE member field `i`
+        // initializes: the same index for a struct, the member the value names for a
+        // union. Every type-side read below — the member's type, offset, bit-field
+        // placement and width — is asked of `m`, never of `i`.
         for (std::size_t i = 0; i < agg.fields.size(); ++i) {
+            std::size_t const m = isUnion ? unionMember : i;
             bool const isBitfield =
-                i < lay->bitFields.size() && lay->bitFields[i].unitBytes != 0;
+                m < lay->bitFields.size() && lay->bitFields[m].unitBytes != 0;
             if (!isBitfield) {
                 // A zero-width bit-field marker (`unsigned : 0;`) has no storage
                 // (`unitBytes == 0` AND `fieldBitWidth` present); its `fieldOffsets`
                 // entry aliases the NEXT unit, so a full-width write here would
                 // touch that neighbour unit. Skip it (its synthetic child is 0).
-                if (in.fieldBitWidth(ty, i).has_value()) continue;
-                if (!encodeAggregateValue(ops[i], agg.fields[i], in, lp, dm, buf,
-                                          base + lay->fieldOffsets[i], relocs,
+                if (in.fieldBitWidth(ty, m).has_value()) continue;
+                if (!encodeAggregateValue(ops[m], agg.fields[i], in, lp, dm, buf,
+                                          base + lay->fieldOffsets[m], relocs,
                                           absPtrRelocKind, why))
                     return false;
                 continue;
             }
             // Pack one bit-field: read its scalar value, mask to width, shift to
-            // bitOffset, OR into the unit at `base + fieldOffsets[i]`. The unit
+            // bitOffset, OR into the unit at `base + fieldOffsets[m]`. The unit
             // load/store width is `unitBytes` (little-endian, matching the MIR
             // read-modify-write codegen + the layout's LSB-first packing).
-            BitFieldPlacement const& p = lay->bitFields[i];
+            BitFieldPlacement const& p = lay->bitFields[m];
             // ⚠ THE u64 PACKING BELOW IS ONLY VALID UP TO 64 BITS AND 8 UNIT BYTES,
             // and past those bounds it is not merely approximate — it is the SAME
             // `>> (j*8)` UB the 128-bit arm was walled for: `placed` is a
@@ -2277,19 +2332,19 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
             // the MIR bit-field insert applies, so a signed negative field packs
             // identically whichever tier writes it.
             std::optional<std::uint64_t> bitsOpt;
-            if (materialScalarKind(in, ops[i]) == TypeKind::BitInt) {
-                auto const bv = bitIntLiteralValue(agg.fields[i], in, ops[i], why);
+            if (materialScalarKind(in, ops[m]) == TypeKind::BitInt) {
+                auto const bv = bitIntLiteralValue(agg.fields[i], in, ops[m], why);
                 if (!bv.has_value()) return false;    // `why` already written
                 bitsOpt = bv->low64();
             } else {
                 bitsOpt = decodeScalarLiteralBits(agg.fields[i],
-                                                  materialScalarKind(in, ops[i]));
+                                                  materialScalarKind(in, ops[m]));
             }
             if (!bitsOpt.has_value()) return false;   // non-int bit-field leaf → fail loud
             std::uint64_t const mask =
                 p.bitWidth >= 64 ? ~0ull : ((1ull << p.bitWidth) - 1);
             std::uint64_t const placed = (*bitsOpt & mask) << p.bitOffset;
-            std::uint64_t const unitBase = base + lay->fieldOffsets[i];
+            std::uint64_t const unitBase = base + lay->fieldOffsets[m];
             if (unitBase + p.unitBytes > buf.size()) return false;  // layout↔buf disagreement
             for (std::uint32_t j = 0; j < p.unitBytes; ++j)
                 buf[unitBase + j] |= static_cast<std::uint8_t>((placed >> (j * 8)) & 0xFFu);
@@ -2436,7 +2491,18 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
     // exactly as the F5 scalar arm does. MUST precede decodeScalarLiteralBits
     // (which would reject the MirSymbolAddrValue variant).
     if (std::holds_alternative<MirSymbolAddrValue>(v.value)) {
-        if (!absPtrRelocKind.has_value()) return false;
+        // The cause is this leaf's own (P69 fold 3d): the generic text the
+        // caller falls back to names several causes, and this one is exact.
+        if (!absPtrRelocKind.has_value()) {
+            why.set(DiagnosticCode::K_NoMatchingObjectFormat,
+                    std::format("has a member at byte offset {} initialized to a "
+                                "symbol address, but the target declares no "
+                                "absolute address slot of a pointer's width "
+                                "(an absolute relocation whose field holds every "
+                                "address) — cannot emit the member's pointer fixup",
+                                base));
+            return false;
+        }
         auto const& sa = std::get<MirSymbolAddrValue>(v.value);
         relocs.push_back(Relocation{static_cast<std::uint32_t>(base),
                                     SymbolId{sa.symbol}, *absPtrRelocKind,
@@ -2452,13 +2518,13 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
     // ★ MUST PRECEDE the `scalarByteSize` / `decodeScalarLiteralBits` pair below,
     // and neither of them could serve this leaf anyway — `scalarByteSize` takes a
     // KIND and a `_BitInt`'s size lives in its interned WIDTH (hence
-    // `sizeOfScalarOrBitInt` inside the producer), and the decode chokepoint returns
+    // `computeLayout` inside the producer), and the decode chokepoint returns
     // a `std::uint64_t` that structurally cannot carry an N>64 image. Before this
     // arm existed the leaf fell to `scalarByteSize(BitInt) == nullopt` and refused —
     // LOUD, but with the generic aggregate text that names f16/f80/f128 and not
     // `_BitInt`; the producer's `why` now reaches the caller with the real cause.
     if (k == TypeKind::BitInt) {
-        auto const img = encodeBitIntImage(v, in, ty, dm, why);
+        auto const img = encodeBitIntImage(v, in, ty, lp, dm, why);
         if (!img.has_value()) return false;              // `why` already written
         if (base + img->size() > buf.size()) {
             why.set(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
@@ -2852,17 +2918,19 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
         // + an ABSOLUTE-64 relocation against the target symbol; the linker writes
         // the target's VA into the slot. Dispatch on the literal VARIANT (the same
         // discriminator the string / aggregate arms use), BEFORE the TypeKind-keyed
-        // primitive gate. The 8-byte width matches the abs64 reloc (widthBytes 8);
-        // all shipped targets are 64-bit-pointer (a 32-bit-pointer target would
-        // declare abs32 + a 4-byte slot — anchored future, no shipped consumer).
+        // primitive gate. The slot is the data model's pointer width, and its
+        // fixup the target's address-slot row of that width
+        // (`addressSlotRelocationKind`, chosen by the caller). P69 fold 3e (X9
+        // R8/R13): this said "all shipped targets are 64-bit-pointer" and wrote 8.
         if (std::holds_alternative<MirSymbolAddrValue>(v.value)) {
             auto const& sa = std::get<MirSymbolAddrValue>(v.value);
             if (!absPtrRelocKind.has_value()) {
                 emit(DiagnosticCode::K_NoMatchingObjectFormat,
                      std::format("lowerMirGlobalsToDataItems: global SymbolId={{ {} "
                                  "}} is initialized to a symbol address, but the "
-                                 "target declares no absolute-64 relocation "
-                                 "(widthBytes==8 && !pcRelative) — cannot emit the "
+                                 "target states no one row that fills an address "
+                                 "slot of the data model's pointer width "
+                                 "(addressSlotRelocationKind) — cannot emit the "
                                  "pointer fixup (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL).",
                                  sym.v));
                 continue;
@@ -2889,8 +2957,9 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
             // silently make the pointer ONE process-shared slot — the exact
             // storage-duration miscompile the section-select guards against.
             d.section = relocBearingGlobalSection(isThreadLocal, isConstGlobal);
-            d.bytes.assign(8, 0);                       // pointer-width zero slot
-            d.alignment = raiseToExplicit(Alignment::ofRuntimePow2(8));
+            std::uint64_t const pointerBytes = scalarByteSize(TypeKind::Ptr, dataModel).value_or(0);
+            d.bytes.assign(pointerBytes, 0);            // pointer-width zero slot
+            d.alignment = raiseToExplicit(Alignment::ofRuntimePow2(pointerBytes));
             d.relocations.push_back(Relocation{
                 /*offset=*/0u,
                 /*target=*/SymbolId{sa.symbol},
@@ -3065,7 +3134,7 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
         // shifted by 64+ bits (UB, and on both shipped host arches a repeat of the
         // low word), and `scalarByteSize` takes a KIND, which cannot know N. Both are
         // answered by `encodeBitIntImage`: a wider SOURCE (the wrapped limbs) and the
-        // TypeId-aware `sizeOfScalarOrBitInt` ladder. The producer is SHARED with the
+        // layout authority's own ladder (`computeLayout`). The producer is SHARED with the
         // aggregate-leaf recursion, so closing this does not leave a member of a
         // struct refusing a width the scalar arm emits.
         //
@@ -3087,8 +3156,19 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
         // the image the producer actually built: a disagreement is a wrong record, so
         // it refuses rather than shipping a short or long item.
         if (k == TypeKind::BitInt) {
+            if (!aggregateLayout.has_value()) {
+                emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                     std::format("lowerMirGlobalsToDataItems: `_BitInt` global "
+                                 "SymbolId={{ {} }} needs the target's "
+                                 "`aggregateLayout` block to resolve its size and "
+                                 "alignment and none is declared — refusing rather "
+                                 "than guessing an ABI layout "
+                                 "(D-CSUBSET-BITINT-DATA-GLOBAL).",
+                                 sym.v));
+                continue;
+            }
             EncodeFailure why;
-            auto const    img = encodeBitIntImage(v, interner, ty, dataModel, why);
+            auto const    img = encodeBitIntImage(v, interner, ty, *aggregateLayout, dataModel, why);
             if (!img.has_value()) {
                 // `encodeBitIntImage` writes a cause on EVERY refusal path, so the
                 // fallback here is unreachable-by-construction rather than a real
@@ -3099,17 +3179,6 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                 emit(why.codeOr(DiagnosticCode::K_NoMatchingObjectFormat),
                      std::format("lowerMirGlobalsToDataItems: global SymbolId={{ {} }} "
                                  "— {}.", sym.v, why.text));
-                continue;
-            }
-            if (!aggregateLayout.has_value()) {
-                emit(DiagnosticCode::K_NoMatchingObjectFormat,
-                     std::format("lowerMirGlobalsToDataItems: `_BitInt` global "
-                                 "SymbolId={{ {} }} needs the target's "
-                                 "`aggregateLayout` block to resolve its alignment "
-                                 "and none is declared — refusing rather than "
-                                 "guessing an ABI alignment "
-                                 "(D-CSUBSET-BITINT-DATA-GLOBAL).",
-                                 sym.v));
                 continue;
             }
             auto const lay = computeLayout(ty, interner, *aggregateLayout, dataModel);

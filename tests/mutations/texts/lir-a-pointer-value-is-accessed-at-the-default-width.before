@@ -1,0 +1,2 @@
+                return address_.accessFlags;
+            // 8-byte integers — width-default full-slot access.

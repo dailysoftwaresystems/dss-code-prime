@@ -1,0 +1,3 @@
+            auto const& params = model.aggregateLayout();
+            if (true || !params.has_value()) return std::nullopt;
+            auto const member = anon_member_search::memberByteOffset(

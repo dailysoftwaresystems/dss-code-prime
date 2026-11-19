@@ -27,6 +27,8 @@
 //      byte-compares.
 
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/parse_diagnostic.hpp"           // diagnosticCodeName
+#include "core/types/target_schema.hpp"              // regClassForCoreType
 #include "core/types/type_lattice/type_interner.hpp"
 #include "mir/mir.hpp"
 #include "mir/mir_node.hpp"
@@ -38,12 +40,22 @@
 
 #include <cstdint>
 #include <optional>
+#include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
 using namespace dss;
 
 namespace {
+
+// What a verifier refused, each finding by its code and its sentence (empty when it accepted).
+[[nodiscard]] std::string verifierSaid(DiagnosticReporter const& rep) {
+    std::string out;
+    for (ParseDiagnostic const& d : rep.all())
+        out += "\n  " + std::string{diagnosticCodeName(d.code)} + ": " + d.actual;
+    return out;
+}
 
 std::size_t countOpInModule(Mir const& mir, MirOpcode want) {
     std::size_t n = 0;
@@ -173,6 +185,7 @@ TEST(Mem2Reg, DiamondConditionalStoreInsertsPhi) {
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const tArm  = mb.createBlock(StructCfMarker::IfThen);
@@ -242,6 +255,106 @@ TEST(Mem2Reg, DiamondConditionalStoreInsertsPhi) {
     EXPECT_TRUE(foundPhi);
 }
 
+// ★ A BLOCK'S PHIS COME IN THE ORDER OF THEIR ALLOCAS (P69, lane `cs`, fold f26d; the host-toolchain class, its site
+// in Mem2Reg). The pass mints a block's phis while it walks the promoted allocas. Walked in a hash set's order, the
+// phis -- and every value and register after them -- were a function of the standard library that built DSS: lane
+// `xa` MEASURED one source compiled to different code by a Windows-built and a Linux-built DSS, and the same image
+// on both once the walk is by alloca id. THE CELL: 64 allocas, each stored a value naming it on one arm of a diamond
+// and another value on the other, all read at the join, so the join holds 64 phis, and their order is the allocas'.
+// Each alloca follows an irregular run of constants (k*k mod 37, plus one), so the alloca ids stand at irregular
+// gaps up to about 1300. MEASURED (the arm's sweep on macos-arm64-debug, run 20261117-084234-b06ffb3c): at a constant
+// stride of 2 libc++ walked the allocas ascending and the arm survived. libc++ heads its list with an insertion into
+// an empty bucket and its rehash keeps the list's order, so the pass's two hash walks (`allocaType`, then
+// `promoted_`) reverse twice, and no constant stride puts two of 64 ids in one bucket (a model of libc++'s and
+// libstdc++'s tables, INFERRED). The irregular gaps share buckets, out of order under both models for every table
+// of 64 to 509 buckets, and MSVC's FNV scrambles. RED-ON-DISABLE: walk `promoted_` itself (the arm) -> the phis
+// leave ascending order.
+TEST(Mem2Reg, AJoinsPhisComeInTheOrderOfTheirAllocas) {
+    constexpr std::int64_t kN = 64;
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const ptr   = interner.pointer(i32);
+    TypeId const params[] = {boolT};
+    TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const tArm  = mb.createBlock(StructCfMarker::IfThen);
+    MirBlockId const fArm  = mb.createBlock(StructCfMarker::IfElse);
+    MirBlockId const join  = mb.createBlock(StructCfMarker::IfJoin);
+    auto const literal = [](std::int64_t v) {
+        MirLiteralValue l;
+        l.value = v;
+        l.core  = TypeKind::I32;
+        return l;
+    };
+
+    mb.beginBlock(entry);
+    MirInstId const cond = mb.addArg(0, boolT);
+    std::vector<MirInstId> slots;
+    for (std::int64_t k = 0; k < kN; ++k) {
+        for (std::int64_t c = 0; c <= (k * k) % 37; ++c)   // spreads the alloca ids, irregularly
+            (void)mb.addConst(literal(5000 + c), i32);
+        slots.push_back(mb.addInst(MirOpcode::Alloca, {}, ptr));
+    }
+    mb.addCondBr(cond, tArm, fArm);
+    for (auto const& [arm, base] : {std::pair{tArm, std::int64_t{0}}, std::pair{fArm, std::int64_t{1000}}}) {
+        mb.beginBlock(arm);
+        for (std::int64_t k = 0; k < kN; ++k) {
+            MirInstId const c    = mb.addConst(literal(base + k), i32);
+            MirInstId const st[] = {c, slots[static_cast<std::size_t>(k)]};
+            (void)mb.addInst(MirOpcode::Store, st, InvalidType);
+        }
+        mb.addBr(join);
+    }
+    mb.beginBlock(join);
+    MirInstId acc{};
+    for (std::int64_t k = 0; k < kN; ++k) {
+        MirInstId const ldOps[] = {slots[static_cast<std::size_t>(k)]};
+        MirInstId const ld      = mb.addInst(MirOpcode::Load, ldOps, i32);
+        if (k == 0) {
+            acc = ld;
+            continue;
+        }
+        MirInstId const addOps[] = {acc, ld};
+        acc = mb.addInst(MirOpcode::Add, addOps, i32);
+    }
+    mb.addReturn(acc);
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runMem2Reg(mir, interner, rep);
+    ASSERT_TRUE(r.ok) << verifierSaid(rep);
+    ASSERT_EQ(r.phisInserted, static_cast<std::size_t>(kN)) << "one phi per alloca at the join";
+
+    // The join's phis, in block order, each named by the value its then-arm stores (the alloca's k; the else-arm
+    // stores 1000 + k). The pass REBUILDS the module, so its blocks are read by the rebuilt module's own walk --
+    // the builder's block ids name the module it built, not this one. Only the join holds phis.
+    std::vector<std::int64_t> order;
+    for (std::uint32_t fi = 0; fi < mir.moduleFuncCount(); ++fi) {
+        MirFuncId const f = mir.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < mir.funcBlockCount(f); ++bi) {
+            MirBlockId const b = mir.funcBlockAt(f, bi);
+            for (std::uint32_t i = 0; i < mir.blockInstCount(b); ++i) {
+                MirInstId const id = mir.blockInstAt(b, i);
+                if (mir.instOpcode(id) != MirOpcode::Phi) continue;
+                std::int64_t thenArm = -1;
+                for (MirPhiIncoming const& inc : mir.phiIncomings(id)) {
+                    auto const v = constIntValue(mir, inc.value);
+                    if (v.has_value() && *v < 1000) thenArm = *v;
+                }
+                order.push_back(thenArm);
+            }
+        }
+    }
+    std::vector<std::int64_t> ascending(static_cast<std::size_t>(kN));
+    for (std::int64_t k = 0; k < kN; ++k) ascending[static_cast<std::size_t>(k)] = k;
+    EXPECT_EQ(order, ascending) << "the join's phis in the order of their allocas";
+}
+
 // D-OPT-MEM2REG-CONDITIONAL-INIT-UNDEF — a LIVE conditionally-initialized local:
 // `if (c) x = 1; return x + c;` stores x on ONLY ONE arm. The merge Phi's else-edge
 // (entry → join) has no reaching store; Mem2Reg must materialize undef-as-zero (an
@@ -257,6 +370,7 @@ TEST(Mem2Reg, ConditionallyInitializedLiveAllocaZeroFillsUndefEdge) {
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const tArm  = mb.createBlock(StructCfMarker::IfThen);
@@ -312,7 +426,7 @@ TEST(Mem2Reg, ConditionallyInitializedLiveAllocaZeroFillsUndefEdge) {
     // The entry-block Const 0 must dominate the join predecessor — proven by a full
     // structural/dominance verify of the rebuilt module (the fix's load-bearing claim).
     DiagnosticReporter vrep;
-    EXPECT_TRUE(MirVerifier(mir, &interner).verify(vrep))
+    EXPECT_TRUE(MirVerifier(mir, &interner).verify(vrep)) << verifierSaid(vrep)
         << "the undef-as-zero incoming must be dominance-legal";
 }
 
@@ -346,7 +460,7 @@ TEST(Mem2Reg, ConditionallyInitializedLoadZeroFillsUninitPath) {
     EXPECT_EQ(countOpInModule(mir, MirOpcode::Alloca), 0u);
     EXPECT_GE(countConstIntInModule(mir, 0), 1u) << "the read resolves to a Const 0";
     DiagnosticReporter vrep;
-    EXPECT_TRUE(MirVerifier(mir, &interner).verify(vrep));
+    EXPECT_TRUE(MirVerifier(mir, &interner).verify(vrep)) << verifierSaid(vrep);
 }
 
 // ── D-OPT-MEM2REG-FPR-CONDITIONAL-INIT-RODATA-ZERO ────────────────────────────
@@ -367,14 +481,26 @@ CondInitFloatFixture runCondInitFloat(TypeInterner& interner, TypeKind floatKind
     TypeId const fnSig = interner.fnSig(params, fT, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
+    // This hand-built module is its own table: nothing beside it names an id it
+    // does not define, so its end is the counted one, STATED — the pass mints the
+    // rodata zero's symbol past it, and the symbol-id door refuses to mint past an
+    // end nobody stated.
+    mb.stateSelfContainedSymbolIds();
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const tArm  = mb.createBlock(StructCfMarker::IfThen);
     MirBlockId const join  = mb.createBlock(StructCfMarker::IfJoin);
 
     mb.beginBlock(entry);
-    MirInstId const cond = mb.addArg(0, boolT);
-    MirInstId const val  = mb.addArg(1, fT);
+    // Ordinals PER CLASS, as SysV counts them (the MIR verifier holds a function's `Arg`s to its
+    // stamped counting), and each `Arg` at its own FLAT call-operand position (the verifier holds no
+    // two `Arg`s to one: I_ArgPositionDuplicate), as HIR->MIR writes both: the flag is the first
+    // general argument at position 0; the value is at position 1, the first of an FP kind's class
+    // or the second general one of an integer kind's.
+    bool const valueIsGeneral = regClassForCoreType(floatKind) == TargetRegClass::GPR;
+    MirInstId const cond = mb.addArg(0, boolT, 0u);
+    MirInstId const val  = mb.addArg(valueIsGeneral ? 1u : 0u, fT, 1u);
     MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, ptr);
     mb.addCondBr(cond, tArm, join);   // else edge → join: NO store to x
 
@@ -458,7 +584,7 @@ TEST(Mem2Reg, ConditionallyInitializedFloatAllocaPromotesViaRodataZero) {
     });
 
     DiagnosticReporter vrep;
-    EXPECT_TRUE(MirVerifier(mir, &interner).verify(vrep))
+    EXPECT_TRUE(MirVerifier(mir, &interner).verify(vrep)) << verifierSaid(vrep)
         << "the rodata-zero incoming must be dominance- and type-legal";
 }
 
@@ -477,7 +603,7 @@ TEST(Mem2Reg, ConditionallyInitializedFloat32AllocaPromotesViaRodataZero) {
     MirLiteralValue const& lv = fx.mir.literalValue(fx.mir.globalInitLiteralIndex(g));
     EXPECT_EQ(lv.core, TypeKind::F32) << "the literal's core is the ELEMENT width";
     DiagnosticReporter vrep;
-    EXPECT_TRUE(MirVerifier(fx.mir, &interner).verify(vrep));
+    EXPECT_TRUE(MirVerifier(fx.mir, &interner).verify(vrep)) << verifierSaid(vrep);
 }
 
 // ══ THE FAIL-LOUD-IN-PLACE BOUNDARY, SPLIT IN TWO ═══════════════════════════════
@@ -516,7 +642,7 @@ TEST(Mem2Reg, ConditionallyInitializedF16AllocaStaysDepromoted) {
     EXPECT_EQ(countOpInModule(fx.mir, MirOpcode::Load),   1u) << ord;
     EXPECT_EQ(countOpInModule(fx.mir, MirOpcode::Phi),    0u) << ord;
     DiagnosticReporter vrep;
-    EXPECT_TRUE(MirVerifier(fx.mir, &interner).verify(vrep)) << ord;
+    EXPECT_TRUE(MirVerifier(fx.mir, &interner).verify(vrep)) << verifierSaid(vrep) << ord;
 }
 
 // D-CSUBSET-LONG-DOUBLE-CONTROL-MERGE — INVERTED from the de-promotion arm above.
@@ -554,7 +680,7 @@ TEST(Mem2Reg, ConditionallyInitializedLongDoubleAllocaPromotesViaRodataZero) {
         EXPECT_EQ(countOpInModule(fx.mir, MirOpcode::Store),  0u) << ord;
         EXPECT_EQ(countOpInModule(fx.mir, MirOpcode::Phi),    1u) << ord;
         DiagnosticReporter vrep;
-        EXPECT_TRUE(MirVerifier(fx.mir, &interner).verify(vrep)) << ord;
+        EXPECT_TRUE(MirVerifier(fx.mir, &interner).verify(vrep)) << verifierSaid(vrep) << ord;
     }
 }
 
@@ -570,6 +696,8 @@ TEST(Mem2Reg, ConditionallyInitializedIntAllocaStillUsesADirectConstZero) {
     EXPECT_EQ(countOpInModule(fx.mir, MirOpcode::Load),       0u);
     EXPECT_EQ(countOpInModule(fx.mir, MirOpcode::GlobalAddr), 0u);
     EXPECT_GE(countConstIntInModule(fx.mir, 0), 1u);
+    DiagnosticReporter vrep;   // the fixture's integer form is a well-formed module too
+    EXPECT_TRUE(MirVerifier(fx.mir, &interner).verify(vrep)) << verifierSaid(vrep);
 }
 
 // TWO conditionally-initialized floats of DIFFERENT widths in one function: one
@@ -586,15 +714,19 @@ TEST(Mem2Reg, TwoFloatWidthsMintTwoDistinctZeroGlobals) {
     TypeId const fnSig = interner.fnSig(params, f64, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
+    mb.stateSelfContainedSymbolIds();   // its own table, as `runCondInitFloat`'s
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const tArm  = mb.createBlock(StructCfMarker::IfThen);
     MirBlockId const join  = mb.createBlock(StructCfMarker::IfJoin);
 
     mb.beginBlock(entry);
-    MirInstId const cond = mb.addArg(0, boolT);
-    MirInstId const v32  = mb.addArg(1, f32);
-    MirInstId const v64  = mb.addArg(2, f64);
+    // Ordinals PER CLASS, as SysV counts them: the flag is general #0, the two values FP #0 and #1;
+    // the flat call-operand positions 0, 1 and 2, one per `Arg`.
+    MirInstId const cond = mb.addArg(0, boolT, 0u);
+    MirInstId const v32  = mb.addArg(0, f32, 1u);
+    MirInstId const v64  = mb.addArg(1, f64, 2u);
     MirInstId const s32  = mb.addInst(MirOpcode::Alloca, {}, p32);
     MirInstId const s64  = mb.addInst(MirOpcode::Alloca, {}, p64);
     mb.addCondBr(cond, tArm, join);
@@ -627,7 +759,7 @@ TEST(Mem2Reg, TwoFloatWidthsMintTwoDistinctZeroGlobals) {
               mir.globalSymbol(mir.globalAt(1)).v)
         << "each minted global needs its OWN symbol";
     DiagnosticReporter vrep;
-    EXPECT_TRUE(MirVerifier(mir, &interner).verify(vrep));
+    EXPECT_TRUE(MirVerifier(mir, &interner).verify(vrep)) << verifierSaid(vrep);
 }
 
 // RISK PIN #1 — the promotability gate.
@@ -762,6 +894,7 @@ TEST(Mem2Reg, StructCfMarkersUnchanged) {
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const tArm  = mb.createBlock(StructCfMarker::IfThen);
@@ -1259,6 +1392,7 @@ VaForwardFixture buildVaForward(TypeInterner& interner) {
     TypeId const callerSig = interner.fnSig(callerParams, i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(calleeSig, SymbolId{50},
                    SymbolBinding::Global, SymbolVisibility::Default);
     MirBlockId const calleeEntry = mb.createBlock(StructCfMarker::EntryBlock);
@@ -1334,7 +1468,7 @@ TEST(Mem2Reg, PromotedValueArrivesAtCallOperandWithTheDeclaredPointee) {
         << "Mem2Reg must not erase the declared pointee at a call operand";
 
     DiagnosticReporter vrep;
-    EXPECT_TRUE(MirVerifier(fx.mir, &interner).verify(vrep));
+    EXPECT_TRUE(MirVerifier(fx.mir, &interner).verify(vrep)) << verifierSaid(vrep);
 }
 
 // The retag lands at the STORE, so it also fixes the PHI shape — a diamond whose two
@@ -1353,6 +1487,7 @@ TEST(Mem2Reg, RetagAtTheStoreKeepsPhiIncomingsTypeExact) {
     TypeId const fnSig = interner.fnSig(params, vaList, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const tArm  = mb.createBlock(StructCfMarker::IfThen);
@@ -1399,7 +1534,7 @@ TEST(Mem2Reg, RetagAtTheStoreKeepsPhiIncomingsTypeExact) {
     });
     EXPECT_TRUE(sawPhi);
     DiagnosticReporter vrep;
-    EXPECT_TRUE(MirVerifier(mir, &interner).verify(vrep));
+    EXPECT_TRUE(MirVerifier(mir, &interner).verify(vrep)) << verifierSaid(vrep);
 }
 
 // THE NARROWNESS IS THE CORRECTNESS ARGUMENT. A `Bitcast` is a REINTERPRETATION, so
@@ -1449,6 +1584,7 @@ TEST(Mem2Reg, MatchingPointerStoreInsertsNoRetag) {
     TypeId const fnSig = interner.fnSig(params, vaList, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(entry);

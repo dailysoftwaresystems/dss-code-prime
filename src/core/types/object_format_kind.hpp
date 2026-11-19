@@ -4,10 +4,12 @@
 #include "core/types/enum_name_table.hpp"   // EnumNameTable<E,N> (leaf header — no target_schema cycle)
 
 #include <cstddef>
+#include <array>
 #include <cstdint>
 #include <cstdio>    // selectableObjectFormat's refusal (stderr)
 #include <cstdlib>   // selectableObjectFormat's refusal (abort)
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -734,8 +736,9 @@ externAddrBindingFromName(std::string_view s) noexcept {
 //     LOWERING lands with the PE TLS cycle — the MIR→LIR arm fails
 //     LOUD (never a silently-wrong local-exec sequence) until then.
 //   * `macho-tlv` (Mach-O, C4): access is a CALL through the object's
-//     `__thread_vars` TLV descriptor (`_tlv_bootstrap`). Declared as
-//     vocabulary; fails loud at lowering until the Mach-O TLS cycle.
+//     `__thread_vars` TLV descriptor, whose word0 the image binds to the
+//     format's declared bootstrap routine (`TlsAccessInfo::bootstrap*`;
+//     Darwin's `__tlv_bootstrap`, from libSystem).
 //
 // A format that declares NO `tlsAccess` block cannot lower a
 // thread-local access at all: MIR→LIR fails loud
@@ -767,18 +770,25 @@ tlsAccessModelFromName(std::string_view s) noexcept {
     return kTlsAccessModelTable.fromName(s);
 }
 
+// The runtime-library role table's enumeration (its enumerators, names and
+// rows are further down): the `macho-tlv` model names the ROLE of the image
+// that exports its bootstrap routine (`TlsAccessInfo::bootstrapRole`).
+enum class RuntimeLibraryRole : std::uint8_t;
+
 // D-CSUBSET-THREAD-LOCAL (TLS C3): the reserved well-known SymbolId VALUE
 // that names the PE `_tls_index` slot — a LINK-TIER writer-minted SINGLETON
 // (never a MIR symbol) that the `pe-indexed` access sequence's riprel read
 // targets AND the PE writer binds. It is a HIGH sentinel a DENSE per-CU
-// SymbolId (minted upward from 1) can never reach, so on the single-CU
-// emission path (the only path a thread-local access + definition co-reside
-// on today) it survives from MIR→LIR lowering to `pe.cpp` UNREMAPPED and the
-// writer binds `symbolVa[reserved] = _tls_index VA` unambiguously. On a
-// multi-CU merge the retarget would remap it to a fresh dense id → the riprel
-// reloc resolves against no `symbolVa` entry → FAIL-LOUD undefined (multi-file
-// extern-`thread_local` is the deferred `D-PIPELINE-CU5-MULTIFILE-EXTERN-DATA`
-// surface; never a silent wrong-address). Both `mir_to_lir.cpp` (the lowering)
+// SymbolId (minted upward from 1) can never reach, so it survives from MIR→LIR
+// lowering to `pe.cpp` UNREMAPPED and the writer binds
+// `symbolVa[reserved] = _tls_index VA` unambiguously — on the single-CU path
+// and through the multi-CU merge alike, which keeps the value (`mergeModules`'
+// `mergedIdFor`) and resolves it as the writer's (`resolveCrossCuSymbols`).
+// Until P69 round 4 the merge REMAPPED it to a fresh dense id no writer binds,
+// so a PE program with a thread-local was refused beside ANY other unit — a
+// static-library member, an object input:
+//   D-LK-PE-THREAD-LOCAL-PROGRAM-REFUSED-BESIDE-ANY-OTHER-UNIT
+// Both `mir_to_lir.cpp` (the lowering)
 // and `pe.cpp` (the writer) read this ONE constant — a plain `std::uint32_t`
 // so this leaf header stays free of the `strong_ids.hpp` dependency; each side
 // wraps it in `SymbolId{...}` at use.
@@ -793,10 +803,25 @@ inline constexpr std::uint32_t kTlsIndexReservedSymbolIdValue = 0xFFFF'FF01u;
 // no TLS machinery, e.g. an ELF module that somehow carried the id). Keeps the
 // linker free of any format-name branch: it asks "is this a writer-reserved
 // id", not "is this PE".
+//
+// ★ P69 (lane `cs`, fold f26d — review-csf26c2 N9): the reserved values are ONE LIST, read by this predicate
+// (which a COUNTING id space steps over: core/types/symbol_id_cursor.hpp's `SymbolIdEnd`) and by the end of an
+// INDEX id space (`kFirstWriterReservedSymbolIdValue`, where an id IS a position and so cannot step over one).
+// A reserved value added lower lowers every index space's end with it.
+inline constexpr std::array<std::uint32_t, 1> kWriterReservedSymbolIdValues{kTlsIndexReservedSymbolIdValue};
 [[nodiscard]] constexpr bool
 isWriterReservedSymbolIdValue(std::uint32_t v) noexcept {
-    return v == kTlsIndexReservedSymbolIdValue;
+    for (std::uint32_t const r : kWriterReservedSymbolIdValues)
+        if (r == v) return true;
+    return false;
 }
+// The lowest reserved value: where an index space ends (`IndexSymbolIds`, core/types/symbol_id_cursor.hpp).
+inline constexpr std::uint32_t kFirstWriterReservedSymbolIdValue = [] {
+    std::uint32_t lowest = kWriterReservedSymbolIdValues[0];
+    for (std::uint32_t const r : kWriterReservedSymbolIdValues)
+        if (r < lowest) lowest = r;
+    return lowest;
+}();
 
 // The format's TLS access block (`"tlsAccess"` in `.format.json`).
 // `segmentPrefixByte` is the x86 segment-override prefix byte the
@@ -823,6 +848,26 @@ struct DSS_EXPORT TlsAccessInfo {
     // is the human-readable anchor (diagnostics + the loader's presence
     // gate) so the config stays self-describing.
     std::string    tlsIndexSlotName;
+    // The stride of the module TLS array the `pe-indexed` sequence indexes: the
+    // data model's pointer width (each entry is a block pointer). DERIVED by the
+    // format document's loader from its `dataModel`, never stated; 0 on a
+    // hand-built block, which the lowering refuses rather than index by zero
+    // (P69 fold 3e, the review of fold 3d's X9, R15: the scale was a literal 8).
+    std::uint8_t   blockPointerBytes = 0;
+    // P69 fold 3f (ledger 716): the routine every `macho-tlv` descriptor's
+    // word0 is BOUND to (Darwin's `__tlv_bootstrap`, which dyld overwrites
+    // with its tlv_get_addr at load), as the object file spells it, and the
+    // runtime-library ROLE of the image that exports it -- the format's
+    // `tlsAccess.bootstrap` (`{"role", "mangledName"}`, the
+    // `sehPersonality` shape), REQUIRED for `macho-tlv` and refused for the
+    // other models, which bind none. The image is resolved where it is bound,
+    // through the format's role table (its FAMILY's, for a flavour whose own
+    // table does not declare the role: the dylib's). ✔MEASURED 2026-11-17
+    // (Apple clang 21's exec, `nm -m`): `__tlv_bootstrap (from libSystem)`.
+    // Empty / `None` on a hand-built block, which the writer refuses rather
+    // than bind a nameless routine.
+    std::string        bootstrapMangledName;
+    RuntimeLibraryRole bootstrapRole{};
 };
 
 // ── Shipped-library synthesis vehicle (D-CSUBSET-C11-THREADS-MACHO) ─
@@ -950,14 +995,40 @@ enum class RuntimeLibraryRole : std::uint8_t {
     // runtime-sized entries dispatch through libatomic's lock table. Declaring
     // the names per format (below) is what keeps that choice in config.
     AtomicsRuntime    = 4,
+    // The routines a REFERENCE toolchain's own static runtime defines for the
+    // objects it compiles, which a FOREIGN object therefore names by name and
+    // no platform image exports to it: on pe, cl's and clang-cl's stack probe
+    // `__chkstk` and the /GS family (`__security_cookie`,
+    // `__security_check_cookie`, `__GSHandlerCheck`, `__GSHandlerCheck_SEH`,
+    // `__report_rangecheckfailure`), cl's `_fltused`, and mingw-w64 gcc's
+    // `___chkstk_ms`, `__main`, unwinder entry points
+    // (`__gcc_personality_seh0`, `_Unwind_Resume`) and stack protector
+    // (`__stack_chk_guard`, `__stack_chk_fail`: gcc's own link imports the
+    // reporter from libssp-0.dll, an image a plain Windows does not have,
+    // ✔MEASURED 2026-11-03). ✔MEASURED 2026-10-28 (nm
+    // over 31 reference objects; GetProcAddress on the in-box images): none of
+    // ucrtbase, vcruntime140, kernel32 or ntdll exports `___chkstk_ms` or the
+    // /GS family, so DSS ships the bodies -- a `sources` row, several units
+    // (one register contract no C function keeps is written in assembly).
+    CompilerSupport   = 5,
+    // P69 fold 3f (ledger 563 (A)): the PROGRAM INTERPRETER -- the image a dynamic ELF
+    // executable names in PT_INTERP, which is also a library a program imports from:
+    // aarch64 glibc's ld-linux-aarch64.so.1 exports the stack protector's canary
+    // `__stack_chk_guard` and libc.so.6 does not (MEASURED, P69 fold 3f: `readelf -V`
+    // files gcc's aarch64 image's `__stack_chk_guard@GLIBC_2.17` under the interpreter).
+    // An ELF document with an `elf.interpreter` path declares this role's row, its image
+    // the path's last component (the elf backend refuses the two disagreeing).
+    ProgramInterpreter = 6,
 };
 
-inline constexpr EnumNameTable<RuntimeLibraryRole, 5> kRuntimeLibraryRoleTable{{{
+inline constexpr EnumNameTable<RuntimeLibraryRole, 7> kRuntimeLibraryRoleTable{{{
     { RuntimeLibraryRole::None,              "none"              },
     { RuntimeLibraryRole::CLibrary,          "cLibrary"          },
     { RuntimeLibraryRole::UnwindPersonality, "unwindPersonality" },
     { RuntimeLibraryRole::SystemPrimitives,  "systemPrimitives"  },
     { RuntimeLibraryRole::AtomicsRuntime,    "atomicsRuntime"    },
+    { RuntimeLibraryRole::CompilerSupport,   "compilerSupport"   },
+    { RuntimeLibraryRole::ProgramInterpreter, "programInterpreter" },
 }}};
 
 // Well-formedness of the table itself: no empty spelling, no duplicate
@@ -996,7 +1067,7 @@ isSelectableRuntimeLibraryRole(RuntimeLibraryRole r) noexcept {
 // `core/types/target_schema.hpp`
 // (D-CORE-NAMESWHERE-COUNT-DERIVED-FROM-THE-TABLE-IS-A-TAUTOLOGY).
 inline constexpr auto kSelectableRuntimeLibraryRoleNames =
-    namesWhere<4>(kRuntimeLibraryRoleTable, isSelectableRuntimeLibraryRole);
+    namesWhere<6>(kRuntimeLibraryRoleTable, isSelectableRuntimeLibraryRole);
 static_assert(kRuntimeLibraryRoleTable.rows.size()
                   == kSelectableRuntimeLibraryRoleNames.size() + 1,
               "kRuntimeLibraryRoleTable must have exactly ONE unselectable row "
@@ -1092,10 +1163,23 @@ static_assert(kRuntimeLibraryRoleTable.rows.size()
 // `EveryFlavourOfAFormatKindNamesOneProviderPerRole` refuses two flavours of one
 // kind naming different providers for a role, so the repetition cannot become a
 // disagreement even though it cannot become a single line.
+//
+// ★ A BODY OF SEVERAL UNITS IS ONE ROW
+// (D-LK-PE-FOREIGN-OBJECT-STACK-PROBE-ROUTINE-UNDEFINED, P69 H5). The `compilerSupport` role is played by three
+// shipped units -- a C one, an assembly one (a register contract no C function
+// keeps), and gcc's unwinder entry points -- and a role names exactly ONE
+// provider: the loader refuses a second row of one role ("one role names exactly
+// one image; two rows would make the resolution order the answer"), and the
+// flavour family's agreement is asked per role. So the row's provider is the
+// LIST of units, written `sources` (two or more); a body of one unit keeps the
+// `source` spelling every shipped row and descriptor already uses (78 sites
+// across 22 documents), and the loader refuses the other spelling of each shape
+// -- `sources` holding one unit, both keys, or neither beside `image` -- so each
+// shape has exactly one way to be written.
 struct DSS_EXPORT RuntimeLibraryBinding {
-    RuntimeLibraryRole role = RuntimeLibraryRole::None;
-    std::string        image;   // "ucrtbase.dll" / "libgcc_s.so.1" / a dylib path
-    std::string        source;  // "runtime/platform/src/atomic.c"
+    RuntimeLibraryRole       role = RuntimeLibraryRole::None;
+    std::string              image;    // "ucrtbase.dll" / "libgcc_s.so.1" / a dylib path
+    std::vector<std::string> sources;  // {"runtime/platform/src/atomic.c"}: EMPTY = played by `image`
 };
 
 // The format's whole role table. A VECTOR of rows rather than a fixed struct of
@@ -1127,13 +1211,13 @@ struct DSS_EXPORT RuntimeLibraryTable {
         return std::nullopt;
     }
 
-    // The shipped source realizing `role`, or nullopt when this format either
-    // declares no such row or fills it from an image.
-    [[nodiscard]] std::optional<std::string_view>
-    sourceForRole(RuntimeLibraryRole role) const noexcept {
+    // The shipped units realizing `role`, in declaration order -- EMPTY when
+    // this format either declares no such row or fills it from an image.
+    [[nodiscard]] std::span<std::string const>
+    sourcesForRole(RuntimeLibraryRole role) const noexcept {
         auto const* b = rowForRole(role);
-        if (b == nullptr || b->source.empty()) return std::nullopt;
-        return std::string_view{b->source};
+        if (b == nullptr) return {};
+        return b->sources;
     }
 
     // Every shipped source this table realizes, in declaration order. The driver
@@ -1142,7 +1226,7 @@ struct DSS_EXPORT RuntimeLibraryTable {
     [[nodiscard]] std::vector<std::string> realizedSources() const {
         std::vector<std::string> out;
         for (auto const& b : bindings) {
-            if (!b.source.empty()) out.push_back(b.source);
+            out.insert(out.end(), b.sources.begin(), b.sources.end());
         }
         return out;
     }
@@ -1281,6 +1365,59 @@ struct DSS_EXPORT AtomicsRuntime {
     // that refuses BY NAME at compile time — it never lowers half of the pair and
     // faults later. Empty = not declared.
     std::string compareExchangeMangledName;  // "__atomic_compare_exchange" / "___…"
+};
+
+// ── D-LK-PE-FOREIGN-OBJECT-GS-COOKIE-ROUTINES-UNDEFINED (P69 H5): the
+//    compiler-support declaration ──────────────────────────────────────────
+//
+// The format's `compilerSupport` block: the role whose row realizes the
+// routines a reference toolchain's own static runtime defines for its objects
+// (`RuntimeLibraryRole::CompilerSupport`), and the ONE of them DSS's own PE
+// startup must CALL -- the routine that seeds the /GS cookie, which every
+// reference C runtime runs before any initializer and before the entry, so a
+// guarded frame never compares against the value the runtime's object ships.
+// Populated from JSON with `role` resolved against `runtimeLibraries` AT LOAD,
+// exactly like `AtomicsRuntime`; `libraryPath` is therefore the empty
+// "no library binding" shape of a realized role.
+struct DSS_EXPORT CompilerSupport {
+    RuntimeLibraryRole role = RuntimeLibraryRole::None;  // declared in JSON
+    std::string libraryPath;                          // DERIVED: resolved from `role` at load
+    std::string securityCookieInitializerMangledName; // "__security_init_cookie"
+};
+
+// ── P69 fold 3d (D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL): a symbol the
+//    IMAGE defines ───────────────────────────────────────────────────────────
+//
+// A name every reference linker of the format defines in each image it links,
+// at an address of the image itself, for a reference that no linked unit
+// defines. PE's is `__ImageBase`, the image's DOS header: cl's dense `switch`
+// reaches its ADDR32NB jump table through an `lea` of it, and a C program reads
+// it as `extern IMAGE_DOS_HEADER __ImageBase;`. The document states each one
+// (`imageDefinedSymbols`). A linked unit's own definition of the name is that
+// unit's, as link.exe keeps it (✔MEASURED P69 fold 3d: a unit defining
+// `int __ImageBase = 1;` links and reads 1, probe-reference-cc run
+// 20261104-200657-1038ae7c).
+enum class ImageDefinedAddress : std::uint8_t {
+    ImageHeader = 0,   // the image's first byte: its header, where the loader maps it
+};
+
+inline constexpr EnumNameTable<ImageDefinedAddress, 1> kImageDefinedAddressTable{{{
+    { ImageDefinedAddress::ImageHeader, "imageHeader" },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kImageDefinedAddressTable);
+
+[[nodiscard]] constexpr std::string_view
+imageDefinedAddressName(ImageDefinedAddress a) noexcept {
+    return kImageDefinedAddressTable.name(a);
+}
+[[nodiscard]] constexpr std::optional<ImageDefinedAddress>
+imageDefinedAddressFromName(std::string_view s) noexcept {
+    return kImageDefinedAddressTable.fromName(s);
+}
+
+struct DSS_EXPORT ImageDefinedSymbol {
+    std::string         name;      // the link-level name a unit's reference names
+    ImageDefinedAddress address = ImageDefinedAddress::ImageHeader;
 };
 
 // The format's shipped-library synthesis block (`"librarySynthesis"` in
@@ -1494,6 +1631,56 @@ stackReserveUnsupportedRemedy(StackReserveUnsupportedReason r) noexcept {
     return kStackReserveUnsupportedRemedyTable.name(r);
 }
 
+// ── WHY A FORMAT GIVES NO DEFINITION A SECOND NAME (`"symbolAliasUnsupportedReason"`)
+//    P69 (lane `cs`) ─────────────────────────────────────────────────────────
+//
+// A symbol ALIAS — `__attribute__((alias("g"))) int f(void)` — gives the
+// definition `g` a second external name `f`. Whether an artifact of a format
+// may carry one is the FORMAT's fact, asked by the semantic tier when it judges
+// the attribute, and an ABSENT key means "supported": the ELF and PE documents
+// declare nothing, and gcc, clang and mingw-w64 gcc all build aliases there.
+//
+// A declared reason REFUSES the attribute by name, with the reason's sentence.
+// One reason exists, and it is not a limit of the object file: ✔MEASURED
+// (lane `cs`, probe al2, 2026-10-15) Apple clang refuses every one of 32 alias
+// cells with "aliases are not supported on darwin", while the measurement the
+// `macho-alias-ld64-matrix` action keeps shows Apple's ld64 linking a plain
+// second defined symbol at one address. Accepting what no compiler of the
+// platform accepts would be a defect of its own, whatever the linker can carry,
+// so the reason names the PLATFORM's compilers, not the format's records.
+enum class SymbolAliasUnsupportedReason : std::uint8_t {
+    PlatformCompilersRefuse = 1,
+};
+
+inline constexpr EnumNameTable<SymbolAliasUnsupportedReason, 1>
+kSymbolAliasUnsupportedReasonTable{{{
+    { SymbolAliasUnsupportedReason::PlatformCompilersRefuse, "platform-compilers-refuse" },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kSymbolAliasUnsupportedReasonTable);
+
+[[nodiscard]] constexpr std::string_view
+symbolAliasUnsupportedReasonName(SymbolAliasUnsupportedReason r) noexcept {
+    return kSymbolAliasUnsupportedReasonTable.name(r);
+}
+[[nodiscard]] constexpr std::optional<SymbolAliasUnsupportedReason>
+symbolAliasUnsupportedReasonFromName(std::string_view s) noexcept {
+    return kSymbolAliasUnsupportedReasonTable.fromName(s);
+}
+
+// The sentence a refusal carries for a declared reason.
+inline constexpr EnumNameTable<SymbolAliasUnsupportedReason, 1>
+kSymbolAliasUnsupportedSentenceTable{{{
+    { SymbolAliasUnsupportedReason::PlatformCompilersRefuse,
+      "the C compilers of this platform refuse a symbol alias, so no program "
+      "written for it defines one, and this compiler refuses it as they do" },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kSymbolAliasUnsupportedSentenceTable);
+
+[[nodiscard]] constexpr std::string_view
+symbolAliasUnsupportedSentence(SymbolAliasUnsupportedReason r) noexcept {
+    return kSymbolAliasUnsupportedSentenceTable.name(r);
+}
+
 struct DSS_EXPORT StackReserveControl {
     StackReserveVehicle vehicle = StackReserveVehicle::PeOptionalHeader;
     // Smallest honourable request. Below this the image is legal but the
@@ -1551,22 +1738,35 @@ struct DSS_EXPORT StackReserveControl {
 //     IMAGE_SCN_LNK_COMDAT whose Selection byte is IMAGE_COMDAT_SELECT_ANY
 //     ("any section that defines the same COMDAT symbol can be linked; the
 //     rest are removed"). ✔The published PE/COFF format, "COMDAT Sections
-//     (Object Only)". NOT `IMAGE_SYM_CLASS_WEAK_EXTERNAL`, which is a weak
-//     REFERENCE with a fallback alias and serves the separate ALIAS path —
-//     see `pe.cpp`'s weak-definition block for the measured reference
-//     encodings that fix this choice.
+//     (Object Only)". `IMAGE_SYM_CLASS_WEAK_EXTERNAL`, a name with a
+//     fallback, is the format's OTHER spelling (`weak-external`, below) and
+//     a different mechanism — see `pe.cpp`'s weak-definition block for the
+//     measured reference encodings.
 //   * `symbol-binding` (ELF): the weakness lives in the symbol's BINDING
 //     field — `STB_WEAK` in the high nibble of `st_info`. No section flag is
 //     involved (`elf.cpp`, `stbForBinding`).
 //   * `symbol-flag` (Mach-O): the weakness lives in a per-symbol FLAG bit
 //     ALONGSIDE an ordinary binding — `N_WEAK_DEF` (0x0080) in the nlist's
 //     `n_desc`, on a symbol that is otherwise `N_SECT|N_EXT` (`macho.cpp`).
+//   * `weak-external` (PE/COFF, P69): the weakness lives in a SECOND RECORD.
+//     The body is an ordinary external definition under a default name of its
+//     own, and the weak name is an `IMAGE_SYM_CLASS_WEAK_EXTERNAL` record
+//     whose Auxiliary Format 3 names that default: "use this unless another
+//     definition of the name is linked". It is how MinGW gcc and clang spell
+//     `__attribute__((weak))` on COFF, and a different MECHANISM from
+//     `comdat`, with a different duplicate rule (✔MEASURED 2026-10-10,
+//     link.exe 14.44 and lld-link 19.1.5: it yields to a strong definition
+//     and to a select-any one, where a COMDAT beside a strong definition is a
+//     duplicate; two of them for one name conflict, where two COMDATs
+//     coalesce). WHICH KIND of weak definition takes which dialect is the
+//     document's (`weakDefinition.byKind`, read through
+//     `ObjectFormatSchema::weakDefinitionDialectFor`), never this enum's.
 //
-// ★ WHY ALL THREE SHIP AS VOCABULARY. Each names an encoder that EXISTS in
+// ★ WHY EVERY ONE SHIPS AS VOCABULARY. Each names an encoder that EXISTS in
 // this tree today, so none is a verb shipped ahead of its walker arm (the
 // `StackReserveVehicle` discipline).
 //
-// ★★ ALL THREE ARE NOW CONSULTED BY THE WALKER THAT WRITES THEM
+// ★★ EACH IS CONSULTED BY THE WALKER THAT WRITES IT
 // ([[D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS]],
 // cycle P28). The shared gate is `link/format/weak_definition_gate.hpp`, called
 // once by `pe::encode`'s Obj arm, once by `elf::encode`, and once by
@@ -1599,13 +1799,15 @@ enum class WeakDefinitionDialect : std::uint8_t {
     Comdat        = 1,  // COFF: IMAGE_SCN_LNK_COMDAT + IMAGE_COMDAT_SELECT_ANY
     SymbolBinding = 2,  // ELF: STB_WEAK in st_info
     SymbolFlag    = 3,  // Mach-O: N_WEAK_DEF (0x0080) in n_desc
+    WeakExternal  = 4,  // COFF: IMAGE_SYM_CLASS_WEAK_EXTERNAL naming a default
 };
 
-inline constexpr EnumNameTable<WeakDefinitionDialect, 3>
+inline constexpr EnumNameTable<WeakDefinitionDialect, 4>
 kWeakDefinitionDialectTable{{{
     { WeakDefinitionDialect::Comdat,        "comdat"         },
     { WeakDefinitionDialect::SymbolBinding, "symbol-binding" },
     { WeakDefinitionDialect::SymbolFlag,    "symbol-flag"    },
+    { WeakDefinitionDialect::WeakExternal,  "weak-external"  },
 }}};
 
 // Well-formedness of the table itself: no empty spelling, no duplicate
@@ -1624,6 +1826,7 @@ weakDefinitionDialectName(WeakDefinitionDialect d) noexcept {
         case WeakDefinitionDialect::Comdat:
         case WeakDefinitionDialect::SymbolBinding:
         case WeakDefinitionDialect::SymbolFlag:
+        case WeakDefinitionDialect::WeakExternal:
             break;
     }
     return kWeakDefinitionDialectTable.nameOrEmpty(d);   // NOT .name()

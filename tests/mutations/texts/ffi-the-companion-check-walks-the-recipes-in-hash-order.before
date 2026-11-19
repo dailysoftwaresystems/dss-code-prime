@@ -1,0 +1,3 @@
+    for (auto const* entry : substrate::entriesInKeyOrder(out)) {
+        std::string const& shimName = entry->first;
+        ShippedSymbolRealization const& shimReal = entry->second;

@@ -21,8 +21,9 @@ struct LeafField {
     std::uint64_t offset;    // absolute byte offset within the top aggregate
     TypeKind      kind;      // a scalar/pointer leaf kind
     // D-CSUBSET-BITINT: the leaf's byte size, resolved at collection through
-    // `sizeOfScalarOrBitInt` (a `_BitInt(N)`'s size needs its width scalar, which
-    // `scalarByteSize(kind,...)` — kind-only — cannot see). 0 = un-sized (the
+    // `computeLayout` (a `_BitInt(N)`'s size needs its width scalar and, above 64
+    // bits, the target's chunk, which `scalarByteSize(kind,...)` — kind-only —
+    // cannot see). 0 = un-sized (the
     // classifier's defensive fsz=1). Carrying it here fixes a BitInt leaf that
     // STRADDLES an eightbyte boundary: sized as 1 byte it would leave the second
     // eightbyte marked SSE (a silent GPR→XMM ABI miscompile of a by-value struct).
@@ -42,10 +43,10 @@ struct LeafField {
 
 // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): a long-double (F80|F128) leaf
 // forces the SysV x87 MEMORY class. SysV classes an x87 eightbyte pair
-// X87/X87UP → the WHOLE aggregate goes MEMORY (ByReference) regardless of size
+// X87/X87UP → the WHOLE aggregate goes MEMORY regardless of size
 // (a naive float-kind join would classify it SSE → XMM pieces; a non-join
 // classifies it INTEGER → a silent 2-GPR by-value pass, ABI-divergent at FFI).
-// Used by the SysV arm to force ByReference. (AAPCS64 uses the narrower
+// Used by the SysV arm to force MEMORY (or, for a result, X87). (AAPCS64 uses the narrower
 // `hasF80Leaf` — its binary128 leaf is a legitimate Q-register HFA.)
 [[nodiscard]] bool hasLongDoubleClassLeaf(std::vector<LeafField> const& leaves) noexcept {
     for (LeafField const& f : leaves) {
@@ -106,8 +107,10 @@ struct LeafField {
     // element FLOAT kind. WITHOUT this arm the bare-Complex default below emits ONE
     // zero-size NON-float leaf → the eightbyte mis-classes INTEGER (a silent 2-GPR
     // by-value pass, ABI-divergent at FFI). double _Complex → 2 SSE eightbytes /
-    // 2-double HFA; a long-double-complex leaf (F80/F128) then trips
-    // hasLongDoubleClassLeaf and the aggregate refuses classification — automatic.
+    // 2-double HFA. A long-double complex: on SysV the BARE type is COMPLEX_X87,
+    // answered by `classifyAggregate` before any leaf is collected, and an aggregate
+    // holding one is MEMORY by size; on AAPCS64 a binary128 complex is a two-piece
+    // HFA and an F80 one refuses (`hasF80Leaf`).
     if (k == TypeKind::Complex) {
         TypeId const elem = in.complexElement(ty);
         auto const elemLay = computeLayout(elem, in, lp, dm);
@@ -117,25 +120,60 @@ struct LeafField {
         out.push_back(LeafField{base + elemLay->size, ek, elemLay->size});
         return true;
     }
-    // D-CSUBSET-BITINT: size the leaf through the TypeId-aware shim so a
-    // `_BitInt(N)` gets its CONTAINER size (not the kind-only nullopt→1 default).
-    out.push_back(LeafField{base, k,
-                            sizeOfScalarOrBitInt(in, ty, dm).value_or(0)});
+    // D-CSUBSET-BITINT: size the leaf by the layout authority so a `_BitInt(N)`
+    // gets its CONTAINER size (not the kind-only nullopt→1 default), the target's
+    // chunk included.
+    auto const leafLay = computeLayout(ty, in, lp, dm);
+    out.push_back(LeafField{base, k, leafLay.has_value() ? leafLay->size : 0});
     return true;
+}
+
+// ★ P69 (lane `cs`, fold f26c, main's ledger 454): psABI 3.2.3's eightbyte classes and its merge, for an
+// aggregate holding an x87 `long double` (the only one whose classes go past INTEGER and SSE here).
+enum class EightbyteClass : std::uint8_t { NoClass, Integer, Sse, X87, X87Up, Memory };
+
+// psABI 3.2.3, "the class of each eightbyte": (a) equal classes are that class; (b) NO_CLASS yields the other;
+// (c) MEMORY wins; (d) then INTEGER; (e) then an X87, X87UP or COMPLEX_X87 makes MEMORY; (f) else SSE.
+[[nodiscard]] EightbyteClass mergeEightbyte(EightbyteClass acc, EightbyteClass field) noexcept {
+    using C = EightbyteClass;
+    if (acc == field || field == C::NoClass) return acc;
+    if (acc == C::NoClass) return field;
+    if (acc == C::Memory || field == C::Memory) return C::Memory;
+    if (acc == C::Integer || field == C::Integer) return C::Integer;
+    if (acc == C::X87 || acc == C::X87Up || field == C::X87 || field == C::X87Up) return C::Memory;
+    return C::Sse;
 }
 
 } // namespace
 
 std::optional<AbiPassing>
-classifyAggregate(AggregateClassKind strategy, std::uint16_t maxRegBytes,
+classifyAggregate(AggregateConventionRules const& rules,
                   TypeId aggTy, TypeInterner const& in,
-                  AggregateLayoutParams lp, DataModel dm) {
+                  AggregateLayoutParams lp, DataModel dm,
+                  AggregatePosition position) {
+    AggregateClassKind const strategy    = rules.classification;
+    std::uint16_t const      maxRegBytes = rules.maxRegBytes;
     if (!aggregateAbiImplemented(strategy))
         return std::nullopt;   // unimplemented strategy (AAPCS64 until C3) → fail loud
 
     auto const lay = computeLayout(aggTy, in, lp, dm);
     if (!lay.has_value()) return std::nullopt;   // un-sizeable → fail loud
     std::uint64_t const size = lay->size;
+
+    // ★ P69 (lane `cs`, fold f26e -- D-TARGET-WIN64-INT128-RESULT-GOES-THROUGH-A-HIDDEN-POINTER-NOT-XMM0): a
+    // 128-bit INTEGER result comes back where the convention STATES (`integer128Result`), before any
+    // strategy's size rule: Win64 returns `__int128` in XMM0 (every reference that has the type), where its
+    // by-size rule sends a 16-byte value through the hidden pointer. One 16-byte FP piece: the piece's
+    // register is the convention's first FP return register, its 16 bytes the value's (the low limb first).
+    // An argument, and every other type, takes the strategy's answer below.
+    if (position == AggregatePosition::Result
+        && rules.integer128Result == Integer128Result::InTheFirstFpr
+        && (in.kind(aggTy) == TypeKind::I128 || in.kind(aggTy) == TypeKind::U128)) {
+        AbiPassing iout;
+        iout.kind = AbiPassing::Kind::InRegisters;
+        iout.pieces.push_back(AbiPiece{AbiPieceClass::Fpr, 0, static_cast<std::uint32_t>(size)});
+        return iout;
+    }
 
     if (strategy == AggregateClassKind::Win64BySize) {
         // MS x64: a struct/union is passed/returned in ONE GPR iff its size is a
@@ -151,7 +189,7 @@ classifyAggregate(AggregateClassKind strategy, std::uint16_t maxRegBytes,
             wout.pieces.push_back(AbiPiece{AbiPieceClass::Gpr, 0,
                                            static_cast<std::uint32_t>(size)});
         } else {
-            wout.kind = AbiPassing::Kind::ByReference;
+            wout.kind = AbiPassing::Kind::Memory;
         }
         return wout;
     }
@@ -176,7 +214,19 @@ classifyAggregate(AggregateClassKind strategy, std::uint16_t maxRegBytes,
         // HFA element homogeneity: every leaf is the SAME float kind. The member
         // COUNT is size/elem (NOT the leaf count) so a union of N floats — whose
         // members overlap to one element — is a 1-member HFA, while a struct/array
-        // of N packs to N. count must be 1..4 and divide the size evenly.
+        // of N packs to N. count must be 1..4 and divide the size evenly, AND THE
+        // ELEMENTS MUST TILE THE COMPOSITE: a leaf at every multiple of the element
+        // below the size.
+        // ★ P69 (lane `cs`, fold f26c2 — F14's neighbour, the HFA this arm states):
+        // a composite of one floating type WITH PADDING is no HFA. ✔MEASURED (probe hp,
+        // -O1 asm, both sides): aarch64 gcc 13.3.0, clang 18.1.3 and Apple clang pass
+        // `struct { _Alignas(16) double a; }` in x0/x1, `struct { float a;
+        // _Alignas(8) float b; }` and `struct { _Alignas(16) float a; float b; }` in
+        // general registers, and `struct { double a; _Alignas(16) double b; }` (32
+        // bytes) by reference -- clang's rule, `size == members * element`. This arm
+        // counted size/elem alone, so it put each in d0.. as 2 or 4 elements, a slot
+        // the reference never reads. (`struct { _Alignas(32) double a, b, c, d; }`
+        // tiles its 32 bytes and stays a four-double HFA, as all three put it.)
         bool allSameFp = !leaves.empty() && isFloatKind(leaves.front().kind);
         if (allSameFp)
             for (LeafField const& f : leaves)
@@ -185,22 +235,26 @@ classifyAggregate(AggregateClassKind strategy, std::uint16_t maxRegBytes,
             std::uint64_t const elem =
                 scalarByteSize(leaves.front().kind, dm).value_or(0);
             if (elem == 0) return std::nullopt;   // un-sized FP leaf → fail loud
-            if (size % elem == 0) {
-                std::uint64_t const count = size / elem;
-                if (count >= 1 && count <= 4) {
-                    AbiPassing hout;
-                    hout.kind = AbiPassing::Kind::InRegisters;
-                    for (std::uint64_t i = 0; i < count; ++i)
-                        hout.pieces.push_back(AbiPiece{AbiPieceClass::Fpr,
-                            i * elem, static_cast<std::uint32_t>(elem)});
-                    return hout;
-                }
+            std::uint64_t const count = size % elem == 0 ? size / elem : 0;
+            bool tiles = count >= 1 && count <= 4;
+            for (std::uint64_t i = 0; tiles && i < count; ++i)
+                tiles = std::any_of(leaves.begin(), leaves.end(), [&](LeafField const& f) {
+                    return f.offset == i * elem;
+                });
+            if (tiles) {
+                AbiPassing hout;
+                hout.kind = AbiPassing::Kind::InRegisters;
+                hout.homogeneousElementBytes = static_cast<std::uint32_t>(elem);
+                for (std::uint64_t i = 0; i < count; ++i)
+                    hout.pieces.push_back(AbiPiece{AbiPieceClass::Fpr,
+                        i * elem, static_cast<std::uint32_t>(elem)});
+                return hout;
             }
         }
         // Non-HFA: ≤16B → ceil(size/8) GPR pieces (1 or 2); >16B / empty → by ref.
         AbiPassing aout;
         if (size == 0 || size > maxRegBytes) {
-            aout.kind = AbiPassing::Kind::ByReference;
+            aout.kind = AbiPassing::Kind::Memory;
             return aout;
         }
         aout.kind = AbiPassing::Kind::InRegisters;
@@ -215,10 +269,34 @@ classifyAggregate(AggregateClassKind strategy, std::uint16_t maxRegBytes,
 
     // SysVEightbyte (the only other implemented strategy).
     AbiPassing out;
+    // ★ P69 (lane `cs`, fold f26c2 — review-csf26c F3): COMPLEX_X87, psABI 3.2.3's class of the bare complex type
+    // whose element is the x87 `long double`. Asked BEFORE the size rule below, which answered MEMORY for its 32
+    // bytes in both positions: "If the class is COMPLEX_X87, the real part of the value is returned in %st0 and
+    // the imaginary part in %st1" -- so a RESULT is the two x87 values (X87, two pieces, %st0 first), and an
+    // ARGUMENT is MEMORY ("If the class is X87, X87UP or COMPLEX_X87, it is passed in memory"). The class is the
+    // TYPE's: an aggregate holding one is classed by its eightbytes, and at 32 bytes is MEMORY by size below.
+    // ✔MEASURED 2026-11-05 (probe cx, -O1 and -O0 asm): gcc 13.3.0 and clang 18.1.3 on Linux and Apple clang
+    // 21.0.0 for x86_64 return it in %st0 (real) / %st1 (imaginary), with no hidden pointer, pass it as 32 bytes on
+    // the stack (16-aligned), read it through `...` from the overflow area, and return a struct holding one through
+    // the hidden pointer.
+    if (in.kind(aggTy) == TypeKind::Complex && in.kind(in.complexElement(aggTy)) == TypeKind::F80) {
+        if (position == AggregatePosition::Argument) {
+            out.kind = AbiPassing::Kind::Memory;
+            return out;
+        }
+        auto const elemLay = computeLayout(in.complexElement(aggTy), in, lp, dm);
+        if (!elemLay.has_value() || elemLay->size == 0) return std::nullopt;   // un-sizeable → fail loud
+        auto const w = static_cast<std::uint32_t>(elemLay->size);
+        out.kind = AbiPassing::Kind::X87;
+        out.pieces.push_back(AbiPiece{AbiPieceClass::Fpr, 0, w});               // the real part, %st0
+        out.pieces.push_back(AbiPiece{AbiPieceClass::Fpr, elemLay->size, w});   // the imaginary part, %st1
+        return out;
+    }
     // SysV §3.2.3: an aggregate larger than two eightbytes (> maxRegBytes) — or
-    // empty — goes in MEMORY (by reference for args; sret for returns).
+    // empty — goes in MEMORY (an argument by the convention's carrier — its bytes on
+    // the stack under SysV; a result through sret).
     if (size == 0 || size > maxRegBytes) {
-        out.kind = AbiPassing::Kind::ByReference;
+        out.kind = AbiPassing::Kind::Memory;
         return out;
     }
 
@@ -226,16 +304,85 @@ classifyAggregate(AggregateClassKind strategy, std::uint16_t maxRegBytes,
     if (!collectLeaves(aggTy, 0, in, lp, dm, leaves))
         return std::nullopt;
     // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): a long-double (F80|F128) leaf
-    // forces the SysV x87 MEMORY class → the WHOLE aggregate goes BY REFERENCE
-    // (X87/X87UP → MEMORY regardless of size). This is the same hidden-pointer
-    // pass path a >16B aggregate already takes (inheriting D-FC7's sret /
-    // by-ref-arg realization — §2.6-1, pre-existing), NOT the SSE/INTEGER
+    // forces the SysV x87 MEMORY class → the WHOLE aggregate goes to MEMORY
+    // (X87/X87UP → MEMORY regardless of size, except a RESULT of class X87, below).
+    // This is the same memory path a >16B aggregate takes (an argument's bytes on
+    // the stack, a result through sret), NOT the SSE/INTEGER
     // eightbyte merge below (which would silently 2-GPR-pass or XMM-pass a
     // 16-byte x87 value). Win64BySize needs NO arm: its formats declare the f64
     // axis (long double ≡ F64, so no F80/F128 leaf can form) and its by-size
-    // rule sends any 16-byte aggregate ByReference anyway.
+    // rule sends any 16-byte aggregate to memory anyway.
+    // ★ P69 (lane `cs`, fold f26c — D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET):
+    // an aggregate whose ONLY content is one x87 value — every leaf an
+    // F80 at offset 0 (`struct { long double x; }`, a one-element array of it, a union of two),
+    // so its two eightbytes are X87 and X87UP — is RETURNED in the x87 register (psABI 3.2.3,
+    // "If the class is X87, the value is returned on the X87 stack in %st0"), where a merge with
+    // any other leaf is MEMORY; it is PASSED in memory either way. ✔MEASURED 2026-10-07 (lane
+    // `lm`'s two-unit witness, linux-x86_64-debug run 20261008-015420-b7a36825): gcc 13.3.0 and
+    // clang 18.1.3 leave `struct { long double x; }` on the x87 stack, and a DSS caller of theirs
+    // read a wrong value through the hidden pointer this arm used to answer.
+    // ★ P69 (lane `cs`, fold f26c, main's ledger 454): AND EVERY OTHER x87-BEARING AGGREGATE IS CLASSED BY psABI's
+    // MERGE, eightbyte by eightbyte, where this arm answered MEMORY whenever such a leaf was present. The x87
+    // value's eightbytes are X87 and X87UP; another leaf's are INTEGER or SSE; the merge (`mergeEightbyte`) takes
+    // INTEGER over the x87 halves and MEMORY for an x87 half beside SSE; then the post-merger cleanup: any MEMORY
+    // makes the whole MEMORY; X87 then X87UP is the x87 value alone (returned in st0, passed in memory); an X87UP
+    // not preceded by X87 is the convention's (`AggregateConventionRules::x87UpWithoutX87`: MEMORY by psABI 0.98,
+    // SSE on Apple's x86_64). ✔MEASURED 2026-11-03 (probe su, -O1 asm, each union as a result and as an argument
+    // followed by a long): gcc 13.3.0 and clang 18.1.3 on Linux pass and return `union { long double; int / long /
+    // void * }` in memory (the hidden pointer; the stack, the long in %rdi), Apple clang 21.0.0 for x86_64 in %rax
+    // or %rdi and %xmm0 (the long in %rsi); the double and float unions and `double[2]` in memory on all three;
+    // `long[2]` in two integer registers on all three (%rax:%rdx; %rdi:%rsi) -- where this arm answered MEMORY.
+    // A binary128 (F128) leaf keeps the MEMORY answer it had (no x86_64 shape of it is measured here).
     if (hasLongDoubleClassLeaf(leaves)) {
-        out.kind = AbiPassing::Kind::ByReference;
+        bool const binary128 = std::any_of(leaves.begin(), leaves.end(), [](LeafField const& f) {
+            return f.kind == TypeKind::F128;
+        });
+        std::size_t const n = static_cast<std::size_t>((size + 7) / 8);   // 1 or 2
+        std::vector<EightbyteClass> cls(n, EightbyteClass::NoClass);
+        for (LeafField const& f : leaves) {
+            std::size_t const e = static_cast<std::size_t>(f.offset / 8);
+            if (f.kind == TypeKind::F80) {
+                if (e < n) cls[e] = mergeEightbyte(cls[e], EightbyteClass::X87);
+                if (e + 1 < n) cls[e + 1] = mergeEightbyte(cls[e + 1], EightbyteClass::X87Up);
+                continue;
+            }
+            std::uint64_t fsz = f.byteSize;
+            if (fsz == 0) fsz = 1;   // as the INTEGER/SSE loop below
+            for (std::size_t k = e; k <= static_cast<std::size_t>((f.offset + fsz - 1) / 8) && k < n; ++k)
+                cls[k] = mergeEightbyte(cls[k], isFloatKind(f.kind) ? EightbyteClass::Sse
+                                                                    : EightbyteClass::Integer);
+        }
+        bool memory = binary128
+            || std::find(cls.begin(), cls.end(), EightbyteClass::Memory) != cls.end();
+        if (!memory && n == 2 && cls[0] == EightbyteClass::X87 && cls[1] == EightbyteClass::X87Up) {
+            if (position == AggregatePosition::Result) {
+                // One x87 value, at offset 0, in %st0 (f26c2: an X87 result states its pieces, as COMPLEX_X87's).
+                out.kind = AbiPassing::Kind::X87;
+                out.pieces.push_back(AbiPiece{AbiPieceClass::Fpr, 0, static_cast<std::uint32_t>(size)});
+            } else {
+                out.kind = AbiPassing::Kind::Memory;
+            }
+            return out;
+        }
+        for (std::size_t e = 0; e < n && !memory; ++e) {
+            if (cls[e] == EightbyteClass::X87Up && (e == 0 || cls[e - 1] != EightbyteClass::X87)) {
+                if (rules.x87UpWithoutX87 == X87UpWithoutX87::Memory) memory = true;
+                else cls[e] = EightbyteClass::Sse;
+            } else if (cls[e] == EightbyteClass::X87 || cls[e] == EightbyteClass::X87Up) {
+                memory = true;   // an x87 half the pair above did not account for
+            }
+        }
+        if (memory) {
+            out.kind = AbiPassing::Kind::Memory;
+            return out;
+        }
+        out.kind = AbiPassing::Kind::InRegisters;
+        for (std::size_t e = 0; e < n; ++e) {
+            std::uint64_t const eoff = e * 8;
+            out.pieces.push_back(AbiPiece{
+                cls[e] == EightbyteClass::Integer ? AbiPieceClass::Gpr : AbiPieceClass::Fpr, eoff,
+                static_cast<std::uint32_t>(std::min<std::uint64_t>(8, size - eoff))});
+        }
         return out;
     }
 

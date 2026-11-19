@@ -1,5 +1,5 @@
 #include "link/entry_trampoline.hpp"
-#include "link/fresh_symbol_ids.hpp"   // maxExistingSymbolIdV — shared with linker.cpp
+#include "link/fresh_symbol_ids.hpp"   // ModuleSymbolIds — the module's one door of a fresh id
 #include "link/static_init_tables.hpp"
 
 #include "core/types/config_key_vocabulary.hpp"  // renderAllowedList — the ONE closed-set renderer
@@ -24,21 +24,14 @@ namespace dss::linker {
 
 namespace {
 
-// ⓘ `maxExistingSymbolIdV` USED TO LIVE HERE and is now
-// `link/fresh_symbol_ids.hpp`, unchanged in behaviour. It gained a SECOND
-// caller — the object-carried data-import slot mint
-// (D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET) — and the
-// scan has already been widened twice by a collision that reached a walker
-// (dataItems, then blockSymbols), so a copy would have inherited the old rule
-// and failed the same way from the other pass. The two widenings and the
-// sequential-mint caller contract are recorded in full at the new home.
+// ⓘ The taken-id scan USED TO LIVE HERE. Every link-tier mint now comes
+// through the module's door (`link/fresh_symbol_ids.hpp`), whose scan reads
+// every holder the types declare; its history is recorded there.
 
-// Resolve user-entry SymbolId from the format's `entryPoint` field.
-// Empty entryPoint defaults to `functions[0]` (cycle-2 convention
-// shared by all 3 walkers — see pe.cpp / elf.cpp / macho.cpp's
-// entry-resolution path). MUST be called BEFORE the trampoline is
-// prepended; reading `functions[0]` AFTER prepend would
-// self-reference the trampoline.
+// Resolve the user-entry SymbolId: the ELECTED entry the module states
+// (`userEntrySymbol`), else the format's `entryPoint` field. A module that
+// states neither has NO entry -- never its first or only function. MUST be
+// called BEFORE the trampoline is prepended.
 //
 // D-LK10-ENTRY-EXTERN-ENTRY-DIAG: the two failure modes (no match
 // at all vs. match resolves to an ExternImport) are semantically
@@ -51,6 +44,7 @@ enum class EntryResolutionStatus : std::uint8_t {
     Found,             // entry resolved to a defined AssembledFunction
     NotFound,          // entryName matched neither a function nor an extern
     ResolvedToExtern,  // entryName matched an ExternImport (invalid)
+    NotElected,        // the module states no entry and the format names none
 };
 
 struct EntryResolution {
@@ -72,7 +66,8 @@ struct EntryResolution {
     // use it. Pre-fix, multi-function modules whose entry wasn't
     // declared first in source order silently called the wrong
     // function (the first-declared one was picked as `functions[0]`
-    // via the empty-entryPoint fallback below).
+    // by a fallback for an empty entryPoint, which P69 fold 3e deleted:
+    // a module that states no entry has none, below).
     if (module.userEntrySymbol.has_value()) {
         SymbolId const want = *module.userEntrySymbol;
         for (auto const& fn : module.functions) {
@@ -90,25 +85,17 @@ struct EntryResolution {
     }
     auto const entryName = std::string{format.entryPoint()};
     if (entryName.empty()) {
-        // Silent-failure HIGH #3 + code-architect Q5 post-fold
-        // (2026-06-03): the `functions[0]` fallback is silently
-        // wrong-direction for multi-function modules whose entry
-        // isn't declared first in source order. The corpus expansion
-        // surfaced this via `int helper(int x){return x;}; int
-        // main(){return helper(42);}` returning 0 (the trampoline
-        // called helper). Single-function modules are unambiguous
-        // — keep the silent fallback there (the lone function IS
-        // the entry by construction). Multi-function modules
-        // without an explicit userEntrySymbol or format.entryPoint
-        // are a SUBSTRATE BUG: the compile pipeline failed to
-        // stamp userEntrySymbol, OR the language config didn't
-        // declare its entry-function name. Fail-loud rather than
-        // silently invoke the first-declared function.
-        if (module.functions.size() > 1) {
-            return {EntryResolutionStatus::NotFound, SymbolId{}};
-        }
-        return {EntryResolutionStatus::Found,
-                module.functions[0].symbol};
+        // ★ P69 fold 3e (D-PROGRAM-AN-OBJECTS-ENTRY-IS-CALLED-WITHOUT-ITS-ARGUMENTS,
+        // the review of fold 3d): NO ENTRY WAS ELECTED, AND NOTHING HERE ELECTS
+        // ONE. A lone function used to be taken for the entry "by construction"
+        // -- and the construction was false: a link of objects with no
+        // `--language` elected nothing and the trampoline called the one function
+        // the NAMED object held, while the entry sat in an archive member.
+        // ✔MEASURED (lane `xa`, cd349db1's bytes): that pe64 image exited
+        // 298975272, where every reference links the member's `main` (42). The
+        // program's entry is the election's (`resolveProgramEntry`), stated on
+        // the module that holds it; a module that states none has none.
+        return {EntryResolutionStatus::NotElected, SymbolId{}};
     }
     // Walker-side synthesized name convention: `sym_<id>` on
     // ELF/PE; `_sym_<id>` on Mach-O. Match either form (real-name
@@ -213,6 +200,42 @@ constexpr std::size_t kStackVectorLoadedArgs = 2;
     return n;
 }
 
+// ── THE /GS SECURITY COOKIE IS SEEDED BEFORE ANY OTHER CODE RUNS ────────────
+//
+// The routine the image's document names (`compilerSupport.
+// securityCookieInitializer`), when the linked program DEFINES it: the symbol
+// the trampoline calls first, or none. Every reference C runtime calls it before
+// any initializer and before the entry. MSVC's and mingw-w64's startups both do,
+// whether or not an object was compiled /GS. Without the call, a guarded frame
+// compares against the value the runtime's object ships, which an attacker knows
+// and which protects nothing.
+//
+// ★ "DEFINES" IS "USES" HERE, AND THAT IS A FACT OF THE RUNTIME'S LAYOUT. The
+// compiler-support runtime is linked as archives, so a member is linked only
+// when something names it. The cookie and its initializer are defined by ONE
+// member, and the member holding `__security_check_cookie` names the cookie. So
+// an image that reads the cookie, directly or through the checker, links the
+// initializer too. An image that names none of them links neither and calls
+// nothing. A definition of the name in the program's own units is the one the
+// call binds to, as a reference startup's call binds to it.
+//
+// A FILE-LOCAL row of the name is not the routine: a `static` function of that
+// name in some unit is that unit's own, as it is to a reference linker.
+[[nodiscard]] std::optional<SymbolId> securityCookieInitializerOf(
+        AssembledModule const&    module,
+        ObjectFormatSchema const& format) {
+    auto const& support = format.compilerSupport();
+    if (!support.has_value()) return std::nullopt;
+    std::string const& name = support->securityCookieInitializerMangledName;
+    for (auto const& row : module.symbols) {
+        if (row.binding == SymbolBinding::Local || row.name != name) continue;
+        for (auto const& fn : module.functions) {
+            if (fn.symbol.v == row.symbol.v) return fn.symbol;
+        }
+    }
+    return std::nullopt;
+}
+
 } // namespace
 
 bool injectEntryTrampoline(AssembledModule&          module,
@@ -284,13 +307,52 @@ bool injectEntryTrampoline(AssembledModule&          module,
         return false;
     }
 
+    // ★★ WHERE THE STACK STANDS AT THE ENTRY'S FIRST INSTRUCTION
+    // (D-LK-PROCESS-ENTRY-BIAS-TAKEN-FROM-THE-CALLING-CONVENTION).
+    // DERIVED from two facts with one owner each: how the platform's
+    // loader enters the image (the FORMAT's `entryTransition`) and what a
+    // call does to the stack pointer (the convention's `callPushBytes`, an
+    // ISA fact). A loader that CALLS the entry has pushed a return
+    // address, so the stack is `callPushBytes` past the alignment
+    // quantum, exactly as at any function's entry; one that JUMPS has
+    // pushed nothing.
+    // ⚠ THIS USED TO BE THE CONVENTION'S OWN `entryStackPointerBias`, and
+    // that put a fact of the ENTRY MECHANISM on the wrong owner: one
+    // convention, `sysv_amd64`, serves ELF — whose kernel / ld.so JUMPS
+    // to the entry — and Mach-O, whose dyld CALLS LC_MAIN's entry. Its 0
+    // was right for ELF and wrong for Mach-O x86_64, where every DSS frame
+    // then ran 8 bytes off the 16-byte alignment: ✔MEASURED P69, a DSS
+    // frame's 16-aligned local at 8 mod 16, and libSystem's va_arg reading
+    // a DSS caller's stacked long double 8 bytes off ("0.00" for 7.75L) —
+    // silent under Rosetta, which does not fault an unaligned `movaps`.
+    // ✔MEASURED, every exec format, with the reference toolchains (a C
+    // function made the entry point, its 16-aligned locals' address mod
+    // 16): ELF x86_64 jumped; Mach-O x86_64 and pe64 called; arm64 cannot
+    // tell (BL pushes nothing — `callPushBytes` 0 — so the bias is 0
+    // either way).
+    auto const transition = format.entryTransition();
+    if (!transition.has_value()) {
+        // D-LK-PROCESS-ENTRY-BIAS-TAKEN-FROM-THE-CALLING-CONVENTION: no default.
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("entry-trampoline: format '{}' declares "
+                         "processExit but no `entryTransition` — the "
+                         "trampoline cannot place its first call without "
+                         "knowing whether the loader CALLED the entry or "
+                         "JUMPED to it; declare `\"called\"` or `\"jumped\"`, "
+                         "as measured on the platform.",
+                         std::string{format.name()}));
+        return false;
+    }
+    std::uint32_t const entryBias =
+        *transition == EntryTransition::Called ? std::uint32_t{cc->callPushBytes} : 0u;
+
     // Look up all needed opcodes from the target schema (Slice A
     // ships `syscall`, `call_indirect_via_extern`, and the existing
     // `call` / `mov` / `unreachable` opcodes). `sub` is required
     // ONLY when alignedSizeWithBias(cc.shadowSpaceBytes,
-    // cc.stackAlignment, cc.entryStackPointerBias) > 0 — i.e. when
-    // the entry cc declares shadow space OR a non-zero process-
-    // entry RSP bias (closes D-LK10-ENTRY-TRAMP-PROLOGUE).
+    // cc.stackAlignment, entryBias) > 0 — i.e. when the entry cc
+    // declares shadow space OR the process entry leaves the stack off
+    // the quantum (closes D-LK10-ENTRY-TRAMP-PROLOGUE).
     auto const callOp     = target.opcodeByMnemonic("call");
     auto const movOp      = target.opcodeByMnemonic("mov");
     auto const unreachOp  = target.opcodeByMnemonic("unreachable");
@@ -345,6 +407,18 @@ bool injectEntryTrampoline(AssembledModule&          module,
                              std::string{format.name()},
                              std::string{format.entryPoint()}));
             return false;
+        case EntryResolutionStatus::NotElected:
+            emit(reporter, DiagnosticCode::K_ProgramEntryUndefined,
+                 std::format("entry-trampoline: no program entry was elected "
+                             "for this image of format '{}' -- the linked "
+                             "module states no entry function and the format "
+                             "names none, so the startup has nothing to call. "
+                             "The entry is the one function the build's "
+                             "election chose among every input's entry "
+                             "names; a module's only function is never taken "
+                             "for it.",
+                             std::string{format.name()}));
+            return false;
     }
     SymbolId const userEntrySym = entryRes.symbol;
 
@@ -362,37 +436,21 @@ bool injectEntryTrampoline(AssembledModule&          module,
         return false;
     }
 
-    // Mint trampoline + (ByNameImport) synthetic-extern SymbolIds
-    // SEQUENTIALLY (maxV+1, maxV+2, ...). Calling the mint helper
-    // twice without intermediate module mutation produces a
-    // collision (max() of unchanged input is the same — first bug
-    // caught at Slice C build).
-    //
-    // SymbolId space-exhaustion guard (3-agent convergence:
-    // silent-failure + test-analyzer + dim-2 at the Slice C audit
-    // fold). `maxV+1` / `maxV+2` are uint32 — at UINT32_MAX they
-    // wrap silently to 0/1 (the InvalidSymbol sentinel + low-ID
-    // user fns), silently colliding with declared symbols. The
-    // BOTH-defined-AND-ExternImport guard — `buildCompoundIndex`'s
-    // duplicate-compound-key `declare()` gate in `linker.cpp` — would
-    // catch the ByNameImport arm but the pure Syscall arm has no
-    // cross-table check. Fail loud HERE before the wrap can
-    // corrupt the module.
-    std::uint32_t const maxV = maxExistingSymbolIdV(module);
-    std::uint32_t const needed =
-        (pe.mechanism == ExitMechanism::ByNameImport) ? 2u : 1u;
-    if (maxV > std::numeric_limits<std::uint32_t>::max() - needed) {
-        emit(reporter, DiagnosticCode::K_SymbolUndefined,
-             std::format("entry-trampoline: SymbolId space exhausted "
-                         "— module's max SymbolId is {} + {} fresh "
-                         "IDs would wrap uint32. Reduce module size "
-                         "OR reset CU SymbolId allocator.",
-                         maxV, needed));
-        return false;
-    }
-    SymbolId const trampSym{maxV + 1};
+    // The trampoline's id and, on the ByNameImport exit, the synthetic
+    // extern's come from the module's door (`link/fresh_symbol_ids.hpp`),
+    // BOTH AT ONCE before the module is touched: each is past every id the
+    // module holds or a door handed out, and a space too short for them is
+    // refused there by name with nothing written -- never a wrap onto 0
+    // (the invalid id) or onto a declared symbol's id, which the pure
+    // Syscall arm has no cross-table check to catch.
+    bool const exitsByImport = pe.mechanism == ExitMechanism::ByNameImport;
+    std::size_t const ids = exitsByImport ? 2u : 1u;   // the trampoline, and its process-exit import
+    std::optional<std::vector<SymbolId>> const taken = ModuleSymbolIds{module}.take(
+        ids, reporter, std::format("entry-trampoline: the {} id(s) of the trampoline and its exit", ids));
+    if (!taken.has_value()) return false;
+    SymbolId const trampSym = (*taken)[0];
     SymbolId exitImportSym{0};
-    if (pe.mechanism == ExitMechanism::ByNameImport) {
+    if (exitsByImport) {
         // Append the synthetic ExternImport so the PE walker's IAT
         // writer (LK6 cycle 2a) emits the IAT slot. The reloc-apply
         // kernel populates `symbolVa[exitImportSym]` from the IAT
@@ -400,7 +458,7 @@ bool injectEntryTrampoline(AssembledModule&          module,
         // `call_indirect_via_extern` patches that VA into its
         // disp32 patch site via the REL32 reloc.
         ExternImport synth;
-        synth.symbol      = SymbolId{maxV + 2};
+        synth.symbol      = (*taken)[1];
         synth.mangledName = pe.importMangledName;
         synth.libraryPath = pe.importLibraryPath;
         exitImportSym     = synth.symbol;
@@ -535,14 +593,16 @@ bool injectEntryTrampoline(AssembledModule&          module,
     //    smallest frame-size adjust satisfying BOTH (a) the cc's
     //    shadow-space requirement and (b) the cc's stack-alignment
     //    at the call sites about to follow, given the process-entry
-    //    RSP bias the kernel/loader provides. Algorithm lives ONCE
-    //    in `alignedSizeWithBias()` (lir_callconv.hpp) so ML7 and
+    //    stack bias DERIVED above (`entryBias`: the format's
+    //    `entryTransition` × the cc's `callPushBytes`). Algorithm lives
+    //    ONCE in `alignedSizeWithBias()` (lir_callconv.hpp) so ML7 and
     //    the trampoline share one source of truth — see header
     //    docblock for the consumers + reasoning.
     //
     //    Result is non-zero only when shadowSpaceBytes != 0 OR the
-    //    process-entry RSP is misaligned for the cc (Windows PE:
-    //    32+8=40; SysV ELF / Mach-O / ARM64: 0).
+    //    process entry leaves the stack off the quantum: pe64 32
+    //    shadow + called 8 = 40; Mach-O x86_64 called 8 = 8; ELF x86_64
+    //    (jumped) and every arm64 (BL pushes nothing) 0.
     //
     //    No restoration is emitted — the exit mechanism never
     //    returns (the trampoline ends in `unreachable` / `ud2`).
@@ -552,7 +612,7 @@ bool injectEntryTrampoline(AssembledModule&          module,
     std::uint32_t const adjustBytes = alignedSizeWithBias(
         cc->shadowSpaceBytes,
         cc->stackAlignment,
-        cc->entryStackPointerBias);
+        entryBias);
     if (adjustBytes > 0) {
         if (!cc->stackPointer.has_value()) {
             emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
@@ -619,6 +679,10 @@ bool injectEntryTrampoline(AssembledModule&          module,
     auto const afterEntry =
         runsSchedule ? staticInitOrder(module, StaticInitPhase::AfterEntry)
                      : std::vector<StaticInitOrderEntry>{};
+    // The cookie's seeding is no static initializer. No loader runs it, so the
+    // trampoline calls it whichever runner the format declares.
+    auto const cookieInitializer = securityCookieInitializerOf(module, format);
+    bool const callsBeforeEntry  = cookieInitializer.has_value() || !beforeEntry.empty();
 
     // The convention's own callee-saved GENERAL-PURPOSE registers, handed out in
     // declaration order. Every value the trampoline must carry ACROSS a call goes
@@ -659,7 +723,7 @@ bool injectEntryTrampoline(AssembledModule&          module,
     // count cannot be the one the entry is called with, so it is refused rather
     // than parked partially.
     std::vector<std::pair<LirReg, LirReg>> parkedArgs;   // (saved, original)
-    if (!beforeEntry.empty()) {
+    if (callsBeforeEntry) {
         std::size_t const nArgs = liveEntryArgumentCount(format);
         if (nArgs > cc->argGprs.size()) {
             // Anchored: D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE.
@@ -709,10 +773,17 @@ bool injectEntryTrampoline(AssembledModule&          module,
         }
     }
 
-    // 0. call each before-entry initializer, in schedule order. Emitted AFTER the
-    //    ABI prologue above — these are ordinary calls and need the shadow space
-    //    and the alignment bias the prologue established, exactly as the user
-    //    entry does.
+    // 0. seed the /GS security cookie, FIRST: an initializer may hold a guarded
+    //    frame of its own (`securityCookieInitializerOf`).
+    if (cookieInitializer.has_value()) {
+        LirOperand const cookieOps[] = { LirOperand::makeSymbolRef(cookieInitializer->v) };
+        (void)b.addInst(*callOp, InvalidLirReg, cookieOps);
+    }
+
+    //    Then call each before-entry initializer, in schedule order. Emitted AFTER
+    //    the ABI prologue above — these are ordinary calls and need the shadow
+    //    space and the alignment bias the prologue established, exactly as the
+    //    user entry does.
     for (auto const& e : beforeEntry) {
         LirOperand const ctorOps[] = { LirOperand::makeSymbolRef(e.symbol.v) };
         (void)b.addInst(*callOp, InvalidLirReg, ctorOps);

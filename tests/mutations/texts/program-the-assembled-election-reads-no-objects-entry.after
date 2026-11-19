@@ -1,0 +1,2 @@
+        for (ForeignEntryCandidate const& c : unitEntries) cands.push_back(c.candidate);
+        (void)objectEntries;

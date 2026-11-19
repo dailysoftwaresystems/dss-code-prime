@@ -1,0 +1,1 @@
+    return (si.dwFlags & STARTF_USESHOWWINDOW) != 0 ? (int)si.wShowWindow : SW_SHOWDEFAULT;

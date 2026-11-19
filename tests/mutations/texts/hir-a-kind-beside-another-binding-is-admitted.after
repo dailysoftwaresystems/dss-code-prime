@@ -1,0 +1,2 @@
+        if (false && attr.binding != SymbolBinding::Weak
+            && attr.weakKind != WeakDefinitionKind{}) {

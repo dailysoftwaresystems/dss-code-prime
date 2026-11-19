@@ -1,0 +1,1 @@
+        if (!asked.has_value() || !lay.has_value() || *asked <= lay->align.bytes()) {

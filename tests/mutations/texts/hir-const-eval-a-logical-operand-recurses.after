@@ -1,0 +1,5 @@
+        case CstFoldFrame::Kind::Logical:
+            if (f.phase == 0) {
+                f.phase = 1;
+                NodeId const lhsN = f.child;
+                result = evalImpl(lhsN, ctx, env, options, scope, visitedInitNodes);

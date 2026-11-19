@@ -1,0 +1,3 @@
+    if (!id.has_value()) return false;
+    ExternImport required;
+    required.symbol              = *id;

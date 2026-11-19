@@ -1,0 +1,3 @@
+      "sequence": [ "identDeclHead", "declAttrRun" ],
+      "commitRequiresTypeName": { "rule": "identDeclHead", "polarity": "requireKnownType" },
+      "followedByFirstOf": "emptyStmt"

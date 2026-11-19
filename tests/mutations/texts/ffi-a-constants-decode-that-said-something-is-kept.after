@@ -1,0 +1,2 @@
+    (void)saidBefore;   // the arm: kept whatever the decode said
+    if (key.has_value() && !reads.failed) {

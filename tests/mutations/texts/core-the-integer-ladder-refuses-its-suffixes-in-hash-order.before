@@ -1,0 +1,2 @@
+                        for (auto const* integerClaim : substrate::entriesInKeyOrder(claims)) {
+                            auto const& [sfx, count] = *integerClaim;

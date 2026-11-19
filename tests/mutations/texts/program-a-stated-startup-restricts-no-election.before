@@ -1,0 +1,2 @@
+    std::erase_if(scope.verbs, outside);
+    for (auto& group : scope.precedence) std::erase_if(group, outside);

@@ -1552,20 +1552,23 @@ TEST(DependencyResolverAbsorption, SharedLibraryPropagatesPastAStaticArchive) {
               renderManifest({.profile = "lib",
                               .targets = {std::string{kElfX64Exec}},
                               .sources = {"s.c"}}));
-    // ⓘ THE ARCHIVE MEMBER DELIBERATELY MAKES NO EXTERN CALL, and the reason is
-    // a defect OUTSIDE this subject rather than a weakening of it. ✔MEASURED on
-    // the plain CLI path with no `dependsOn` anywhere — build a `staticlib`
-    // whose member calls an extern, then `--resolve-library` it into an
-    // `…-linux-exec` link — the read fails with
-    // `F_CorruptedBinary: relocation type 4 in '.rela.text' is not declared by
-    // ELF format 'elf64-x86_64-linux-exec'`: the staticlib format emits
-    // `pltNativeId` 4 (R_X86_64_PLT32) for a call to an undefined extern, and
-    // the exec format declares no row that maps type 4 back. Reported for its
-    // own anchor. What U-8 is about is which artifacts REACH which build, and
-    // that is exercised in full below — by the ROOT calling the transitive
-    // shared library's symbol, so a propagation failure is an undefined symbol
-    // rather than a map that merely looks wrong.
-    writeText(arch / "a.c", "int dep_answer(void){ return 7; }\n");
+    // ⓘ THE ARCHIVE MEMBER CALLS THE TRANSITIVE SHARED LIBRARY'S SYMBOL ITSELF,
+    // which is U-8's own case: the reference that sits two hops from its
+    // definition is the MEMBER's. ✔MEASURED once on the plain CLI path, a member
+    // that called an extern could not be read into an `…-linux-exec` link
+    // (`F_CorruptedBinary: relocation type 4 in '.rela.text' is not declared by
+    // ELF format 'elf64-x86_64-linux-exec'`: the member's R_X86_64_PLT32 was read
+    // through the IMAGE document), so this member made no extern call and only
+    // the root called `shared_answer`. Both causes are gone: the member is read
+    // through the document that WROTE it since P22
+    // (D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-THE-OBJECT-FORMAT), and
+    // since P69 every ELF x86_64 document declares the CALL row (`rel32` =
+    // R_X86_64_PLT32, `isCall`). The root still calls `shared_answer` too, so a
+    // propagation failure is an undefined symbol from either reference rather
+    // than a map that merely looks wrong.
+    writeText(arch / "a.c",
+              "extern int shared_answer(void);\n"
+              "int dep_answer(void){ return 4 + shared_answer(); }\n");
     writeText(fs::path{manifestPathIn(arch)},
               renderManifest({.profile   = "staticlib",
                               .targets   = {std::string{kElfX64Exec}},
@@ -1627,13 +1630,14 @@ TEST(DependencyResolverAbsorption, StaticArchiveAbsorbsAStaticArchive) {
               renderManifest({.profile = "staticlib",
                               .targets = {std::string{kElfX64Exec}},
                               .sources = {"i.c"}}));
-    // No extern call from the archive member — see the ✔MEASURED note in the
-    // sibling pin above (the exec format cannot read the PLT32 the staticlib
-    // format emits for one; a pre-existing, AP6-independent defect). The ROOT
-    // calls BOTH symbols instead, so the fat-archive merge is what has to have
-    // carried `inner_answer` into `o.a`: if the inner archive were dropped
-    // rather than absorbed, this link fails with `K_SymbolUndefined`.
-    writeText(outer / "o.c", "int dep_answer(void){ return 7; }\n");
+    // The outer archive's member calls the inner archive's symbol (the sibling
+    // pin above says why a member's extern call is readable since P22 and P69),
+    // and the ROOT calls BOTH symbols too, so the fat-archive merge is what has
+    // to have carried `inner_answer` into `o.a`: if the inner archive were
+    // dropped rather than absorbed, this link fails with `K_SymbolUndefined`.
+    writeText(outer / "o.c",
+              "extern int inner_answer(void);\n"
+              "int dep_answer(void){ return 5 + inner_answer(); }\n");
     writeText(fs::path{manifestPathIn(outer)},
               renderManifest({.profile   = "staticlib",
                               .targets   = {std::string{kElfX64Exec}},

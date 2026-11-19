@@ -1,0 +1,3 @@
+            if (!resolved->declaredType.has_value()) {
+                return fail(ConstEvalFailure::NotAConstantExpression, expr);
+            }

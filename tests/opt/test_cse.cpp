@@ -99,6 +99,7 @@ TEST(Cse, CommutativeOperandsCanonicalized) {
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(entry);
@@ -129,6 +130,7 @@ TEST(Cse, NonCommutativeSubtractionNotMerged) {
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(entry);
@@ -518,6 +520,7 @@ TEST(Cse, RefusedLoadRebindIsRestoredNotErasedOnScopeExit) {
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const tArm  = mb.createBlock(StructCfMarker::IfThen);
@@ -831,6 +834,7 @@ TEST(Cse, LoadCsedAcrossDistinctPrimitiveStoreUnderStrictTBAA) {
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.setAliasingMode(MirAliasingMode::StrictTBAA);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
@@ -880,6 +884,7 @@ TEST(Cse, LoadNotCsedAcrossDistinctPrimitiveStoreUnderPermissive) {
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     // Explicit Permissive (not relying on default) so a future flip
     // of the default can't silently make this test vacuous.
     mb.setAliasingMode(MirAliasingMode::Permissive);
@@ -928,6 +933,7 @@ TEST(Cse, LoadCsedAcrossDistinctPrimitiveStoreUnderStrictTBAANoCharException) {
     TypeId const fnSig = interner.fnSig(params, charT, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.setAliasingMode(MirAliasingMode::StrictTBAA);
     mb.setCharTypesAliasAll(false);  // Rust-like / strict-typed DSL
     mb.addFunction(fnSig, SymbolId{100});
@@ -974,6 +980,7 @@ TEST(Cse, LoadNotCsedAcrossDistinctPrimitiveStoreUnderStrictTBAAWithCharExceptio
     TypeId const fnSig = interner.fnSig(params, charT, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.setAliasingMode(MirAliasingMode::StrictTBAA);
     mb.setCharTypesAliasAll(true);  // C/C++/ObjC default — explicit
     mb.addFunction(fnSig, SymbolId{100});
@@ -1007,6 +1014,7 @@ TEST(Cse, VolatileBinaryOpNotCsed) {
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(entry);
@@ -1043,6 +1051,7 @@ TEST(Cse, DominanceScopingDiamondNoCrossArmMerge) {
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const tArm  = mb.createBlock(StructCfMarker::IfThen);
@@ -1099,6 +1108,7 @@ TEST(Cse, DominanceScopingEntryDefAvailableInChild) {
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const tArm  = mb.createBlock(StructCfMarker::IfThen);
@@ -1153,6 +1163,7 @@ TEST(Cse, CrossBlockLoadCseDecidedPerFunctionInMultiFunctionModule) {
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     for (std::uint32_t fnIdx = 0; fnIdx < 2; ++fnIdx) {
         mb.addFunction(fnSig, SymbolId{100u + fnIdx});
         MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
@@ -1208,6 +1219,7 @@ TEST(Cse, MultiFunctionModuleEachCsedIndependently) {
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     for (std::uint32_t fnIdx = 0; fnIdx < 2; ++fnIdx) {
         mb.addFunction(fnSig, SymbolId{100u + fnIdx});
         MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
@@ -1243,6 +1255,7 @@ TEST(Cse, ResultTypeDiscriminatesKey) {
     TypeId const fnSig = interner.fnSig(params, i64, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(entry);
@@ -1277,6 +1290,7 @@ TEST(Cse, TransitiveChainResolves) {
     TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
 
     MirBuilder mb;
+    mb.stateArgCounting(MirArgCounting::PerClass);
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(entry);

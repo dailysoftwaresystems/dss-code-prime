@@ -1,0 +1,2 @@
+            if (!s.machineModeClausesJudged.contains(
+                    (static_cast<std::uint64_t>(tree.id().v) << 32) | cl.v) && cl.v == 0u) {

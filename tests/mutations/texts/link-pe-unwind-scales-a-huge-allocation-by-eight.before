@@ -1,0 +1,2 @@
+                                     {static_cast<std::uint16_t>(delta & 0xFFFF),
+                                      static_cast<std::uint16_t>((delta >> 16) & 0xFFFF)},

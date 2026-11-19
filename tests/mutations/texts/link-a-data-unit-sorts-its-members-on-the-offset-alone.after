@@ -1,0 +1,2 @@
+                      return dataItems[a].inputSection->offset
+                           < dataItems[b].inputSection->offset;

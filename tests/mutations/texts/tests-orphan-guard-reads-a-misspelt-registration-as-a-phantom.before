@@ -1,0 +1,1 @@
+            folded = [n for n in names if n.casefold() == part.casefold()]

@@ -1,0 +1,3 @@
+                if (mir.instOpcode(call) != MirOpcode::Call) continue;
+                auto const operands = mir.instOperands(call);
+                for (std::size_t k = 1; k < operands.size(); ++k) {

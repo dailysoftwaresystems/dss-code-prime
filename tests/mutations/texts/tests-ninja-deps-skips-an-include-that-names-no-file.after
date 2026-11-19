@@ -1,0 +1,1 @@
+        if not m or m.group(1) not in _INCLUDE_DIRECTIVES or not _HEADER_NAME.match(m.group(2)):

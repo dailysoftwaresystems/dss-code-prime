@@ -1,0 +1,1 @@
+Expected: (diagText(rep).find("'weak-external'")) != (std::string::npos)

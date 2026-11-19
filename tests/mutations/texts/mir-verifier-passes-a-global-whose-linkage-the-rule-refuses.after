@@ -1,0 +1,2 @@
+                             hasInitializer, mir_.globalIsThreadLocal(g));
+        if (true || defect.empty()) continue;

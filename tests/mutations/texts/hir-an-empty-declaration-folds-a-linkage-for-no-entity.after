@@ -1,0 +1,2 @@
+        (void)linkageFrom(linkagePrefixRoots(node, decl), decl, nullptr, {}, nullptr);
+        if (!isFn && declarators.empty()) {

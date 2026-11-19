@@ -1,0 +1,1 @@
+        out.push_back(TreeEntry{HostPath{text / fs::path{name}}, std::move(names), kind, kind, depth});

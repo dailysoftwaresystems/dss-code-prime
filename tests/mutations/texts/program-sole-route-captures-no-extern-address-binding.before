@@ -1,0 +1,2 @@
+        format.externAddrBinding(),
+        // TLS C1 (D-CSUBSET-THREAD-LOCAL): capture the format's thread-local

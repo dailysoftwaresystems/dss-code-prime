@@ -24,6 +24,8 @@
 //
 // Runs natively on the x86_64-Linux CI leg.
 
+#include <stdarg.h>
+
 struct Big { long a; long b; long c; };   // 24B -> MEMORY class
 
 long combine(int n, ...) {

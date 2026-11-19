@@ -58,6 +58,8 @@
 #include "link/format/macho_object_reader.hpp"
 #include "link/format/object_atom_coverage.hpp"
 #include "link/format/pe.hpp"
+#include "link/format/record_symbol_ids.hpp"
+#include "link/fresh_symbol_ids.hpp"   // maxExistingSymbolIdV -- the module's holders
 #include "link/object_format_schema.hpp"
 
 #include "link_test_support.hpp"
@@ -100,6 +102,25 @@ struct Loaded {
         out.format = std::move(f).value();
     }
     return out;
+}
+
+// The sink of a record table built by a test, which never exhausts one (test_fresh_symbol_ids.cpp pins the
+// refusals).
+[[nodiscard]] DiagnosticReporter& recordIdsSink() {
+    static DiagnosticReporter sink;
+    return sink;
+}
+
+// A record table a test reads, OPENED as a reader opens one (P69 f26e, B1); never refused here.
+[[nodiscard]] dss::link::format::RecordSymbolIds openRecordIds(std::size_t records) {
+    return dss::link::format::RecordSymbolIds::open(records, recordIdsSink(), "test::reader").value();
+}
+
+// What `referenceFor` answers for a record, its fresh id never refused here (test_fresh_symbol_ids.cpp pins the
+// refusals): the reference, or nullopt where the record keeps no name.
+template <class Refs>
+[[nodiscard]] auto referenceOf(Refs& refs, std::uint32_t record, dss::link::format::RecordSymbolIds& ids) {
+    return refs.referenceFor(record, ids).value();
 }
 
 [[nodiscard]] bool sawCode(DiagnosticReporter const& rep, DiagnosticCode code) {
@@ -256,7 +277,7 @@ std::vector<std::uint8_t> encodeElf(AssembledModule const& m, TargetSchema const
 }
 std::vector<std::uint8_t> encodePe(AssembledModule const& m, TargetSchema const& t,
                                    ObjectFormatSchema const& f, DiagnosticReporter& r) {
-    return pe::encode(m, t, f, r);
+    return pe::encode(m, t, f, r).value_or(std::vector<std::uint8_t>{});
 }
 std::vector<std::uint8_t> encodeMacho(AssembledModule const& m, TargetSchema const& t,
                                       ObjectFormatSchema const& f, DiagnosticReporter& r) {
@@ -410,7 +431,7 @@ TEST(ObjectAtomCoverage, CoffLocalFunctionIsItsOwnAtomWithInternalLinkage) {
 
     DiagnosticReporter wrep;
     auto obj = pe::encode(subjectModule(/*withLocalHelper=*/true), *loaded.target,
-                          *loaded.format, wrep);
+                          *loaded.format, wrep).value();
     ASSERT_EQ(wrep.errorCount(), 0u) << "the WRITER accepts this module -- the "
                                         "object is well formed; the reader was "
                                         "the half that could not represent it";
@@ -1162,4 +1183,384 @@ TEST(ObjectAtomCoverage, SharedAliasRuleRefusesEqualOffsetWithConflictingExtents
     DiagnosticReporter split;
     EXPECT_FALSE(resolveEqualOffsetAtomAliases(straddled, owner, "test::reader", split));
     EXPECT_EQ(split.errorCount(), 1u);
+}
+
+// ═══ THE WEAK-NAME RULE (`object_atom_coverage.hpp`) ═══════════════════════
+//
+// D-LK-WEAK-NAME-REFERENCE-BOUND-TO-THE-BODY-NOT-THE-NAME. The QUESTION on its
+// own, and the readers' half of the bookkeeping, in the neutral coordinates the
+// three readers and the merge ask it in. What the answer does to a link -- an
+// override reached, a common, an artifact's record, the bytes a unit's own
+// relocation stays on -- is pinned where links are made
+// (`test_common_symbols.cpp`, the `WeakNameReferences` suites).
+
+TEST(ObjectAtomCoverage, AReferenceThroughAWeakNameFollowsTheNameWhateverElseNamesTheBody) {
+    using namespace dss::link::format;
+
+    // THE QUESTION: for every WEAK name that has a spelling, and for no other.
+    EXPECT_TRUE(referenceFollowsTheName(SymbolBinding::Weak, "shared"));
+    EXPECT_FALSE(referenceFollowsTheName(SymbolBinding::Global, "other"))
+        << "a strong name can only ever denote its own body";
+    EXPECT_FALSE(referenceFollowsTheName(SymbolBinding::Local, "ltmp0")) << "a module-private name is no link name";
+    EXPECT_FALSE(referenceFollowsTheName(SymbolBinding::Weak, "")) << "no name recorded: nothing to keep";
+    static_assert(referenceFollowsTheName(SymbolBinding::Weak, "w"), "the question is a constant expression");
+
+    // ASKED OF AN OBJECT'S SYMBOLS, the answer never depends on what ELSE names
+    // the body. Until the review of cycle P69's first fold it did: a weak name
+    // kept its references only "beside another EXTERNAL name", so `alone` and
+    // `beside_local` below were bound to the body at read time -- and a
+    // relocation written through a static name of that body then had no way to
+    // mean the BYTES apart from the name (the measurements at THE WEAK-NAME RULE).
+    struct Named {
+        std::uint64_t offset;
+        std::uint32_t record;
+        char const*   name;
+        SymbolBinding binding;
+        bool          kept;
+    };
+    std::vector<Named> const names = {
+        {0, 1, "other", SymbolBinding::Global, false},        // a strong name is never the kept one
+        {0, 2, "shared", SymbolBinding::Weak, true},          // weak, beside a strong name
+        {16, 3, "alone", SymbolBinding::Weak, true},          // a body's ONLY name
+        {32, 4, "ltmp0", SymbolBinding::Local, false},        // a module-private name is never kept ...
+        {32, 5, "beside_local", SymbolBinding::Weak, true},   // ... and the weak name beside it is
+        {48, 6, "a", SymbolBinding::Weak, true},              // two weak names of one body:
+        {48, 7, "b", SymbolBinding::Weak, true},              // each keeps its own
+        {64, 8, "g1", SymbolBinding::Global, false},          // two strong names: neither is weak
+        {64, 9, "g2", SymbolBinding::Global, false},
+    };
+    for (bool const reversed : {false, true}) {
+        SCOPED_TRACE(reversed ? "staged in reverse" : "staged in order");
+        std::vector<AtomStartCandidate> c;
+        for (auto const& n : names) c.push_back(cand(1, n.offset, n.record, n.name, n.binding));
+        // The answer is a property of each symbol, never of the order the
+        // symbols were staged in.
+        if (reversed) std::reverse(c.begin(), c.end());
+        std::vector<std::uint32_t> owner;
+        DiagnosticReporter         rep;
+        ASSERT_TRUE(resolveEqualOffsetAtomAliases(c, owner, "test::reader", rep));
+        RecordSymbolIds    ids = openRecordIds(100);
+        WeakNameReferences refs;
+        refs.decideFrom(c, owner, ids);
+        for (auto const& n : names) {
+            EXPECT_EQ(referenceOf(refs, n.record, ids).has_value(), n.kept) << "'" << n.name << "'";
+        }
+
+        // THE ROWS SAY SO (`ModuleSymbol::referencedByName`). Filed as a reader
+        // files them -- every name of a body under the id of the symbol that
+        // owns it -- each row of a kept name is stated, and no other: not a
+        // strong or a module-private name of the same body, and not a weak row
+        // the class decided nothing for (a symbol that starts no atom, here
+        // `sizeless`), whose references it left where they were.
+        std::vector<ModuleSymbol> rows;
+        for (std::size_t i = 0; i < c.size(); ++i) {
+            rows.push_back(ModuleSymbol{ids.of(owner[i]), std::string{c[i].name}, c[i].binding,
+                                        SymbolVisibility::Default});
+        }
+        rows.push_back(ModuleSymbol{SymbolId{50}, "sizeless", SymbolBinding::Weak, SymbolVisibility::Default});
+        for (auto const& row : rows) ASSERT_FALSE(row.referencedByName) << "the PREMISE: a row is born unstated";
+        refs.stateOn(rows);
+        for (auto const& row : rows) {
+            bool kept = false;
+            for (auto const& n : names) kept = kept || (n.kept && row.name == n.name);
+            EXPECT_EQ(row.referencedByName, kept) << "the row '" << row.name << "'";
+        }
+    }
+
+    // A weak name with no spelling keeps nothing, and says nothing.
+    {
+        std::vector<AtomStartCandidate> const c = {cand(1, 0, 1, "", SymbolBinding::Weak),
+                                                   cand(1, 0, 2, "named", SymbolBinding::Global)};
+        std::vector<std::uint32_t> owner;
+        DiagnosticReporter         rep;
+        ASSERT_TRUE(resolveEqualOffsetAtomAliases(c, owner, "test::reader", rep));
+        RecordSymbolIds    ids = openRecordIds(100);
+        WeakNameReferences refs;
+        refs.decideFrom(c, owner, ids);
+        EXPECT_FALSE(referenceOf(refs, 1, ids).has_value());
+        EXPECT_FALSE(referenceOf(refs, 2, ids).has_value());
+    }
+
+    // An object with no symbol at all: nothing kept, and nothing to state.
+    {
+        RecordSymbolIds           ids = openRecordIds(0);
+        WeakNameReferences        refs;
+        std::vector<ModuleSymbol> rows;
+        refs.decideFrom({}, {}, ids);
+        refs.stateOn(rows);
+        EXPECT_FALSE(referenceOf(refs, 0, ids).has_value());
+        EXPECT_TRUE(rows.empty());
+    }
+}
+
+TEST(ObjectAtomCoverage, AKeptWeakNameGetsOneReferenceRowUnderAnIdNoBodyHolds) {
+    using namespace dss::link::format;
+
+    // `other` (strong, id 5) and `shared` (weak, id 9) name one body; `w1` and
+    // `w2` (both weak, ids 2 and 3) name another, which `w1` owns as the lower
+    // id; `lone` (weak, id 7) is a body's only name.
+    std::vector<AtomStartCandidate> const c = {
+        cand(1, 0, 5, "other", SymbolBinding::Global),
+        cand(1, 0, 9, "shared", SymbolBinding::Weak),
+        cand(1, 16, 2, "w1", SymbolBinding::Weak),
+        cand(1, 16, 3, "w2", SymbolBinding::Weak),
+        cand(1, 32, 7, "lone", SymbolBinding::Weak),
+    };
+    std::vector<std::uint32_t> owner;
+    DiagnosticReporter         rep;
+    ASSERT_TRUE(resolveEqualOffsetAtomAliases(c, owner, "test::reader", rep));
+    ASSERT_EQ(owner, (std::vector<std::uint32_t>{5u, 5u, 2u, 2u, 7u}));
+
+    // A table of 100 records, none of these the first: each one's id is its
+    // index, and the ids no record holds start at 101 (`RecordSymbolIds`).
+    RecordSymbolIds    ids = openRecordIds(100);
+    WeakNameReferences refs;
+    refs.decideFrom(c, owner, ids);
+    // The next id `ids` would hand out, read off a copy so the counter stays put.
+    auto const nextFresh = [&ids] {
+        RecordSymbolIds peek = ids;
+        return peek.fresh();
+    };
+    EXPECT_FALSE(referenceOf(refs, 5, ids).has_value()) << "a strong name keeps the alias remap";
+    EXPECT_FALSE(referenceOf(refs, 44, ids).has_value()) << "a symbol that starts no atom";
+
+    // A weak name the alias rule took the atom FROM: its own id is free, so the
+    // row takes it, and the counter of fresh ids does not move.
+    auto const shared = referenceOf(refs, 9, ids);
+    ASSERT_TRUE(shared.has_value());
+    EXPECT_EQ(shared->id, SymbolId{9});
+    EXPECT_TRUE(shared->fresh) << "the first relocation through the name states the row";
+    EXPECT_EQ(shared->name, "shared");
+    EXPECT_EQ(shared->atom, SymbolId{5});
+    auto const sharedAgain = referenceOf(refs, 9, ids);
+    ASSERT_TRUE(sharedAgain.has_value());
+    EXPECT_FALSE(sharedAgain->fresh) << "ONE row per name, however many relocations name it";
+    EXPECT_EQ(sharedAgain->id, SymbolId{9});
+    EXPECT_EQ(nextFresh(), SymbolId{101});
+
+    // A weak name that OWNS the atom: its id IS the body's, so the row takes
+    // the next id no symbol holds. The other weak name of that body keeps its own.
+    auto const w1 = referenceOf(refs, 2, ids);
+    ASSERT_TRUE(w1.has_value());
+    EXPECT_EQ(w1->id, SymbolId{101});
+    EXPECT_EQ(w1->atom, SymbolId{2});
+    EXPECT_EQ(nextFresh(), SymbolId{102});
+    auto const w1Again = referenceOf(refs, 2, ids);
+    ASSERT_TRUE(w1Again.has_value());
+    EXPECT_EQ(w1Again->id, SymbolId{101});
+    EXPECT_EQ(nextFresh(), SymbolId{102}) << "the fresh id is minted once";
+    auto const w2 = referenceOf(refs, 3, ids);
+    ASSERT_TRUE(w2.has_value());
+    EXPECT_EQ(w2->id, SymbolId{3});
+    EXPECT_EQ(w2->atom, SymbolId{2});
+    EXPECT_EQ(nextFresh(), SymbolId{102});
+
+    // A weak name that is its body's ONLY name owns the atom as `w1` does: its
+    // row takes the next id no symbol holds, and the body keeps the symbol's own
+    // -- so a relocation the object wrote through the section, or through a
+    // static name of that body, can name the BYTES apart from the name (P69
+    // fold 2: until then such a name stated no row, and nothing could).
+    auto const lone = referenceOf(refs, 7, ids);
+    ASSERT_TRUE(lone.has_value());
+    EXPECT_TRUE(lone->fresh);
+    EXPECT_EQ(lone->id, SymbolId{102});
+    EXPECT_EQ(lone->atom, SymbolId{7});
+    EXPECT_EQ(lone->name, "lone");
+    EXPECT_EQ(nextFresh(), SymbolId{103});
+    auto const loneAgain = referenceOf(refs, 7, ids);
+    ASSERT_TRUE(loneAgain.has_value());
+    EXPECT_FALSE(loneAgain->fresh) << "ONE row per name";
+    EXPECT_EQ(loneAgain->id, SymbolId{102});
+    EXPECT_EQ(nextFresh(), SymbolId{103});
+
+    // The row states the name and what its body IS, read off the sliced atoms:
+    // a data item of that id is a datum (thread-local by its section), anything
+    // else a function. It is a PLAIN reference: strong, unbound, no common.
+    std::vector<AssembledData> items(2);
+    items[0].symbol  = SymbolId{5};
+    items[0].section = DataSectionKind::Tdata;
+    items[1].symbol  = SymbolId{77};
+    items[1].section = DataSectionKind::Data;
+    ExternImport const datum = referenceRowOfAWeakName(*shared, items);
+    EXPECT_EQ(datum.symbol, SymbolId{9});
+    EXPECT_EQ(datum.mangledName, "shared");
+    EXPECT_TRUE(datum.isData);
+    EXPECT_TRUE(datum.isThreadLocal);
+    EXPECT_EQ(datum.binding, SymbolBinding::Global);
+    EXPECT_EQ(datum.kindOrigin, ExternKindOrigin::Stated);
+    EXPECT_EQ(datum.commonSize, 0u);
+    EXPECT_TRUE(datum.libraryPath.empty());
+    EXPECT_FALSE(datum.readThroughSlot);
+    items[0].section = DataSectionKind::Data;
+    EXPECT_FALSE(referenceRowOfAWeakName(*shared, items).isThreadLocal);
+    ExternImport const function = referenceRowOfAWeakName(*w1, items);
+    EXPECT_EQ(function.symbol, SymbolId{101});
+    EXPECT_EQ(function.mangledName, "w1");
+    EXPECT_FALSE(function.isData) << "no data item carries the body: a function";
+    EXPECT_FALSE(function.isThreadLocal);
+}
+
+// ═══ THE ID OF A SYMBOL-TABLE RECORD (`record_symbol_ids.hpp`) ═══════════════
+//
+// D-LK-OBJECT-READERS-GAVE-RECORD-ZERO-THE-INVALID-SYMBOL-ID. The rule on its
+// own, and the weak-name bookkeeping with record 0 in each role it can take.
+// What the rule does to an object — a definition at record 0 that keeps its
+// name through a relocatable link — is pinned where links are made
+// (`test_common_symbols.cpp`, the `RecordSymbolIds` suites).
+
+// ★ P69 (lane `cs`, fold f26d -- review-csf26c2 N9): A READ MODULE CARRIES ITS RECORD TABLE'S END. Every reader hands
+// the module it builds the end of its record table (`RecordSymbolIds::end`, `AssembledModule::symbolIdEnd`): one past
+// every record's id and every fresh id it handed out, so a pass that mints on the module later
+// (`link/fresh_symbol_ids.hpp`) continues past them -- a record that became nothing of the module, and a fresh id
+// the reader dropped, included. RED-ON-DISABLE: drop a reader's carry, and its module's end stays 1, below the ids
+// the module holds.
+TEST(ObjectAtomCoverage, EveryReadModuleCarriesItsRecordTablesEnd) {
+    struct Leg {
+        char const* targetName;
+        char const* formatName;
+        EncodeFn    encode;
+        ReadFn      read;
+    };
+    Leg const legs[] = {
+        {"x86_64", "elf64-x86_64-linux", &encodeElf, &elf::readRelocatableObject},
+        {"x86_64", "pe64-x86_64-windows", &encodePe, &pe::readRelocatableObject},
+        {"arm64", "macho64-arm64-darwin", &encodeMacho, &macho::readRelocatableObject},
+    };
+    for (auto const& leg : legs) {
+        SCOPED_TRACE(leg.formatName);
+        auto loaded = loadShipped(leg.targetName, leg.formatName);
+        ASSERT_TRUE(loaded.target && loaded.format);
+        DiagnosticReporter wrep;
+        auto obj = leg.encode(subjectModule(/*withLocalHelper=*/true), *loaded.target, *loaded.format, wrep);
+        ASSERT_EQ(wrep.errorCount(), 0u);
+        DiagnosticReporter rep;
+        auto got = leg.read(obj, *loaded.target, *loaded.format, rep, {});
+        ASSERT_TRUE(got.has_value()) << "errors=" << rep.errorCount();
+        std::uint32_t const held = linker::maxExistingSymbolIdV(*got);
+        ASSERT_GT(held, 0u) << "the PREMISE: the read module holds ids";
+        EXPECT_GT(got->symbolIdEnd.value(), held) << "the module's end is past every id it holds";
+    }
+}
+
+TEST(ObjectAtomCoverage, ARecordsIdIsItsIndexAndRecordZeroTakesTheFirstIdPastTheTable) {
+    using dss::link::format::RecordSymbolIds;
+
+    RecordSymbolIds ids = openRecordIds(7);
+    EXPECT_EQ(ids.of(0), SymbolId{7}) << "record 0's index is the INVALID id: it takes the record count";
+    std::vector<std::uint32_t> seen;
+    for (std::uint32_t i = 0; i < 7; ++i) {
+        EXPECT_TRUE(ids.of(i).valid()) << "record " << i << " must have an id";
+        if (i != 0) EXPECT_EQ(ids.of(i), SymbolId{i}) << "every other record's id is its index";
+        EXPECT_EQ(std::count(seen.begin(), seen.end(), ids.of(i).v), 0) << "record " << i << " shares an id";
+        seen.push_back(ids.of(i).v);
+    }
+    // The ids no record holds come after every record's, from one counter.
+    for (std::uint32_t expected : {8u, 9u, 10u}) {
+        SymbolId const fresh = ids.fresh().value();
+        EXPECT_EQ(fresh, SymbolId{expected});
+        EXPECT_EQ(std::count(seen.begin(), seen.end(), fresh.v), 0) << "a fresh id is no record's";
+    }
+    EXPECT_EQ(ids.of(0), SymbolId{7}) << "minting fresh ids moves no record's id";
+
+    // The smallest tables: one record, and none (an object with no symbol can
+    // still be given rows, and their ids must be valid).
+    RecordSymbolIds one = openRecordIds(1);
+    EXPECT_EQ(one.of(0), SymbolId{1});
+    EXPECT_EQ(one.fresh(), SymbolId{2});
+    RecordSymbolIds none = openRecordIds(0);
+    EXPECT_TRUE(none.fresh().has_value());
+}
+
+TEST(ObjectAtomCoverage, AWeakNameBesideOrAtRecordZeroIsStatedInIdsNotInRecordIndices) {
+    using namespace dss::link::format;
+
+    std::vector<AssembledData> items(1);
+    items[0].section = DataSectionKind::Tdata;
+
+    // (A) THE BODY IS RECORD 0's: `first` (strong, record 0) and `first_weak`
+    // (weak, record 4) name one datum. The row takes the weak name's own id, and
+    // the atom it names is record 0's ID — the record count — not its index: the
+    // data item of that id is what makes the row a (thread-local) datum.
+    {
+        std::vector<AtomStartCandidate> const c = {
+            cand(1, 0, 0, "first", SymbolBinding::Global),
+            cand(1, 0, 4, "first_weak", SymbolBinding::Weak),
+        };
+        std::vector<std::uint32_t> owner;
+        DiagnosticReporter         rep;
+        ASSERT_TRUE(resolveEqualOffsetAtomAliases(c, owner, "test::reader", rep));
+        ASSERT_EQ(owner, (std::vector<std::uint32_t>{0u, 0u}));
+        RecordSymbolIds    ids = openRecordIds(6);
+        WeakNameReferences refs;
+        refs.decideFrom(c, owner, ids);
+        EXPECT_FALSE(referenceOf(refs, 0, ids).has_value()) << "the strong name at record 0 keeps the alias remap";
+        auto const ref = referenceOf(refs, 4, ids);
+        ASSERT_TRUE(ref.has_value());
+        EXPECT_EQ(ref->id, SymbolId{4});
+        EXPECT_EQ(ref->atom, SymbolId{6}) << "the body is record 0's: its ID, never its index";
+        EXPECT_TRUE(ref->atom.valid());
+        items[0].symbol = ids.of(0);
+        ExternImport const row = referenceRowOfAWeakName(*ref, items);
+        EXPECT_EQ(row.symbol, SymbolId{4});
+        EXPECT_TRUE(row.isData) << "the data item under record 0's id carries the body: a datum";
+        EXPECT_TRUE(row.isThreadLocal);
+        RecordSymbolIds peek = ids;
+        EXPECT_EQ(peek.fresh(), SymbolId{7}) << "no fresh id was needed";
+    }
+
+    // (B) THE WEAK NAME IS RECORD 0: `zero_weak` (weak, record 0) beside `strong`
+    // (record 3), which owns the body. The row takes record 0's own id — the
+    // record count, which no body holds — and the counter does not move.
+    {
+        std::vector<AtomStartCandidate> const c = {
+            cand(1, 0, 0, "zero_weak", SymbolBinding::Weak),
+            cand(1, 0, 3, "strong", SymbolBinding::Global),
+        };
+        std::vector<std::uint32_t> owner;
+        DiagnosticReporter         rep;
+        ASSERT_TRUE(resolveEqualOffsetAtomAliases(c, owner, "test::reader", rep));
+        ASSERT_EQ(owner, (std::vector<std::uint32_t>{3u, 3u}));
+        RecordSymbolIds    ids = openRecordIds(6);
+        WeakNameReferences refs;
+        refs.decideFrom(c, owner, ids);
+        auto const ref = referenceOf(refs, 0, ids);
+        ASSERT_TRUE(ref.has_value());
+        EXPECT_EQ(ref->id, SymbolId{6}) << "record 0's own id";
+        EXPECT_TRUE(ref->id.valid()) << "a row under the invalid id names nothing";
+        EXPECT_EQ(ref->atom, SymbolId{3});
+        items[0].symbol = ids.of(3);
+        EXPECT_TRUE(referenceRowOfAWeakName(*ref, items).isData);
+        RecordSymbolIds peek = ids;
+        EXPECT_EQ(peek.fresh(), SymbolId{7});
+    }
+
+    // (C) THE WEAK NAME AT RECORD 0 OWNS THE BODY: `w0` (record 0) and `w2`
+    // (record 2), both weak — the lower record owns. Its id IS the body's, so
+    // its row takes a fresh one; the other weak name keeps its own; both name
+    // the body by record 0's id.
+    {
+        std::vector<AtomStartCandidate> const c = {
+            cand(1, 0, 0, "w0", SymbolBinding::Weak),
+            cand(1, 0, 2, "w2", SymbolBinding::Weak),
+        };
+        std::vector<std::uint32_t> owner;
+        DiagnosticReporter         rep;
+        ASSERT_TRUE(resolveEqualOffsetAtomAliases(c, owner, "test::reader", rep));
+        ASSERT_EQ(owner, (std::vector<std::uint32_t>{0u, 0u}));
+        RecordSymbolIds    ids = openRecordIds(6);
+        WeakNameReferences refs;
+        refs.decideFrom(c, owner, ids);
+        auto const w0 = referenceOf(refs, 0, ids);
+        ASSERT_TRUE(w0.has_value());
+        EXPECT_EQ(w0->id, SymbolId{7}) << "the owner's id is the body's: its row takes a fresh one";
+        EXPECT_EQ(w0->atom, SymbolId{6});
+        auto const w2 = referenceOf(refs, 2, ids);
+        ASSERT_TRUE(w2.has_value());
+        EXPECT_EQ(w2->id, SymbolId{2});
+        EXPECT_EQ(w2->atom, SymbolId{6});
+        items[0].symbol = ids.of(0);
+        EXPECT_TRUE(referenceRowOfAWeakName(*w0, items).isData);
+        EXPECT_TRUE(referenceRowOfAWeakName(*w2, items).isData);
+        EXPECT_EQ(ids.fresh(), SymbolId{8}) << "one fresh id was minted, once";
+    }
 }

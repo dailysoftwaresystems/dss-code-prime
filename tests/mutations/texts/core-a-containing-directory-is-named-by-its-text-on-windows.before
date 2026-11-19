@@ -1,0 +1,1 @@
+    if (parseRoot(std::wstring_view{leaf}, PathGrammar::Win32).kind != RootSpelling::Kind::Verbatim) {

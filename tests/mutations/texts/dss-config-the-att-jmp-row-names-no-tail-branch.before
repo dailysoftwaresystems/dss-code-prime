@@ -1,0 +1,1 @@
+"spelling": "jmp",   "opcodes": ["jmp", "jmp_indirect", "jmp_tail"], "width": 64 },

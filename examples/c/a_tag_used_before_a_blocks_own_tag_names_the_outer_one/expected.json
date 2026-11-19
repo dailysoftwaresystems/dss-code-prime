@@ -1,0 +1,16 @@
+{
+  "$comment": "A TAG USED BEFORE A BLOCK'S OWN TAG OF THAT NAME NAMES THE OUTER ONE (C 6.2.1p7, C 6.7.2.3p5-p9; P69 round 1, lane cs, fold f26c -- the TAG form of D-C-A-NAME-USED-BEFORE-ITS-DECLARATION-BINDS-THE-LATER-ONE, its class-closure sweep). The scope tree binds a whole block's tags up front, and the tag lookup took the block's LATER `struct S` for a use written before it: a `sizeof` silently wrong, a member of the outer type refused. MEASURED by probe tg (the analyzer before this fold, pe64 and ELF x86_64, each RUN; the references on their legs). `struct S;` declares the block's own tag (C 6.7.2.3p7) and a use before its own scope's definition with nothing outside is that definition's tag -- both pinned here because the ordered lookup must not lose them. Every return before 42 names the first fact that failed; the release arm pins that the optimizer reads the same sizes.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

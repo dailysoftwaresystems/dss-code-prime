@@ -1,0 +1,1 @@
+        return labels_[hit.index].isEntry;

@@ -374,7 +374,7 @@ constexpr DialectPair kArmPair{"asm-arm64-gas", "arm64", "mov %0, %1"};
 
     std::uint32_t const firstEngineInst = b.lastInst().v + 1u;
     if (!lowerAsmTemplateToLirRun(*tree, *dialect, *out.target, bindings, b,
-                                  rep)) {
+                                  rep, nullptr)) {
         std::string why;
         for (auto const& d : rep.all()) { why += d.actual; why += '\n'; }
         throw std::runtime_error{"engine refused the template: " + why};

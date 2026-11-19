@@ -1,0 +1,2 @@
+    for (auto& [secIdx, ivs] : funcIntervalsBySec) {
+        std::vector<Interval> sorted = ivs;

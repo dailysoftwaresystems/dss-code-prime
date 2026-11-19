@@ -59,10 +59,12 @@
 #include "diagnostic_count.hpp"
 #include "scoped_env.hpp"
 #include "scratch_dir.hpp"
+#include "system_reason_text.hpp"  // the test side's one oracle for an OS code's own text (H6c2)
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <condition_variable>
 #include <filesystem>
 #include <fstream>
@@ -80,6 +82,7 @@
 #ifdef _WIN32
 #include <process.h>
 #else
+#include <fcntl.h>  // open: the lock cell's oracle
 #include <unistd.h>
 #endif
 
@@ -494,10 +497,11 @@ TEST(SystemGitRunnerIsolation, AnInvalidCheckoutNeverResolvesToTheEnclosingRepos
     fs::path const project = scratch.path() / "consumer";
     fs::create_directories(project);
     auto const run = [&](std::vector<std::string> args) {
-        std::vector<std::string> argv{gitExe->string(), "-c", "user.name=dss-test",
+        // The image is the resolved git, a value; argv[0] its rendering (as git_acquire.cpp hands it, H6c).
+        std::vector<std::string> argv{gitExe->spelling().display(), "-c", "user.name=dss-test",
                                       "-c", "user.email=dss-test@example.invalid"};
         argv.insert(argv.end(), args.begin(), args.end());
-        return dss::substrate::spawnAndWaitInherit(argv, project);
+        return dss::substrate::spawnAndWaitInherit(*gitExe, argv, project);
     };
     ASSERT_EQ(run({"init", "--quiet"}).exitCode, 0);
     writeFile(project / "tracked.txt", "committed\n");
@@ -557,10 +561,10 @@ TEST(SystemGitRunnerIsolation, GitsOwnRepositoryVariablesNeverReachTheDependency
     }
     ScratchDir scratch{Location::Temp, "dep-git-environment"};
     auto const gitIn = [&](fs::path const& dir, std::vector<std::string> args) {
-        std::vector<std::string> argv{gitExe->string(), "-c", "user.name=dss-test",
+        std::vector<std::string> argv{gitExe->spelling().display(), "-c", "user.name=dss-test",
                                       "-c", "user.email=dss-test@example.invalid"};
         argv.insert(argv.end(), args.begin(), args.end());
-        return dss::substrate::spawnAndWaitInherit(argv, dir);
+        return dss::substrate::spawnAndWaitInherit(*gitExe, argv, dir);
     };
 
     // The dependency's upstream: one commit.
@@ -628,7 +632,7 @@ TEST(SystemGitRunnerIsolation, TheWithheldListCoversEverythingTheInstalledGitCal
     ScratchDir     scratch{Location::Temp, "dep-git-local-env"};
     fs::path const out = scratch.path() / "local-env-vars.txt";
     auto const     r   = dss::substrate::spawnAndWaitRedirectStdout(
-        {gitExe->string(), "rev-parse", "--local-env-vars"}, scratch.path(), out);
+        *gitExe, {gitExe->spelling().display(), "rev-parse", "--local-env-vars"}, scratch.path(), out);
     ASSERT_TRUE(r.spawned && r.exitCode == 0) << r.diagnostic;
 
     auto const&              ours = dss::gitRepositoryLocalVariables();
@@ -1577,4 +1581,54 @@ TEST(DependencyCacheConcurrency, ASecondAcquisitionWaitsAndNeverDisturbsTheFirst
     EXPECT_NE(gotB.outcome, CacheOutcome::AcquireFailed) << allMessages(repB);
     EXPECT_TRUE(fs::exists(scratch.path() / ".dss-deps" / "bar" / "HEAD"));
     EXPECT_FALSE(fs::exists(scratch.path() / ".dss-deps" / "+partial" / "bar"));
+}
+
+// THE LOCK'S REFUSAL NAMES THE HOST'S OWN REASON, READ AT THE OPEN THAT FAILED
+// (P69 H6c2). A DIRECTORY planted where `<name>`'s lock file belongs cannot be
+// opened for reading and writing -- the host refuses it (Windows: the open of a
+// directory without backup semantics; POSIX: EISDIR) -- and the acquisition
+// fails loud, touching nothing, with exactly the code the host itself answers
+// to the same open of the same spelling. The ORACLE is that open, made here
+// (CreateFileW of the literal `\\?\` spelling, OPEN_ALWAYS, and GetLastError;
+// POSIX `open` with O_CREAT and errno), and its text the system's own
+// (`systemReasonText`), never the product's renderer.
+TEST(DependencyCacheLock, ALockFileThatCannotBeOpenedNamesTheHostsOwnReason) {
+    ScratchDir         scratch{Location::Temp, "dep-git-lock-reason"};
+    FakeGitRunner      git;
+    DiagnosticReporter rep;
+    auto cache = DependencyCache::open(scratch.path(), git, false, rep);
+    ASSERT_TRUE(cache.has_value()) << allMessages(rep);
+    auto const name = cache->registerGitDependency(kUrl, std::nullopt, rep);
+    ASSERT_TRUE(name.has_value()) << allMessages(rep);
+
+    fs::path const lockPath = cache->depsDir() / std::string{dss::kDependencyLockDirName} / *name;
+    fs::create_directories(lockPath);
+    ASSERT_TRUE(fs::is_directory(lockPath));
+#ifdef _WIN32
+    fs::path literal = lockPath;
+    literal.make_preferred();
+    std::wstring const spelling = L"\\\\?\\" + literal.native();
+    HANDLE const       probe    = ::CreateFileW(spelling.c_str(), GENERIC_READ | GENERIC_WRITE,
+                                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                                OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    DWORD const oracle = probe == INVALID_HANDLE_VALUE ? ::GetLastError() : ERROR_SUCCESS;
+    if (probe != INVALID_HANDLE_VALUE) ::CloseHandle(probe);
+    ASSERT_NE(oracle, static_cast<DWORD>(ERROR_SUCCESS)) << "the host opened a directory as the lock file";
+#else
+    int const probe  = ::open(lockPath.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0666);
+    int const oracle = probe < 0 ? errno : 0;
+    if (probe >= 0) ::close(probe);
+    ASSERT_NE(oracle, 0) << "the host opened a directory as the lock file";
+#endif
+
+    auto const got = cache->acquire(*name, rep);
+
+    EXPECT_EQ(got.outcome, CacheOutcome::AcquireFailed) << allMessages(rep);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_DependencyGitAcquireFailed), 1u) << allMessages(rep);
+    std::string const reason = dss::test_support::systemReasonText(oracle);
+    EXPECT_NE(allMessages(rep).find("' could not be opened: " + reason + ". Without the lock"), std::string::npos)
+        << "the refusal must name the host's own reason for this open, " << reason << ", and it says:\n"
+        << allMessages(rep);
+    EXPECT_TRUE(git.clonedUrls.empty()) << "a clone ran without the lock";
+    EXPECT_TRUE(fs::is_directory(lockPath)) << "the refused lock path was disturbed";
 }

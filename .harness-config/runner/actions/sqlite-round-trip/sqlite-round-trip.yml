@@ -4,16 +4,78 @@ description: >-
   The action executes a carried sqlite payload on a host that runs its target -- the round trip.
   The program documents itself in its own header; this file declares only how a
   runner starts it and what witnesses that it ran.
-inputs:
-  payload:
-    description: 'a payload `sqlite-round-trip.py pack` produced on the build leg'
-    required: true
 steps:
+  # RUN a carried payload on a host that runs its target. The step runs at the tree's root, so `payload` is a tree
+  # path -- the kept output of a `pack` run, carried here by `dssharness sync --artifact <that run id>`. The CLI
+  # arm's gate is always this tree's own cli-smoke.py.
   - name: run-the-carried-payload
-    workingDirectoryRoot: action
+    inputs:
+      payload:
+        description: 'the payload a `pack` run kept, as a tree path (after dssharness sync --artifact <its run id>)'
+        required: true
+      testFiles:
+        description: 'the upstream .test files for the UNITS arm, comma-separated; required unless skipUnits'
+        default: ''
+      skipUnits:
+        description: 'true skips the UNITS arm (and the report says so)'
+        default: 'false'
+      skipCli:
+        description: 'true skips the CLI arm (and the report says so)'
+        default: 'false'
+      cliTarget:
+        description: 'the CLI binary target triple; empty asks harness_legs.py --identify-binary'
+        default: ''
+      launchers:
+        description: 'launcher tokens before each binary, comma-separated in order; empty runs it natively'
+        default: ''
+      env:
+        description: 'extra NAME=VALUE environment items, separated by ;'
+        default: ''
+      tclLibrary:
+        description: 'TCL_LIBRARY for the fixture; empty uses the carried script library'
+        default: ''
+      testdirSeed:
+        description: 'a directory each unit run directory is seeded from; empty seeds none'
+        default: ''
+      timeout:
+        description: 'seconds each arm may run'
+        default: '3600'
     run: |
-      python3 ./sqlite-round-trip.py run --payload {payload} --workdir {stepBuild} --ran-on {host} --json {stepBuild}/round-trip.json
+      python3 .harness-config/runner/actions/sqlite-round-trip/sqlite-round-trip.py run --payload="{payload}" --workdir="{stepBuild}" --ran-on="{host}" --json="{stepBuild}/round-trip.json" --cli-smoke="{treeDir}/.harness-config/runner/actions/real-examples/c/sqlite/cli-smoke.py" --test-file="{testFiles}" --skip-units="{skipUnits}" --skip-cli="{skipCli}" --cli-target="{cliTarget}" --launcher="{launchers}" --env="{env}" --tcl-library="{tclLibrary}" --testdir-seed="{testdirSeed}" --timeout="{timeout}"
     successPattern: 'result json: '
     outputs: ['round-trip.json']
     persist: true
+    requireInputsUnmoved: true
+
+  # PACK a leg's artefacts on the BUILD leg: the leg's OUTPUT DIRECTORY (never a hand-picked file) and the staged
+  # sqlite3.h the expectation travels with, hashed. The payload directory is this step's kept output, whole.
+  - name: pack
+    manual: true
+    inputs:
+      outDir:
+        description: 'the sqlite driver OUT_DIR on this leg, relative to the tree'
+        required: true
+      sqliteLeg:
+        description: 'the sqlite leg whose artefacts travel, e.g. pe64-x86_64'
+        required: true
+      legSpec:
+        description: 'that leg as ARCH:FORMAT -- its FORMAT names the artefact directory'
+        required: true
+      sqliteHeader:
+        description: 'the staged sqlite3.h the artefacts were built against, relative to the tree'
+        required: true
+      tclScriptDir:
+        description: 'the leg staged Tcl script library (harness-libs/<leg>/tcl8.6); empty carries none'
+        default: ''
+      sqliteSha:
+        description: 'the upstream sqlite commit -- a corpus number without it is meaningless'
+        default: ''
+      dssSha:
+        description: 'the compiler commit'
+        default: ''
+    run: |
+      python3 .harness-config/runner/actions/sqlite-round-trip/sqlite-round-trip.py pack --out-dir="{outDir}" --leg="{sqliteLeg}" --leg-spec="{legSpec}" --built-on="{leg}" --sqlite-header="{sqliteHeader}" --tcl-script-dir="{tclScriptDir}" --sqlite-sha="{sqliteSha}" --dss-sha="{dssSha}" --dest="{stepBuild}/payload"
+    outputs: [payload]
+    persist: true
+    successPattern: '^packed  : '
     requireInputsUnmoved: true

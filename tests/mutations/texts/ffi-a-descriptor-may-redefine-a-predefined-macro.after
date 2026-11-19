@@ -1,0 +1,1 @@
+        if (predefinedNames.contains(name) && name.empty()) out.push_back(name);

@@ -1,0 +1,2 @@
+                lhsE = asBitFieldValue(lhsN, lhsE);
+                rhsE = asBitFieldValue(rhsN, rhsE);

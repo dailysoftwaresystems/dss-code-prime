@@ -24,8 +24,9 @@
  *   97  no apple entry starts with `executable_path=`.
  *
  * DARWIN-ONLY: on ELF and pe no loader or CRT hands an entry a fourth vector, so
- * those formats do not realize the verb and the same source is refused there
- * (examples/c/entry_main_apple_refused_off_darwin).
+ * those formats do not realize the verb; since P69 fold 3e the same source is
+ * entered there with the richest row they realize and warned, as gcc and MSVC
+ * link it (examples/c/entry_main_apple_warned_off_darwin).
  *
  * RED-ON-DISABLE: park only two argument registers in the entry trampoline (the
  * literal this row replaced) -> 92..97 on both Mach-O legs; drop

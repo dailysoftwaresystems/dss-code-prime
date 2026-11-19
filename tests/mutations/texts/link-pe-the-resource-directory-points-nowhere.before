@@ -1,0 +1,1 @@
+    std::uint32_t const resourceDirRva = rsrc.has_value() ? rsrc->rva : 0u;

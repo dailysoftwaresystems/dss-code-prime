@@ -1,0 +1,1 @@
+    list(APPEND CMAKE_IGNORE_PATH ${_dss_python_ignored})

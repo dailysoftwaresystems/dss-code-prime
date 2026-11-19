@@ -1,0 +1,4 @@
+        n = NodeId{};
+    }
+    return std::nullopt;
+}

@@ -1,0 +1,1 @@
+            if (s.name != block->section || s.type != block->type) continue;

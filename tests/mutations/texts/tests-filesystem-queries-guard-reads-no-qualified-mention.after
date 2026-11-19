@@ -1,0 +1,1 @@
+        for (auto const form : {&Scanner::member, &Scanner::option, &Scanner::projection}) {

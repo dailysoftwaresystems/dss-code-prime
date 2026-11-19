@@ -562,6 +562,9 @@ TEST(ParserSpeculation, COperandAltBranchesAreInDeclaredOrder) {
     const std::vector<std::string> declared{
         "stringLiteralExpr",
         "charLiteralExpr",
+        // P69: C23's storage-class compound literal `( static T ){ … }`, declared just
+        // before the plain one (each fails one token past the `(` of the other's form).
+        "storageCompoundLiteralExpr",
         "compoundLiteralExpr",
         "sizeofExpr",            // FC6
         // P31 [[D-CSUBSET-ALIGNOF-VALUE-OPERAND]]: was `alignofType` (the FORM).
@@ -574,6 +577,7 @@ TEST(ParserSpeculation, COperandAltBranchesAreInDeclaredOrder) {
         "vaStartExpr",           // FC12a-core (D-FC12A-VARIADIC-CALLEE)
         "vaArgExpr",             // FC12a-core
         "vaEndExpr",             // FC12a-core
+        "vaCopyExpr",            // P69 (`va_copy`)
         "genericExpr",           // FC16 (D-CSUBSET-GENERIC-SELECTION, `_Generic`)
         // P31: the three GNU compile-time OPERATORS. Keyword-led, so the LL(k)
         // predictive prune discards each in ONE token for every operand that is
@@ -989,8 +993,8 @@ flatChainParseMetrics(std::shared_ptr<GrammarSchema const> const& schema,
 // this non-recursive chain does not, which is why the two tests carry
 // different bounds — the separate row is
 // D-PARSE-DEEP-NEST-RECURSION-MEMORY.
-// ⚠ FOR ITS STATUS ASK THE INSTRUMENT — `python
-// .harness-config/runner/actions/check-anchor-balance/check-anchor-balance.py` — never a comment: a
+// ⚠ FOR ITS STATUS ASK THE INSTRUMENT — `dssharness read-anchor
+// D-PARSE-DEEP-NEST-RECURSION-MEMORY` — never a comment: a
 // status word in prose is a measurement with no instrument attached, which is
 // how this sentence rotted in the first place.
 TEST(ParserSpeculation, FlatChainParseWorkIsLinear) {
@@ -1454,4 +1458,226 @@ TEST(ParserSpeculation, FinalCandidateDescentIsGatedOnTheFallbackReading) {
     Tree ok = parseWithSchema(kFallbackReadingGateSchema, "A C N N ;");
     EXPECT_FALSE(ok.diagnostics().hasErrors());
     EXPECT_EQ(countNodesByRule(ok, "unboundedCase"), 1u);
+}
+
+// ── P69 (lane `cs`, D-C-SIZEOF-OF-A-COMPOUND-LITERAL-IS-A-PARSE-ERROR): `notFollowedBy` ───────────
+// The facet is a generic PEG NOT-PREDICATE on a speculative candidate's FOLLOWER: a candidate that
+// closes cleanly but is followed by a listed token kind is not the alt's reading. C uses it for
+// `sizeof ( T ) {` (the compound literal); nothing in the engine knows that — this grammar names no
+// C construct. `stmt` may itself consume a trailing `C`, so a parse that IGNORED the predicate
+// would still succeed: only the predicate makes `pair` + `C` a non-reading. The loader admits the
+// facet only where a probe evaluates it (`GrammarSchema.NotFollowedByIsAdmittedOnlyWhereAProbeEvaluatesIt`).
+// RED-ON-DISABLE: (a) drop the predicate from `decideClosedCandidate_` → the probe case parses
+// `pair` and `C`; (b) let the unique-survivor descent enter a predicate-carrying candidate without
+// a probe (`candidateNeedsProbe_` asking only the type-name guard) → the survivor case parses in
+// silence.
+namespace {
+
+[[nodiscard]] std::string notFollowedBySchema(std::string_view itemAlt) {
+    return std::string{R"JSON({
+  "dssSchemaVersion": 2,
+  "language": { "name": "NotFollowedBySpec", "version": "0.1.0" },
+  "tokens": {
+    " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\n": [{ "kind": "Newline",    "flags": ["EmptySpace"] }],
+    "A":  [{ "kind": "AKind" }],
+    "B":  [{ "kind": "BKind" }],
+    "C":  [{ "kind": "CKind" }],
+    "X":  [{ "kind": "XKind" }],
+    ";":  [{ "kind": "Semi" }]
+  },
+  "shapes": {
+    "root":   { "sequence": [{ "repeat": "stmt" }] },
+    "stmt":   { "sequence": ["item", { "optional": "CKind" }, "Semi"] },
+    "item":   { "alt": )JSON"} + std::string{itemAlt} + R"JSON(, "speculative": true, "lookahead": 3 },
+    "pair":   { "sequence": ["AKind", "BKind"], "notFollowedBy": ["CKind"] },
+    "triple": { "sequence": ["AKind", "BKind", "CKind"] },
+    "axe":    { "sequence": ["AKind", "XKind"] },
+    "other":  { "sequence": ["XKind"] }
+  }
+})JSON";
+}
+
+} // namespace
+
+TEST(ParserSpeculation, NotFollowedByVetoesACleanCloseOnEveryPathToTheCandidate) {
+    std::string const probeAlt = notFollowedBySchema(R"(["pair", "triple", "other"])");
+    // The probe: `pair` closes on `A B`, but `C` follows — the alt takes `triple`.
+    Tree vetoed = parseWithSchema(probeAlt, "A B C ;");
+    EXPECT_FALSE(vetoed.diagnostics().hasErrors());
+    EXPECT_EQ(countNodesByRule(vetoed, "triple"), 1u) << "`A B C` must parse as triple";
+    EXPECT_EQ(countNodesByRule(vetoed, "pair"), 0u) << "`pair` must not commit before `C`";
+    // The control: no `C` follows — `pair` is the reading.
+    Tree kept = parseWithSchema(probeAlt, "A B ; X ;");
+    EXPECT_FALSE(kept.diagnostics().hasErrors());
+    EXPECT_EQ(countNodesByRule(kept, "pair"), 1u);
+    EXPECT_EQ(countNodesByRule(kept, "other"), 1u);
+
+    // A LONE PRUNED SURVIVOR: `axe` needs `X` second, so on `A B` the predictive prune leaves
+    // `pair` as the only candidate. Entering it without a probe would read `A B` and let `stmt`
+    // take the `C` — the reading the grammar's own predicate forbids. It must be refused.
+    std::string const survivorAlt = notFollowedBySchema(R"(["pair", "axe"])");
+    Tree survivor = parseWithSchema(survivorAlt, "A B C ;");
+    EXPECT_TRUE(survivor.diagnostics().hasErrors())
+        << "the predicate must hold on the unique-survivor path too";
+    EXPECT_EQ(countNodesByRule(survivor, "pair"), 0u);
+    Tree survivorOk = parseWithSchema(survivorAlt, "A B ; A X ;");
+    EXPECT_FALSE(survivorOk.diagnostics().hasErrors());
+    EXPECT_EQ(countNodesByRule(survivorOk, "pair"), 1u);
+    EXPECT_EQ(countNodesByRule(survivorOk, "axe"), 1u);
+}
+
+// ── P69 round 4 (lane `cs`): `followedByFirstOf`, THE POSITIVE TWIN ───────────────────────────────
+// A candidate that closes cleanly is the alt's reading only if the next token can START the shape
+// it names. C uses it for an attribute run among a type's specifiers — part of the specifier list
+// when a specifier follows it, the declaration's own otherwise; this grammar names no C construct.
+// `list` is an `X`, then any number of `X` or of a `run`, and a `run` belongs to the list only when
+// an `X` follows. `stmt` has its OWN slot for an `A B` after the list (`tail`), so a parse that
+// IGNORED the predicate would still succeed: only the tree says who took it.
+// `run` is the only candidate of the repeat's alt that starts with `A`, at the trailing repeat of a
+// non-root rule — the shape the loader admits because that alt skips before it could ever replay
+// (`GrammarSchema.AFollowerPredicateIsJudgedAtTheAltTheParserStandsAt`).
+// RED-ON-DISABLE: drop the positive test from `decideClosedCandidate_` → `X A B ;` keeps the run
+// inside the list (`tail` 0, `run` 1).
+namespace {
+
+constexpr std::string_view kFollowedBySchema = R"JSON({
+  "dssSchemaVersion": 2,
+  "language": { "name": "FollowedBySpec", "version": "0.1.0" },
+  "tokens": {
+    " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\n": [{ "kind": "Newline",    "flags": ["EmptySpace"] }],
+    "A":  [{ "kind": "AKind" }],
+    "B":  [{ "kind": "BKind" }],
+    "X":  [{ "kind": "XKind" }],
+    ";":  [{ "kind": "Semi" }]
+  },
+  "shapes": {
+    "root": { "sequence": [{ "repeat": "stmt" }] },
+    "stmt": { "sequence": ["list", { "optional": "tail" }, "Semi"] },
+    "list": { "sequence": ["XKind", { "repeat": { "alt": ["XKind", "run"], "speculative": true, "lookahead": 4 } }] },
+    "run":  { "sequence": ["AKind", "BKind"], "followedByFirstOf": "list" },
+    "tail": { "sequence": ["AKind", "BKind"] }
+  }
+})JSON";
+
+} // namespace
+
+TEST(ParserSpeculation, FollowedByFirstOfKeepsACleanCloseOnlyBeforeTheNamedShape) {
+    // An `X` follows the run: it is part of the list.
+    Tree kept = parseWithSchema(kFollowedBySchema, "X A B X ;");
+    EXPECT_FALSE(kept.diagnostics().hasErrors());
+    EXPECT_EQ(countNodesByRule(kept, "run"), 1u) << "`A B` before an `X` is the list's";
+    EXPECT_EQ(countNodesByRule(kept, "tail"), 0u);
+
+    // Nothing that starts a list follows: the list ends BEFORE the run and the statement's own
+    // slot takes it.
+    Tree left = parseWithSchema(kFollowedBySchema, "X A B ;");
+    EXPECT_FALSE(left.diagnostics().hasErrors());
+    EXPECT_EQ(countNodesByRule(left, "run"), 0u)
+        << "`A B` before `;` was kept inside the list: the follower predicate was skipped";
+    EXPECT_EQ(countNodesByRule(left, "tail"), 1u);
+
+    // Both in one statement, and the loop goes on after a kept run.
+    Tree both = parseWithSchema(kFollowedBySchema, "X X A B X A B ; X ;");
+    EXPECT_FALSE(both.diagnostics().hasErrors());
+    EXPECT_EQ(countNodesByRule(both, "run"), 1u);
+    EXPECT_EQ(countNodesByRule(both, "tail"), 1u);
+    EXPECT_EQ(countNodesByRule(both, "list"), 2u);
+
+    // CONTROL: a list with no run at all is unaffected.
+    Tree plain = parseWithSchema(kFollowedBySchema, "X X X ;");
+    EXPECT_FALSE(plain.diagnostics().hasErrors());
+    EXPECT_EQ(countNodesByRule(plain, "run"), 0u);
+    EXPECT_EQ(countNodesByRule(plain, "tail"), 0u);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// ★★ P69 (lane `cs`, fold f26e): A SPECULATIVE CHOICE IS DECIDED WHERE IT STANDS. A speculative
+// choice — an optional, a repeat of an alt, an alt — that an enclosing NON-speculative choice of the
+// same rule reaches (an optional's or a repeat's continuation, an alt's branch) is dispatched at its
+// own position: the enclosing choice routes the cursor TO it (`GrammarSchema::nestedSpeculativeChoice`)
+// and stops its own enumeration there (`detail::enumerationEnters`). Entered rule-first by the
+// enclosing choice, the nested one's lookahead prune, probes and skip never ran: the enclosing loop
+// descended `pair` on its first token alone — C's `void f(int[3]);` read the `[` as a C23 attribute
+// sequence's. Every grammar here has `pair` = `[ [ N ] ]` (FIRST_2 = `[ [`) and `tail` = `[ N ]`,
+// which share their first token; `lead` = `A` is the enclosing choice's own element. The nested choice
+// ENDS its rule (`head`), and `tail` follows in the enclosing one, as in every shipped instance (c's
+// `declAttrRun`, `enumSpec`): a nested optional or repeat followed IN ITS OWN RULE by a required element
+// sharing its first token takes no skip, a property of the speculative-optional engine apart from this
+// class (its loop-exit boundary, `SpeculativeInlineRepeatAltBacktracksToSiblingBranch`).
+// RED-ON-DISABLE: let the enumeration enter a nested speculative choice from a non-speculative root
+// (`enumerationEnters` answers true) → every `[ N ]` cell is refused; take the route away → every
+// cell that does not start with `A` is refused.
+namespace {
+
+[[nodiscard]] std::string nestedSpeculativeSchema(std::string_view rootBody, std::string_view headBody) {
+    return std::string{R"JSON({
+  "dssSchemaVersion": 2,
+  "language": { "name": "NestedSpeculative", "version": "0.1.0" },
+  "tokens": {
+    " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\n": [{ "kind": "Newline",    "flags": ["EmptySpace"] }],
+    "[":  [{ "kind": "BracketOpen" }],
+    "]":  [{ "kind": "BracketClose" }],
+    "N":  [{ "kind": "Num" }],
+    "A":  [{ "kind": "AKind" }]
+  },
+  "shapes": {
+    "root": )JSON"} + std::string{rootBody} + R"JSON(,
+    "head": )JSON" + std::string{headBody} + R"JSON(,
+    "pair": { "sequence": ["BracketOpen", "BracketOpen", "Num", "BracketClose", "BracketClose"] },
+    "tail": { "sequence": ["BracketOpen", "Num", "BracketClose"] },
+    "lead": { "sequence": ["AKind"] }
+  }
+})JSON";
+}
+
+} // namespace
+
+TEST(ParserSpeculation, ANestedSpeculativeChoiceIsDecidedWhereItStands) {
+    std::string const specOpt = R"({ "optional": "pair", "speculative": true, "lookahead": 2 })";
+    std::string const specRep = R"({ "repeat": { "alt": ["pair"], "speculative": true, "lookahead": 2 } })";
+    std::string const specAlt = R"({ "alt": ["pair", "tail"], "speculative": true, "lookahead": 2 })";
+    struct Input { char const* src; std::size_t pair; std::size_t tail; std::size_t lead; };
+    // A nested optional / repeat is followed by `tail`; a nested alt holds `tail` as its own branch.
+    std::vector<Input> const followed = {
+        {"[ N ]", 0, 1, 0}, {"[ [ N ] ] [ N ]", 1, 1, 0}, {"A [ N ]", 0, 1, 1}};
+    std::vector<Input> const asBranch = {{"[ N ]", 0, 1, 0}, {"[ [ N ] ]", 1, 0, 0}, {"A [ N ]", 0, 1, 1}};
+    // `head` holds the enclosing choice and, ENDING it, the nested one; `root` is `head` then `tail`, or `head`
+    // alone where the nested alt holds `tail` as its own branch.
+    std::string const thenTail = R"({ "sequence": ["head", "tail"] })";
+    std::string const alone = R"({ "sequence": ["head"] })";
+    struct Cell { char const* name; std::string root; std::string head; std::vector<Input> inputs; };
+    std::vector<Cell> const cells = {
+        {"optional · speculative optional", thenTail,
+         R"({ "sequence": [{ "optional": "lead" }, )" + specOpt + R"(] })", followed},
+        {"optional · speculative repeat", thenTail,
+         R"({ "sequence": [{ "optional": "lead" }, )" + specRep + R"(] })", followed},
+        {"optional · speculative alt", alone,
+         R"({ "sequence": [{ "optional": "lead" }, )" + specAlt + R"(] })", asBranch},
+        {"repeat · speculative optional", thenTail,
+         R"({ "sequence": [{ "repeat": "lead" }, )" + specOpt + R"(] })", followed},
+        {"repeat · speculative repeat", thenTail,
+         R"({ "sequence": [{ "repeat": "lead" }, )" + specRep + R"(] })", followed},
+        {"repeat · speculative alt", alone,
+         R"({ "sequence": [{ "repeat": "lead" }, )" + specAlt + R"(] })", asBranch},
+        {"alt branch · speculative optional", thenTail, R"({ "alt": ["lead", )" + specOpt + R"(] })", followed},
+        {"alt branch · speculative repeat", thenTail, R"({ "alt": ["lead", )" + specRep + R"(] })", followed},
+        {"alt branch · speculative alt", alone, R"({ "alt": ["lead", )" + specAlt + R"(] })",
+         {{"[ N ]", 0, 1, 0}, {"[ [ N ] ]", 1, 0, 0}, {"A", 0, 0, 1}}},
+    };
+    for (Cell const& c : cells) {
+        std::string const schema = nestedSpeculativeSchema(c.root, c.head);
+        for (Input const& in : c.inputs) {
+            Tree t = parseWithSchema(schema, in.src);
+            ASSERT_NE(t.root(), InvalidNode) << c.name << " `" << in.src << "`";
+            EXPECT_FALSE(t.diagnostics().hasErrors())
+                << c.name << " `" << in.src << "`: a speculative choice nested in a non-speculative "
+                   "one must be decided where it stands";
+            EXPECT_EQ(countNodesByRule(t, "pair"), in.pair) << c.name << " `" << in.src << "`";
+            EXPECT_EQ(countNodesByRule(t, "tail"), in.tail) << c.name << " `" << in.src << "`";
+            EXPECT_EQ(countNodesByRule(t, "lead"), in.lead) << c.name << " `" << in.src << "`";
+        }
+    }
 }

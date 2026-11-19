@@ -1,0 +1,16 @@
+{
+  "$comment": "Constructors of ONE priority in one unit run in the order the unit DEFINES them (src/link/static_init_tables.hpp states the decision, its measurement and what it refuses). `wc` is prototyped before `wa` and `wb` are defined, so the unit numbers it first and an order taken from ids runs it first; one unit, so the link renumbers nothing. The stdout is the order, the exit code the count (three ran). Every constructor is `static` and called from nowhere, so the release arm also needs the optimizer to keep the schedule's functions. FOUR TARGETS: pe runs natively on the Windows gate host, elf x86_64 + arm64 under qemu on Linux, macho on darwin.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 3,
+  "expectedStdout": "21 22 23 ",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

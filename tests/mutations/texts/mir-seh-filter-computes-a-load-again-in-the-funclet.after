@@ -1,0 +1,3 @@
+        case MirOpcode::Const:
+        case MirOpcode::Load:
+        case MirOpcode::GlobalAddr:

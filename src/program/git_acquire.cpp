@@ -1,5 +1,6 @@
 #include "program/git_acquire.hpp"
 
+#include "core/substrate/bounded_retry.hpp"  // retryUpTo: a fresh capture directory
 #include "core/substrate/path_identity.hpp"  // genericSpelling
 #include "core/substrate/process_spawn.hpp"
 
@@ -66,14 +67,15 @@ fromSpawn(substrate::SpawnResult const& r, std::string const& what) {
 // capture file appearing inside a dependency's checkout would be a byte we
 // wrote into a tree we promised only to read.
 struct CaptureSlot {
-    fs::path dir;   // empty when the slot could not be claimed
-    fs::path file;
+    core::HostPath dir;   // empty when the slot could not be claimed; made below the home's temporary directory
+    core::HostPath file;
 
     ~CaptureSlot() {
         if (dir.empty()) return;
-        std::error_code ec;
-        fs::remove_all(dir, ec);   // best effort; a leaked temp dir is not a
-                                   // build failure and has no user impact
+        // best effort; a leaked temp dir is not a build failure and has no user
+        // impact. The substrate's removal, never `remove_all`: it takes a link as
+        // itself on every build (the substrate's header has the measurement).
+        static_cast<void>(core::removeTree(dir));
     }
     CaptureSlot()                              = default;
     CaptureSlot(CaptureSlot const&)            = delete;
@@ -82,27 +84,40 @@ struct CaptureSlot {
     CaptureSlot& operator=(CaptureSlot&&)      = delete;
 };
 
-void claimCaptureSlot(CaptureSlot& slot) {
+// Claims a fresh capture directory under the system temporary directory, or says why it
+// could not (P69 L2, lane `lm`: the 64 attempts are the substrate's bounded retry, so running
+// out names the operation and the last attempt's reason instead of answering nothing).
+[[nodiscard]] std::string claimCaptureSlot(CaptureSlot& slot) {
     static std::atomic<std::uint64_t> seq{0};
 
-    std::error_code ec;
-    fs::path const base = fs::temp_directory_path(ec) / "dss-git-rev-parse";
-    if (ec) return;
-    fs::create_directories(base, ec);
-    if (ec) return;
+    std::error_code      ec;
+    core::HostPath const temporary = core::temporaryDirectory(ec);   // the home's answer, a value (H6c)
+    if (ec) return "the system temporary directory is unknown (" + core::reasonText(ec) + ")";
+    core::HostPath const base = temporary / "dss-git-rev-parse";
+    static_cast<void>(core::createDirectories(base, ec));   // at any length (`core::createDirectories`)
+    if (ec)
+        return "'" + base.spelling().generic() + "' could not be created (" + core::reasonText(ec) + ")";
 
     auto const stamp = static_cast<std::uint64_t>(
         std::chrono::system_clock::now().time_since_epoch().count());
-    for (std::uint32_t attempt = 0; attempt < 64u; ++attempt) {
-        fs::path candidate = base / (std::to_string(stamp) + "-"
-                                     + std::to_string(seq.fetch_add(1)));
-        std::error_code cec;
-        if (fs::create_directory(candidate, cec)) {
-            slot.dir  = std::move(candidate);
-            slot.file = slot.dir / "stdout.txt";
-            return;
-        }
-    }
+    auto made = substrate::retryUpTo(
+        64, "claiming a fresh git capture directory",
+        [&](std::size_t, std::string& whyNot) -> std::optional<core::HostPath> {
+            core::HostPath candidate = base / (std::to_string(stamp) + "-"
+                                               + std::to_string(seq.fetch_add(1)));
+            std::error_code cec;
+            // FALSE for a candidate that already existed (no level made): the uniqueness probe. Its parent `base`
+            // exists, so the candidate is the one level it can make.
+            if (core::createDirectories(candidate, cec) && !cec) return candidate;
+            whyNot = "'" + candidate.spelling().generic() + "' "
+                   + (cec ? "could not be created (" + core::reasonText(cec) + ")"
+                          : std::string{"already exists"});
+            return std::nullopt;
+        });
+    if (!made.succeeded()) return made.failure();
+    slot.dir  = std::move(made.value());
+    slot.file = slot.dir / "stdout.txt";
+    return {};
 }
 
 // Trailing (and leading) ASCII whitespace off a captured stdout. `git
@@ -191,7 +206,7 @@ std::vector<std::string> gitRevParseArgv(std::string const& gitExe,
     return argv;
 }
 
-std::optional<fs::path> SystemGitRunner::resolve_() {
+std::optional<core::HostPath> SystemGitRunner::resolve_() {
     // Answered once. PATH cannot change under a running build, and the lookup
     // walks every PATH entry with extension probing on Windows — cheap, but not
     // free, and re-answering it per operation would make an N-dependency build
@@ -218,7 +233,7 @@ GitCommandResult SystemGitRunner::clone(std::string const& url,
     // Every spawn in this runner withholds git's repository variables — see the
     // ★★★ note over `gitRepositoryLocalVariables` in the header.
     return fromSpawn(
-        substrate::spawnAndWaitInherit(gitCloneArgv(exe->string(), url, dest),
+        substrate::spawnAndWaitInherit(*exe, gitCloneArgv(exe->spelling().display(), url, dest),
                                        /*cwd=*/{}, gitRepositoryLocalVariables()),
         "git clone of '" + url + "'");
 }
@@ -233,7 +248,7 @@ GitCommandResult SystemGitRunner::fetch(fs::path const&    checkoutDir,
     }
     return fromSpawn(
         substrate::spawnAndWaitInherit(
-            gitFetchArgv(exe->string(), checkoutDir, ref), checkoutDir,
+            *exe, gitFetchArgv(exe->spelling().display(), checkoutDir, ref), checkoutDir,
             gitRepositoryLocalVariables()),
         "git fetch in '" + core::genericSpelling(checkoutDir) + "'");
 }
@@ -248,7 +263,7 @@ GitCommandResult SystemGitRunner::checkout(fs::path const&    checkoutDir,
     }
     return fromSpawn(
         substrate::spawnAndWaitInherit(
-            gitCheckoutArgv(exe->string(), checkoutDir, rev), checkoutDir,
+            *exe, gitCheckoutArgv(exe->spelling().display(), checkoutDir, rev), checkoutDir,
             gitRepositoryLocalVariables()),
         "git checkout of '" + rev + "'");
 }
@@ -263,10 +278,9 @@ GitCommandResult SystemGitRunner::revParse(fs::path const&    checkoutDir,
     }
 
     CaptureSlot slot;
-    claimCaptureSlot(slot);
-    if (slot.file.empty()) {
+    if (std::string const why = claimCaptureSlot(slot); !why.empty()) {
         out.detail = "git rev-parse could not claim a capture file under the "
-                     "system temporary directory";
+                     "system temporary directory: " + why;
         return out;
     }
 
@@ -278,18 +292,19 @@ GitCommandResult SystemGitRunner::revParse(fs::path const&    checkoutDir,
     // that has no timeout to escape it with.
     out = fromSpawn(
         substrate::spawnAndWaitRedirectStdout(
-            gitRevParseArgv(exe->string(), checkoutDir, rev), checkoutDir,
+            *exe, gitRevParseArgv(exe->spelling().display(), checkoutDir, rev), checkoutDir,
             slot.file, gitRepositoryLocalVariables()),
         "git rev-parse " + rev + " in '" + core::genericSpelling(checkoutDir) + "'");
     if (!out.ok) return out;
 
-    std::ifstream in{slot.file, std::ios::binary};
-    if (!in) {
+    auto opened = core::openInputStream(slot.file, std::ios::binary);   // the value's leaf, at any length
+    if (!opened) {
         out.ok     = false;
         out.detail = "git rev-parse succeeded but its captured output at '"
-                   + core::genericSpelling(slot.file) + "' could not be read";
+                   + slot.file.spelling().generic() + "' could not be read: " + core::reasonText(opened.error());
         return out;
     }
+    std::ifstream& in = *opened;
     out.output = trimAscii(std::string{std::istreambuf_iterator<char>{in},
                                        std::istreambuf_iterator<char>{}});
 

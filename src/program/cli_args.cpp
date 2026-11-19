@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <format>
+#include <iterator>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -416,6 +417,10 @@ parseCliArgs(int argc, char* argv[]) {
     enum class Mode : std::uint8_t { None, Compile, Transpile, Directory, Project, Lsp,
                                      DumpPredefinedMacros, EmitHir, DumpHirKinds };
     Mode mode = Mode::None;
+    // Every unit the walk refused, in argv order (R-ARGV): a refused unit is recorded here and the walk goes on past
+    // its span. Of the parse's exits, those INSIDE the walk are each a unit's refusal and go here; those after it are
+    // the consistency checks of a whole command line, which read only a walk that refused nothing.
+    std::vector<CliArgsErrorInfo> refused;
     auto const setMode = [&](Mode m, std::string_view flag)
             -> std::expected<void, CliArgsErrorInfo> {
         if (mode != Mode::None) {
@@ -443,25 +448,27 @@ parseCliArgs(int argc, char* argv[]) {
     // shell-glob-expanded empty arg or treating `-` (stdin
     // shorthand) as a real filename. (silent-failure-hunter F2
     // post-fold.)
+    // An empty or bare-hyphen positional is REFUSED and SPANNED: it is this list's, never read again as a unit of
+    // its own (which would add a refusal it does not deserve).
     auto const consumePositionals = [&](int& i, std::vector<std::string>& out,
-                                         std::string_view flag)
-            -> std::expected<void, CliArgsErrorInfo> {
+                                         std::string_view flag) {
         while (i + 1 < argc) {
             std::string_view const next{argv[i + 1]};
             // Check bare `-` and empty BEFORE the flag-prefix break:
             // `-` starts with "-" but is meant as the (rejected) stdin-
             // shorthand, not a flag. F2 post-fold ordering.
             if (next.empty() || next == "-") {
-                return std::unexpected(make_error(
+                refused.push_back(make_error(
                     CliArgsError::EmptyFilename,
                     std::string{flag} + ": empty or bare-hyphen "
                     "positional argument is not a valid file path"));
+                ++i;
+                continue;
             }
             if (next.starts_with("-")) break;
             ++i;
             out.emplace_back(argv[i]);
         }
-        return {};
     };
 
     // Helper for the `=`-form of value flags. The non-`=` form is
@@ -544,7 +551,8 @@ parseCliArgs(int argc, char* argv[]) {
             if (auto e = setMode(Mode::DumpPredefinedMacros,
                                  "--dump-predefined-macros");
                 !e) {
-                return std::unexpected(e.error());
+                refused.push_back(e.error());
+                continue;
             }
             out.dumpPredefinedMacros = true;
             continue;
@@ -553,7 +561,8 @@ parseCliArgs(int argc, char* argv[]) {
         // ── HIR node-kind inventory (a MODE: prints, compiles nothing) ──
         if (a == "--dump-hir-kinds") {
             if (auto e = setMode(Mode::DumpHirKinds, "--dump-hir-kinds"); !e) {
-                return std::unexpected(e.error());
+                refused.push_back(e.error());
+                continue;
             }
             out.dumpHirKinds = true;
             continue;
@@ -568,16 +577,18 @@ parseCliArgs(int argc, char* argv[]) {
         // why the bare-positional arm below has to know about this mode.
         {
             auto m = valueFlag(a, i, "--emit-hir");
-            if (!m) return std::unexpected(m.error());
+            if (!m) { refused.push_back(m.error()); continue; }
             if (m->has_value()) {
                 if (auto e = setMode(Mode::EmitHir, "--emit-hir"); !e) {
-                    return std::unexpected(e.error());
+                    refused.push_back(e.error());
+                    continue;
                 }
                 if ((*m)->empty()) {
-                    return std::unexpected(make_error(
+                    refused.push_back(make_error(
                         CliArgsError::EmptyFilename,
                         "--emit-hir requires a destination path (or '-' for "
                         "stdout)"));
+                    continue;
                 }
                 out.emitHirPath = std::move(**m);
                 continue;
@@ -586,13 +597,13 @@ parseCliArgs(int argc, char* argv[]) {
 
         // ── LSP ─────────────────────────────────────────────────
         if (a == "--lsp") {
-            if (auto e = setMode(Mode::Lsp, "--lsp"); !e) return std::unexpected(e.error());
+            if (auto e = setMode(Mode::Lsp, "--lsp"); !e) { refused.push_back(e.error()); continue; }
             out.lspMode = true;
             continue;
         }
         {
             auto m = valueFlag(a, i, "--schema-dir");
-            if (!m) return std::unexpected(m.error());
+            if (!m) { refused.push_back(m.error()); continue; }
             if (m->has_value()) {
                 out.lspSchemaDir = std::filesystem::path{std::move(**m)};
                 continue;
@@ -601,33 +612,35 @@ parseCliArgs(int argc, char* argv[]) {
 
         // ── Compile mode ────────────────────────────────────────
         if (a == "--compile") {
-            if (auto e = setMode(Mode::Compile, "--compile"); !e) return std::unexpected(e.error());
-            if (auto e = consumePositionals(i, out.sourceFiles, "--compile"); !e) return std::unexpected(e.error());
+            // Refused or not, the flag's list is this unit's span.
+            if (auto e = setMode(Mode::Compile, "--compile"); !e) refused.push_back(e.error());
+            consumePositionals(i, out.sourceFiles, "--compile");
             continue;
         }
 
         // ── Transpile mode (plan 10 — fail-loud at dispatch) ────
         if (a == "--transpile") {
-            if (auto e = setMode(Mode::Transpile, "--transpile"); !e) return std::unexpected(e.error());
-            if (auto e = consumePositionals(i, out.transpileFiles, "--transpile"); !e) return std::unexpected(e.error());
+            // Refused or not, the flag's list is this unit's span.
+            if (auto e = setMode(Mode::Transpile, "--transpile"); !e) refused.push_back(e.error());
+            consumePositionals(i, out.transpileFiles, "--transpile");
             continue;
         }
 
         // ── Directory mode ──────────────────────────────────────
         {
             auto m = valueFlag(a, i, "--directory");
-            if (!m) return std::unexpected(m.error());
+            if (!m) { refused.push_back(m.error()); continue; }
             if (m->has_value()) {
-                if (auto e = setMode(Mode::Directory, "--directory"); !e) return std::unexpected(e.error());
+                if (auto e = setMode(Mode::Directory, "--directory"); !e) { refused.push_back(e.error()); continue; }
                 out.directoryPath = std::move(**m);
                 continue;
             }
         }
         {
             auto m = valueFlag(a, i, "--dir");
-            if (!m) return std::unexpected(m.error());
+            if (!m) { refused.push_back(m.error()); continue; }
             if (m->has_value()) {
-                if (auto e = setMode(Mode::Directory, "--directory"); !e) return std::unexpected(e.error());
+                if (auto e = setMode(Mode::Directory, "--directory"); !e) { refused.push_back(e.error()); continue; }
                 out.directoryPath = std::move(**m);
                 continue;
             }
@@ -636,9 +649,9 @@ parseCliArgs(int argc, char* argv[]) {
         // ── Project mode ────────────────────────────────────────
         {
             auto m = valueFlag(a, i, "--project");
-            if (!m) return std::unexpected(m.error());
+            if (!m) { refused.push_back(m.error()); continue; }
             if (m->has_value()) {
-                if (auto e = setMode(Mode::Project, "--project"); !e) return std::unexpected(e.error());
+                if (auto e = setMode(Mode::Project, "--project"); !e) { refused.push_back(e.error()); continue; }
                 out.projectPath = std::move(**m);
                 continue;
             }
@@ -647,7 +660,7 @@ parseCliArgs(int argc, char* argv[]) {
         // ── Compile-mode shared options ─────────────────────────
         {
             auto m = valueFlag(a, i, "--language");
-            if (!m) return std::unexpected(m.error());
+            if (!m) { refused.push_back(m.error()); continue; }
             if (m->has_value()) {
                 out.languageName = std::move(**m);
                 continue;
@@ -655,7 +668,7 @@ parseCliArgs(int argc, char* argv[]) {
         }
         {
             auto m = valueFlag(a, i, "--lang");
-            if (!m) return std::unexpected(m.error());
+            if (!m) { refused.push_back(m.error()); continue; }
             if (m->has_value()) {
                 out.languageName = std::move(**m);
                 continue;
@@ -663,7 +676,7 @@ parseCliArgs(int argc, char* argv[]) {
         }
         {
             auto m = valueFlag(a, i, "--target");
-            if (!m) return std::unexpected(m.error());
+            if (!m) { refused.push_back(m.error()); continue; }
             if (m->has_value()) {
                 out.targets.push_back(std::move(**m));
                 continue;
@@ -673,7 +686,7 @@ parseCliArgs(int argc, char* argv[]) {
             // D-LK10-ENTRY Slice C companion: `--output <dir>` /
             // `--output=<dir>` routes emitted binaries.
             auto m = valueFlag(a, i, "--output");
-            if (!m) return std::unexpected(m.error());
+            if (!m) { refused.push_back(m.error()); continue; }
             if (m->has_value()) {
                 out.outputDir = std::filesystem::path{std::move(**m)};
                 continue;
@@ -686,24 +699,26 @@ parseCliArgs(int argc, char* argv[]) {
             // predefinedMacros carry the params axis). Tokenizer-true name
             // validation happens in the preprocessor's directive handler.
             auto m = valueFlag(a, i, "--define");
-            if (!m) return std::unexpected(m.error());
+            if (!m) { refused.push_back(m.error()); continue; }
             if (m->has_value()) {
                 std::string d = std::move(**m);
                 auto const eq = d.find('=');
                 std::string_view const name =
                     std::string_view{d}.substr(0, eq);
                 if (name.empty()) {
-                    return std::unexpected(CliArgsErrorInfo{
+                    refused.push_back(CliArgsErrorInfo{
                         CliArgsError::InvalidDefine,
                         "--define requires a non-empty macro NAME "
                         "(--define NAME[=VALUE]); got: '" + d + "'"});
+                    continue;
                 }
                 if (name.find('(') != std::string_view::npos) {
-                    return std::unexpected(CliArgsErrorInfo{
+                    refused.push_back(CliArgsErrorInfo{
                         CliArgsError::InvalidDefine,
                         "a function-like --define is not supported (got '" + d
                             + "'); declare a config predefinedMacros entry "
                               "with 'params' instead"});
+                    continue;
                 }
                 // c105 audit M1: NAME must be a single C-family identifier —
                 // trailing junk (`--define "FOO,BAR=1"`) would otherwise flow
@@ -723,10 +738,11 @@ parseCliArgs(int argc, char* argv[]) {
                     }
                 }
                 if (!nameOk) {
-                    return std::unexpected(CliArgsErrorInfo{
+                    refused.push_back(CliArgsErrorInfo{
                         CliArgsError::InvalidDefine,
                         "--define NAME must be a single identifier "
                         "([A-Za-z_][A-Za-z0-9_]*); got: '" + d + "'"});
+                    continue;
                 }
                 out.defines.push_back(std::move(d));
                 continue;
@@ -744,7 +760,7 @@ parseCliArgs(int argc, char* argv[]) {
             // header still fails loud P0016 downstream).
             if (a == "-I") {                                   // -I <dir> (space)
                 auto v = takeFlagValue(a, i, argc, argv);
-                if (!v) return std::unexpected(v.error());
+                if (!v) { refused.push_back(v.error()); continue; }
                 out.includeDirs.push_back(std::move(*v));
                 continue;
             }
@@ -753,7 +769,7 @@ parseCliArgs(int argc, char* argv[]) {
                 continue;
             }
             auto m = valueFlag(a, i, "--include-dir");          // --include-dir <dir>/=<dir>
-            if (!m) return std::unexpected(m.error());
+            if (!m) { refused.push_back(m.error()); continue; }
             if (m->has_value()) {
                 out.includeDirs.push_back(std::move(**m));
                 continue;
@@ -781,7 +797,7 @@ parseCliArgs(int argc, char* argv[]) {
             // (`--resolve-library=/p/lib.dylib=libtcl8.6.dylib` -- `equalsValue`
             // strips only the flag's own first `=`).
             auto m = valueFlag(a, i, "--resolve-library");
-            if (!m) return std::unexpected(m.error());
+            if (!m) { refused.push_back(m.error()); continue; }
             if (m->has_value()) {
                 std::string v = std::move(**m);
                 ResolveLibrarySpec spec;
@@ -802,20 +818,22 @@ parseCliArgs(int argc, char* argv[]) {
                     // that dies at load, the exact silent failure this flag
                     // exists to prevent.
                     if (path.empty()) {
-                        return std::unexpected(CliArgsErrorInfo{
+                        refused.push_back(CliArgsErrorInfo{
                             CliArgsError::InvalidResolveLibrary,
                             "--resolve-library requires a non-empty PATH before "
                             "the '=' (--resolve-library <path>[=<import-name>]); "
                             "got: '" + v + "'"});
+                        continue;
                     }
                     if (name.empty()) {
-                        return std::unexpected(CliArgsErrorInfo{
+                        refused.push_back(CliArgsErrorInfo{
                             CliArgsError::InvalidResolveLibrary,
                             "--resolve-library requires a non-empty IMPORT NAME "
                             "after the '=' (--resolve-library "
                             "<path>[=<import-name>]); got: '" + v
                             + "'. Omit the '=' entirely to record the binary's "
                               "own embedded soname."});
+                        continue;
                     }
                     spec.path               = std::move(path);
                     spec.declaredImportName = std::move(name);
@@ -836,15 +854,16 @@ parseCliArgs(int argc, char* argv[]) {
         // ── --config=<debug|release> (plan 22 OPT* wiring) ──────
         {
             auto m = valueFlag(a, i, "--config");
-            if (!m) return std::unexpected(m.error());
+            if (!m) { refused.push_back(m.error()); continue; }
             if (m->has_value()) {
                 auto const cfg = parseCompileConfig(**m);
                 if (!cfg.has_value()) {
-                    return std::unexpected(make_error(
+                    refused.push_back(make_error(
                         CliArgsError::InvalidConfig,
                         std::string{"--config: '"} + **m
                         + "' is not a recognized configuration "
                           "(accepted: debug, release)"));
+                    continue;
                 }
                 out.config = *cfg;
                 continue;
@@ -877,15 +896,16 @@ parseCliArgs(int argc, char* argv[]) {
             // because a silent fallback reports the same green as a build that
             // honoured the flag.
             auto m = valueFlag(a, i, "--lto");
-            if (!m) return std::unexpected(m.error());
+            if (!m) { refused.push_back(m.error()); continue; }
             if (m->has_value()) {
                 auto const mode = parseLtoModeArg(**m);
                 if (!mode.has_value()) {
-                    return std::unexpected(make_error(
+                    refused.push_back(make_error(
                         CliArgsError::InvalidLto,
                         std::string{"--lto: '"} + **m
                         + "' is not a recognized link-time-optimization mode "
                           "(accepted: full, thin)"));
+                    continue;
                 }
                 out.lto = *mode;
                 continue;
@@ -897,18 +917,19 @@ parseCliArgs(int argc, char* argv[]) {
             // numeric value, trailing junk, or 0 fails loud (InvalidJobs) rather
             // than silently falling back to auto (which would mask a typo'd -j).
             auto m = valueFlag(a, i, "--jobs");
-            if (!m) return std::unexpected(m.error());
+            if (!m) { refused.push_back(m.error()); continue; }
             if (m->has_value()) {
                 std::string const& v = **m;
                 unsigned n = 0;
                 auto const [p, ec] = std::from_chars(
                     v.data(), v.data() + v.size(), n);
                 if (ec != std::errc{} || p != v.data() + v.size() || n == 0) {
-                    return std::unexpected(make_error(
+                    refused.push_back(make_error(
                         CliArgsError::InvalidJobs,
                         std::string{"--jobs: '"} + v
                         + "' is not a positive integer worker count "
                           "(e.g. --jobs 4; use --jobs 1 for a serial build)"));
+                    continue;
                 }
                 out.jobs = n;
                 continue;
@@ -930,7 +951,7 @@ parseCliArgs(int argc, char* argv[]) {
             // yet, so the linker gate owns that check. Parsing what is
             // syntactically a byte count is all this layer can honestly do.
             auto m = valueFlag(a, i, "--stack-reserve");
-            if (!m) return std::unexpected(m.error());
+            if (!m) { refused.push_back(m.error()); continue; }
             if (m->has_value()) {
                 std::string const& v = **m;
                 std::uint64_t n = 0;
@@ -942,7 +963,7 @@ parseCliArgs(int argc, char* argv[]) {
                 // `p != end` catches trailing junk (`4096x` must not silently
                 // become 4096).
                 if (ec != std::errc{} || p != v.data() + v.size() || n == 0) {
-                    return std::unexpected(make_error(
+                    refused.push_back(make_error(
                         CliArgsError::InvalidStackReserve,
                         std::string{"--stack-reserve: '"} + v
                         + "' is not a positive integer byte count "
@@ -950,6 +971,7 @@ parseCliArgs(int argc, char* argv[]) {
                           "value must be in the range the target's object "
                           "format declares; a format that cannot carry a "
                           "stack reserve rejects the request outright."));
+                    continue;
                 }
                 out.stackReserveBytes = n;
                 continue;
@@ -965,7 +987,7 @@ parseCliArgs(int argc, char* argv[]) {
             // `runpathEntryRefusal`), and whether the chosen format records
             // runpaths at all is the format document's — neither is known here.
             auto m = valueFlag(a, i, "--rpath");
-            if (!m) return std::unexpected(m.error());
+            if (!m) { refused.push_back(m.error()); continue; }
             if (m->has_value()) {
                 out.runpaths.push_back(std::move(**m));
                 continue;
@@ -998,19 +1020,20 @@ parseCliArgs(int argc, char* argv[]) {
             // of truth about a domain the library already defines — see the
             // `CliArgs::maxDiagnostics` docblock.
             auto m = valueFlag(a, i, "--max-diagnostics");
-            if (!m) return std::unexpected(m.error());
+            if (!m) { refused.push_back(m.error()); continue; }
             if (m->has_value()) {
                 std::string const& v = **m;
                 std::size_t n = 0;
                 auto const [p, ec] = std::from_chars(
                     v.data(), v.data() + v.size(), n);
                 if (ec != std::errc{} || p != v.data() + v.size()) {
-                    return std::unexpected(make_error(
+                    refused.push_back(make_error(
                         CliArgsError::InvalidMaxDiagnostics,
                         std::string{"--max-diagnostics: '"} + v
                         + "' is not a non-negative integer diagnostic count "
                           "(e.g. --max-diagnostics 5000; 0 is legal and means "
                           "show none, just count them)"));
+                    continue;
                 }
                 out.maxDiagnostics = n;
                 continue;
@@ -1030,19 +1053,20 @@ parseCliArgs(int argc, char* argv[]) {
             // so `100x` cannot silently become 100. Zero is accepted here too
             // — see the `CliArgs::maxPerCode` docblock.
             auto m = valueFlag(a, i, "--max-per-code");
-            if (!m) return std::unexpected(m.error());
+            if (!m) { refused.push_back(m.error()); continue; }
             if (m->has_value()) {
                 std::string const& v = **m;
                 std::size_t n = 0;
                 auto const [p, ec] = std::from_chars(
                     v.data(), v.data() + v.size(), n);
                 if (ec != std::errc{} || p != v.data() + v.size()) {
-                    return std::unexpected(make_error(
+                    refused.push_back(make_error(
                         CliArgsError::InvalidMaxPerCode,
                         std::string{"--max-per-code: '"} + v
                         + "' is not a non-negative integer diagnostic count "
                           "(e.g. --max-per-code 500; 0 is legal and means "
                           "elide every one, just count them per code)"));
+                    continue;
                 }
                 out.maxPerCode = n;
                 continue;
@@ -1050,14 +1074,15 @@ parseCliArgs(int argc, char* argv[]) {
         }
         {
             auto m = valueFlag(a, i, "--suppress");
-            if (!m) return std::unexpected(m.error());
+            if (!m) { refused.push_back(m.error()); continue; }
             if (m->has_value()) {
                 auto const code = parseSuppressCode(**m);
                 if (!code.has_value()) {
-                    return std::unexpected(make_error(
+                    refused.push_back(make_error(
                         CliArgsError::InvalidSuppressCode,
                         std::string{"--suppress: '"} + **m
                         + "' is not a recognized diagnostic-code name or hex value"));
+                    continue;
                 }
                 out.suppress.push_back(*code);
                 continue;
@@ -1066,11 +1091,12 @@ parseCliArgs(int argc, char* argv[]) {
 
         // ── Unknown flag (fail loud) ────────────────────────────
         if (a.starts_with("-")) {
-            return std::unexpected(make_error(
+            refused.push_back(make_error(
                 CliArgsError::UnknownFlag,
                 std::string{"unknown flag '"} + std::string{a}
                 + "' (value flags also accept the '=' form, "
                   "e.g. --target=x86_64:elf64-x86_64-linux)"));
+            continue;
         }
 
         // `--emit-hir <path>` takes its DESTINATION as a value, so the TU's
@@ -1079,9 +1105,10 @@ parseCliArgs(int argc, char* argv[]) {
         // mode keeps the refusal below.
         if (mode == Mode::EmitHir) {
             if (a.empty()) {
-                return std::unexpected(make_error(
+                refused.push_back(make_error(
                     CliArgsError::EmptyFilename,
                     "--emit-hir: empty source file name"));
+                continue;
             }
             out.emitHirFiles.emplace_back(a);
             continue;
@@ -1091,11 +1118,21 @@ parseCliArgs(int argc, char* argv[]) {
         // remediation is "move this token to follow --compile/
         // --transpile/--directory", NOT "spell the flag right"
         // (type-design audit post-fold #2 — UnknownFlag was overloaded).
-        return std::unexpected(make_error(
+        refused.push_back(make_error(
             CliArgsError::UnexpectedPositional,
             std::string{"unexpected positional argument '"}
             + std::string{a} + "' — file lists belong after --compile "
               "or --transpile"));
+        continue;
+    }
+
+    // THE WALK'S ANSWER: every unit it refused -- the first as the error's own kind and detail, every later one in
+    // `also`, in argv order. The checks below judge a whole command line, so they read only a walk that refused
+    // nothing.
+    if (!refused.empty()) {
+        CliArgsErrorInfo first = std::move(refused.front());
+        first.also.assign(std::make_move_iterator(refused.begin() + 1), std::make_move_iterator(refused.end()));
+        return std::unexpected(std::move(first));
     }
 
     // ── Post-parse validation ───────────────────────────────────

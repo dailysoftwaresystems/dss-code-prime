@@ -1,0 +1,1 @@
+            string(APPEND _dss_manifest "\t${_dss_h}\n")

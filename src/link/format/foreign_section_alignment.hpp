@@ -3,6 +3,7 @@
 #include "core/types/alignment.hpp"
 
 #include <cstdint>
+#include <optional>
 
 // ── ONE POLICY FOR A FOREIGN OBJECT'S DECLARED SECTION ALIGNMENT ───────────
 //
@@ -37,53 +38,40 @@
 //
 // ── THE POLICY ────────────────────────────────────────────────────────────
 //
-// A declared section alignment is a RE-LAYOUT HINT, never a correctness input
-// on read-back: the merge re-lays-out every item it takes in, so this value
-// constrains where an item MAY be placed, and nothing downstream trusts it as a
-// statement about where the item already IS. Consequently a value ABOVE THE 256
-// BYTES THESE TWO HELPERS ACCEPT (or -- for the byte-count encoding -- not a
-// power of two at all) degrades to byte alignment rather than failing the read:
-// refusing an object over a hint we do not depend on would reject input every
-// reference linker accepts.
+// A declared section alignment is a CORRECTNESS INPUT. Each reader states an
+// item's alignment as its section's (and the linker narrows it by the item's
+// offset in the section), and the merge places the item there: C's `_Alignas`
+// is a guarantee the program observes, so an alignment read as less than the
+// producer declared is a miscompile, not a layout difference. So every
+// alignment the `Alignment` newtype holds -- each power of two up to
+// `Alignment::kMaxBytes` -- is carried as declared, and a field that is no
+// such alignment (a byte count that is not a power of two, which the gABI
+// does not allow, or an exponent or count past 2^31) is NO ANSWER (`nullopt`):
+// the reader refuses the object by name rather than place its bytes at an
+// alignment nothing declared.
 //
-// ⚠ P63 (D-CSUBSET-ALIGNMENT-CEILING-REFUSES-WHAT-TWO-REFERENCES-RUN): THE 256
-// BELOW IS NOW THIS FILE'S OWN NUMBER, NOT THE NEWTYPE'S. It used to be both --
-// `Alignment::fromBytes` capped at 256 and these guards mirrored it -- and the
-// sentences here said so. The newtype's domain is now its STORAGE domain
-// (`Alignment::kMaxBytes`), because a policy number smuggled into a storage type
-// is what refused `aligned(4096)` in the front end for a whole release. These
-// two guards keep 256 as a DELIBERATE read-side policy, unchanged in behaviour;
-// what changed is that it no longer claims to be the newtype's limit.
-// ⓘ Raising it is a real, separate question with a real witness on the other
-// side: BOTH mingw-w64 gcc 13.2.0 and clang emit `IMAGE_SCN_ALIGN_*` classes up
-// to 8192, so a COFF `.rdata` declaring 512..8192 currently degrades to byte
-// alignment here rather than being carried. Not taken in P63 -- stated, because
-// a number that has stopped being derived should say what it is.
-//
-// ⚠ The degrade direction is deliberate and is the ONLY safe one available
-// here: it can only make the merge place an item MORE freely than the producer
-// asked, which is visible as a layout difference. The opposite reflex --
-// silently substituting some "reasonable" larger alignment for an
-// unrepresentable one -- would let an over-aligned item ride at an alignment
-// nothing declared, which is a fact about our output that is false.
+// ★ UNTIL P69 BOTH HELPERS DEGRADED EVERY ALIGNMENT ABOVE 256 TO ONE BYTE, on
+// the argument that a declared alignment is "a re-layout hint, never a
+// correctness input". ✔MEASURED 2026-10-15 (the windows-x86_64 finals of the
+// re-review of fold 3b, and a probe with the same dsscp): a DSS PE object's
+// `_Alignas(4096) char v;` -- a `.bss` definition its section declares 2**12
+// -- linked by DSS landed at an address that is not a multiple of 4096, with
+// its object alone or beside a common it outranks, while link.exe placed the
+// same object at 4096 in the same run (`TentativeDefinitionsNative`, its cl
+// arm). 256 was the newtype's old ceiling, kept here as a policy
+// after P63 lifted the newtype's to 2^31; mingw-w64 gcc and clang emit
+// `IMAGE_SCN_ALIGN_*` classes up to 8192, so the degrade met real input.
 
 namespace dss::link::format {
 
 // The policy kernel, for the two formats that already speak in exponents
-// (Mach-O directly, PE/COFF after its class-field arithmetic).
-//
-// `log2 == 0` is alignment 1 -- "no constraint" -- and is the same answer as
-// the degrade arm, deliberately: a producer that declared byte alignment and a
-// producer that declared something we cannot represent both leave the merge
-// free to place the item anywhere.
-[[nodiscard]] constexpr Alignment
+// (Mach-O directly, PE/COFF after its class-field arithmetic). `log2 == 0` is
+// alignment 1 -- "no constraint". An exponent past 31 is no alignment an
+// `Alignment` holds: nullopt, and the reader refuses it by name.
+[[nodiscard]] constexpr std::optional<Alignment>
 foreignSectionAlignmentFromLog2(std::uint32_t log2) noexcept {
-    // 2^8 = 256 is THIS FILE'S read-side policy (see the docblock -- it is no
-    // longer the newtype's ceiling); a wild exponent (a corrupt or simply
-    // larger-than-we-model field) takes the same degrade arm.
-    if (log2 == 0u || log2 > 8u) return Alignment{};
-    return Alignment::fromBytes(std::uint32_t{1} << log2)
-        .value_or(Alignment{});
+    if (log2 > 31u) return std::nullopt;
+    return Alignment::fromBytes(std::uint32_t{1} << log2);
 }
 
 // The policy kernel for the byte-count encoding (ELF `sh_addralign`).
@@ -93,12 +81,13 @@ foreignSectionAlignmentFromLog2(std::uint32_t log2) noexcept {
 // bytes, a plausible-looking wrong answer rather than a refusal. This is the
 // same trap the WRITE side names in `macho.cpp`'s `sectionAlignLog2`, met from
 // the other direction, so the pow2 test is `fromBytes`'s and not a caller's.
-[[nodiscard]] constexpr Alignment
+// 0 and 1 both mean "no constraint" in the gABI, which allows only those and
+// powers of two.
+[[nodiscard]] constexpr std::optional<Alignment>
 foreignSectionAlignmentFromByteCount(std::uint64_t bytes) noexcept {
-    // 0 and 1 both mean "no constraint" in the gABI.
-    if (bytes <= 1u || bytes > 256u) return Alignment{};
-    return Alignment::fromBytes(static_cast<std::uint32_t>(bytes))
-        .value_or(Alignment{});
+    if (bytes <= 1u) return Alignment{};
+    if (bytes > Alignment::kMaxBytes) return std::nullopt;
+    return Alignment::fromBytes(static_cast<std::uint32_t>(bytes));
 }
 
 } // namespace dss::link::format

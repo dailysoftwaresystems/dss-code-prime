@@ -1,0 +1,3 @@
+EntryKind reachedKind(HostPath const& p, Use use, std::error_code& ec) {
+    ec.clear();
+    auto const reference = callSpelling(p, use, ec);

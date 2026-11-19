@@ -1,0 +1,55 @@
+{
+  "$comment": "P69 (lane `lm`, the scalar brace closure): C 6.7.9p11 gives a scalar `a single expression, optionally enclosed in braces`, and C 6.7.9p2 makes a second element a constraint violation. DSS refused both S_InvalidScalarInitializer — `{{42}}` and `{42, 7}` on every path, and a static object's excess element that is not a constant S_StaticInitializerNotConstant. MEASURED 2026-10-16, THIS file's bytes, each program RUN: clang 18.1.3 and gcc 13.3.0 build it at -std=c2x and -std=gnu2x, -O0 and -O2, and exit 42 — every scalar holds its innermost FIRST value (`{{}}` is zero), and `bump()` in an excess element never runs. Both warn once per brace level beyond the first and, around a scalar member or element of an aggregate, already at the first (clang leaves that one unsaid where the list also has excess, gcc says it); both warn the excess (clang once per list and not inside an inner list, gcc once per excess element). DSS warns S_BracesAroundScalarInitializer at each such inner brace list and S_ExcessElementsInScalarInitializer once per list at its first excess element — the positions below. Exit 42, or the number of the first check that fails (main.c). The release arm is report-only: every object is volatile, so the optimized program reads the stored values.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectWarnings": [
+    { "code": "S_BracesAroundScalarInitializer", "line": 10, "col": 18 },
+    { "code": "S_ExcessElementsInScalarInitializer", "line": 11, "col": 22 },
+    { "code": "S_BracesAroundScalarInitializer", "line": 12, "col": 18 },
+    { "code": "S_ExcessElementsInScalarInitializer", "line": 12, "col": 24 },
+    { "code": "S_BracesAroundScalarInitializer", "line": 15, "col": 24 },
+    { "code": "S_BracesAroundScalarInitializer", "line": 16, "col": 24 },
+    { "code": "S_BracesAroundScalarInitializer", "line": 16, "col": 25 },
+    { "code": "S_ExcessElementsInScalarInitializer", "line": 17, "col": 28 },
+    { "code": "S_BracesAroundScalarInitializer", "line": 18, "col": 24 },
+    { "code": "S_ExcessElementsInScalarInitializer", "line": 18, "col": 30 },
+    { "code": "S_BracesAroundScalarInitializer", "line": 19, "col": 24 },
+    { "code": "S_BracesAroundScalarInitializer", "line": 20, "col": 24 },
+    { "code": "S_ExcessElementsInScalarInitializer", "line": 20, "col": 29 },
+    { "code": "S_BracesAroundScalarInitializer", "line": 21, "col": 29 },
+    { "code": "S_ExcessElementsInScalarInitializer", "line": 21, "col": 34 },
+    { "code": "S_BracesAroundScalarInitializer", "line": 22, "col": 27 },
+    { "code": "S_BracesAroundScalarInitializer", "line": 22, "col": 33 },
+    { "code": "S_BracesAroundScalarInitializer", "line": 23, "col": 29 },
+    { "code": "S_ExcessElementsInScalarInitializer", "line": 23, "col": 35 }
+  ],
+  "forbidDiagnostics": [ "S_InvalidScalarInitializer", "S_StaticInitializerNotConstant" ],
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": false}
+  ]
+}

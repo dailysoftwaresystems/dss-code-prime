@@ -1,0 +1,2 @@
+    // each descriptor once and resolve each path once.
+    ffi::ShippedDescriptorReadScope const oneSnapshot;

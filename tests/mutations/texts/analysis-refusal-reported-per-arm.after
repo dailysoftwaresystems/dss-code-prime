@@ -1,0 +1,1 @@
+            (void)libraryRefusalReportedAt.emplace(tree.id().v, span.start(), span.end());

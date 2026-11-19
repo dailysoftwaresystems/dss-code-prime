@@ -192,6 +192,7 @@ TEST(Mir, MovedFromModuleIsObservablyEmpty) {
 // Build a straight-line function and read every tier back.
 TEST(Mir, BuildsAndReadsAStraightLineFunction) {
     MirBuilder b;
+    b.stateArgCounting(MirArgCounting::PerClass);
     MirFuncId const f = b.addFunction(kFnSig, SymbolId{7});
     MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
     b.beginBlock(entry);
@@ -332,6 +333,7 @@ TEST(Mir, PhiIncomingsCanBeBackpatched) {
 // successors [case targets…, default].
 TEST(Mir, BuildsASwitchWithPositionalCasePairing) {
     MirBuilder b;
+    b.stateArgCounting(MirArgCounting::PerClass);
     b.addFunction(kFnSig, SymbolId{1});
     MirBlockId const entry = b.createBlock(StructCfMarker::SwitchHead);
     MirBlockId const caseA = b.createBlock(StructCfMarker::SwitchCase);
@@ -365,6 +367,7 @@ TEST(Mir, BuildsASwitchWithPositionalCasePairing) {
 // regression in either the bound or in addSwitch's unconditional-default push.
 TEST(Mir, BuildsASwitchWithDefaultOnly) {
     MirBuilder b;
+    b.stateArgCounting(MirArgCounting::PerClass);
     b.addFunction(kFnSig, SymbolId{1});
     MirBlockId const entry = b.createBlock(StructCfMarker::SwitchHead);
     MirBlockId const dflt  = b.createBlock(StructCfMarker::SwitchCase);
@@ -826,6 +829,7 @@ TEST(MirDeathTest, DirectCtorGlobalArenaTagMismatchAborts) {
 // result has the supplied resultType.
 TEST(Mir, ExtractValueProducesGepShapedOperands) {
     MirBuilder b;
+    b.stateArgCounting(MirArgCounting::PerClass);
     constexpr TypeId kStruct{4};   // stand-in for a struct TypeId
     MirFuncId const f = b.addFunction(kFnSig, SymbolId{42});
     MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
@@ -850,6 +854,7 @@ TEST(Mir, ExtractValueProducesGepShapedOperands) {
 // and returns a value of the aggregate's type.
 TEST(Mir, InsertValueProducesGepShapedOperands) {
     MirBuilder b;
+    b.stateArgCounting(MirArgCounting::PerClass);
     constexpr TypeId kStruct{4};
     MirFuncId const f = b.addFunction(kFnSig, SymbolId{42});
     MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
@@ -874,6 +879,7 @@ TEST(Mir, InsertValueProducesGepShapedOperands) {
 // Nested extract: path {0, 2} produces operands [agg, idx0=0, idx1=2].
 TEST(Mir, ExtractValueSupportsNestedPath) {
     MirBuilder b;
+    b.stateArgCounting(MirArgCounting::PerClass);
     constexpr TypeId kStruct{4};
     MirFuncId const f = b.addFunction(kFnSig, SymbolId{42});
     MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
@@ -898,6 +904,7 @@ TEST(Mir, ExtractValueSupportsNestedPath) {
 TEST(MirDeathTest, ExtractValueRejectsEmptyPath) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     MirBuilder b;
+    b.stateArgCounting(MirArgCounting::PerClass);
     b.addFunction(kFnSig, SymbolId{42});
     MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
     b.beginBlock(entry);
@@ -911,6 +918,7 @@ TEST(MirDeathTest, ExtractValueRejectsEmptyPath) {
 TEST(MirDeathTest, ExtractValueRejectsSingleOperand) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     MirBuilder b;
+    b.stateArgCounting(MirArgCounting::PerClass);
     b.addFunction(kFnSig, SymbolId{42});
     MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
     b.beginBlock(entry);
@@ -927,6 +935,7 @@ TEST(MirDeathTest, InsertValueRejectsEmptyPath) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     constexpr TypeId kStruct{4};
     MirBuilder b;
+    b.stateArgCounting(MirArgCounting::PerClass);
     b.addFunction(kFnSig, SymbolId{42});
     MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
     b.beginBlock(entry);
@@ -945,6 +954,7 @@ TEST(MirDeathTest, InsertValueRejectsMismatchedResultType) {
     constexpr TypeId kStruct{4};
     constexpr TypeId kOther{5};
     MirBuilder b;
+    b.stateArgCounting(MirArgCounting::PerClass);
     b.addFunction(kFnSig, SymbolId{42});
     MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
     b.beginBlock(entry);
@@ -962,6 +972,7 @@ TEST(MirDeathTest, InsertValueRejectsMismatchedResultType) {
 TEST(Mir, InsertValueSupportsNestedPath) {
     constexpr TypeId kStruct{4};
     MirBuilder b;
+    b.stateArgCounting(MirArgCounting::PerClass);
     b.addFunction(kFnSig, SymbolId{42});
     MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
     b.beginBlock(entry);
@@ -987,6 +998,7 @@ TEST(Mir, InsertValueSupportsNestedPath) {
 TEST(Mir, AggregatePathOperandsCarryCorrectValues) {
     constexpr TypeId kStruct{4};
     MirBuilder b;
+    b.stateArgCounting(MirArgCounting::PerClass);
     b.addFunction(kFnSig, SymbolId{42});
     MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
     b.beginBlock(entry);

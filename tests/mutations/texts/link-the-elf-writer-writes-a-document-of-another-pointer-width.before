@@ -1,0 +1,4 @@
+    if (!::dss::link::format::requireTheWritersAddressWidth(objectFormatSchema, kElf64AddressBytes,
+                                                           "elf::encode", reporter)) {
+        return {};
+    }

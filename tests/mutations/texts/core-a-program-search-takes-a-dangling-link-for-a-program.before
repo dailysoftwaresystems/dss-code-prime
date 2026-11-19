@@ -1,0 +1,1 @@
+    return core::reachedKind(candidate, core::Use::Leaf, ec) == core::EntryKind::File && !ec

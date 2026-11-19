@@ -1,0 +1,29 @@
+    std::unordered_map<std::uint32_t, std::size_t> inputPositionOfUnit;   // cuId -> its place in `modules`
+    std::vector<std::unordered_map<std::uint32_t, std::size_t>> definitionPositionIn(modules.size());
+    for (std::size_t i = 0; i < modules.size(); ++i) {
+        inputPositionOfUnit.try_emplace(modules[i].cuId.v, i);
+        std::size_t place = 0;
+        for (auto const& fn : modules[i].functions) definitionPositionIn[i].try_emplace(fn.symbol.v, place++);
+        for (auto const& di : modules[i].dataItems) definitionPositionIn[i].try_emplace(di.symbol.v, place++);
+    }
+    auto const placeOf = [&](LinkedSymbolKey const& key) {
+        auto const unit = inputPositionOfUnit.find(key.cuId.v);
+        std::size_t const u = unit == inputPositionOfUnit.end() ? modules.size() : unit->second;
+        std::size_t       d = std::numeric_limits<std::size_t>::max();
+        if (u < modules.size()) {
+            auto const at = definitionPositionIn[u].find(key.symbol.v);
+            if (at != definitionPositionIn[u].end()) d = at->second;
+        }
+        return std::tuple{u, d, key.cuId.v, key.symbol.v};
+    };
+    std::vector<std::pair<std::string const*, LinkedSymbolKey>> winnersInOrder;
+    winnersInOrder.reserve(image.resolvedGlobalDefs.size());
+    for (auto const& [name, key] : image.resolvedGlobalDefs) winnersInOrder.emplace_back(&name, key);
+    std::ranges::sort(winnersInOrder, [&](auto const& a, auto const& b) {
+        auto const pa = placeOf(a.second);
+        auto const pb = placeOf(b.second);
+        if (pa != pb) return pa < pb;
+        return *a.first < *b.first;   // the names of one definition: distinct, so the order is total
+    });
+    for (auto const& [namePtr, key] : winnersInOrder) {
+        std::string const& name = *namePtr;

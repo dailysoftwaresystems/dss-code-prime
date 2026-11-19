@@ -1,0 +1,2 @@
+                if (v.unionMember.has_value())
+                    out_ += std::format("member {} ", *v.unionMember);

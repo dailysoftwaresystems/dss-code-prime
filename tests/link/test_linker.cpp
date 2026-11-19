@@ -75,6 +75,7 @@ constexpr std::string_view kFormatMatchingX86_64 = R"({
   ],
   "relocationAddends": "explicit",
   "inputSectionPlacement": "unit",
+  "weakDefinitionBesideStrong": "yields",
   "relocations": [
     { "name": "R_X86_64_PC32",   "kind": 1, "nativeId": 2  },
     { "name": "R_X86_64_64",     "kind": 2, "nativeId": 1  },
@@ -275,6 +276,7 @@ TEST(Linker, ImageWithNoDataBindingStillRejectsReferencedDataExtern) {
       "entryVerbs": ["none","argc-argv"],
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
       "entryCallingConvention": "ms_x64",
+      "entryTransition": "called",
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
       "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}],
@@ -1495,6 +1497,7 @@ TEST(Linker, TdataItemOnNonOptedInFormatsRejectsAtAcceptsGate) {
         d.bytes     = {7, 0, 0, 0};
         d.alignment = Alignment::of<4>();
         mod.dataItems.push_back(std::move(d));
+        mod.userEntrySymbol = SymbolId{1};   // a program's module states its entry (the build's election)
 
         DiagnosticReporter rep;
         auto image = linker::link(mod, **target, **fmt, rep);
@@ -1825,7 +1828,7 @@ TEST(LinkerStackReserve, DllWalkerItselfRefusesWhenReachedDirectly) {
     ImageRequest req;
     req.stackReserveBytes = 4194304u;
     auto const bytes = pe::encode(mod, **target, **dll, rep, req);
-    EXPECT_TRUE(bytes.empty())
+    EXPECT_FALSE(bytes.has_value())
         << "the walker must emit NOTHING rather than an image carrying an "
            "inert reserve";
     EXPECT_EQ(countCode(rep, DiagnosticCode::K_FormatLacksStackReserveControl),
@@ -1967,7 +1970,7 @@ TEST(LinkerStackReserve, WalkerEnforcesTheDeclaredBoundsNotJustTheCapability) {
         ImageRequest req;
         req.stackReserveBytes = c.value;
         auto const bytes = pe::encode(mod, **target, **fmt, rep, req);
-        EXPECT_TRUE(bytes.empty())
+        EXPECT_FALSE(bytes.has_value())
             << c.why << " (" << c.value
             << "): the walker must emit NOTHING rather than an image whose "
                "header carries an out-of-range reserve";
@@ -1982,7 +1985,7 @@ TEST(LinkerStackReserve, WalkerEnforcesTheDeclaredBoundsNotJustTheCapability) {
     DiagnosticReporter okRep;
     ImageRequest okReq;
     okReq.stackReserveBytes = 4194304u;
-    auto const okBytes = pe::encode(mod, **target, **fmt, okRep, okReq);
+    auto const okBytes = pe::encode(mod, **target, **fmt, okRep, okReq).value();
     EXPECT_EQ(okRep.errorCount(), 0u);
     ASSERT_GT(okBytes.size(), 0xE8u);
     std::uint64_t landed = 0;

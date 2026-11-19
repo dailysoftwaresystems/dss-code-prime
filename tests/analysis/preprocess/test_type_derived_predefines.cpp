@@ -419,7 +419,6 @@ struct IntFacts {
 [[nodiscard]] std::string errorsOf(TargetSchema const& target, ObjectFormatSchema const& format,
                                    std::string source) {
     UnitBuilder builder{cLanguage(), DiagnosticBudget::libraryDefault()};
-    applySystemDirs(builder, *cLanguage());
     applyTargetFormatPair(builder, target, format);
     builder.addInMemory(std::move(source), "probe.c");
     auto const cu = std::make_shared<CompilationUnit const>(std::move(builder).finish());
@@ -703,19 +702,26 @@ TEST(TypeDerivedPredefinesLoader, ATargetDocumentCannotDeclareTheKinds) {
     for (auto const& [k, spelling] : kPredefinedMacroKindTable.rows) {
         if (predefinedMacroKindNeedsLanguage(k)) kinds.push_back(spelling);
     }
-    ASSERT_EQ(kinds.size(), 3u);
+    // P69 (M4): four — `type-format` joined the language-realized kinds.
+    ASSERT_EQ(kinds.size(), 4u);
     for (std::string_view kind : kinds) {
         // A row that is well-formed for its kind in every other respect — `limit`
-        // on the `type-limit` row alone — so the family is the ONE thing refused.
+        // on the `type-limit` row alone, `conversion` on the `type-format` row
+        // alone — so the family is the ONE thing refused.
         bool const isLimit =
             kind == predefinedMacroKindName(PredefinedMacroKind::TypeLimit);
+        bool const isFormat =
+            kind == predefinedMacroKindName(PredefinedMacroKind::TypeFormat);
         auto r = TargetSchema::loadFromText(
             std::format(R"({{"dssTargetVersion":1,"target":{{"name":"X"}},
                 "opcodes":[{{"mnemonic":"invalid","result":"none"}}],
                 "predefinedMacros":[{{"name":"__X__","kind":"{}","type":"int",{}
                   "programRedefinition":"ordinary",
                   "impliedSurface":{{"kind":"claims-nothing","reason":"arch-property"}}}}]}})",
-                        kind, isLimit ? R"("limit":"max",)" : ""),
+                        kind,
+                        isLimit    ? R"("limit":"max",)"
+                        : isFormat ? R"("conversion":"d",)"
+                                   : ""),
             "<inline>");
         ASSERT_FALSE(r.has_value()) << "a target document must not declare a '" << kind << "' row";
         bool named = false;
@@ -740,10 +746,33 @@ TEST(TypeDerivedPredefines, ATypeThePairRealizesButTheLanguageCannotSpellIsAConf
     bool named = false;
     for (auto const& c : conflicts) {
         named |= c.find("__INT64_TYPE__") != std::string::npos
-                 && c.find("lists no name for") != std::string::npos;
+                 && c.find("lists no name for") != std::string::npos
+                 // P69 fold f26d (ruling 617): the type as the language spells it — the
+                 // vocabulary tag `long` — never the engine's kind name (`I64 "long"`).
+                 && c.find("its type on this pair is 'long' under data model") != std::string::npos;
     }
-    EXPECT_TRUE(named) << "the conflict must name __INT64_TYPE__ and why";
+    EXPECT_TRUE(named) << "the conflict must name __INT64_TYPE__, its type and why"
+                       << (conflicts.empty() ? std::string{} : ": " + conflicts.front());
     EXPECT_TRUE(out.empty()) << "a merge with conflicts yields no effective list";
+
+    // ruling 621: the same document with no `semantics.typeSpelling` table names no type.
+    std::string bare = text;
+    std::string const key = "\"typeSpelling\": {";
+    ASSERT_NE(bare.find(key), std::string::npos) << "the shipped c document spells its types";
+    bare.replace(bare.find(key), key.size(), "\"$typeSpelling\": {");
+    auto noTable = GrammarSchema::loadFromText(bare, "<edited-c-without-type-spelling>");
+    ASSERT_TRUE(noTable.has_value()) << (noTable.error().empty() ? "" : noTable.error()[0].message);
+    std::vector<std::string> bareConflicts;
+    (void)realized(&elf, noTable->get(), ObjectFormatKind::Elf, &bareConflicts);
+    bool bareNamed = false;
+    for (auto const& c : bareConflicts) {
+        bareNamed |= c.find("__INT64_TYPE__") != std::string::npos
+                     && c.find("its type on this pair is the declared type under data model")
+                            != std::string::npos
+                     && c.find("I64") == std::string::npos;
+    }
+    EXPECT_TRUE(bareNamed) << "with no table the conflict names no type"
+                           << (bareConflicts.empty() ? std::string{} : ": " + bareConflicts.front());
 }
 
 TEST(TypeDerivedPredefines, AShippedTypedefOfAHeaderDssDoesNotShipIsAConflict) {

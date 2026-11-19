@@ -1,0 +1,1 @@
+    if (auto const w = semanticBitFieldValueWidth(s, cfg, tree, operand, scope); w.has_value()) {

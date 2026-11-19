@@ -1,0 +1,2 @@
+        if not is_candidate(content):
+            continue   # the ERE's verb sat inside a word: no detector runs on this line

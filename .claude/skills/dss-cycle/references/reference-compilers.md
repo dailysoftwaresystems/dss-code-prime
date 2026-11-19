@@ -37,7 +37,7 @@ IDENTITY-KEYED**: DSS refuses a program gcc compiles (a vendored/copied header),
 
 ⇒ **Before invoking the disjunction, ask which question the references are splitting on.**
 Accept-vs-refuse ⇒ the disjunction governs and the accepting reference wins. Disagreement about what
-a valid program MEANS ⇒ **that is an architectural fork: PAUSE and ask.** AMENDED 2026-09-21 by "you do everything. I'm not your babysitter." — a meaning fork is decided by the agent, by measurement and the references' own documentation, the rationale written into the row and the decision reported veto-able (see SKILL.md, the decision gate)
+a valid program MEANS ⇒ **that is an architectural fork: PAUSE and ask.** AMENDED 2026-09-21 by "you do everything. I'm not your babysitter." — a meaning fork is decided by the session, by measurement and the references' own documentation, the rationale written into the row and the decision reported veto-able (see SKILL.md, the decision gate)
 ⇒ **Record the refusal cost in the row**, or a later cycle applying the disjunction by reflex will
 "fix" it back. This ruling is exactly that shape.
 
@@ -65,7 +65,7 @@ output; it is simply not a working reference for that construct.
 |---|---|
 | **ACCEPT vs REFUSE** | the union — any reference that accepts a correct construct makes it REQUIRED |
 | **QUALITY — one reference WORKS and another silently does not** | **the union again, read over WORKING**: match the one that works, whichever it is |
-| **What a valid program MEANS**, both readings defensible and both working | an architectural fork — **PAUSE and ask** AMENDED 2026-09-21 by the decision gate — decided by the agent, recorded in the row, reported veto-able (see SKILL.md) |
+| **What a valid program MEANS**, both readings defensible and both working | an architectural fork — **PAUSE and ask** AMENDED 2026-09-21 by the decision gate — decided by the session, recorded in the row, reported veto-able (see SKILL.md) |
 
 ⚠ **A quality split is NOT a meaning fork, and must not be escalated as one.** A meaning fork is two
 defensible readings of the same program (`#pragma once` content-keyed vs identity-keyed) where both

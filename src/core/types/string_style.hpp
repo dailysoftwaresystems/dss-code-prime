@@ -3,6 +3,8 @@
 #include "core/export.hpp"
 #include "core/types/enum_name_table.hpp"  // EnumNameTable (kEscapeKindTable)
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -46,16 +48,31 @@ escapeKindFromName(std::string_view s) noexcept {
     return kEscapeKindTable.fromName(s);
 }
 
+// The tag a delimiter carries when its style says `delimiterTag: "matched"` (C++
+// `R"DELIM(...)DELIM"`): a BOUNDED run of the bytes `characters` admits, read from the
+// opener's end. The run is the longest one of at most `maxLength` admitted bytes; it is
+// the tag when it is at least `minLength` long, and otherwise nothing is captured and
+// nothing is consumed. Every field is the language document's (`"tag": {"characters",
+// "minLength", "maxLength"}`, each required): no width, alphabet or bound is the code's.
+// ★ P69 (lane `cs`, fold f26d, ruling 643 (3)): this replaced `tagPattern`, a regular
+// expression compiled by `std::regex` and run over the rest of the buffer at every
+// opener. The library's matcher recurses per character a repetition consumes, so its
+// stack depth was proportional to the INPUT; the tag is a bounded run, matched by a loop.
+struct DSS_EXPORT DelimiterTag {
+    std::array<bool, 256> characters{};   // characters[b]: byte b may stand in the tag
+    std::size_t           minLength = 0;  // fewer admitted bytes than this: no tag
+    std::size_t           maxLength = 0;  // the run is read over at most this many bytes (>= 1)
+};
+
 // Tokenizer metadata for a delimited string literal. Attached to the
 // opening-delimiter token's meaning (e.g. `"`, `@"`, `R"`).
 //
 // Invariants (enforced by the loader; do not construct outside it):
 //   - `escapeChar` is meaningful only when `escapeKind == Char`;
 //     interpreted as a single ASCII byte.
-//   - `tagPattern` non-empty IS the signal that the delimiter carries
-//     a dynamically-captured tag (C++ R"DELIM(...)DELIM", Rust r#"..."#).
-//     Default pattern when the JSON sets `delimiterTag: "matched"` but
-//     omits `tagPattern` is `[A-Za-z0-9_]{0,16}`.
+//   - `delimiterTag` present IS the signal that the delimiter carries a
+//     dynamically-captured tag (C++ R"DELIM(...)DELIM", Rust r#"..."#); the
+//     document states its alphabet and bounds (`DelimiterTag`).
 //   - `endsAt` is required, non-empty.
 struct DSS_EXPORT StringStyle {
     EscapeKind   escapeKind         = EscapeKind::None;
@@ -81,7 +98,7 @@ struct DSS_EXPORT StringStyle {
     // consumed (correct for `*/`, a closing quote, `>`, etc.).
     bool         endsAtExclusive    = false;
     std::string  endsAt;
-    std::string  tagPattern;                    // non-empty ⇒ dynamic delimiter tag
+    std::optional<DelimiterTag> delimiterTag;   // present ⇒ dynamic delimiter tag
 };
 
 // Decode the inner text of a bracket-quoted identifier whose opener `[`

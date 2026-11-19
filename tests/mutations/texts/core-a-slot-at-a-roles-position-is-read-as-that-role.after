@@ -1,0 +1,2 @@
+        if (decl_prefix_detail::isRolePosition(decl, i)
+            && decl_prefix_detail::isAttrSlotNode(tree, kids[i], decl) && i == kids.size()) {

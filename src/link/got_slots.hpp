@@ -5,6 +5,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/target_schema.hpp"
+#include "link/link_pass_outcome.hpp"           // LinkPassOutcome
 #include "link/object_format_schema.hpp"
 
 #include <cstdint>
@@ -99,16 +100,21 @@ gotSlotDirectTwin(TargetSchema const& target, TargetRelocationInfo const& gotRow
 // reference order, so the image is a deterministic function of the module) and
 // rewrite each such relocation into its direct twin against its slot, keeping
 // the addend only where the formula keeps it on the reference. A RELOCATABLE
-// format is left alone — its GOT relocations are the final linker's.
-// `resolvedToNothing` names the WEAK data symbols the link bound to no
-// definition (the reference gate's null-bound set): their slot HOLDS 0 — S is 0
-// — so it is minted with no relocation, and a nonzero addend (a slot that would
-// hold the bare number A) is refused rather than guessed.
-// Returns TRUE when the module needs no change (`out` untouched); FALSE when
-// `out` holds the lowered module OR an error was reported — the caller tells
-// the two apart by the reporter's error count (the convention
-// `materializeObjectImportSlots` follows).
-[[nodiscard]] DSS_EXPORT bool
+// format keeps every GOT relocation it can SPELL — those are the final
+// linker's — and the ones it cannot (COFF has no GOT relocation at all) get a
+// slot the object CARRIES, minted exactly as above: one absolute relocation to
+// the symbol, the relocation the object's own statics use, so the code's `&X`
+// and a static `{X}` are one value under every linker (P69 re-review MAJOR 2,
+// D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB).
+// `resolvedToNothing` names the WEAK symbols the link bound to no definition
+// (the reference gate's null-bound set — a datum, a function, or a row that
+// states no kind, P69): their slot HOLDS 0 — S is 0 — so it is minted with no
+// relocation, and a nonzero addend (a slot that would hold the bare number A) is
+// refused rather than guessed.
+// Answers (`link/link_pass_outcome.hpp`) Unchanged when the module needs no
+// change (`out` untouched), Rewritten when `out` holds the lowered module, and
+// Refused when a reference was refused by name.
+DSS_EXPORT LinkPassOutcome
 lowerGotSlotReferences(AssembledModule const&    in,
                        AssembledModule&          out,
                        TargetSchema const&       target,

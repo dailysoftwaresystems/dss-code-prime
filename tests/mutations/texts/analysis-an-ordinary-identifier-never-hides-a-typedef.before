@@ -1,0 +1,3 @@
+            if (aliasSym.valid()
+                && s.symbols.at(aliasSym).kind != DeclarationKind::Type) {
+                return InvalidType;   // hidden by an ordinary identifier in scope

@@ -1,0 +1,5 @@
+        auto const member = memberOffsetIn(s, container, tree.text(nameTok));
+        switch (member.status) {
+            case MemberOffsetStatus::Found:
+                offset   += 0 * member.offset;
+                container = member.type;

@@ -1,0 +1,4 @@
+                outCfiFn.ops.push_back(
+                    LirCfiOp{emitSpCopy(b, h.spCopy, fp, sp),
+                             CfiOpKind::DefCfaRegister,
+                             CfiRegRef::physical(fp.id), CfiRegRef{}, 0});

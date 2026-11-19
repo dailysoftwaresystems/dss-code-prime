@@ -1,0 +1,40 @@
+{
+  "$comment": "Runtime witness for an attribute written where a TYPE is written — among a type's own specifiers, after a tag that is only referred to, in a type name, in a pointer layer, at the start of a parenthesized declarator. Until cycle P69 those positions were a parse error or worse: `struct S __attribute__((aligned(16))) w;` parsed with the specifier's own word read as the tag, so with a `struct aligned` in scope `w` silently became an object of THAT structure (arm 4: `sizeof w` must be `sizeof(struct small)`, 4, not 64). Thirteen arms, each scoring 1 when it holds, exit 29 + the count (42 when all hold). Arms 1-4: in a DECLARATION the specifier is the declaration's and aligns the declared object or member, never the type. Arms 5-9: in a TYPE NAME `aligned` applies to the type named (gcc's reading; clang ignores it with a warning). Arms 10-13: inside a DECLARATOR a specifier beside the declared name is the declared entity's; `packed` there is ignored for a pointer type and said so.",
+  "$commentWarnings": "`expectWarnings`: exactly one S_AttributeIgnoredForDeclarationKind, at the `packed` specifier of `struct packed_after_star` — gcc's own answer for that member (\"'packed' attribute ignored for type 'int *'\", the member stays at 8), where clang packs the member to offset 1. Its being the ONLY report of that code is what says none of the other twelve specifiers of the file was ignored.",
+  "$commentRedOnDisable": "WRITTEN, NOT READ — no mutation named here has been built and read, and this example is a corpus check, never a pin. The claims are the unit TESTs of tests/analysis/semantic/test_attribute_type_positions.cpp (`AttributeTypePositions.ARunAfterAReferredTagIsTheDeclarationsAndNoTagName`, `.ARunBetweenTwoSpecifiersAlignsTheDeclaredObject`, `.TypeNameALeadingRunAlignsTheWholeNamedType`, `.TypeNameARunInAPointerLayerAlignsThatPointer`, `.DeclaratorAlignedBesideTheNameAlignsThePointer`, `.DeclaratorPackedBesideAMemberNameIsIgnoredAndSaidSo` and their neighbours, one per position). Each mutation is to be an arm of tests/mutations/arms.registry, and proves its claim when that arm reads `passed`. Until then this is a PREDICTION from the code, not a measurement: with the specifier after a referred tag read as the tag again arm 4 would fail (64); with the specifier-run fold dropped arms 1-3 would fail; the type-name fold, arms 5-9; the name-adjacent fold, arms 10, 11 and 13 — and the warning of arm 12 would disappear.",
+  "$measuredComment": "MEASURED 2026-10-08 on these bytes (main.c md5 7b9f7eb0f0758c4e171cc804ee3ca323), each at `-std=c2x -Wall`: gcc 13.3.0 on Linux x86_64, mingw-w64 gcc 13 on Windows and gcc on Linux arm64 compile it and exit 42; gcc's one warning is the `packed` specifier of arm 12 (\"'packed' attribute ignored for type 'int *'\"). clang 18.1.3 on Linux and Apple clang compile it and exit 36, six arms short: they report \"'aligned' attribute ignored when parsing type\" nine times, once per type name of arms 5 to 9, and say nothing of arm 12's `packed`, which clang applies (the member moves to offset 1). So arms 5 to 9 and arm 12 are gcc's reading, the one this compiler takes; cl is not asked (it has no `__attribute__`).",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "expectWarnings": [
+    {"code": "S_AttributeIgnoredForDeclarationKind", "line": 62, "col": 42}
+  ],
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

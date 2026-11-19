@@ -1,0 +1,1 @@
+        if ((false)) sketch.recordAtDeclaratorEnd(std::string{src->slice(nameSpan)}, row->isType,

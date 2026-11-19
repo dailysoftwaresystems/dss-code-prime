@@ -1,0 +1,2 @@
+                if (ri->regClass != TargetRegClass::FPR
+                    || ri->widthBytes != kUwopVectorSaveBytes) {

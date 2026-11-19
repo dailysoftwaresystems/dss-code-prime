@@ -440,6 +440,12 @@ TEST(FfiResolveLibraryRoundTrip, PerFormatRowsUnionKeepsSymbolKnownEverywhere) {
         // Silently binding libSystem instead was only ever possible because the
         // bare path consulted no descriptor at all.
         //
+        // ⓘ P69 (lane lm, the coordinator's grant): that omission is RETIRED —
+        // macho64-x86_64-darwin-exec now declares the same pthread vehicle as its
+        // arm64 sibling ("consumer exists": C11 threads on every pair), so this leg
+        // is expected to BUILD; the refusal arm below stays as the strict guard for
+        // any format that declares no vehicle.
+        //
         // Kept STRICT: the build must either SUCCEED or fail with exactly that one
         // no-synthesis-vehicle refusal. Any other diagnostic — and in particular
         // any availability verdict, which is this test's actual subject — is red.
@@ -457,6 +463,42 @@ TEST(FfiResolveLibraryRoundTrip, PerFormatRowsUnionKeepsSymbolKnownEverywhere) {
                    "tier UNBOUND — that would mean no row realized it";
         }
     }
+}
+
+// ★ ON THE PAIR, NOT THE FORMAT (P69 fold 3f, lane `xa`; ledger 563 (A)). `__stack_chk_guard` is libSystem's
+// canary on macho and the aarch64 glibc's on ELF: stdlib.json makes it available on `macho` and on `elf` for
+// arm64 alone (x86_64 glibc keeps its canary in the thread block and exports no such name). The oracle asked the
+// FORMAT alone, so on x86_64 ELF the name read as declared here and was bound to the format's default library,
+// which has no such export. It asks the pair: the name is refused by name, the target named with it.
+TEST(FfiResolveLibraryRoundTrip, AShippedSymbolOfAnotherArchOfTheFormatFailsLoud) {
+    FormatLeg const& leg = kFormatLegs[0];
+    ASSERT_EQ(leg.formatName, "elf");
+
+    ScratchDir scratch{Location::InsideRepo, "ffi-resolve-lib-arch"};
+    auto const dir = scratch.path();
+    auto const libSrc = writeSrc(dir, "dsslib.c", kLibSrc);
+    DiagnosticReporter libRep;
+    ASSERT_EQ(buildOne(dir, {}, libSrc.string(), std::string{leg.libTarget}, libRep), 0)
+        << "DSS must build the dynamic library for the " << leg.formatName << " leg";
+    auto const libPath = dir / std::string{leg.libArtifact};
+    ASSERT_TRUE(fs::exists(libPath));
+    ASSERT_FALSE(libraryExportsSymbol(libPath, "__stack_chk_guard"));
+
+    auto const badSrc = writeSrc(
+        dir, "arch_bad.c",
+        "extern unsigned long __stack_chk_guard;\n"
+        "extern int dss_lib_answer(void);\n"
+        "int main(void){ return dss_lib_answer() + (int)(__stack_chk_guard & 0u); }\n");
+    DiagnosticReporter badRep;
+    EXPECT_NE(buildOne(dir, {libPath}, badSrc.string(), std::string{leg.execTarget}, badRep), 0)
+        << "a shipped symbol declared only on another arch of this format must FAIL the build";
+    std::string said;
+    for (auto const& d : badRep.all()) said += d.actual + "\n";
+    EXPECT_EQ(::dss::test_support::countCode(badRep, DiagnosticCode::F_ShippedSymbolUnavailableForTarget), 1u)
+        << "the name is refused by name on this pair:\n" << said;
+    std::string const msg = messageForCode(badRep, DiagnosticCode::F_ShippedSymbolUnavailableForTarget);
+    EXPECT_NE(msg.find("__stack_chk_guard"), std::string::npos) << "the diagnostic names the symbol: [" << msg << "]";
+    EXPECT_NE(msg.find("x86_64"), std::string::npos) << "the diagnostic names the target: [" << msg << "]";
 }
 
 // ── (3) The oracle's own contract, measured against the REAL config ───────

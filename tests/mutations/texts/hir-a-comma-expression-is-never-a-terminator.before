@@ -1,0 +1,1 @@
+                        if (kids.empty()) { verdict = false; break; }

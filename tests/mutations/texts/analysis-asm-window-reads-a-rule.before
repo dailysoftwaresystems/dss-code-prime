@@ -1,0 +1,3 @@
+            std::optional<RuleId> const scanned = tree.ruleIfInternal(cur);
+            if (!scanned.has_value()) continue;
+            if (ia.isTailRule(*scanned)) continue;   // never enter a section

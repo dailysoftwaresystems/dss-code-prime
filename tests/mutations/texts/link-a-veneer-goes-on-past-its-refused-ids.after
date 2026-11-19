@@ -1,0 +1,2 @@
+    std::vector<SymbolId> const veneerId =
+        taken.value_or(std::vector<SymbolId>(plan.veneers.size(), SymbolId{}));

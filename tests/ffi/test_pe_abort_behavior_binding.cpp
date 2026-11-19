@@ -88,6 +88,7 @@
 #include "repo_root.hpp"
 #include "scratch_dir.hpp"
 #include "shipped_read_pairs.hpp"   // the real pairs a REAL descriptor is read on
+#include "validation_va_list_binding.hpp"   // the descriptor word a validation read binds (c82)
 
 #include <nlohmann/json.hpp>
 
@@ -572,7 +573,8 @@ TEST(PeAbortBehaviorBinding, DecodedSignatureIsTwoU32ParamsReturningU32) {
     ShippedPairFacts const facts = pair->pairFacts();
     auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
                                          pair->dataModel(), pair->activeTarget(),
-                                         pair->activeFormat(), {}, nullptr, &facts);
+                                         pair->activeFormat(),
+                                         dss::test_support::validationVaListBinding(interner), nullptr, &facts);
     ASSERT_TRUE(desc.has_value())
         << "the REAL stdlib.json must decode for a pe/LLP64 target";
     EXPECT_FALSE(rep.hasErrors());

@@ -1,0 +1,1 @@
+        && rules.integer128Result == Integer128Result::InTheFirstFpr

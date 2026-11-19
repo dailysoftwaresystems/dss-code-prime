@@ -1,0 +1,1 @@
+one check resolves each descriptor path's identity once, for its one read

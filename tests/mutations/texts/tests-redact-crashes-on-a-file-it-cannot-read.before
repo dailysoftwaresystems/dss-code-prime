@@ -1,0 +1,1 @@
+            except OSError as exc:  # a missing file, a directory, no permission: said, never a traceback

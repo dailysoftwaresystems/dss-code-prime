@@ -1,0 +1,1 @@
+        auto const size = fs::is_regular_file(path, ec) ? std::optional<std::uintmax_t>{fs::file_size(path, ec)} : std::nullopt;

@@ -172,6 +172,18 @@ public:
     [[nodiscard]] HirNodeId rmwUpdate(HirNodeId id)         const;
     [[nodiscard]] SymbolId  rmwOldValueSymbol(HirNodeId id) const;
 
+    // P69 (D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT): an unnamed
+    // object — its initializer (the one child) and its storage duration (the payload).
+    [[nodiscard]] HirNodeId        unnamedObjectInit(HirNodeId id)    const;
+    [[nodiscard]] HirObjectStorage unnamedObjectStorage(HirNodeId id) const;
+    // ★ THE ONE PEEL. The node a VALUE use of `id` reads: `id` itself, or — for an unnamed
+    // object, used as a value — its initializer, repeatedly (a literal whose initializer is
+    // itself a literal). Every consumer that DISPATCHES ON AN INITIALIZER'S KIND asks
+    // here, so a `ConstructAggregate` / string `Literal` behind the object is seen exactly
+    // as it was before the object existed. A consumer that needs the OBJECT (its address,
+    // an array's decay) must not ask: it keeps the `UnnamedObject` node.
+    [[nodiscard]] HirNodeId        unnamedObjectValue(HirNodeId id)   const;
+
     // ── declaration accessors (HR4) ──────────────────────────────────────────
     // module: its top-level declarations.
     [[nodiscard]] std::span<HirNodeId const> moduleDecls(HirNodeId id) const;
@@ -429,9 +441,13 @@ public:
     // Vector swizzle off [base]; `componentMask` is the payload.
     HirNodeId makeSwizzle(HirNodeId base, std::uint32_t componentMask, TypeId type,
                           HirFlags flags = HirFlags::None);
-    // Aggregate construction over [fields...]; `type` is the aggregate type.
+    // Aggregate construction over [fields...]; `type` is the aggregate type. P69 (lane `cs`,
+    // D-C-A-CONST-UNION-MEMBER-READ-IN-A-STATIC-INITIALIZER-IS-REFUSED): for a UNION, the one
+    // field initializes the member `unionMember` names (its index among the union's
+    // variants) — the node's payload; every other aggregate keeps payload 0.
     HirNodeId makeConstructAggregate(std::span<HirNodeId const> fields, TypeId type,
-                                     HirFlags flags = HirFlags::None);
+                                     HirFlags flags = HirFlags::None,
+                                     std::uint32_t unionMember = 0);
     // Conditional: children are [cond, thenExpr, elseExpr].
     HirNodeId makeTernary(HirNodeId cond, HirNodeId thenExpr, HirNodeId elseExpr,
                           TypeId type, HirFlags flags = HirFlags::None);
@@ -465,6 +481,9 @@ public:
     HirNodeId makeVaArg(HirNodeId apExpr, HirNodeId typeRef, TypeId type,
                         HirFlags flags = HirFlags::None);
     HirNodeId makeVaEnd(HirNodeId apExpr, TypeId type, HirFlags flags = HirFlags::None);
+    // P69: `va_copy(dest, src)` — [dest, src], both `va_list` lvalues; `type` is `void`.
+    HirNodeId makeVaCopy(HirNodeId dest, HirNodeId src, TypeId type,
+                         HirFlags flags = HirFlags::None);
     // Address-of [operand]; `type` is the resulting pointer type.
     HirNodeId makeAddressOf(HirNodeId operand, TypeId type, HirFlags flags = HirFlags::None);
     // Pointer dereference of [operand]; `type` is the pointee type.
@@ -575,6 +594,12 @@ public:
     HirNodeId makeReadModifyWrite(HirNodeId target, HirNodeId update,
                                   std::uint32_t oldValueSymbol, TypeId type,
                                   HirFlags flags = HirFlags::None);
+
+    // P69 (D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT): an unnamed object
+    // of `type` initialized by `init` (its one child), with `storage` its storage duration
+    // (the payload). See `HirKind::UnnamedObject`.
+    HirNodeId makeUnnamedObject(HirNodeId init, TypeId type, HirObjectStorage storage,
+                                HirFlags flags = HirFlags::None);
 
     // ── typed declaration helpers (HR4) ──────────────────────────────────────
     //

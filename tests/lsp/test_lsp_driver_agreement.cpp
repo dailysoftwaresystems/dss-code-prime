@@ -54,6 +54,7 @@
 #include "lsp_test_helpers.hpp"
 #include "program/program.hpp"
 #include "scratch_dir.hpp"
+#include "driver_diagnostics_listener.hpp"   // AskedDriverCodes
 
 #include <nlohmann/json.hpp>
 
@@ -65,6 +66,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <optional>
 
 namespace fs = std::filesystem;
 using dss::lsp::testing::LspTestHarness;
@@ -256,6 +258,7 @@ TEST(LspDriverAgreement, EditorAcceptsAConsumedStdioTheDriverAccepts) {
 // and the editor published an EMPTY diagnostics array — which every editor
 // renders as "clean".
 TEST(LspDriverAgreement, EditorReportsTheMissingSystemHeaderTheDriverRejects) {
+    dss::test_support::AskedDriverCodes const asked{dss::DiagnosticCode::F_ShippedHeaderNotFound};   // the missing header IS the subject, for the driver and the editor
     dss::test_support::ScratchDir scratch{dss::test_support::Location::InsideRepo,
                                           "lsp-driver-agreement-missing"};
     auto const src = writeSource(scratch.path(), "missing.c", kMissing);
@@ -291,6 +294,11 @@ TEST(LspDriverAgreement, NoSpuriousUnbackedPredefinedMacro) {
                           {"stdio_use.c", kStdio},
                           {"missing.c", kMissing}};
     for (auto const& c : cases) {
+        // `missing.c`'s header miss is its own subject (the case above pins it); the
+        // other rows ask for no driver error.
+        std::optional<dss::test_support::AskedDriverCodes> asked;
+        if (c.name == "missing.c") asked.emplace(std::initializer_list<dss::DiagnosticCode>{
+                                       dss::DiagnosticCode::F_ShippedHeaderNotFound});
         auto const src = writeSource(scratch.path(), c.name, c.text);
         auto const codes = lspPublishedCodes(src, c.text);
         EXPECT_FALSE(has(codes, "C_UnbackedPredefinedMacro"))

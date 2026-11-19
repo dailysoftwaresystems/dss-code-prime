@@ -90,7 +90,7 @@ TEST(StringStyleLoader, CStyleQuotedStringLoadsAndPopulates) {
     EXPECT_EQ(style->endsAt, "\"");
     EXPECT_FALSE(style->endsAtLongestMatch);
     EXPECT_FALSE(style->multiline);
-    EXPECT_TRUE(style->tagPattern.empty());
+    EXPECT_FALSE(style->delimiterTag.has_value());
 }
 
 TEST(StringStyleLoader, VerbatimStringDoubledDelimiterPopulates) {
@@ -115,6 +115,8 @@ TEST(StringStyleLoader, VerbatimStringDoubledDelimiterPopulates) {
     EXPECT_EQ(style->endsAt, "\"");
 }
 
+// P69 (lane `cs`, fold f26d, ruling 643 (3)): the dynamic tag is a BOUNDED tag the
+// document states whole — `characters`, `minLength`, `maxLength` — read by a loop.
 TEST(StringStyleLoader, RawStringMatchedDelimiterTagPopulates) {
     constexpr std::string_view kCfg = R"JSON({
       "dssSchemaVersion": 2,
@@ -124,22 +126,30 @@ TEST(StringStyleLoader, RawStringMatchedDelimiterTagPopulates) {
                    "stringStyle": {
                      "escapeKind":   "none",
                      "endsAt":       ")\"",
-                     "delimiterTag": "matched"
+                     "delimiterTag": "matched",
+                     "tag": { "characters": "A-Za-z0-9_", "minLength": 0, "maxLength": 16 }
                    } }]
       },
       "shapes": { "root": { "sequence": [ "RawStringStart" ] } }
     })JSON";
     auto loaded = GrammarSchema::loadFromText(kCfg);
-    ASSERT_TRUE(loaded.has_value());
+    ASSERT_TRUE(loaded.has_value())
+        << (loaded.error().empty() ? "<no diagnostics>" : loaded.error()[0].message);
     auto const& m = (*loaded)->lookupLexeme("R\"");
     auto const* style = (*loaded)->stringStyle(m[0]);
     ASSERT_NE(style, nullptr);
     EXPECT_EQ(style->escapeKind, EscapeKind::None);
-    EXPECT_FALSE(style->tagPattern.empty())
-        << "non-empty tagPattern IS the dynamic-tag signal";
-    EXPECT_EQ(style->tagPattern, "[A-Za-z0-9_]{0,16}")
-        << "delimiterTag: 'matched' without explicit tagPattern must default to "
-           "[A-Za-z0-9_]{0,16}";
+    ASSERT_TRUE(style->delimiterTag.has_value())
+        << "a present delimiterTag IS the dynamic-tag signal";
+    DelimiterTag const& tag = *style->delimiterTag;
+    EXPECT_EQ(tag.minLength, 0u);
+    EXPECT_EQ(tag.maxLength, 16u);
+    // Every byte: admitted exactly when it is a letter, a digit or `_`.
+    for (unsigned b = 0; b < 256; ++b) {
+        bool const want = (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')
+                          || (b >= '0' && b <= '9') || b == '_';
+        EXPECT_EQ(tag.characters[b], want) << "byte " << b;
+    }
 }
 
 TEST(StringStyleLoader, TripleQuotedLongestMatchPopulates) {
@@ -168,7 +178,8 @@ TEST(StringStyleLoader, TripleQuotedLongestMatchPopulates) {
     EXPECT_TRUE(style->multiline);
 }
 
-TEST(StringStyleLoader, CustomTagPatternRetained) {
+TEST(StringStyleLoader, CustomTagBoundsRetained) {
+    // A `-` that is first or last is the byte itself, never a range.
     constexpr std::string_view kCfg = R"JSON({
       "dssSchemaVersion": 2,
       "language": { "name": "X", "version": "0.1.0" },
@@ -178,16 +189,51 @@ TEST(StringStyleLoader, CustomTagPatternRetained) {
                      "escapeKind":   "none",
                      "endsAt":       ")\"",
                      "delimiterTag": "matched",
-                     "tagPattern":   "[a-z]{1,8}"
+                     "tag": { "characters": "-a-c#", "minLength": 1, "maxLength": 8,
+                              "$comment": "a documentation key passes" }
                    } }]
       },
       "shapes": { "root": { "sequence": [ "RawStringStart" ] } }
     })JSON";
     auto loaded = GrammarSchema::loadFromText(kCfg);
-    ASSERT_TRUE(loaded.has_value());
+    ASSERT_TRUE(loaded.has_value())
+        << (loaded.error().empty() ? "<no diagnostics>" : loaded.error()[0].message);
     auto const* style = (*loaded)->stringStyle((*loaded)->lookupLexeme("R\"")[0]);
     ASSERT_NE(style, nullptr);
-    EXPECT_EQ(style->tagPattern, "[a-z]{1,8}");
+    ASSERT_TRUE(style->delimiterTag.has_value());
+    EXPECT_EQ(style->delimiterTag->minLength, 1u);
+    EXPECT_EQ(style->delimiterTag->maxLength, 8u);
+    std::string admitted;
+    for (unsigned b = 0; b < 256; ++b)
+        if (style->delimiterTag->characters[b]) admitted.push_back(static_cast<char>(b));
+    EXPECT_EQ(admitted, "#-abc");
+}
+
+TEST(StringStyleLoader, ATagRangeEndingInADashIsTheDashItself) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 2,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": {
+        "R\"": [{ "kind": "RawStringStart",
+                   "stringStyle": {
+                     "escapeKind":   "none",
+                     "endsAt":       ")\"",
+                     "delimiterTag": "matched",
+                     "tag": { "characters": "x-", "minLength": 0, "maxLength": 2 }
+                   } }]
+      },
+      "shapes": { "root": { "sequence": [ "RawStringStart" ] } }
+    })JSON";
+    auto loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_TRUE(loaded.has_value())
+        << (loaded.error().empty() ? "<no diagnostics>" : loaded.error()[0].message);
+    auto const* style = (*loaded)->stringStyle((*loaded)->lookupLexeme("R\"")[0]);
+    ASSERT_NE(style, nullptr);
+    ASSERT_TRUE(style->delimiterTag.has_value());
+    std::string admitted;
+    for (unsigned b = 0; b < 256; ++b)
+        if (style->delimiterTag->characters[b]) admitted.push_back(static_cast<char>(b));
+    EXPECT_EQ(admitted, "-x");
 }
 
 // ── Loader error paths ─────────────────────────────────────────────────
@@ -320,25 +366,118 @@ TEST(StringStyleLoader, UnknownDelimiterTagValueIsError) {
     }));
 }
 
-TEST(StringStyleLoader, InvalidTagPatternRegexIsError) {
+// ── The bounded tag's refusals, each BY NAME (P69, fold f26d, ruling 643 (3)) ──
+//
+// Every row is one `stringStyle` object on a raw-string opener; each must be refused with
+// C_InvalidStringStyle at the named path, with the named words in the message — and be the
+// ONLY error, so a row cannot pass on another key's refusal.
+namespace {
+
+struct TagRefusal {
+    char const* name;
+    char const* style;      // the stringStyle object's text
+    char const* pathEnd;    // the diagnostic's path ends so
+    char const* says;       // the message holds these words
+};
+
+constexpr TagRefusal kTagRefusals[] = {
+    {"the retired tagPattern",
+     R"J({ "escapeKind": "none", "endsAt": ")\"", "delimiterTag": "matched", "tagPattern": "[a-z]{1,8}" })J",
+     "/stringStyle/tagPattern", "'tagPattern' is retired"},
+    {"the retired tagPattern without delimiterTag",
+     R"J({ "escapeKind": "none", "endsAt": ")\"", "tagPattern": "[a-z]+" })J",
+     "/stringStyle/tagPattern", "'tagPattern' is retired"},
+    {"delimiterTag without tag",
+     R"J({ "escapeKind": "none", "endsAt": ")\"", "delimiterTag": "matched" })J",
+     "/stringStyle/tag", "requires 'tag'"},
+    {"tag without delimiterTag",
+     R"J({ "escapeKind": "none", "endsAt": ")\"", "tag": { "characters": "a-z", "minLength": 0, "maxLength": 8 } })J",
+     "/stringStyle/tag", "'tag' requires 'delimiterTag: \"matched\"'"},
+    {"a tag that is no object",
+     R"J({ "escapeKind": "none", "endsAt": ")\"", "delimiterTag": "matched", "tag": "a-z" })J",
+     "/stringStyle/tag", "'tag' must be an object"},
+    {"a missing maxLength",
+     R"J({ "escapeKind": "none", "endsAt": ")\"", "delimiterTag": "matched", "tag": { "characters": "a-z", "minLength": 0 } })J",
+     "/stringStyle/tag/maxLength", "at most maxLength characters"},
+    {"a missing minLength",
+     R"J({ "escapeKind": "none", "endsAt": ")\"", "delimiterTag": "matched", "tag": { "characters": "a-z", "maxLength": 8 } })J",
+     "/stringStyle/tag/minLength", "'minLength' is required"},
+    {"a fractional maxLength",
+     R"J({ "escapeKind": "none", "endsAt": ")\"", "delimiterTag": "matched", "tag": { "characters": "a-z", "minLength": 0, "maxLength": 8.5 } })J",
+     "/stringStyle/tag/maxLength", "non-negative integer"},
+    {"a negative minLength",
+     R"J({ "escapeKind": "none", "endsAt": ")\"", "delimiterTag": "matched", "tag": { "characters": "a-z", "minLength": -1, "maxLength": 8 } })J",
+     "/stringStyle/tag/minLength", "non-negative integer"},
+    {"a maxLength spelled as a string",
+     R"J({ "escapeKind": "none", "endsAt": ")\"", "delimiterTag": "matched", "tag": { "characters": "a-z", "minLength": 0, "maxLength": "8" } })J",
+     "/stringStyle/tag/maxLength", "non-negative integer"},
+    {"a maxLength of zero",
+     R"J({ "escapeKind": "none", "endsAt": ")\"", "delimiterTag": "matched", "tag": { "characters": "a-z", "minLength": 0, "maxLength": 0 } })J",
+     "/stringStyle/tag/maxLength", "at least one byte"},
+    {"a maxLength below the minLength",
+     R"J({ "escapeKind": "none", "endsAt": ")\"", "delimiterTag": "matched", "tag": { "characters": "a-z", "minLength": 4, "maxLength": 3 } })J",
+     "/stringStyle/tag/maxLength", "at least 'minLength'"},
+    {"an empty character set",
+     R"J({ "escapeKind": "none", "endsAt": ")\"", "delimiterTag": "matched", "tag": { "characters": "", "minLength": 0, "maxLength": 8 } })J",
+     "/stringStyle/tag/characters", "'characters' is required"},
+    {"a missing character set",
+     R"J({ "escapeKind": "none", "endsAt": ")\"", "delimiterTag": "matched", "tag": { "minLength": 0, "maxLength": 8 } })J",
+     "/stringStyle/tag/characters", "'characters' is required"},
+    {"a reversed range",
+     R"J({ "escapeKind": "none", "endsAt": ")\"", "delimiterTag": "matched", "tag": { "characters": "z-a", "minLength": 0, "maxLength": 8 } })J",
+     "/stringStyle/tag/characters", "reversed range 'z-a'"},
+    {"a byte outside ASCII",
+     R"J({ "escapeKind": "none", "endsAt": ")\"", "delimiterTag": "matched", "tag": { "characters": "aé", "minLength": 0, "maxLength": 8 } })J",
+     "/stringStyle/tag/characters", "is not ASCII"},
+    {"an unknown tag key",
+     R"J({ "escapeKind": "none", "endsAt": ")\"", "delimiterTag": "matched", "tag": { "characters": "a-z", "minLength": 0, "maxLength": 8, "maxLen": 4 } })J",
+     "/stringStyle/tag/maxLen", "unknown key 'maxLen'"},
+    {"an unknown stringStyle key",
+     R"J({ "escapeKind": "none", "endsAt": "\"", "multiLine": true })J",
+     "/stringStyle/multiLine", "unknown key 'multiLine'"},
+};
+
+} // namespace
+
+TEST(StringStyleLoader, EveryMalformedDelimiterTagIsRefusedByName) {
+    for (TagRefusal const& row : kTagRefusals) {
+        SCOPED_TRACE(row.name);
+        std::string const cfg = std::string{R"JSON({
+          "dssSchemaVersion": 2,
+          "language": { "name": "X", "version": "0.1.0" },
+          "tokens": { "R\"": [{ "kind": "RawStringStart", "stringStyle": )JSON"}
+                                + row.style + R"JSON( }] },
+          "shapes": { "root": { "sequence": [ "RawStringStart" ] } }
+        })JSON";
+        auto loaded = GrammarSchema::loadFromText(cfg);
+        ASSERT_FALSE(loaded.has_value()) << "the document loaded";
+        auto const errors = std::ranges::count_if(loaded.error(), [](auto const& d) {
+            return d.severity != DiagnosticSeverity::Warning;
+        });
+        EXPECT_EQ(errors, 1) << "one refusal, and only it";
+        EXPECT_TRUE(std::ranges::any_of(loaded.error(), [&](auto const& d) {
+            return d.code == DiagnosticCode::C_InvalidStringStyle
+                   && d.path.ends_with(row.pathEnd)
+                   && d.message.find(row.says) != std::string::npos;
+        })) << "first diagnostic: " << loaded.error()[0].path << ": " << loaded.error()[0].message;
+    }
+}
+
+// The control: the same opener with a WELL-FORMED tag loads, so each refusal above is
+// its own key's.
+TEST(StringStyleLoader, AWellFormedDelimiterTagLoads) {
     constexpr std::string_view kCfg = R"JSON({
       "dssSchemaVersion": 2,
       "language": { "name": "X", "version": "0.1.0" },
-      "tokens": {
-        "R\"": [{ "kind": "RawStringStart",
-                   "stringStyle": { "escapeKind":   "none",
-                                     "endsAt":       ")\"",
-                                     "delimiterTag": "matched",
-                                     "tagPattern":   "[a-z" } }]
-      },
+      "tokens": { "R\"": [{ "kind": "RawStringStart", "stringStyle":
+        { "escapeKind": "none", "endsAt": ")\"", "delimiterTag": "matched",
+          "$tagComment": "a documentation key passes",
+          "tag": { "characters": "a-z", "minLength": 4, "maxLength": 4 } } }] },
       "shapes": { "root": { "sequence": [ "RawStringStart" ] } }
     })JSON";
     auto loaded = GrammarSchema::loadFromText(kCfg);
-    ASSERT_FALSE(loaded.has_value());
-    EXPECT_TRUE(std::ranges::any_of(loaded.error(), [](auto const& d) {
-        return d.code == DiagnosticCode::C_InvalidStringStyle &&
-               d.path.find("tagPattern") != std::string::npos;
-    }));
+    ASSERT_TRUE(loaded.has_value())
+        << (loaded.error().empty() ? "<no diagnostics>" : loaded.error()[0].message);
 }
 
 TEST(StringStyleLoader, WrongTypeBoolFieldIsError) {
@@ -503,27 +642,8 @@ TEST(StringStyleLoader, EscapeCharWithNonCharKindIsLoadError) {
     }));
 }
 
-// ── C2: tagPattern without delimiterTag is now a load error ────────────
-
-TEST(StringStyleLoader, TagPatternWithoutDelimiterTagIsLoadError) {
-    constexpr std::string_view kCfg = R"JSON({
-      "dssSchemaVersion": 2,
-      "language": { "name": "X", "version": "0.1.0" },
-      "tokens": {
-        "R\"": [{ "kind": "RawStringStart",
-                   "stringStyle": { "escapeKind": "none",
-                                     "endsAt":     ")\"",
-                                     "tagPattern": "[a-z]+" } }]
-      },
-      "shapes": { "root": { "sequence": [ "RawStringStart" ] } }
-    })JSON";
-    auto loaded = GrammarSchema::loadFromText(kCfg);
-    ASSERT_FALSE(loaded.has_value());
-    EXPECT_TRUE(std::ranges::any_of(loaded.error(), [](auto const& d) {
-        return d.code == DiagnosticCode::C_InvalidStringStyle &&
-               d.message.find("requires 'delimiterTag: \"matched\"'") != std::string::npos;
-    }));
-}
+// ── C2 (a tag without delimiterTag is a load error) is a row of
+// EveryMalformedDelimiterTagIsRefusedByName since P69 fold f26d. ──────────
 
 // ── C4: out-of-range stringStyleId aborts ──────────────────────────────
 

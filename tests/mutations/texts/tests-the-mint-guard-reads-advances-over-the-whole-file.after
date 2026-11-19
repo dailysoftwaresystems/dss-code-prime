@@ -1,0 +1,2 @@
+        Body const* const b = nullptr;
+        if (b == nullptr) return fileWide;

@@ -1,0 +1,2 @@
+        if (nodeIsASelection(semCfg, tree, c)) {
+            c = selectionResultOf(s, semCfg, tree, c, scope);

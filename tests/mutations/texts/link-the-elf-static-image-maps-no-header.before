@@ -1,0 +1,1 @@
+        appendPhdr(pFlags1, 0, imageBaseVa, seg1FileEnd, seg1FileEnd,

@@ -220,20 +220,21 @@ static_assert(kPathDigestChars == kPathDigestBytes * 8u / 5u);
 [[nodiscard]] std::expected<std::string, std::string>
 readWholeFile(fs::path const& path, std::string_view role) {
     std::error_code ec;
-    if (!fs::is_regular_file(path, ec) || ec) {
+    if (core::reachedKind(path, core::Use::Leaf, ec) != core::EntryKind::File || ec) {
         return std::unexpected(std::format(
             "runtime object cache: the {} '{}' does not exist or is not a "
             "regular file, so its content digest cannot enter the cache key. "
             "Anchored: {}.",
             role, core::genericSpelling(path), kAnchor));
     }
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
+    auto opened = core::openInputStream(path, std::ios::binary);   // at any length (the home)
+    if (!opened) {
         return std::unexpected(std::format(
-            "runtime object cache: could not open the {} '{}' for reading. "
+            "runtime object cache: could not open the {} '{}' for reading: {}. "
             "Anchored: {}.",
-            role, core::genericSpelling(path), kAnchor));
+            role, core::genericSpelling(path), core::reasonText(opened.error()), kAnchor));
     }
+    std::ifstream& in = *opened;
     std::string contents{std::istreambuf_iterator<char>(in),
                          std::istreambuf_iterator<char>()};
     if (in.bad()) {
@@ -381,7 +382,7 @@ public:
     ~TempFileGuard() {
         if (!armed_) return;
         std::error_code ec;
-        fs::remove(path_, ec);
+        static_cast<void>(core::removeEntry(path_, ec));
     }
     TempFileGuard(TempFileGuard const&)            = delete;
     TempFileGuard& operator=(TempFileGuard const&) = delete;
@@ -420,6 +421,10 @@ private:
 // file now uses buys ~46 characters of headroom, but headroom is not a proof:
 // a long username, a long unit stem or a deep `DSS_RUNTIME_CACHE_DIR` can still
 // walk into the wall, and when it does the message must say so ITSELF.
+// (P69 H6, H6c: every file call here now takes the value's reference spelling
+// from the home, path_identity.hpp -- so Windows' 260 is no wall any more; a NAME
+// over 255 characters still is, and the experiment below still tells a refused
+// name from an unwritable directory.)
 //
 // ⛔ NO `#ifdef _WIN32` AND NO 260 CONSTANT. A compile-time platform branch
 // would make the other host's arm unreachable and therefore untestable from
@@ -453,27 +458,29 @@ private:
     static std::atomic<std::uint64_t> probeCounter{0};
     fs::path const probe =
         directory / ("." + std::to_string(probeCounter.fetch_add(1u)));
-    bool shortNameOpens = false;
+    bool            shortNameOpens = false;
+    std::error_code shortNameRefused;   // the OS's reason when the short name fails too (H6c2 (d))
     {
-        std::ofstream out(probe, std::ios::binary | std::ios::trunc);
-        shortNameOpens = static_cast<bool>(out);
+        auto const out = core::openOutputStream(probe, std::ios::binary | std::ios::trunc);
+        shortNameOpens = out.has_value();
+        if (!out) shortNameRefused = out.error();
     }
     std::error_code removeEc;
-    fs::remove(probe, removeEc);
+    static_cast<void>(core::removeEntry(probe, removeEc));
 
     if (shortNameOpens) {
         note +=
             ". ✔MEASURED just now by this refusal: a SHORT name in the SAME "
             "directory opened successfully, so the directory IS writable and "
             "the LENGTH of the path above is what failed. Point "
-            "DSS_RUNTIME_CACHE_DIR at a SHORT directory (Windows rejects paths "
-            "over 260 characters unless the process is long-path aware, and "
-            "NTFS/ext4 reject any single name over 255)";
+            "DSS_RUNTIME_CACHE_DIR at a SHORT directory (NTFS and ext4 reject "
+            "any single name over 255 characters, and Windows any path over "
+            "32767)";
     } else {
         note +=
             ". ✔MEASURED just now by this refusal: a SHORT name in the SAME "
-            "directory ALSO failed to open, so the path's LENGTH is not the "
-            "cause — the directory itself cannot be written";
+            "directory ALSO failed to open (" + core::reasonText(shortNameRefused) + "), so the path's LENGTH is "
+            "not the cause — the directory itself cannot be written";
     }
     return note;
 }
@@ -529,7 +536,8 @@ private:
 readKeyDocumentBeside(fs::path const& artifactPath) {
     fs::path const   documentPath = runtimeKeyDocumentPath(artifactPath);
     std::error_code  ec;
-    if (!fs::exists(documentPath, ec) || ec) return std::optional<std::string>{};
+    if (core::reachedKind(documentPath, core::Use::Leaf, ec) == core::EntryKind::Absent || ec)
+        return std::optional<std::string>{};
 
     // ⚠ NOT-A-REGULAR-FILE IS A REFUSAL, AND THE GUARD IS LOAD-BEARING RATHER
     // THAN DEFENSIVE — ✔MEASURED on the WSL x86_64 leg, invisible on Windows.
@@ -540,7 +548,7 @@ readKeyDocumentBeside(fs::path const& artifactPath) {
     // open simply fails and `!in` catches it, which is exactly why a one-leg
     // gate would have shipped this. The sibling reader above already guards
     // with `is_regular_file`; this one did not, and that asymmetry WAS the bug.
-    if (!fs::is_regular_file(documentPath, ec) || ec) {
+    if (core::reachedKind(documentPath, core::Use::Leaf, ec) != core::EntryKind::File || ec) {
         return std::unexpected(std::format(
             "the key document '{}' exists but is NOT A REGULAR FILE, so the "
             "stored key cannot be read and a hit cannot be verified. This is a "
@@ -549,12 +557,13 @@ readKeyDocumentBeside(fs::path const& artifactPath) {
             core::genericSpelling(documentPath)));
     }
 
-    std::ifstream in(documentPath, std::ios::binary);
-    if (!in) {
+    auto opened = core::openInputStream(documentPath, std::ios::binary);   // at any length (the home)
+    if (!opened) {
         return std::unexpected(std::format(
-            "the key document '{}' exists but could not be opened for reading",
-            core::genericSpelling(documentPath)));
+            "the key document '{}' exists but could not be opened for reading: {}",
+            core::genericSpelling(documentPath), core::reasonText(opened.error())));
     }
+    std::ifstream& in = *opened;
     std::string contents{std::istreambuf_iterator<char>(in),
                          std::istreambuf_iterator<char>()};
     if (in.bad()) {
@@ -720,11 +729,14 @@ writeThroughTemp(RuntimeObjectKey const&       key,
             / ("." + destination.filename().string() + ".tmp-"
                + std::to_string(pid) + "-"
                + std::to_string(tempCounter.fetch_add(1u)));
-        claimed = linker::detail::createExclusiveBinary(candidate);
-        if (claimed != nullptr) {
+        auto const claim = linker::detail::createExclusiveBinary(candidate);
+        if (claim) {
+            claimed   = *claim;
             temporary = std::move(candidate);
             break;
         }
+        // The claim's OWN reason, read at the call (H6c2) -- before the entry probe below overwrites it.
+        std::error_code const refused = claim.error();
         // ── WHY THE CLAIM WAS REFUSED, ASKED AT THE ENTRY AND NOT AT ITS
         //    TARGET ────────────────────────────────────────────────────────
         //
@@ -750,13 +762,12 @@ writeThroughTemp(RuntimeObjectKey const&       key,
         // WHY — a "could not claim a unique temporary file after 10000
         // attempts" message names the directory and explains nothing.
         std::error_code    entryEc;
-        auto const         entry = fs::symlink_status(candidate, entryEc);
-        if (!fs::exists(entry)) {
+        if (core::entryKind(candidate, core::Use::Leaf, entryEc) == core::EntryKind::Absent || entryEc) {
             return std::unexpected(unwritableMissRefusal(
                 key,
                 std::format("could not open the temporary file '{}' for "
-                            "writing.{}",
-                            core::genericSpelling(candidate),
+                            "writing: {}.{}",
+                            core::genericSpelling(candidate), core::reasonText(refused),
                             composedPathNote(directory, candidate))));
         }
     }
@@ -769,13 +780,15 @@ writeThroughTemp(RuntimeObjectKey const&       key,
             void operator()(std::FILE* f) const noexcept { std::fclose(f); }
         };
         std::unique_ptr<std::FILE, FileCloser> out{claimed};
+        core::clearRuntimeReason();
         if (!bytes.empty()
             && std::fwrite(bytes.data(), 1u, bytes.size(), out.get())
                    != bytes.size()) {
+            std::error_code const why = core::runtimeReason();   // read before the deleter's close (H6c2)
             return std::unexpected(unwritableMissRefusal(
                 key, std::format("failed writing {} byte(s) to the temporary "
-                                 "file '{}'",
-                                 bytes.size(), core::genericSpelling(temporary))));
+                                 "file '{}': {}",
+                                 bytes.size(), core::genericSpelling(temporary), core::reasonText(why))));
         }
         // ⚠ CLOSED AND CHECKED EXPLICITLY, not left to the deleter. A
         // close-time flush failure (a full disk, a quota) is DISCARDED by a
@@ -783,16 +796,19 @@ writeThroughTemp(RuntimeObjectKey const&       key,
         // place under a key that promises the full bytes — a silently wrong
         // artifact, which is the one outcome this whole mechanism exists to
         // make impossible.
+        core::clearRuntimeReason();
         if (std::fclose(out.release()) != 0) {
+            std::error_code const why = core::runtimeReason();   // read at the failing close (H6c2)
             return std::unexpected(unwritableMissRefusal(
-                key, std::format("failed writing {} byte(s) to the temporary "
-                                 "file '{}'",
-                                 bytes.size(), core::genericSpelling(temporary))));
+                key, std::format("failed closing {} byte(s) written to the temporary "
+                                 "file '{}': {}",
+                                 bytes.size(), core::genericSpelling(temporary), core::reasonText(why))));
         }
     }
 
     std::error_code ec;
-    if (fs::exists(destination, ec) && !ec) return {};  // the temp is discarded
+    if (core::reachedKind(destination, core::Use::Leaf, ec) != core::EntryKind::Absent && !ec)
+        return {};  // the temp is discarded
     ec.clear();
 
     // ── THE COMMIT IS THE LINKER'S, FOR THE SAME REASON THE CLAIM IS ─────────
@@ -815,7 +831,8 @@ writeThroughTemp(RuntimeObjectKey const&       key,
         // A concurrent winner landed between the check and the rename. Same
         // key, same bytes — success, and the guard discards our temp.
         std::error_code probeEc;
-        if (fs::exists(destination, probeEc) && !probeEc) return {};
+        if (core::reachedKind(destination, core::Use::Leaf, probeEc) != core::EntryKind::Absent && !probeEc)
+            return {};
         return std::unexpected(unwritableMissRefusal(
             key,
             std::format("could not rename '{}' into place as '{}': {}.{}",
@@ -949,7 +966,8 @@ resolveArchiveSiblingFormat(ObjectFormatSchema const&      buildFormat,
                             fs::path const&                objectFormatsDir,
                             ArchiveSiblingRequester const& requester) {
     std::error_code ec;
-    if (!fs::is_directory(objectFormatsDir, ec) || ec) {
+    // A CONTAINER (H6c, A2): the directory the format documents are named below.
+    if (core::reachedKind(objectFormatsDir, core::Use::Container, ec) != core::EntryKind::Directory || ec) {
         return std::unexpected(std::format(
             "{}: the object-format directory '{}' does not "
             "exist or is not a directory, so the archive-writing sibling of "
@@ -1488,7 +1506,7 @@ lookupRuntimeObject(RuntimeObjectKey const& key) {
     // FALLING THROUGH. Falling through would silently tolerate a corrupt or
     // foreign file in the packaged tree, and "silently tolerate" on a
     // content-addressed store is how a wrong object gets linked.
-    if (fs::is_regular_file(key.shippedArtifactPath, ec) && !ec) {
+    if (core::reachedKind(key.shippedArtifactPath, core::Use::Leaf, ec) == core::EntryKind::File && !ec) {
         if (auto refusal = verifyKeyDocumentBeside(key, key.shippedArtifactPath);
             refusal.has_value()) {
             return std::unexpected(std::move(*refusal));
@@ -1503,7 +1521,7 @@ lookupRuntimeObject(RuntimeObjectKey const& key) {
     // store REFUSES on exactly this state), so there is no artifact to pass
     // over — only a location no writer could have reached.
     if (!key.userArtifactPath.empty()
-        && fs::is_regular_file(key.userArtifactPath, ec) && !ec) {
+        && core::reachedKind(key.userArtifactPath, core::Use::Leaf, ec) == core::EntryKind::File && !ec) {
         if (auto refusal = verifyKeyDocumentBeside(key, key.userArtifactPath);
             refusal.has_value()) {
             return std::unexpected(std::move(*refusal));
@@ -1550,8 +1568,12 @@ storeRuntimeObject(RuntimeObjectKey const&      key,
 
     std::error_code ec;
     if (!directory.empty()) {
-        fs::create_directories(directory, ec);
-        if (ec && !fs::is_directory(directory)) {
+        // The directory the artifact's own write names (`core::createDirectoriesFor`, P69 H6b): `directory`, the
+        // library's parent, re-resolved as a whole is another directory for a last name ending in a space.
+        static_cast<void>(core::createDirectoriesFor(destination, ec));
+        if (std::error_code dirEc;
+            ec && core::reachedKind(core::containingDirectory(destination), core::Use::Container, dirEc)
+                      != core::EntryKind::Directory) {
             // The arm an INSTALLED compiler hits when the resolved root is not
             // writable — a read-only volume, a quota, a path whose parent is
             // not a directory. It carries the OS reason verbatim, because
@@ -1566,7 +1588,7 @@ storeRuntimeObject(RuntimeObjectKey const&      key,
                 key,
                 std::format("could not create the artifact directory '{}' ({} "
                             "characters): {}",
-                            rendered, rendered.size(), ec.message())));
+                            rendered, rendered.size(), core::reasonText(ec))));
         }
         ec.clear();
     }

@@ -1,0 +1,16 @@
+{
+  "$comment": "D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE (P69 fold 3e, lane `xa`, class C's N3): on pe64, which realizes `wmain`'s rows, `int wmain(int, unsigned int **)` is none of them, so it is a candidate entered with the richest (`argc-wargv-wenvp`) and WARNED at its declarator (S_EntryShapeNotDeclared); beside `main` the document's `entryPrecedence` elects `main` (K_ProgramEntryChosenByPrecedence, a whole-program fact, unpositioned). MEASURED 2026-11-05 (lane `xa`, d131): cl 19.44 (LNK4067, selected 'mainCRTStartup') and MinGW-w64 gcc 13.2 each run `main` (11). Off Windows the same source warns nothing (entry_wmain_of_no_row_is_an_ordinary_function). RED-ON-DISABLE: drop the richest-row stamp -> no precedence warning, which `expectWarnings` reds; make the shape warning an error -> refused.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 11,
+  "expectWarnings": [
+    { "code": "S_EntryShapeNotDeclared", "line": 17, "col": 5 },
+    { "code": "K_ProgramEntryChosenByPrecedence", "line": 0, "col": 0, "positioned": false }
+  ],
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": false }
+  ]
+}

@@ -1,0 +1,44 @@
+{
+  "$comment": "P69 (lane lm, E1.0 of D-C-C23-CONVERSIONS-MISSING-ON-THE-UCRT-AND-LIBSYSTEM — the design audit's MAJOR 2): the compiler behaviour DSS's C23 conversion layer rests on, proven on EVERY pair and above all on x86_64 Mach-O, where nothing ran it before: a DSS-compiled variadic DEFINITION runs; it reads `long double` through `va_arg` (x87 80-bit in memory on x86_64 ELF and Mach-O, binary128 on aarch64 Linux, binary64 on pe and arm64 Mach-O) and every other argument class the layer fetches (int, double, long long, pointer); and it forwards its own `va_list` to the PLATFORM's vfprintf, which walks it with the platform's code (on pe and Mach-O the call reaches DSS's C23 entry point `__dss_isoc23_vfprintf` first, whose fast path hands the caller's `va_list` to the platform's own vfprintf unchanged — the format holds no C23 specification). Expected output is the C standard's reading of the format; the return value (20 characters) is checked in-program. ★ It FOUND what it was written to rule out (D-CODEGEN-LONG-DOUBLE-VA-ARG-READS-THE-WRONG-SLOT): a DSS variadic callee's `va_arg(ap, long double)` read the SSE save area on x86_64 — the x87 long double is MEMORY-class — and the binary128 one past v7 on aarch64 stepped the stack by 8 not 16; so the example also reads a long double after a STACKED int (SysV's 16-byte alignment pad: 21.25), ten long doubles (past aarch64's v7: 27.50), and hands ten to the platform's own printf from a DSS caller (52 characters, checked in-program). ✔MEASURED, the same stdout and exit 42 from Apple clang 21 on arm64 and x86_64 (probe-reference-cc run 20260930-225005-c4f862b6). RED-ON-DISABLE (recorded with the row): the long double fetched as a double — the mutant the audit named — breaks the sum on every pair whose long double is wider than double. ★ AND AAPCS64's OWN SHAPE (P69 round 4, the review's MINOR 9): with x0..x7 full, an eighth int is STACKED in one 8-byte slot and the long doubles past q7 follow it 16-ALIGNED — the ninth after the round-up pad, the tenth one 16-byte step later — read back weighted by position (228.50) and handed to the platform's printf in the same shape (63 characters, checked in-program). ✔MEASURED, the same three lines and exit 42 from gcc 13.3.0 -O0/-O2, clang 18.1.3 and aarch64-linux-gnu-gcc 13.3.0 -O0/-O2 (run 20261007-192839-2074c933), native aarch64 gcc 13.3.0 -O0/-O2 (run 20261007-192900-b2509bb6), Apple clang 21 arm64 and x86_64 (run 20261007-192926-278b2231) and MSVC 19.51 /Od and /O2 (run 20261007-192945-06b41b8e). ★ AND THE STEP'S OWN SHAPE (P69 round 4, found by red-on-disable: the step mutant left the shape above GREEN — two stacked long doubles in a row are both 16-aligned, so the second lands in the same place whatever step the first one took): a NARROWER argument after a stacked wide one — eight ints, nine long doubles, then an int, a double and a tenth long double — read back by `narrow_after_wide` (20178.5) and handed to the platform's printf in the same shape (73 characters, checked in-program). ✔MEASURED, the same four lines and exit 42 from gcc 13.3.0 and clang 18.1.3 at -O0 and -O2 and aarch64-linux-gnu-gcc 13.3.0 -O0/-O2 (run 20261008-040804-09ff9932), native aarch64 gcc 13.3.0 -O0/-O2 (run 20261008-040727-da618cea), Apple clang 21 arm64 and x86_64 at -O0 and -O2 (run 20261008-040654-2d3cf040) and MSVC 19.51 /Od and /O2 (run 20261008-040823-60de6432).",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "42|7.75|text|38|0.5\r\n0.5 1.0 1.5 2.0 2.5 3.0 3.5 4.0 4.5 5.0|27.50|21.25\r\n1 2 3 4 5 6 7 8|0.5 1.0 1.5 2.0 2.5 3.0 3.5 4.0 4.5 5.0|228.50\r\n1 2 3 4 5 6 7 8|0.5 1.0 1.5 2.0 2.5 3.0 3.5 4.0 4.5|9|0.25|0.125|20178.5\r\n",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "expectedStdout": "42|7.75|text|38|0.5\n0.5 1.0 1.5 2.0 2.5 3.0 3.5 4.0 4.5 5.0|27.50|21.25\n1 2 3 4 5 6 7 8|0.5 1.0 1.5 2.0 2.5 3.0 3.5 4.0 4.5 5.0|228.50\n1 2 3 4 5 6 7 8|0.5 1.0 1.5 2.0 2.5 3.0 3.5 4.0 4.5|9|0.25|0.125|20178.5\n"
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "expectedStdout": "42|7.75|text|38|0.5\n0.5 1.0 1.5 2.0 2.5 3.0 3.5 4.0 4.5 5.0|27.50|21.25\n1 2 3 4 5 6 7 8|0.5 1.0 1.5 2.0 2.5 3.0 3.5 4.0 4.5 5.0|228.50\n1 2 3 4 5 6 7 8|0.5 1.0 1.5 2.0 2.5 3.0 3.5 4.0 4.5|9|0.25|0.125|20178.5\n"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": "",
+      "expectedStdout": "42|7.75|text|38|0.5\n0.5 1.0 1.5 2.0 2.5 3.0 3.5 4.0 4.5 5.0|27.50|21.25\n1 2 3 4 5 6 7 8|0.5 1.0 1.5 2.0 2.5 3.0 3.5 4.0 4.5 5.0|228.50\n1 2 3 4 5 6 7 8|0.5 1.0 1.5 2.0 2.5 3.0 3.5 4.0 4.5|9|0.25|0.125|20178.5\n"
+    },
+    {
+      "spec": "x86_64:macho64-x86_64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": "",
+      "expectedStdout": "42|7.75|text|38|0.5\n0.5 1.0 1.5 2.0 2.5 3.0 3.5 4.0 4.5 5.0|27.50|21.25\n1 2 3 4 5 6 7 8|0.5 1.0 1.5 2.0 2.5 3.0 3.5 4.0 4.5 5.0|228.50\n1 2 3 4 5 6 7 8|0.5 1.0 1.5 2.0 2.5 3.0 3.5 4.0 4.5|9|0.25|0.125|20178.5\n"
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

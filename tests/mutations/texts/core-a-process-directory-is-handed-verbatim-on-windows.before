@@ -1,0 +1,2 @@
+    if (root.kind == RootSpelling::Kind::Verbatim) {
+        bool const drive = root.volume >= 6 && isAsciiAlpha(reference[4]) && reference[5] == L':';

@@ -1,0 +1,1 @@
+            rule.typeBaseAskable = !anAttributeStartsWithAName; (void)typeRuleNullable;

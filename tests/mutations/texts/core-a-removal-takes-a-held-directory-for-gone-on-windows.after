@@ -1,0 +1,1 @@
+        if (winNotFound(listingRefusal) || listingRefusal == ERROR_SHARING_VIOLATION) return out;

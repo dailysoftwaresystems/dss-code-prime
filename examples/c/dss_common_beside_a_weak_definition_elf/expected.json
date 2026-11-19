@@ -1,0 +1,36 @@
+{
+  "$comment": "★★ DSS's OWN COMMON BESIDE A WEAK DEFINITION OF ITS NAME ON ELF: THE COMMON STANDS (P69 fold 3b; D-C-TENTATIVE-DEFINITIONS-OF-ONE-NAME-IN-TWO-UNITS-REFUSED) -- `examples/c/common_beside_a_weak_definition_elf` with the COMMON written by DSS: main.c's `int dss_tentative;` is a tentative definition, which a unit compiled for a document that states commons writes as a COMMON, as gcc does under `-fcommon`. The one object named to the link is gcc's build of `__attribute__((weak)) int dss_tentative = 5;` (`OBJECT WEAK`, in `.data`). The ELF documents' `commonYieldsTo: strongDefinition` keeps the common over a weak definition, and the program reads 0, exit 37 -- the answer GNU ld gives gcc's own common beside the same object (✔MEASURED 2026-10-08, both orders, x86_64 natively and aarch64 under qemu-aarch64). This example pins the RANK of a common DSS writes, not the form: a zero-filled strong definition (what the unit wrote before P69 fold 3b) also outranks a weak one and also reads 0; the cells that tell the two forms apart on ELF -- two DSS objects of one name, and a DSS object beside gcc's own `int v;` or `int v = 7;` under GNU ld -- are `link/test_tentative_definitions_as_commons`'s. The `release` arm pins that optimizing the unit changes nothing about which of the two the program reads.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 37,
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "prebuiltLibraries": [
+        {
+          "$comment": "The WEAK definition. Source and rebuild command: `tests/link/data/tentative_weak.source.c` (gcc 13.3.0 `-O2 -fno-pie -c`; md5 47baacfa4638b51806f3ad9a40dcaf5e). A relocatable object named to the link is an OBJECT INPUT, linked eagerly. The witness is the name both units state.",
+          "path": "tests/link/data/tentative_weak_x86_64_elf.o",
+          "containerWitness": "dss_tentative"
+        }
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "prebuiltLibraries": [
+        {
+          "$comment": "The WEAK definition. Source and rebuild command: `tests/link/data/tentative_weak.source.c` (aarch64-linux-gnu-gcc 13.3.0 `-O2 -fno-pie -c`; md5 d81e328e09a5e382bc6ea90ce52f856e).",
+          "path": "tests/link/data/tentative_weak_aarch64_elf.o",
+          "containerWitness": "dss_tentative"
+        }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

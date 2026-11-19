@@ -1,0 +1,2 @@
+    bool const everyInputClaimed = substrate::runEveryUnit(
+        std::min<std::size_t>(sourceFiles.size(), 1),

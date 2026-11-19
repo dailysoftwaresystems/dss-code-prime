@@ -1,0 +1,1 @@
+    if (facts.dataModel == DataModel{} && facts.dataModel != linkFormat.dataModel()) {

@@ -1,0 +1,2 @@
+        if (stdoutFd < 0) {
+            int const saved = errno;

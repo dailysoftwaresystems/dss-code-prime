@@ -766,11 +766,19 @@ TEST(ElfHiddenVisibility, StaticPullTreatsAHiddenDefinitionAsSatisfying) {
     // member. That is the CONTROL: without it, "nothing was pulled" below
     // would be equally consistent with "this archive index is empty" or "the
     // pull never runs", which would say nothing at all.
+    // ★ P69 (D-LK-ARCHIVE-PULL-TAKES-UNREFERENCED-EXTERNS-AS-REFERENCES): the
+    // reference is a RELOCATION — `call pull_hidden` — because the pull follows
+    // only an extern something uses, as every reference linker does (an unused
+    // declaration leaves no undefined symbol in their objects). An extern import
+    // row alone is a declaration, and pulls nothing.
+    auto const* rel32 = (*target)->relocationByName("rel32");
+    ASSERT_NE(rel32, nullptr) << "rel32 missing from x86_64.target.json";
     AssembledModule caller;
     caller.expectedFuncCount = 1;
     AssembledFunction callerFn;
     callerFn.symbol = SymbolId{41};
-    callerFn.bytes  = {0xC3};
+    callerFn.bytes  = {0xE8, 0x00, 0x00, 0x00, 0x00, 0xC3};   // call rel32; ret
+    callerFn.relocations.push_back(Relocation{1u, SymbolId{40}, rel32->kind, -4});
     caller.functions.push_back(std::move(callerFn));
     caller.externImports.push_back(ExternImport{SymbolId{40}, "pull_hidden", ""});
 

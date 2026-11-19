@@ -7,10 +7,12 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/semantic_config.hpp"  // BuiltinLowering / kBuiltinLoweringTable — the `builtincall` payload's closed set
 #include "core/types/source_span.hpp"
+#include "core/types/symbol_attrs.hpp"   // the binding / weak-kind / visibility tables an alias's linkage is spelled in
 #include "core/types/target_schema.hpp"  // callConvName / kCallConvTable
 #include "core/types/type_lattice/composite_definition.hpp"
 #include "core/types/type_lattice/core_type.hpp"
 #include "core/types/type_lattice/type_registry.hpp"
+#include "core/types/wide_float_value.hpp"  // kCanonicalQuietNanBits — the NaN the text spells `nan`
 #include "hir/attributes/diagnostic_info.hpp"
 #include "hir/attributes/ffi_metadata.hpp"
 #include "hir/attributes/shader_intrinsic.hpp"
@@ -21,11 +23,16 @@
 #include "hir/hir_op.hpp"
 #include "hir/hir_op_registry.hpp"
 #include "hir/hir_verifier.hpp"
+#include "core/types/symbol_id_cursor.hpp"   // the one rule of a fresh SymbolId (P69 f26d, N9)
+#include <cstdio>
 
 #include <algorithm>
 #include <array>
+#include <cerrno>    // P69: the `nanbits` pattern's range check
+#include <cmath>     // P69: std::isnan (a NaN's payload is spelled by its bits)
 #include <cstdint>
 #include <cstdlib>   // std::strtod — the float reader decodes token TEXT
+#include <cstring>   // P69: std::memcpy (a NaN's bit pattern)
 #include <deque>
 #include <format>
 #include <limits>
@@ -37,12 +44,16 @@
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // `.dsshir` text format (HR7) — see hir_text.hpp for the contract. Grammar at a
 // glance (whitespace-insignificant; LF only; canonical formatting below):
 //
-//   file       := "dsshir" INT "producer" STR preamble module
+//   file       := "dsshir" INT "producer" STR preamble module aliases?   (then nothing)
+//   aliases    := "aliases" "{" ("alias" SYM ("[" lword ("," lword)* "]")? "=" SYM)* "}"   (v9)
+//   lword      := a binding of `kSymbolBindingTable` — `weak` with its kind, `weak(select-any)` —
+//                 or a visibility of `kSymbolVisibilityTable`
 //   preamble   := ext_kinds? ext_ops? intrinsics? buffers? types? symbols?
 //                 (non-empty sections only)
 //   types      := "types" "{" ("type" INT "=" composite)* "}"
@@ -66,7 +77,8 @@
 //               | arr<T,N> | tuple<T,...> | "type" INT (a `types` entry)
 //               | fn(T,...) -> T [cc NAME] | ext STR (T,...) [N,...] | invalid
 //               (a STANDALONE type text — `parseTypeFromText` — spells a composite
-//               inline instead: struct STR {T,...} | union STR {T,...} | rec INT)
+//               inline instead: struct STR packed? ("aligned" INT)? {T,...} |
+//               union STR packed? ("aligned" INT)? {T,...} | rec INT)
 //
 // Symbols are positional handles (`%1`) bound to a name in the `symbols` preamble;
 // the handle number IS the rebuilt SymbolId.v, so the body and preamble agree by
@@ -233,10 +245,15 @@ enum class HirTextExprKw : std::uint8_t {
     // D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
     // `rmw %<old-value sym> : <type> (<target>, <update>)`.
     Rmw,
+    // P69 (D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT):
+    // `unnamed <storage> : <type> (<init>)` — `storage` one of `kHirObjectStorageTable`.
+    Unnamed,
+    // P69 (D-C-STDARG-VA-COPY-MISSING): `va_copy : void (<dest>, <src>)`.
+    VaCopy,
 
     Count_  // keep last — counts the members; deliberately UNLISTED below
 };
-inline constexpr EnumNameTable<HirTextExprKw, 26> kHirTextExprKwTable{{{
+inline constexpr EnumNameTable<HirTextExprKw, 28> kHirTextExprKwTable{{{
     { HirTextExprKw::Lit,        "lit"         },
     { HirTextExprKw::Ref,        "ref"         },
     { HirTextExprKw::Call,       "call"        },
@@ -263,9 +280,22 @@ inline constexpr EnumNameTable<HirTextExprKw, 26> kHirTextExprKwTable{{{
     { HirTextExprKw::VaArg,      "va_arg"      },
     { HirTextExprKw::VaEnd,      "va_end"      },
     { HirTextExprKw::Rmw,        "rmw"         },
+    { HirTextExprKw::Unnamed,    "unnamed"     },
+    { HirTextExprKw::VaCopy,     "va_copy"     },
 }}};
 DSS_CHECK_ENUM_NAME_TABLE(kHirTextExprKwTable);
 DSS_CHECK_KEY_VOCABULARY(allNames(kHirTextExprKwTable));
+
+// P69: the storage-duration spellings of an `unnamed` node — ONE owner, read by the
+// writer and the reader alike, so an unknown spelling is refused naming the set.
+inline constexpr EnumNameTable<HirObjectStorage, 3> kHirObjectStorageTable{{{
+    { HirObjectStorage::Automatic, "automatic" },
+    { HirObjectStorage::Static,    "static"    },
+    { HirObjectStorage::Thread,    "thread"    },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kHirObjectStorageTable);
+static_assert(kHirObjectStorageTable.rows.size() == kHirObjectStorageCount,
+              "kHirObjectStorageTable must spell every HirObjectStorage");
 
 // ★★★ THE COMPLETENESS CHECK WELL-FORMEDNESS CANNOT GIVE, and it is the reason
 // `Count_` exists on an enum that is otherwise a pure spelling set.
@@ -785,6 +815,8 @@ exprKwForKind(HirKind k) noexcept {
         case HirKind::VaArg:              return HirTextExprKw::VaArg;
         case HirKind::VaEnd:              return HirTextExprKw::VaEnd;
         case HirKind::ReadModifyWrite:    return HirTextExprKw::Rmw;
+        case HirKind::UnnamedObject:      return HirTextExprKw::Unnamed;
+        case HirKind::VaCopy:             return HirTextExprKw::VaCopy;
 
         // ── everything that is NOT written in expression position ──
         // `Error` and `Extension` are the deliberate subtlety: they DO render
@@ -876,6 +908,14 @@ public:
         // field exists to prevent.
         if (!hir_.root().valid()) { emitHeader(); return std::move(out_); }
         prepass(hir_.root());
+        // v9: each alias's two symbols, numbered AFTER every symbol a node names — a module with no
+        // alias keeps every handle it had.
+        if (ctx_.symbolAliases != nullptr) {
+            for (HirSymbolAlias const& a : *ctx_.symbolAliases) {
+                noteSymbol(a.alias.v);
+                noteSymbol(a.target.v);
+            }
+        }
 
         emitHeader();
         emitExtKinds();
@@ -910,12 +950,15 @@ public:
         std::string body = takeOut();
         emitTypes();
         std::string types = takeOut();
+        emitAliases();
+        std::string aliases = takeOut();
 
-        out_.reserve(head.size() + types.size() + symbols.size() + body.size());
+        out_.reserve(head.size() + types.size() + symbols.size() + body.size() + aliases.size());
         out_ += head;
         out_ += types;
         out_ += symbols;
         out_ += body;
+        out_ += aliases;
         return std::move(out_);
     }
 
@@ -1029,8 +1072,11 @@ private:
     // and that is what keeps the output byte-identical.
     void noteSymbol(std::uint32_t sv) {
         if (!symHandle_.contains(sv)) {
+            // An INDEX door, the ABORT form (P69 f26e, B1): the handle IS the rebuilt SymbolId.v, dense by the
+            // reader's contract, so the table ends at the first writer-reserved value -- fatal by name.
+            SymbolId const handle = IndexSymbolIds{symOrder_.size() + 1u}.nextOrAbort("hir_text", "a .dsshir table");
             symOrder_.push_back(sv);
-            symHandle_.emplace(sv, static_cast<std::uint32_t>(symOrder_.size()));
+            symHandle_.emplace(sv, handle.v);
         }
     }
 
@@ -1897,7 +1943,8 @@ private:
             case HirKind::LabelAddressOf: case HirKind::VaStart:
             case HirKind::VaArg:       case HirKind::VaEnd:
             case HirKind::TypeRef:     case HirKind::CaseArm:
-            case HirKind::ReadModifyWrite:
+            case HirKind::ReadModifyWrite: case HirKind::UnnamedObject:
+            case HirKind::VaCopy:
             case HirKind::Count_:
                 report(std::format("unexpected node kind '{}' in statement position",
                                    hirKindName(hir_.kind(id))),
@@ -2285,6 +2332,22 @@ private:
                 header(); out_ += std::format(" %{} : ", handleOf(hir_.payload(id)));
                 appendType(hir_.typeId(id)); out_ += ' ';
                 operands(hir_.children(id)); return;
+            case HirKind::UnnamedObject: {
+                // `unnamed <storage> : <type> (<init>)` — the storage duration by name.
+                std::uint32_t const p = hir_.payload(id);
+                std::string_view const storage =
+                    p < kHirObjectStorageCount
+                        ? kHirObjectStorageTable.nameOrEmpty(static_cast<HirObjectStorage>(p))
+                        : std::string_view{};
+                if (storage.empty()) {
+                    report(std::format("unnamed-object storage {} names no storage duration", p),
+                           DiagnosticSeverity::Error);
+                }
+                header(); out_ += ' ';
+                out_ += storage.empty() ? std::string_view{"?"} : storage;
+                out_ += " : "; appendType(hir_.typeId(id)); out_ += ' ';
+                operands(hir_.children(id)); return;
+            }
             case HirKind::IntrinsicCall: {
                 header(); out_ += ' ';
                 std::uint32_t const p = hir_.payload(id);
@@ -2316,7 +2379,15 @@ private:
             case HirKind::Call:               typedCall(); return;
             case HirKind::Cast:               typedCall(); return;
             case HirKind::Index:              typedCall(); return;
-            case HirKind::ConstructAggregate: typedCall(); return;
+            case HirKind::ConstructAggregate:
+                // P69 (D-C-A-CONST-UNION-MEMBER-READ-IN-A-STATIC-INITIALIZER-IS-REFUSED): a
+                // union aggregate names the member its child initializes — `construct #N :`,
+                // spelled only when N is not the first member, so every other aggregate (and a
+                // union initialized through member 0) writes exactly as before.
+                header();
+                if (hir_.payload(id) != 0) out_ += std::format(" #{}", hir_.payload(id));
+                out_ += " : "; appendType(hir_.typeId(id)); out_ += ' ';
+                operands(hir_.children(id)); return;
             case HirKind::Ternary:            typedCall(); return;
             case HirKind::LogicalAnd:         typedCall(); return;
             case HirKind::LogicalOr:          typedCall(); return;
@@ -2325,6 +2396,7 @@ private:
             case HirKind::VaStart:            typedCall(); return;
             case HirKind::VaArg:              typedCall(); return;
             case HirKind::VaEnd:              typedCall(); return;
+            case HirKind::VaCopy:             typedCall(); return;
             case HirKind::AddressOf:          typedCall(); return;
             case HirKind::Deref:              typedCall(); return;
             case HirKind::LabelAddressOf:
@@ -2465,6 +2537,18 @@ private:
             // std::format renders non-finite doubles as `inf`/`-inf`/`nan`, which
             // takeFloat() accepts back — so they round-trip too (e.g. synthetic
             // HIR from constant folding).
+            // ★ P69 (lane `cs`): EXCEPT a NaN that is not the canonical quiet one — a
+            // payload (`__builtin_nan("1")`) or a sign — which `nan` would read back as a
+            // DIFFERENT value through a clean reporter. It is spelled by its 64-bit
+            // pattern, `nanbits <u64>`; every other value prints exactly as before.
+            if (std::isnan(*d)) {
+                std::uint64_t bits = 0;
+                std::memcpy(&bits, d, sizeof bits);
+                if (bits != kCanonicalQuietNanBits) {
+                    out_ += std::format("float nanbits {}", bits);
+                    return;
+                }
+            }
             out_ += "float "; out_ += std::format("{}", *d); return;
         }
         if (auto const* s = std::get_if<std::string>(&v.value)) {
@@ -2547,7 +2631,16 @@ private:
         // round trip that is byte-stable on re-emit and LOSSY in the pool, which
         // is the failure mode hardest to see from the text alone.
         if (auto const* agg = std::get_if<HirAggregateValue>(&v.value)) {
-            out_ += "agg {";
+            // v8 (P69, lane `cs`): a UNION value names the member its one field
+            // initializes, `agg member N {…}` — `.dssir` v5's spelling, token for token
+            // (`mir_text.cpp`, `appendLiteral`). The field's type cannot say which member
+            // (two may share one), `toMirLiteral` copies the member on, and the static-data
+            // encoder refuses a union value that names none: a writer that dropped it lost
+            // the value's meaning without a word.
+            out_ += "agg ";
+            if (agg->unionMember.has_value())
+                out_ += std::format("member {} ", *agg->unionMember);
+            out_ += "{";
             // Reverse execution order: the closing brace, then each field's
             // `: <core>` tail, the field itself, and the separator before it.
             using Kind = LiteralEmitTask::Kind;
@@ -2700,6 +2793,55 @@ private:
             if (ctx_.symbolNames && symv < ctx_.symbolNames->size()) name = (*ctx_.symbolNames)[symv];
             out_ += std::format("  %{} ", handleOf(symv));
             out_ += quote(name); out_ += '\n';
+        }
+        out_ += "}\n";
+    }
+
+    // ── `aliases { alias %A [<linkage words>] = %T }` (v9, P69 lane `cs`) ─────
+    //
+    // The unit's second names of its definitions (`HirSymbolAlias`), after the module whose definitions
+    // they name, in the order the lowering stated them. The list holds the alias's OWN linkage in the
+    // shared tables' words — the binding unless it is `global` (a weak one with its kind as its argument),
+    // the visibility unless it is `default` — and is left out when both are the defaults: `.dssir` v7's
+    // `alias` item, word for word, so the two texts spell one alias one way. An alias has no storage, so a
+    // linkage carrying the tentative mark or a static-initializer schedule — and a weak one that names no
+    // kind — is no alias either text can state: it is REFUSED BY NAME here (Error), and written with the
+    // `?` the reader refuses, never written without the fact.
+    void emitAliases() {
+        if (ctx_.symbolAliases == nullptr || ctx_.symbolAliases->empty()) return;
+        out_ += "aliases {\n";
+        for (HirSymbolAlias const& a : *ctx_.symbolAliases) {
+            LinkageAttr const& lk = a.linkage;
+            std::string        words;
+            auto const word = [&](std::string_view w) {
+                if (!words.empty()) words += ", ";
+                words += w;
+            };
+            if (lk.binding != SymbolBinding::Global) {
+                word(symbolBindingName(lk.binding));
+                if (lk.binding == SymbolBinding::Weak) {
+                    words += '(';
+                    words += weakDefinitionKindName(lk.weakKind);
+                    words += ')';
+                }
+            }
+            if (lk.visibility != SymbolVisibility::Default) word(symbolVisibilityName(lk.visibility));
+            std::string_view const unstateable =
+                lk.tentative ? "the tentative-definition mark"
+                : lk.staticInit.any() ? "a static-initializer schedule"
+                : lk.binding == SymbolBinding::Weak && weakDefinitionKindName(lk.weakKind).empty()
+                    ? "the weak binding with no weak-definition kind"
+                    : std::string_view{};
+            if (!unstateable.empty()) {
+                report(std::format("alias %{} of %{} carries {} — an alias has no storage and no kind-less weak "
+                                   "binding, and this text states none for it",
+                                   handleOf(a.alias.v), handleOf(a.target.v), unstateable),
+                       DiagnosticSeverity::Error);
+                word("?");
+            }
+            out_ += std::format("  alias %{}", handleOf(a.alias.v));
+            if (!words.empty()) out_ += std::format(" [{}]", words);
+            out_ += std::format(" = %{}\n", handleOf(a.target.v));
         }
         out_ += "}\n";
     }
@@ -3084,6 +3226,9 @@ public:
     // Handles are re-minted IN TREE ORDER by `parseInlineAsm`, which is what
     // makes emit(parse(emit(h))) byte-identical without printing the handle.
     HirInlineAsmPool      pInlineAsm_;
+    // v9: the `aliases` section, in file order (`parseAliases`); handed to the result once each target is
+    // known to be a definition of the built module (`refuseAliasesOfNoDefinition`).
+    std::vector<HirSymbolAlias> pAliases_;
 
     // ★★ HOW MANY TIMES THIS READER REFUSED, COUNTED BY THE READER. `parseHir` and
     // `parseTypeFromText` used to decide "did the text read" by the REPORTER's
@@ -3137,7 +3282,18 @@ public:
         }
         producer_ = takeStr();
         parsePreamble();
-        return parseModule();
+        HirNodeId const root = parseModule();
+        if (!root.valid()) return root;
+        if (acceptKeyword("aliases")) parseAliases();
+        // ★ v9: NOTHING FOLLOWS THE LAST SECTION. A reader that stopped at the module's `}` read a text that
+        // went on — a v9 `aliases` section under a v8 reader, or anything else — as if it ended there, and
+        // dropped the rest in silence; what is left now is refused by name.
+        if (!peekIs(Tk::Eof)) {
+            malformed(std::format("unexpected '{}' after the module — a `.dsshir` text ends with its module "
+                                  "and its `aliases` section",
+                                  lex_.peek().text));
+        }
+        return root;
     }
 
     // Entry for `parseTypeFromText`: decode a STANDALONE type string via the same
@@ -3180,6 +3336,31 @@ public:
             *outQual = std::move(qualTop_);
         }
         return t;
+    }
+
+    // v9: each alias of the section must name a DEFINITION of the built module — a `function` or a
+    // `global` declaration binds its target — and its own name must be no such definition (an alias is a
+    // second name, never storage or a body of its own). Asked by `parseHir` once `hir` is built, before
+    // the verdict; refused by name.
+    void refuseAliasesOfNoDefinition(Hir const& hir) {
+        if (pAliases_.empty()) return;
+        std::unordered_set<std::uint32_t> defined;
+        for (HirNodeId const d : hir.moduleDecls(hir.root())) {
+            if (hir.kind(d) == HirKind::Function) defined.insert(hir.functionSymbol(d).v);
+            else if (hir.kind(d) == HirKind::Global) defined.insert(hir.globalSymbol(d).v);
+        }
+        for (HirSymbolAlias const& a : pAliases_) {
+            if (!defined.contains(a.target.v)) {
+                malformed(std::format("alias %{} names %{}, which no `function` or `global` of the module "
+                                      "defines — an alias is a second name of a definition of its own unit",
+                                      a.alias.v, a.target.v));
+            }
+            if (defined.contains(a.alias.v)) {
+                malformed(std::format("alias %{} is also defined by a `function` or `global` of the module — an "
+                                      "alias is the definition of its name, never a second one",
+                                      a.alias.v));
+            }
+        }
     }
 
 private:
@@ -3519,7 +3700,33 @@ private:
         if (peekIs(Tk::Ident)) {
             std::string const& t = lex_.peek().text;
             if (t == "inf") { lex_.take(); return std::numeric_limits<double>::infinity(); }
-            if (t == "nan") { lex_.take(); return std::numeric_limits<double>::quiet_NaN(); }
+            if (t == "nan") {
+                // EXACTLY the canonical quiet NaN the writer spells `nan` (core's
+                // `kCanonicalQuietNanBits`, P69 review n13) — never the host's own NaN.
+                lex_.take();
+                double d = 0.0;
+                std::memcpy(&d, &kCanonicalQuietNanBits, sizeof d);
+                return d;
+            }
+            // P69 (lane `cs`): a NaN by its bit pattern — what the writer spells for any
+            // NaN but the canonical quiet one, so its payload and sign come back.
+            if (t == "nanbits") {
+                lex_.take();
+                if (!peekIs(Tk::Int)) { malformed("expected the 64-bit pattern after 'nanbits'"); return 0.0; }
+                Tok const b = lex_.take();
+                char* end = nullptr;
+                errno = 0;
+                unsigned long long const raw = std::strtoull(b.text.c_str(), &end, 10);
+                if (errno == ERANGE || end != b.text.c_str() + b.text.size()) {
+                    malformed("malformed 'nanbits' pattern '" + b.text + "'");
+                    return 0.0;
+                }
+                std::uint64_t const bits = raw;
+                double d = 0.0;
+                std::memcpy(&d, &bits, sizeof d);
+                if (!std::isnan(d)) { malformed("'nanbits' pattern is not a NaN"); return 0.0; }
+                return d;
+            }
         }
         malformed("expected float"); return 0.0;
     }
@@ -3564,6 +3771,7 @@ private:
                 // `literalCoreFromName` / `literalCoreAccepted` pair.
                 if (auto const k = literalCoreFromName(core); k.has_value()) {
                     done.core = *k;
+                    checkUnionMember(done);   // a nested union value, its core just read
                 } else {
                     malformed(std::format(
                         "unknown aggregate literal field core '{}' — accepted: {}",
@@ -3591,6 +3799,30 @@ private:
             stack.pop_back();
             done       = std::move(lv);
             haveResult = true;
+        }
+    }
+
+    // v8: `member N` is a UNION value's, and a union value with a field names its member —
+    // the two rules `.dssir` v5 reads by (`mir_text.cpp`, `checkUnionMember`). Both are
+    // refused HERE, at the text and in words about the TEXT: the writer never spells either,
+    // and what a member-less union value meets further down is the static-data encoder's
+    // refusal of an upstream DEFECT in DSS, which a malformed input is not. Whether N is a
+    // member the union HAS is the encoder's to answer — it walks the value against its type.
+    // Called where a value's core is known: a field's, once its `: <core>` is read, and the
+    // top-level value's, once `literalCoreFor` recomputed it from the type annotation.
+    void checkUnionMember(HirLiteralValue const& lv) {
+        auto const* a = std::get_if<HirAggregateValue>(&lv.value);
+        if (a == nullptr) return;
+        if (a->unionMember.has_value() && lv.core != TypeKind::Union) {
+            std::string_view const core = literalCoreName(lv.core);
+            malformed(std::format(
+                "`agg member {}` names a union member, but this literal's core is '{}' — only "
+                "a union value names its member", *a->unionMember,
+                core.empty() ? std::string_view{"?"} : core));
+        } else if (lv.core == TypeKind::Union && !a->fields.empty()
+                   && !a->unionMember.has_value()) {
+            malformed("a union aggregate literal with a field must name the member it "
+                      "initializes — `agg member N {…}`; this text names none");
         }
     }
 
@@ -3694,11 +3926,35 @@ private:
         else if (tag == "agg") {
             // D-HIR-TEXT-WRITER-DROPS-THE-AGGREGATE-LITERAL-ARM: the inverse of
             // `appendLiteralValue`'s aggregate arm, and the SAME syntax
-            // `mir_text.cpp`'s `parseLiteral` reads — `agg { <field>, … }`, each
-            // field a tagged value followed by `: <core>`. The fields are read by
+            // `mir_text.cpp`'s `parseLiteral` reads — `agg [member N] { <field>, … }`,
+            // each field a tagged value followed by `: <core>`. The fields are read by
             // the driver above, one head at a time, into the frame pushed here.
+            //
+            // v8 (P69, lane `cs`): `member N` — the member a UNION value's one field
+            // initializes, as `.dssir` v5 reads it. That the value is a union's, and
+            // that a union value with a field names one, is checked where the value's
+            // core is known (`checkUnionMember`).
+            std::optional<std::uint32_t> member;
+            if (acceptKeyword("member")) {
+                if (!peekIs(Tk::Int)) {
+                    // A punctuation token carries no text: say what stands there only
+                    // when there is a word to quote.
+                    std::string const got = lex_.peek().text;
+                    malformed(got.empty()
+                        ? std::string{"expected a member index after `agg member` — `agg member N {…}`"}
+                        : std::format("expected a member index after `agg member`, got '{}'", got));
+                    // The word that stands where the index belongs is spent with the
+                    // refusal; a `{` is the value's own and is left for it (`agg member {`).
+                    if (!peekIs(Tk::LBrace) && !peekIs(Tk::Eof)) lex_.take();
+                } else {
+                    std::size_t const before = refusals_;
+                    std::uint32_t const idx = takeU32("union member index");
+                    if (refusals_ == before) member = idx;
+                }
+            }
             expect(Tk::LBrace, "'{'");
             stack.push_back(LiteralParseFrame{});
+            stack.back().agg.unionMember = member;
             return false;   // the fields come next
         }
         else if (tag == kHirTextUnspelledAggregateTag) {
@@ -4075,6 +4331,14 @@ private:
             return;
         }
         std::size_t const n = entries.size();
+        // P69 (lane `cs`, fold f26d — N9; f26e B1): a handle is an index, so a table ends at the first
+        // writer-reserved SymbolId value (the index door's `fits`) -- refused by name, before it is sized.
+        if (n != 0 && !IndexSymbolIds::fits(n + 1u)) {
+            malformed(std::format("a `.dsshir` symbol table of {} entries reaches the first "
+                                  "writer-reserved SymbolId value ({}) -- a table of handles ends there",
+                                  n, kFirstWriterReservedSymbolIdValue));
+            return;
+        }
         symbolNames_.assign(n + 1, std::string{});
         std::vector<bool> declared(n + 1, false);
         for (auto& [handle, name] : entries) {
@@ -4091,6 +4355,143 @@ private:
             declared[handle] = true;
             symbolNames_[handle] = std::move(name);
         }
+    }
+
+    // ── `aliases { alias %A [<linkage words>] = %T }` (v9, P69 lane `cs`) ──────
+    //
+    // The twin of `Emitter::emitAliases`. Refused, each by name: an item that is not `alias`; a handle
+    // `symbols` does not declare (`parseSymHandle`); a word of the list that no shared table names, the
+    // default binding or visibility spelled out (`global`, `default`: stated by leaving them out), a
+    // binding or a visibility stated twice; an argument on a binding that is not `weak`, a kind the table
+    // does not name, and a `weak` with no kind; an alias that names itself; a name stated twice. That the
+    // target is a DEFINITION of the module is asked once the module is built (`refuseAliasesOfNoDefinition`):
+    // the section names symbols, and only the tree says which symbol a `function` or `global` binds.
+    void parseAliases() {
+        expect(Tk::LBrace, "'{'");
+        std::unordered_set<std::uint32_t> stated;
+        while (!peekIs(Tk::RBrace) && !peekIs(Tk::Eof)) {
+            std::uint32_t const off = cursorOff();
+            if (!acceptKeyword("alias")) {
+                malformed(std::format("expected 'alias' in the `aliases` section, got '{}'", lex_.peek().text));
+                if (cursorOff() == off) lex_.take();   // progress guard
+                continue;
+            }
+            std::uint32_t const alias  = parseSymHandle();
+            LinkageAttr         linkage{};
+            bool const          read   = parseAliasLinkage(linkage, alias);
+            expect(Tk::Equal, "'=' before the alias's target");
+            std::uint32_t const target = parseSymHandle();
+            if (alias == 0 || target == 0 || !read) continue;
+            if (alias == target) {
+                malformed(std::format("alias %{} names itself as its target — an alias is a second name of "
+                                      "another definition", alias));
+                continue;
+            }
+            if (!stated.insert(alias).second) {
+                malformed(std::format("alias %{} is stated twice — one name, one statement", alias));
+                continue;
+            }
+            pAliases_.push_back(HirSymbolAlias{SymbolId{alias}, SymbolId{target}, linkage});
+        }
+        expect(Tk::RBrace, "'}'");
+    }
+
+    // The bracketed linkage list of one alias, read into `out`. False ⇒ a word was refused (the alias is
+    // then not built). The binding's kind is read as the source text the shared table spells it with —
+    // `select-any` is a word, a `-` and a word to this lexer.
+    [[nodiscard]] bool parseAliasLinkage(LinkageAttr& out, std::uint32_t alias) {
+        if (!accept(Tk::LBrack)) return true;
+        bool ok            = true;
+        bool sawBinding    = false;
+        bool sawVisibility = false;
+        // The words a list states: every binding and visibility but the two an alias has when its list states
+        // none (`global`, `default`), which the writer states by leaving them out — one alias, one spelling.
+        auto const stateable = [](auto const& table, std::string_view unstated) {
+            std::vector<std::string_view> words;
+            for (std::string_view const w : allNames(table)) {
+                if (w != unstated) words.push_back(w);
+            }
+            return detail::renderAllowedList(words);
+        };
+        auto const refuseTheDefault = [&](std::string_view word, std::string_view what) {
+            malformed(std::format("'{}' in the attribute list of alias %{} is the {} an alias has when its list "
+                                  "states none — the text states it by leaving it out, so that an alias has one "
+                                  "spelling",
+                                  word, alias, what));
+            ok = false;
+        };
+        while (true) {
+            if (!peekIs(Tk::Ident)) {
+                malformed(std::format("expected a linkage word in the attribute list of alias %{}", alias));
+                return false;
+            }
+            std::string const word = lex_.take().text;
+            if (auto const v = symbolVisibilityFromName(word); v.has_value()) {
+                if (*v == SymbolVisibility::Default) refuseTheDefault(word, "visibility");
+                if (sawVisibility) {
+                    malformed(std::format("the attribute list of alias %{} states its visibility twice — '{}' "
+                                          "after '{}'", alias, word, symbolVisibilityName(out.visibility)));
+                    ok = false;
+                }
+                sawVisibility  = true;
+                out.visibility = *v;
+            } else if (auto const b = symbolBindingFromName(word); b.has_value()) {
+                if (*b == SymbolBinding::Global) refuseTheDefault(word, "binding");
+                if (sawBinding) {
+                    malformed(std::format("the attribute list of alias %{} states its binding twice — '{}' "
+                                          "after '{}'", alias, word, symbolBindingName(out.binding)));
+                    ok = false;
+                }
+                sawBinding   = true;
+                out.binding  = *b;
+                out.weakKind = WeakDefinitionKind{};
+                if (accept(Tk::LParen)) {
+                    std::string kind;
+                    while (peekIs(Tk::Ident) || peekIs(Tk::Minus)) {
+                        if (accept(Tk::Minus)) kind += '-';
+                        else kind += lex_.take().text;
+                    }
+                    if (!accept(Tk::RParen)) {
+                        malformed(std::format("'{}' in the attribute list of alias %{} opens an argument that is "
+                                              "not closed with ')'", word, alias));
+                        return false;
+                    }
+                    if (*b != SymbolBinding::Weak) {
+                        malformed(std::format("'{}' takes no argument — a weak-definition kind ('{}') is the "
+                                              "argument of '{}' only",
+                                              word, kind, symbolBindingName(SymbolBinding::Weak)));
+                        ok = false;
+                    } else if (auto const k = weakDefinitionKindFromName(kind); k.has_value()) {
+                        out.weakKind = *k;
+                    } else {
+                        unknownName(std::format("unknown weak-definition kind '{}' — accepted: {}", kind,
+                                                detail::renderAllowedList(allNames(kWeakDefinitionKindTable))));
+                        ok = false;
+                    }
+                }
+            } else {
+                unknownName(std::format("unknown word '{}' in the attribute list of alias %{} — accepted: a "
+                                        "binding ({}) or a visibility ({})",
+                                        word, alias,
+                                        stateable(kSymbolBindingTable, symbolBindingName(SymbolBinding::Global)),
+                                        stateable(kSymbolVisibilityTable,
+                                                  symbolVisibilityName(SymbolVisibility::Default))));
+                ok = false;
+            }
+            if (accept(Tk::Comma)) continue;
+            if (!accept(Tk::RBrack)) {
+                malformed(std::format("the attribute list of alias %{} is not closed with ']'", alias));
+                return false;
+            }
+            break;
+        }
+        if (ok && out.binding == SymbolBinding::Weak && weakDefinitionKindName(out.weakKind).empty()) {
+            malformed(std::format("alias %{} is '{}' and names no weak-definition kind — accepted: {}", alias,
+                                  symbolBindingName(SymbolBinding::Weak),
+                                  detail::renderAllowedList(allNames(kWeakDefinitionKindTable))));
+            ok = false;
+        }
+        return ok;
     }
 
     // ── module ───────────────────────────────────────────────────────────────
@@ -4613,6 +5014,7 @@ private:
                 HirLiteralValue v = parseLiteralValue();
                 TypeId t = parseTypeAnnot();
                 v.core = literalCoreFor(t, v);
+                checkUnionMember(v);   // v8: the top-level value's core is its type's
                 std::uint32_t const pidx = pLiterals_.add(std::move(v));
                 return completeNode(builder_.makeLiteral(t, pidx, flags), idx,
                                     std::move(attrs), done);
@@ -4716,6 +5118,28 @@ private:
                 f.attrs    = std::move(attrs);
                 return openParenOperands(stack, done, std::move(f));
             }
+            case HirTextExprKw::Unnamed: {
+                // `unnamed <storage> : <type> (<init>)` — the writer's mirror; the storage
+                // spelling is refused naming the accepted set.
+                NodeParseFrame f;
+                f.kind     = NodeParseFrame::Kind::ParenOperands;
+                f.nodeKind = HirKind::UnnamedObject;
+                f.flags    = flags;
+                std::string const storage = takeIdent();
+                if (auto const s = kHirObjectStorageTable.fromName(storage)) {
+                    f.payload = static_cast<std::uint32_t>(*s);
+                } else {
+                    malformed(std::format("unknown unnamed-object storage '{}' — accepted: {}",
+                                          storage,
+                                          detail::renderAllowedList(
+                                              allNames(kHirObjectStorageTable))));
+                    f.payload = static_cast<std::uint32_t>(HirObjectStorage::Automatic);
+                }
+                f.type     = parseTypeAnnot();
+                f.preIdx   = idx;
+                f.attrs    = std::move(attrs);
+                return openParenOperands(stack, done, std::move(f));
+            }
             case HirTextExprKw::Member:
             case HirTextExprKw::Swizzle: {
                 expect(Tk::Hash, "'#'");
@@ -4754,7 +5178,19 @@ private:
             }
             case HirTextExprKw::Cast:       return typedCall(HirKind::Cast);
             case HirTextExprKw::Index:      return typedCall(HirKind::Index);
-            case HirTextExprKw::Construct:  return typedCall(HirKind::ConstructAggregate);
+            case HirTextExprKw::Construct: {
+                // `construct [#member] : <type> (<fields>)` — the writer's mirror: a union
+                // aggregate's member index when it is not 0 (P69), else none.
+                NodeParseFrame f;
+                f.kind     = NodeParseFrame::Kind::ParenOperands;
+                f.nodeKind = HirKind::ConstructAggregate;
+                f.flags    = flags;
+                f.payload  = accept(Tk::Hash) ? takeU32("union member index") : 0u;
+                f.type     = parseTypeAnnot();
+                f.preIdx   = idx;
+                f.attrs    = std::move(attrs);
+                return openParenOperands(stack, done, std::move(f));
+            }
             case HirTextExprKw::Ternary:    return typedCall(HirKind::Ternary);
             case HirTextExprKw::LogicalAnd: return typedCall(HirKind::LogicalAnd);
             case HirTextExprKw::LogicalOr:  return typedCall(HirKind::LogicalOr);
@@ -4765,6 +5201,7 @@ private:
             case HirTextExprKw::VaStart:    return typedCall(HirKind::VaStart);
             case HirTextExprKw::VaArg:      return typedCall(HirKind::VaArg);
             case HirTextExprKw::VaEnd:      return typedCall(HirKind::VaEnd);
+            case HirTextExprKw::VaCopy:     return typedCall(HirKind::VaCopy);
             // The row-count sentinel. It is UNLISTED in the table, so `fromName`
             // cannot produce it and this arm cannot be reached from any input —
             // it exists because `-Werror=switch` is the pairing guard, and a
@@ -5566,8 +6003,8 @@ private:
             // declarator spine every consumer of this text reconstructs.
             Aligned,
             Tuple,      // tuple<T, …>
-            Struct,     // struct "name" [packed] { T [@off | ~align] [packed], … }
-            Union,      // union "name" [packed] { T [packed], … }
+            Struct,     // struct "name" [packed] [aligned N] { T [@off | ~align] [packed], … }
+            Union,      // union "name" [packed] [aligned N] { T [packed], … }
             Fn,         // fn(P, …[, ...]) -> R [cc X]
             Ext         // ext "name" (T, …) [s, …]
         } kind;
@@ -5577,6 +6014,9 @@ private:
         // Composite / Ext / Tuple / Fn: the name and the operands read so far.
         std::string         name;
         bool                packed = false;   // Struct / Union: the whole-composite marker
+        // P69 (lane `cs`, fold f26e): Struct / Union: the whole-composite `aligned N`
+        // (0 = none), the module `types` grammar's own marker in its own place.
+        std::uint32_t       explicitAlign = 0;
         // v3: the `rec <H>` marker's handle (0 = not a recursive composite) and the
         // forward id minted for it before the field list was read.
         std::uint64_t       recHandle = 0;
@@ -5922,10 +6362,16 @@ private:
             // forwardComposite + completeComposite in `finishStructType` (the
             // structType convenience overloads don't carry packed).
             bool const packed = acceptKeyword("packed");
+            // P69 (lane `cs`, fold f26e): ` aligned N` after it, the whole-composite
+            // alignment the module `types` grammar spells in the same place
+            // (`"packed"? ("aligned" INT)?`), so a standalone text can state every
+            // composite a shipped header defines (Windows `CONTEXT` is DECLSPEC_ALIGN(16)).
+            std::uint32_t const explicitAlign =
+                acceptKeyword("aligned") ? takeCompositeAlign("aligned") : 0u;
             expect(Tk::LBrace, "'{'");
             TypeParseFrame f{.kind = Kind::Struct, .name = std::move(name),
-                             .packed = packed, .recHandle = recH,
-                             .refusedInModule = refused};
+                             .packed = packed, .explicitAlign = explicitAlign,
+                             .recHandle = recH, .refusedInModule = refused};
             if (recH != 0) f.recForward = openRecComposite(TypeKind::Struct, f.name, recH);
             stack.push_back(std::move(f));
             return false;   // the field list comes next
@@ -5945,10 +6391,12 @@ private:
             std::uint64_t recH = takeRecMarker();
             if (refused) recH = 0;               // v5 — see the struct arm
             bool const packed = acceptKeyword("packed");   // D-CSUBSET-PACKED
+            std::uint32_t const explicitAlign =             // the struct arm's marker
+                acceptKeyword("aligned") ? takeCompositeAlign("aligned") : 0u;
             expect(Tk::LBrace, "'{'");
             TypeParseFrame f{.kind = Kind::Union, .name = std::move(name),
-                             .packed = packed, .recHandle = recH,
-                             .refusedInModule = refused};
+                             .packed = packed, .explicitAlign = explicitAlign,
+                             .recHandle = recH, .refusedInModule = refused};
             if (recH != 0) f.recForward = openRecComposite(TypeKind::Union, f.name, recH);
             stack.push_back(std::move(f));
             return false;   // the member list comes next
@@ -6403,8 +6851,9 @@ private:
         std::span<std::int64_t const> const noWidths{};
         if (interner_.isIncompleteComposite(f.recForward)) {
             interner_.completeComposite(f.recForward, ts, f.packed, noWidths, offs, aligns,
-                                        /*explicitAlign=*/0, /*maxFieldAlign=*/0, fp);
-        } else if (!recCompletionAgrees(f.recForward, ts, f.packed, offs, aligns, fp)) {
+                                        f.explicitAlign, /*maxFieldAlign=*/0, fp);
+        } else if (!recCompletionAgrees(f.recForward, ts, f.packed, offs, aligns, fp)
+                   || interner_.explicitCompositeAlign(f.recForward) != f.explicitAlign) {
             malformed(std::format(
                 "recursion handle {} was spelled twice with DIFFERENT content — a "
                 "handle names one composite per artifact, so the two spellings "
@@ -6447,6 +6896,7 @@ private:
         std::size_t const nWithAlign   = f.nWithAlign;
         std::size_t const nFieldPacked = f.nFieldPacked;
         bool const        packed       = f.packed;
+        std::uint32_t const explicitAlign = f.explicitAlign;   // 0 = none
         out = InvalidType;
         expect(Tk::RBrace, "'}'");
         if (nWithOff != 0 && nWithAlign != 0) {
@@ -6525,12 +6975,15 @@ private:
             // must get DISTINCT forward ids instead of colliding. An empty span
             // leaves the key BYTE-IDENTICAL (zero churn).
             for (std::uint8_t p : fpSpan) key = (key ^ p) * 1099511628211ull;
+            // P69 (lane `cs`, fold f26e): the whole-composite `aligned N` too, guarded so
+            // an unaligned spelling keeps its key byte-identical.
+            if (explicitAlign != 0) key = (key ^ (0xA11A00000000ull | explicitAlign)) * 1099511628211ull;
             key |= (std::uint64_t{1} << 62);
             TypeId const fwd =
                 interner_.forwardComposite(TypeKind::Struct, name, key);
             std::span<std::uint64_t const> const noOffs{};
             interner_.completeComposite(fwd, ts, /*packed=*/true, noWidths,
-                                        noOffs, al, /*explicitAlign=*/0,
+                                        noOffs, al, explicitAlign,
                                         /*maxFieldAlign=*/0, fpSpan);
             return fwd;
         };
@@ -6547,29 +7000,40 @@ private:
             for (TypeId fld : ts) key = (key ^ fld.v) * 1099511628211ull;
             for (std::uint32_t a : al) key = (key ^ a) * 1099511628211ull;
             for (std::uint8_t p : fpSpan) key = (key ^ p) * 1099511628211ull;
+            if (explicitAlign != 0) key = (key ^ (0xA11A00000000ull | explicitAlign)) * 1099511628211ull;
             key |= (std::uint64_t{1} << 61);
             TypeId const fwd =
                 interner_.forwardComposite(TypeKind::Struct, name, key);
             std::span<std::uint64_t const> const noOffs{};
             interner_.completeComposite(fwd, ts, /*packed=*/false, noWidths,
-                                        noOffs, al, /*explicitAlign=*/0,
+                                        noOffs, al, explicitAlign,
                                         /*maxFieldAlign=*/0, fpSpan);
             return fwd;
         };
+        // P69 (lane `cs`, fold f26e): a whole-composite `aligned N` takes the overload that
+        // carries it — the one `structType` the shipped-lib `structs` decoder calls for
+        // the same composite, so the two spellings of one header type are one TypeId.
+        std::span<std::uint64_t const> const noOffsets{};
+        std::span<std::uint32_t const> const noAligns{};
         if (nWithOff == 0 && nWithAlign == 0) {
             if (packed) { out = internPacked({}); return true; }
             if (nFieldPacked != 0) { out = internFieldPacked({}); return true; }
-            out = interner_.structType(name, ts);
+            out = explicitAlign != 0
+                      ? interner_.structType(name, ts, noWidths, noOffsets, noAligns, explicitAlign)
+                      : interner_.structType(name, ts);
             return true;
         }
         if (nWithAlign != 0) {   // count + packed exclusivity checked above
             if (packed) { out = internPacked(aligns); return true; }
             if (nFieldPacked != 0) { out = internFieldPacked(aligns); return true; }
-            std::span<std::uint64_t const> const noOffs{};
-            out = interner_.structType(name, ts, noWidths, noOffs, aligns);
+            out = explicitAlign != 0
+                      ? interner_.structType(name, ts, noWidths, noOffsets, aligns, explicitAlign)
+                      : interner_.structType(name, ts, noWidths, noOffsets, aligns);
             return true;
         }
-        out = interner_.structType(name, ts, noWidths, offs);
+        out = explicitAlign != 0
+                  ? interner_.structType(name, ts, noWidths, offs, noAligns, explicitAlign)
+                  : interner_.structType(name, ts, noWidths, offs);
         return true;
     }
 
@@ -6591,12 +7055,17 @@ private:
                                  std::span<std::uint32_t const>{}, fpSpan, out);
             return true;
         }
-        if (!packed && nFieldPacked == 0) { out = interner_.unionType(name, ts); return true; }
+        std::uint32_t const explicitAlign = f.explicitAlign;   // P69 fold f26e; 0 = none
+        if (!packed && nFieldPacked == 0 && explicitAlign == 0) {
+            out = interner_.unionType(name, ts);
+            return true;
+        }
         std::uint64_t key = 1469598103934665603ull;
         for (char ch : name)
             key = (key ^ static_cast<std::uint8_t>(ch)) * 1099511628211ull;
         for (TypeId fld : ts) key = (key ^ fld.v) * 1099511628211ull;
         for (std::uint8_t p : fpSpan) key = (key ^ p) * 1099511628211ull;
+        if (explicitAlign != 0) key = (key ^ (0xA11A00000000ull | explicitAlign)) * 1099511628211ull;
         // Bit 62 is the whole-composite packed key space; bit 61 the per-field one
         // — a union packed as a whole and a union with one packed member are
         // different layouts and must never collapse onto one forward id.
@@ -6606,7 +7075,7 @@ private:
         std::span<std::uint64_t const> const noO{};
         std::span<std::uint32_t const> const noA{};
         interner_.completeComposite(fwd, ts, packed, noW, noO, noA,
-                                    /*explicitAlign=*/0, /*maxFieldAlign=*/0,
+                                    explicitAlign, /*maxFieldAlign=*/0,
                                     fpSpan);
         out = fwd;
         return true;
@@ -6644,6 +7113,9 @@ std::unique_ptr<HirParseResult> parseHir(std::string_view text, CompilationUnitI
         std::move(hir), std::move(*parser.ownedInterner_), std::move(parser.symbolNames_));
     res->producer    = std::move(parser.producer_);
     res->bufferNames = std::move(parser.bufferNames_);
+    // v9: the aliases, each asked whether it names a definition of the module just built.
+    parser.refuseAliasesOfNoDefinition(res->hir);
+    res->symbolAliases = std::move(parser.pAliases_);
 
     // Hand back the rebuilt literal pool (empty if the source used `#index`).
     res->literalPool = std::move(parser.pLiterals_);

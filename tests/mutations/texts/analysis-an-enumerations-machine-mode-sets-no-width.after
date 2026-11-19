@@ -1,0 +1,2 @@
+                                                    if (fits && moded.v == 0u) {
+                                                        compositeTy = enumIn.enumType(

@@ -1,22 +1,21 @@
-// FC2 (V2-4.X, 2026-06-10): the type-name ORACLE runtime witness. The
-// typedef `myint` is ONLY visible via the quote include — main.c's
-// first parse sees `(myint)-x` as a lone UNKNOWN identifier with an
-// operator follower (triage rule 4), rolls back to the value reading,
-// and records an AmbiguousTypeNameCandidate. UnitBuilder::finish()
-// resolves `myint` against the header tree's exported global type
-// names and REPARSES this file once with the name seeded — only then
-// does the cast commit and the program compile clean.
+// FC2 (V2-4.X, 2026-06-10): a QUOTE-INCLUDED typedef commits a cast on the
+// file's one parse. The typedef `myint` is visible ONLY through the quote
+// include; the C preprocessor splices the header's text in before the parse
+// (FC13), so the binder sketch knows `myint` as a type when `(myint)-x` is
+// read and the cast commits. (Before P69 a compilation-unit oracle reparsed
+// the file with names other trees exported; it is retired —
+// D-PP-FC2-ORACLE-RETIRE — and a C file parses once.)
 //
 //   negate(-42) = (myint)-(-42) = 42  ->  exit 42
 //
-// An oracle regression (candidate not recorded / export surface not
-// harvested / reparse not run) leaves the value reading in place ->
+// A regression (the header's text not spliced before the parse, or its
+// typedef not bound in the sketch) leaves the value reading in place ->
 // `myint` is an undeclared VALUE operand -> S_UndeclaredIdentifier ->
 // the harness's zero-diagnostic compile assert flips RED.
 //
 // Identity typedef cast + pure int ops -> all four target arms (the
-// modulo arm set). The runtime exit additionally proves the reparsed
-// tree (not the rolled-back first parse) is what reached codegen.
+// modulo arm set). The runtime exit proves the committed cast is what
+// reached codegen.
 #include "myint.h"
 
 int negate(int x) { return (myint)-x; }

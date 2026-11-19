@@ -453,7 +453,10 @@ void SimplifyCfgPolicy::breakJumpThreadCycles(std::vector<MirBlockId> const& rpo
                 }
                 MirBlockId survivor = v;  // == walk[cycleStart - 1]
                 for (std::size_t i = cycleStart; i < walk.size(); ++i) {
-                    if (rank(walk[i]) < rank(survivor)) survivor = walk[i];
+                    // Named first: `rank` fills its memo on first use, and
+                    // the operands of `<` are unsequenced.
+                    std::uint32_t const candidate = rank(walk[i]);
+                    if (candidate < rank(survivor)) survivor = walk[i];
                 }
                 jumpThreadMap_.erase(survivor);
                 break;

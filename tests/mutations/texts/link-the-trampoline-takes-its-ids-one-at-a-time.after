@@ -1,0 +1,9 @@
+    ModuleSymbolIds door{module};
+    std::vector<SymbolId> oneByOne;
+    for (std::size_t k = 0; k < ids; ++k) {
+        std::optional<SymbolId> const one =
+            door.take(reporter, std::format("entry-trampoline: the {} id(s) of the trampoline and its exit", ids));
+        if (!one.has_value()) return false;
+        oneByOne.push_back(*one);
+    }
+    std::optional<std::vector<SymbolId>> const taken = oneByOne;

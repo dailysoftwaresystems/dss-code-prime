@@ -1,0 +1,1 @@
+    if (oneInstancePerProcess && id.uniqueBinding.has_value() && (id.osabi == 0 || id.osabi == id.uniqueBinding->osabi)) return id.uniqueBinding->value;

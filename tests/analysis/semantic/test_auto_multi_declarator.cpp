@@ -202,13 +202,11 @@ TEST(AutoMultiDeclarator, DisagreeingDeductionsAreRefusedByName) {
         << "the retired constraint must not fire for a multi-declarator list";
 }
 
-// The message must name BOTH deductions and BOTH declarators. ⓘ The types are
-// spelled in the interner's KIND vocabulary (`I32`, `F64`) rather than in C
-// words, and that is measured rather than settled for: `TypeSpecifierRule`
-// carries a `tokenNames` field commented "source spellings, for diagnostics"
-// and it in fact holds TOKEN-KIND names — rendering through it produced
-// `deduces 'IntKeyword' … and 'DoubleKeyword'`. Kind spellings are also what
-// every parser refusal here already prints.
+// The message must name BOTH deductions and BOTH declarators, the types as C spells
+// them (P69 fold f26d, ruling 617: the ONE renderer over the c document's
+// `semantics.typeSpelling`, where the analyzer's own lambda printed the interner's
+// kind names `I32` and `F64`). The sentence without a table, and the other sites,
+// are pinned by analysis/semantic/test_diagnostic_type_spelling.
 TEST(AutoMultiDeclarator, TheDisagreementDiagnosticNamesBothTypesAndBothNames) {
     auto model = analyzeShipped("c", {
         "int main(void) { auto a = 1, b = 2.5; return (int)b; }\n",
@@ -218,8 +216,9 @@ TEST(AutoMultiDeclarator, TheDisagreementDiagnosticNamesBothTypesAndBothNames) {
         if (d.code != DiagnosticCode::S_AutoDeclaratorsInferDifferentTypes)
             continue;
         found = true;
-        EXPECT_NE(d.actual.find("I32"), std::string::npos) << d.actual;
-        EXPECT_NE(d.actual.find("F64"), std::string::npos) << d.actual;
+        EXPECT_NE(d.actual.find("'int'"), std::string::npos) << d.actual;
+        EXPECT_NE(d.actual.find("'double'"), std::string::npos) << d.actual;
+        EXPECT_EQ(d.actual.find("I32"), std::string::npos) << "a core kind name: " << d.actual;
         EXPECT_NE(d.actual.find("a = 1"), std::string::npos) << d.actual;
         EXPECT_NE(d.actual.find("b = 2.5"), std::string::npos) << d.actual;
     }
@@ -227,7 +226,7 @@ TEST(AutoMultiDeclarator, TheDisagreementDiagnosticNamesBothTypesAndBothNames) {
 }
 
 // Two DIFFERENT pointer types must not both print as `Ptr`: the pointee is
-// rendered through, so the message discriminates.
+// spelled through, so the message discriminates.
 TEST(AutoMultiDeclarator, TwoDifferentPointerDeductionsAreNamedDistinctly) {
     auto model = analyzeShipped("c", {
         "int main(void) { int x = 1; double d = 2.0; auto a = &x, b = &d;\n"
@@ -238,8 +237,8 @@ TEST(AutoMultiDeclarator, TwoDifferentPointerDeductionsAreNamedDistinctly) {
         if (d.code != DiagnosticCode::S_AutoDeclaratorsInferDifferentTypes)
             continue;
         found = true;
-        EXPECT_NE(d.actual.find("I32 *"), std::string::npos) << d.actual;
-        EXPECT_NE(d.actual.find("F64 *"), std::string::npos) << d.actual;
+        EXPECT_NE(d.actual.find("'int *'"), std::string::npos) << d.actual;
+        EXPECT_NE(d.actual.find("'double *'"), std::string::npos) << d.actual;
     }
     EXPECT_TRUE(found);
 }

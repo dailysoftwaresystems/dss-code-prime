@@ -321,6 +321,36 @@ TEST(DwarfCfi, PcRelPatchAndSearchHeaderResolveAgainstRealAddresses) {
         << "the lower-addressed function sorts first";
 }
 
+// Two FDEs at ONE address tie on initial_location. The search table must still
+// be a function of the section alone, so the FDE's own offset breaks the tie.
+// The section is laid out with its later FDE first (a merge may do that), which
+// is what a sort keyed on the address alone would keep as given.
+TEST(DwarfCfi, TwoFdesAtOneAddressAreOrderedByTheirOffset) {
+    EhFrameSection sec;
+    sec.patches.resize(2);
+    sec.patches[0].funcIndex = 0;
+    sec.patches[1].funcIndex = 1;
+    sec.fdeOffsets = {0x60u, 0x20u};
+    constexpr std::uint64_t kHdrVa     = 0x400000;
+    constexpr std::uint64_t kEhFrameVa = 0x401000;
+    auto const funcVa = [](std::size_t) -> std::uint64_t { return 0x402000ull; };
+    auto const hdr = buildEhFrameHdr(sec, kHdrVa, kEhFrameVa, funcVa);
+    ASSERT_EQ(hdr.size(), 12u + 2u * 8u);
+    auto rd32 = [&](std::size_t o) {
+        return static_cast<std::int32_t>(
+            static_cast<std::uint32_t>(hdr[o])
+            | (static_cast<std::uint32_t>(hdr[o + 1]) << 8)
+            | (static_cast<std::uint32_t>(hdr[o + 2]) << 16)
+            | (static_cast<std::uint32_t>(hdr[o + 3]) << 24));
+    };
+    EXPECT_EQ(rd32(12), rd32(20)) << "both rows name the one address";
+    EXPECT_EQ(static_cast<std::int64_t>(kHdrVa) + rd32(16),
+              static_cast<std::int64_t>(kEhFrameVa + 0x20u))
+        << "the lower-offset FDE comes first among the rows of one address";
+    EXPECT_EQ(static_cast<std::int64_t>(kHdrVa) + rd32(24),
+              static_cast<std::int64_t>(kEhFrameVa + 0x60u));
+}
+
 TEST(DwarfCfi, EhFrameIsReadableByAnExternalDwarfReader) {
     // The plan-15 DB11 ORACLE witness. Writes the encoder's `.eh_frame` bytes
     // so an external reader can decode them:

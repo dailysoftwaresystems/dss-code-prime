@@ -1,0 +1,29 @@
+{
+  "$comment": "P69 fold 3c (lane `xa`), D-LK-ELF-READER-KEEPS-EVERY-SECTION-GROUP-AND-DISCARDS-NONE, part (c): `elf_group_hidden_pair` with the two objects in the OTHER order. The link keeps the first unit's COMDAT group `h` -- unit B's here -- so both callers answer 9 and the program exits 99, as GNU ld 2.42 and ld.lld 18.1.3 link it (MEASURED 2026-10-20). Unit A's group, `h` with it, is discarded before its definition meets unit B's.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 99,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "prebuiltLibraries": [
+        {
+          "$comment": "UNIT B: h() answers 9, after a `nop`. Source and rebuild command: `tests/link/data/elf_group_hidden_b.source.s` (GNU as 2.42 through gcc 13.3.0, `gcc -c`; md5 56b84b0015f81312add89d21099b5a7e).",
+          "path": "tests/link/data/elf_group_hidden_b_x86_64_elf_gas.o",
+          "containerWitness": "group_hidden_b"
+        },
+        {
+          "$comment": "UNIT A: h() answers 7. Source and rebuild command: `tests/link/data/elf_group_hidden_a.source.s` (GNU as 2.42 through gcc 13.3.0, `gcc -c`; md5 4b50defb746e4b7727127089babe888d). A relocatable object named to the link is an OBJECT INPUT, linked eagerly. The witness is the unit's own caller.",
+          "path": "tests/link/data/elf_group_hidden_a_x86_64_elf_gas.o",
+          "containerWitness": "group_hidden_a"
+        }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

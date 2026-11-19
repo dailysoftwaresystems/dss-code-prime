@@ -1,0 +1,1 @@
+_CODE_BREAK = re.compile(r'/\*|//|["\']')

@@ -1,0 +1,2 @@
+            if (interner.kind(t) != TypeKind::Array) return false;
+            auto const ops = interner.operands(t);

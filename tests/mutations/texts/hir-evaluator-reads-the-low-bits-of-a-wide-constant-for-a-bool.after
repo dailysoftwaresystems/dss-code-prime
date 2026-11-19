@@ -1,0 +1,1 @@
+        if (false && toK == TypeKind::Bool) return ok(makeBoolLiteral(wide->isZero() ? 0 : 1));

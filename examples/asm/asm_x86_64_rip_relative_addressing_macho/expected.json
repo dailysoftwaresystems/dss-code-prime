@@ -1,0 +1,12 @@
+{
+  "$comment": "★★★ RIP-RELATIVE ADDRESSING ON MACH-O — the program of `asm_x86_64_rip_relative_addressing` (P68 round 9, D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER), entered at `_main`. ★ WHY IT IS ITS OWN EXAMPLE (P69 fold 3e, the review of fold 3d's X1): an assembly dialect's entry rows are spelled on the binary in the format's C decoration, as a language's are (`entryLinkNames`), because a `.s` names its labels as the binary spells them -- so Mach-O's startup enters `_main`, and the ELF and PE spelling `main` is an ordinary function there. ✔MEASURED P69 fold 3e (lane xa, Apple clang 21.0.0's ld64): a clang `.s` entered at `_main` links and runs; one entered at `main` is refused, `_main` undefined. The Mach-O arm RUNS only on the darwin leg (it was not measured by the lane that wrote it); its object-file relocations were measured against clang's (X86_64_RELOC_SIGNED / SIGNED_1 / SIGNED_2 / SIGNED_4 with the addend in place) and the reader's decode of them is pinned in `tests/link/test_input_section_units.cpp`. The `release` arm pins only that naming the release pipeline does not break the assembly path.",
+  "language": "asm-x86_64-att",
+  "source": "main.s",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:macho64-x86_64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

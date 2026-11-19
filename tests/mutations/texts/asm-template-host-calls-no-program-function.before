@@ -1,0 +1,2 @@
+        if (namesProgramSymbol(symbol, at)) {
+            auto const sym = programSymbolOf(symbol, at, mnemonic, AsmTemplateNameUse::Call);

@@ -1,0 +1,1 @@
+        for (std::size_t depth = names.size(); depth < names.size(); ++depth) {

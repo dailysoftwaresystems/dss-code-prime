@@ -31,12 +31,16 @@
 #include "core/types/config_key_vocabulary.hpp"  // detail::renderAllowedList
 #include "core/types/parse_diagnostic.hpp"
 #include "link/format/macho.hpp"
+#include "link/format/macho_linker_options.hpp"   // readMachOLinkerOption -- a unit's options, as the reader's
 #include "link/format/macho_object_reader.hpp"
+#include "link/format/macho_relocation_info.hpp"
 #include "link/object_format_schema.hpp"
 
 #include "link/object_format_identity_doc.hpp"
 
 #include <algorithm>
+#include <array>     // the closed key sets of the identity blocks
+#include <cstddef>
 #include <cstdint>
 #include <format>
 #include <limits>
@@ -50,6 +54,23 @@ namespace dss::link::format {
 namespace {
 
 char const* const kMachOBlocks[] = { "macho", "image" };
+
+// P69 (D-CONFIG-FORMAT-IDENTITY-BLOCKS-ACCEPTED-ANY-KEY): every block this
+// backend reads has a CLOSED key set — the shared check
+// (`dss::detail::rejectUnknownKeys`, which lets `$` prose through) bound to this
+// loader's sink and `path/key` convention, once for the six blocks below.
+template <std::size_t N>
+void closeBlock(nlohmann::json const&                    block,
+                std::array<std::string_view, N> const&   keys,
+                std::string_view                         path,
+                std::string_view                         label,
+                substrate::DiagnosticCollector&          coll) {
+    ::dss::detail::rejectUnknownKeys(block, keys, label,
+        [&](std::string_view key, std::string message) {
+            coll.emit(DiagnosticCode::C_MalformedJson, std::format("{}/{}", path, key),
+                      std::move(message));
+        });
+}
 
 // D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS. The weak-
 // definition spellings THIS backend's walker writes. One row: `macho.cpp`
@@ -166,6 +187,14 @@ public:
     [[nodiscard]] bool
     isExecFlavor(detail::ObjectFormatData const& d) const noexcept override {
         return d.macho.filetype == MachOObjectType::Execute;
+    }
+    // P69 fold 3d (D-LK-PE-IMAGE-DEFINES-NO-IMAGE-BASE-SYMBOL, the Mach-O
+    // neighbour): both image writers (`macho::encodeExec`, and
+    // `encodeExecDynamic` for MH_EXECUTE and MH_DYLIB) give each image-defined
+    // name the address of the image's own mach header, at __TEXT's vmaddr.
+    [[nodiscard]] bool
+    writesImageDefinedSymbols(detail::ObjectFormatData const& d) const noexcept override {
+        return isImageFlavor(d);
     }
 
     // c153 (D-LK3-3): MH_DYLIB is FALSE. The shipped bind model is the modern
@@ -312,6 +341,23 @@ public:
                 coll.emit(DiagnosticCode::C_MalformedJson, "/macho",
                           "'macho' must be an object when format.kind == 'macho'");
             } else {
+                // CLOSED (P69, D-CONFIG-FORMAT-IDENTITY-BLOCKS-ACCEPTED-ANY-KEY),
+                // like every block below: a misspelled key loaded clean and
+                // left the field it names at its default.
+                // 4 -> 5 (P69): `differenceRelocations`, the relocation pairs a
+                // reader of this format applies (`MachODifferenceRelocation`).
+                // 5 -> 6 (P69 fold 3e): `addendRelocation`, the record that
+                // carries the next entry's addend (`MachOAddendRelocation`).
+                // 6 -> 7 (P69 fold 3f): `linkerOptions`, the load command an
+                // object hands its final linker options in (`MachOLinkerOptions`).
+                // 7 -> 8 (P69 fold 3f): `skippedLoadCommands`, the commands the
+                // object reader steps over, each for its reason.
+                static constexpr std::array<std::string_view, 8> kMachoBlockKeys{
+                    "cputype", "cpusubtype", "flags", "filetype",
+                    "differenceRelocations", "addendRelocation", "linkerOptions",
+                    "skippedLoadCommands"};
+                DSS_CHECK_KEY_VOCABULARY(kMachoBlockKeys);
+                closeBlock(m, kMachoBlockKeys, "/macho", "the 'macho' block", coll);
                 auto readU32 = [&](char const* field, std::uint32_t& out) {
                     if (!m.contains(field) || !m.at(field).is_number_integer())
                         return;
@@ -329,6 +375,195 @@ public:
                 readU32("cputype",    data.macho.cputype);
                 readU32("cpusubtype", data.macho.cpusubtype);
                 readU32("flags",      data.macho.flags);
+                // `differenceRelocations` (P69,
+                // D-LK-MACHO-LD-R-EH-FRAME-RELOCATIONS-REFUSED-AT-READ): the
+                // (subtrahend, minuend) relocation pairs a reader of this
+                // format applies. This reads the SHAPE; what the rows must BE
+                // is `validateIdentity`'s, so a table built in memory is held
+                // to the same rule.
+                if (m.contains("differenceRelocations")) {
+                    auto const& pairs = m.at("differenceRelocations");
+                    if (!pairs.is_array()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  "/macho/differenceRelocations",
+                                  "'differenceRelocations' must be an array of "
+                                  "{ subtrahendNativeId, minuendNativeId }");
+                    } else {
+                        static constexpr std::array<std::string_view, 2>
+                            kDifferenceRelocationKeys{
+                                "subtrahendNativeId", "minuendNativeId"};
+                        DSS_CHECK_KEY_VOCABULARY(kDifferenceRelocationKeys);
+                        for (std::size_t i = 0; i < pairs.size(); ++i) {
+                            auto const& e = pairs[i];
+                            auto const path = std::format(
+                                "/macho/differenceRelocations/{}", i);
+                            bool shaped = e.is_object();
+                            for (std::string_view const key : kDifferenceRelocationKeys) {
+                                shaped = shaped && e.contains(key)
+                                      && e.at(key).is_number_integer();
+                            }
+                            if (!shaped) {
+                                coll.emit(DiagnosticCode::C_MalformedJson, path,
+                                          "each entry is { \"subtrahendNativeId\": "
+                                          "<wire id>, \"minuendNativeId\": <wire "
+                                          "id> }");
+                                continue;
+                            }
+                            closeBlock(e, kDifferenceRelocationKeys, path,
+                                       "a differenceRelocations entry", coll);
+                            std::int64_t const sub =
+                                e.at("subtrahendNativeId").get<std::int64_t>();
+                            std::int64_t const min =
+                                e.at("minuendNativeId").get<std::int64_t>();
+                            if (sub < 0 || sub > 0xFFFFFFFFLL || min < 0
+                                || min > 0xFFFFFFFFLL) {
+                                coll.emit(DiagnosticCode::C_MalformedJson, path,
+                                          std::format(
+                                              "subtrahendNativeId ({}) and "
+                                              "minuendNativeId ({}) must each be "
+                                              "in [0, 2^32)", sub, min));
+                                continue;
+                            }
+                            data.macho.differenceRelocations.push_back(
+                                MachODifferenceRelocation{
+                                    static_cast<std::uint32_t>(sub),
+                                    static_cast<std::uint32_t>(min)});
+                        }
+                    }
+                }
+                // `addendRelocation` (P69 fold 3e): the record that carries the
+                // next entry's addend. The SHAPE here; what it must BE is
+                // `validateIdentity`'s.
+                if (m.contains("addendRelocation")) {
+                    auto const& a = m.at("addendRelocation");
+                    // 2 -> 3 (P69 fold 3f): `carriesAddendOf`, the relocation rows
+                    // a record may stand before.
+                    static constexpr std::array<std::string_view, 3>
+                        kAddendRelocationKeys{"nativeId", "addendBits", "carriesAddendOf"};
+                    DSS_CHECK_KEY_VOCABULARY(kAddendRelocationKeys);
+                    bool shaped = a.is_object();
+                    for (std::string_view const key : {std::string_view{"nativeId"},
+                                                       std::string_view{"addendBits"}}) {
+                        shaped = shaped && a.contains(key)
+                              && a.at(key).is_number_integer();
+                    }
+                    shaped = shaped && a.contains("carriesAddendOf") && a.at("carriesAddendOf").is_array();
+                    if (shaped) {
+                        for (auto const& e : a.at("carriesAddendOf")) shaped = shaped && e.is_number_integer();
+                    }
+                    if (!shaped) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  "/macho/addendRelocation",
+                                  "'addendRelocation' is { \"nativeId\": <wire id>, "
+                                  "\"addendBits\": <the signed addend's width in "
+                                  "r_symbolnum>, \"carriesAddendOf\": [<the wire id of "
+                                  "each relocation row the record may stand before>] }");
+                    } else {
+                        closeBlock(a, kAddendRelocationKeys, "/macho/addendRelocation",
+                                   "the 'addendRelocation' block", coll);
+                        std::int64_t const id   = a.at("nativeId").get<std::int64_t>();
+                        std::int64_t const bits = a.at("addendBits").get<std::int64_t>();
+                        MachOAddendRelocation record;
+                        bool inRange = id >= 0 && id <= 0xFFFFFFFFLL && bits >= 0 && bits <= 0xFFFFFFFFLL;
+                        for (auto const& e : a.at("carriesAddendOf")) {
+                            std::int64_t const carried = e.get<std::int64_t>();
+                            inRange = inRange && carried >= 0 && carried <= 0xFFFFFFFFLL;
+                            record.carriesAddendOf.push_back(static_cast<std::uint32_t>(carried));
+                        }
+                        if (!inRange) {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      "/macho/addendRelocation",
+                                      std::format("nativeId ({}), addendBits ({}) and every "
+                                                  "carriesAddendOf id must each be in [0, 2^32)",
+                                                  id, bits));
+                        } else {
+                            record.nativeId   = static_cast<std::uint32_t>(id);
+                            record.addendBits = static_cast<std::uint32_t>(bits);
+                            data.macho.addendRelocation = std::move(record);
+                        }
+                    }
+                }
+                // `linkerOptions` (P69 fold 3f): the load command an object
+                // hands its final linker options in, and how that linker reads
+                // them. The SHAPE here; what it must BE is `validateIdentity`'s.
+                if (m.contains("linkerOptions")) {
+                    auto const& o = m.at("linkerOptions");
+                    static constexpr std::array<std::string_view, 5> kLinkerOptionsKeys{
+                        "command", "library", "framework", "inImage", "reason"};
+                    DSS_CHECK_KEY_VOCABULARY(kLinkerOptionsKeys);
+                    bool const shaped =
+                        o.is_object() && o.contains("command") && o.at("command").is_number_integer()
+                        && o.contains("library") && o.at("library").is_string()
+                        && o.contains("framework") && o.at("framework").is_string()
+                        && o.contains("inImage") && o.at("inImage").is_string()
+                        && o.contains("reason") && o.at("reason").is_string();
+                    if (!shaped) {
+                        coll.emit(DiagnosticCode::C_MalformedJson, "/macho/linkerOptions",
+                                  "'linkerOptions' is { \"command\": <the load command's number>, "
+                                  "\"library\": <a library option's prefix>, \"framework\": <a "
+                                  "framework option's first string>, \"inImage\": \"ignored\", "
+                                  "\"reason\": <why an image link ignores them> }");
+                    } else {
+                        closeBlock(o, kLinkerOptionsKeys, "/macho/linkerOptions",
+                                   "the 'linkerOptions' block", coll);
+                        std::int64_t const command = o.at("command").get<std::int64_t>();
+                        // `ignored` is the one verdict a DSS image link has built: it binds a
+                        // library through its descriptors, as for ELF's and COFF's libraries.
+                        if (o.at("inImage").get<std::string>() != "ignored") {
+                            coll.emit(DiagnosticCode::C_MalformedJson, "/macho/linkerOptions/inImage",
+                                      "'inImage' must be \"ignored\" -- the one verdict a DSS link that "
+                                      "makes an image has built");
+                        } else if (command <= 0 || command > 0xFFFFFFFFLL) {
+                            coll.emit(DiagnosticCode::C_MalformedJson, "/macho/linkerOptions/command",
+                                      std::format("'command' ({}) must be a load command's number, in "
+                                                  "(0, 2^32)",
+                                                  command));
+                        } else {
+                            data.macho.linkerOptions = MachOLinkerOptions{
+                                static_cast<std::uint32_t>(command), o.at("library").get<std::string>(),
+                                o.at("framework").get<std::string>(), o.at("reason").get<std::string>()};
+                        }
+                    }
+                }
+                // `skippedLoadCommands` (P69 fold 3f): the load commands the object
+                // reader steps over, each for its reason. The SHAPE here; what each
+                // must BE is `validateIdentity`'s.
+                if (m.contains("skippedLoadCommands")) {
+                    auto const& list = m.at("skippedLoadCommands");
+                    static constexpr std::array<std::string_view, 3> kSkippedKeys{"command", "name", "reason"};
+                    DSS_CHECK_KEY_VOCABULARY(kSkippedKeys);
+                    if (!list.is_array()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson, "/macho/skippedLoadCommands",
+                                  "'skippedLoadCommands' is an array of { \"command\": <the load command's "
+                                  "number>, \"name\": <its name>, \"reason\": <why nothing a link makes reads it> }");
+                    } else {
+                        for (std::size_t k = 0; k < list.size(); ++k) {
+                            auto const& row  = list.at(k);
+                            std::string const path = std::format("/macho/skippedLoadCommands/{}", k);
+                            bool const shaped = row.is_object() && row.contains("command")
+                                             && row.at("command").is_number_integer() && row.contains("name")
+                                             && row.at("name").is_string() && row.contains("reason")
+                                             && row.at("reason").is_string();
+                            if (!shaped) {
+                                coll.emit(DiagnosticCode::C_MalformedJson, path,
+                                          "a skipped load command is { \"command\": <its number>, \"name\": <its "
+                                          "name>, \"reason\": <why nothing a link makes reads it> }");
+                                continue;
+                            }
+                            closeBlock(row, kSkippedKeys, path, "a skipped load command", coll);
+                            std::int64_t const command = row.at("command").get<std::int64_t>();
+                            if (command <= 0 || command > 0xFFFFFFFFLL) {
+                                coll.emit(DiagnosticCode::C_MalformedJson, path + "/command",
+                                          std::format("'command' ({}) must be a load command's number, in (0, 2^32)",
+                                                      command));
+                                continue;
+                            }
+                            data.macho.skippedLoadCommands.push_back(MachOSkippedLoadCommand{
+                                static_cast<std::uint32_t>(command), row.at("name").get<std::string>(),
+                                row.at("reason").get<std::string>()});
+                        }
+                    }
+                }
                 // `filetype`: closed enum MachOObjectType. Accepts the
                 // string form ("object"/"execute"/"dylib") OR the
                 // integer wire value (1/2/6) for back-compat with
@@ -402,6 +637,11 @@ public:
                 coll.emit(DiagnosticCode::C_MalformedJson, "/image",
                           "'image' must be an object");
             } else {
+                static constexpr std::array<std::string_view, 11> kImageBlockKeys{
+                    "pageZeroSize", "segmentPageSize", "dylinkerPath", "installName",
+                    "loadDylibs", "bindNow", "codeSignatureSize", "useChainedFixups",
+                    "uuid", "codeSignature", "buildVersion"};
+                closeBlock(im, kImageBlockKeys, "/image", "the 'image' block", coll);
                 if (im.contains("pageZeroSize")) {
                     if (!im.at("pageZeroSize").is_number_integer()) {
                         coll.emit(DiagnosticCode::C_MalformedJson,
@@ -486,6 +726,11 @@ public:
                             } else if (arr[i].is_object()
                                     && arr[i].contains("path")
                                     && arr[i].at("path").is_string()) {
+                                static constexpr std::array<std::string_view, 1> kDylibRowKeys{
+                                    "path"};
+                                closeBlock(arr[i], kDylibRowKeys,
+                                           std::format("/image/loadDylibs/{}", i),
+                                           "a loadDylibs entry", coll);
                                 data.machoImage.loadDylibs.push_back(
                                     MachODylibRef{arr[i].at("path")
                                                       .get<std::string>()});
@@ -581,6 +826,8 @@ public:
                                   "/image/uuid",
                                   "'uuid' must be an object {derivation}");
                     } else {
+                        static constexpr std::array<std::string_view, 1> kUuidKeys{"derivation"};
+                        closeBlock(uu, kUuidKeys, "/image/uuid", "the 'uuid' block", coll);
                         MachOUuid uid;
                         bool ok = true;
                         // derivation (closed enum; default "content-hash").
@@ -640,6 +887,10 @@ public:
                                   "{kind, hashAlgorithm, pageSize, "
                                   "identifier}");
                     } else {
+                        static constexpr std::array<std::string_view, 4> kSignatureKeys{
+                            "kind", "hashAlgorithm", "pageSize", "identifier"};
+                        closeBlock(cs, kSignatureKeys, "/image/codeSignature",
+                                   "the 'codeSignature' block", coll);
                         MachOCodeSignature sig;
                         bool ok = true;
                         // kind (closed enum; default "adhoc").
@@ -819,6 +1070,10 @@ public:
                                   "'buildVersion' must be an object "
                                   "{platform, minOs, sdk}");
                     } else {
+                        static constexpr std::array<std::string_view, 3> kBuildVersionKeys{
+                            "platform", "minOs", "sdk"};
+                        closeBlock(bv, kBuildVersionKeys, "/image/buildVersion",
+                                   "the 'buildVersion' block", coll);
                         // "X.Y" / "X.Y.Z" → (major<<16)|(minor<<8)|patch.
                         // major 16-bit, minor/patch 8-bit each (the
                         // build_version_command field layout).
@@ -977,6 +1232,267 @@ public:
                  "value, e.g. 0x01000007 for x86_64, 0x0100000C for "
                  "arm64)");
         }
+        // `differenceRelocations` (P69,
+        // D-LK-MACHO-LD-R-EH-FRAME-RELOCATIONS-REFUSED-AT-READ). A pair names
+        // two WIRE ids. Each is held to the wire as a relocation row's id is
+        // (only r_type, r_length and r_pcrel), is not pc-relative — the reader
+        // applies `minuend - subtrahend + addend` and nothing else — and the
+        // two state ONE width, since they patch one field. The subtrahend's id
+        // decodes to no kind, so no relocation row may claim it — the reverse
+        // map would then read half of a reference as a whole one — and it
+        // names ONE minuend, or the reader's choice would be a
+        // declaration-order coin flip. And only a document a READER is handed
+        // states any: on an image document nothing reads the table, and config
+        // that is parsed and never read reads as authority while it drifts.
+        for (std::size_t i = 0; i < macho.differenceRelocations.size(); ++i) {
+            auto const& p = macho.differenceRelocations[i];
+            auto const path = std::format("/macho/differenceRelocations/{}", i);
+            if (macho.filetype != MachOObjectType::Object) {
+                fail(path,
+                     std::format(
+                         "'differenceRelocations' is read by the object READER, "
+                         "which is handed '{}' documents only; this document's "
+                         "filetype is '{}', so nothing would read the table",
+                         machoObjectTypeName(MachOObjectType::Object),
+                         machoObjectTypeName(macho.filetype)));
+            }
+            auto holdToTheWire = [&](std::uint32_t id, std::string_view key) {
+                if ((id & (dss::macho::kRInfoExternBit
+                           | dss::macho::kRInfoSymbolnumMask)) != 0u) {
+                    fail(std::format("{}/{}", path, key),
+                         std::format(
+                             "'{}' 0x{:08X} sets bits that belong to ONE "
+                             "relocation entry (bit 27 = r_extern, bits 0..23 = "
+                             "r_symbolnum); a wire id packs only r_type, "
+                             "r_length and r_pcrel",
+                             key, id));
+                }
+                if ((id & dss::macho::kRInfoPcrelBit) != 0u) {
+                    fail(std::format("{}/{}", path, key),
+                         std::format(
+                             "'{}' 0x{:08X} is pc-relative (r_pcrel = 1): the "
+                             "difference of two addresses does not depend on "
+                             "where its field is, and the reader applies "
+                             "`minuend - subtrahend + addend` and nothing else",
+                             key, id));
+                }
+            };
+            holdToTheWire(p.subtrahendNativeId, "subtrahendNativeId");
+            holdToTheWire(p.minuendNativeId, "minuendNativeId");
+            if (dss::macho::relocationFieldBytes(p.subtrahendNativeId)
+                != dss::macho::relocationFieldBytes(p.minuendNativeId)) {
+                fail(std::format("{}/minuendNativeId", path),
+                     std::format(
+                         "the two entries of a difference pair patch ONE field, "
+                         "but their wire ids state different widths "
+                         "(subtrahendNativeId {}: {} byte(s); minuendNativeId "
+                         "{}: {} byte(s))",
+                         p.subtrahendNativeId,
+                         dss::macho::relocationFieldBytes(p.subtrahendNativeId),
+                         p.minuendNativeId,
+                         dss::macho::relocationFieldBytes(p.minuendNativeId)));
+            }
+            for (auto const& r : relocations) {
+                bool claims = r.nativeId == p.subtrahendNativeId;
+                for (auto const& e : r.nativeIdByBytesAfterField) {
+                    claims = claims || e.nativeId == p.subtrahendNativeId;
+                }
+                if (claims) {
+                    fail(std::format("{}/subtrahendNativeId", path),
+                         std::format(
+                             "wire id {} is also relocation '{}''s: a "
+                             "subtrahend entry is half of a reference and "
+                             "decodes to no RelocationKind, so no relocation "
+                             "row may claim its wire id",
+                             p.subtrahendNativeId, r.name));
+                }
+            }
+            for (std::size_t j = 0; j < macho.differenceRelocations.size(); ++j) {
+                auto const& q = macho.differenceRelocations[j];
+                if (j < i && q.subtrahendNativeId == p.subtrahendNativeId) {
+                    fail(std::format("{}/subtrahendNativeId", path),
+                         std::format(
+                             "wire id {} is already the subtrahend of "
+                             "/macho/differenceRelocations/{}: one subtrahend "
+                             "names one minuend",
+                             p.subtrahendNativeId, j));
+                }
+                if (q.minuendNativeId == p.subtrahendNativeId) {
+                    fail(std::format("{}/subtrahendNativeId", path),
+                         std::format(
+                             "wire id {} is the minuend of "
+                             "/macho/differenceRelocations/{}: an entry of that "
+                             "type would be both the start of a pair and the "
+                             "end of one",
+                             p.subtrahendNativeId, j));
+                }
+            }
+        }
+        // `addendRelocation` (P69 fold 3e, `MachOAddendRelocation`): a record
+        // that names no symbol and patches no field, carrying the next entry's
+        // addend in its r_symbolnum. Its id is held to the wire as a relocation
+        // row's is; it is not pc-relative (it has no field whose place could
+        // matter); its addend fits r_symbolnum's 24 bits; no relocation row and
+        // no difference pair may claim its id -- the reverse map would then
+        // read it as a reference -- only a document the object reader and
+        // writer are handed states it, and the entries it may stand before
+        // are this document's relocation rows (P69 fold 3f).
+        if (macho.addendRelocation.has_value()) {
+            auto const& a = *macho.addendRelocation;
+            std::string const path = "/macho/addendRelocation";
+            if (macho.filetype != MachOObjectType::Object) {
+                fail(path,
+                     std::format(
+                         "'addendRelocation' is read by the object READER and "
+                         "written by the object WRITER, which are handed '{}' "
+                         "documents only; this document's filetype is '{}', so "
+                         "nothing would read the record",
+                         machoObjectTypeName(MachOObjectType::Object),
+                         machoObjectTypeName(macho.filetype)));
+            }
+            if ((a.nativeId & (dss::macho::kRInfoExternBit
+                               | dss::macho::kRInfoSymbolnumMask)) != 0u) {
+                fail(path + "/nativeId",
+                     std::format(
+                         "0x{:08X} sets bits that belong to ONE relocation entry "
+                         "(bit 27 = r_extern, bits 0..23 = r_symbolnum, which holds "
+                         "the record's addend); a wire id packs only r_type, "
+                         "r_length and r_pcrel",
+                         a.nativeId));
+            }
+            if ((a.nativeId & dss::macho::kRInfoPcrelBit) != 0u) {
+                fail(path + "/nativeId",
+                     std::format(
+                         "0x{:08X} is pc-relative (r_pcrel = 1): an addend record "
+                         "patches no field, so no place enters its arithmetic",
+                         a.nativeId));
+            }
+            if (a.addendBits == 0u || a.addendBits > 24u) {
+                fail(path + "/addendBits",
+                     std::format(
+                         "{} is no width of a signed addend in r_symbolnum, which "
+                         "holds 24 bits: it is in [1, 24]",
+                         a.addendBits));
+            }
+            for (auto const& r : relocations) {
+                bool claims = r.nativeId == a.nativeId;
+                for (auto const& e : r.nativeIdByBytesAfterField) {
+                    claims = claims || e.nativeId == a.nativeId;
+                }
+                if (claims) {
+                    fail(path + "/nativeId",
+                         std::format(
+                             "wire id {} is also relocation '{}''s: an addend "
+                             "record decodes to no RelocationKind, so no "
+                             "relocation row may claim its wire id",
+                             a.nativeId, r.name));
+                }
+            }
+            for (std::size_t j = 0; j < macho.differenceRelocations.size(); ++j) {
+                auto const& q = macho.differenceRelocations[j];
+                if (q.subtrahendNativeId == a.nativeId || q.minuendNativeId == a.nativeId) {
+                    fail(path + "/nativeId",
+                         std::format(
+                             "wire id {} is an entry of "
+                             "/macho/differenceRelocations/{}: one entry type is "
+                             "either half of a difference or an addend record",
+                             a.nativeId, j));
+                }
+            }
+            // `carriesAddendOf` (P69 fold 3f): the entries a record may stand
+            // before -- each a relocation row's wire id, none twice, and at least
+            // one, or the record could carry no entry's addend and every one the
+            // writer would emit is refused by its reader.
+            if (a.carriesAddendOf.empty()) {
+                fail(path + "/carriesAddendOf",
+                     "names no relocation: a record that may stand before no entry "
+                     "carries no addend, and the writer could emit none a reader takes");
+            }
+            for (std::size_t j = 0; j < a.carriesAddendOf.size(); ++j) {
+                std::uint32_t const id = a.carriesAddendOf[j];
+                bool isRow = false;
+                for (auto const& r : relocations) {
+                    isRow = isRow || r.nativeId == id;
+                    for (auto const& e : r.nativeIdByBytesAfterField) isRow = isRow || e.nativeId == id;
+                }
+                if (!isRow) {
+                    fail(std::format("{}/carriesAddendOf/{}", path, j),
+                         std::format("wire id {} is no relocation row's of this document, so "
+                                     "no entry the record stood before would decode",
+                                     id));
+                }
+                for (std::size_t k = 0; k < j; ++k) {
+                    if (a.carriesAddendOf[k] == id) {
+                        fail(std::format("{}/carriesAddendOf/{}", path, j),
+                             std::format("wire id {} is listed twice (first at {})", id, k));
+                    }
+                }
+            }
+        }
+        // `linkerOptions` (P69 fold 3f, `MachOLinkerOptions`): read by the
+        // object reader and written by the object writer, which are handed
+        // `object` documents alone; a library prefix and a framework word that
+        // name something, and the reason an image link ignores what they name.
+        if (macho.linkerOptions.has_value()) {
+            auto const& o = *macho.linkerOptions;
+            std::string const path = "/macho/linkerOptions";
+            if (macho.filetype != MachOObjectType::Object) {
+                fail(path,
+                     std::format(
+                         "'linkerOptions' is read by the object READER and written by the object "
+                         "WRITER, which are handed '{}' documents only; this document's filetype is "
+                         "'{}', so nothing would read the command",
+                         machoObjectTypeName(MachOObjectType::Object),
+                         machoObjectTypeName(macho.filetype)));
+            }
+            if (o.command == 0u) {
+                fail(path + "/command", "names no load command (0)");
+            }
+            if (o.library.empty()) {
+                fail(path + "/library",
+                     "is empty: every option would read as a library, its whole text the name");
+            }
+            if (o.framework.empty()) {
+                fail(path + "/framework", "is empty: no option would read as a framework");
+            }
+            if (o.inImageReason.empty()) {
+                fail(path + "/reason",
+                     "is empty: say why a link that makes an image ignores the libraries and "
+                     "frameworks an object names");
+            }
+        }
+        // `skippedLoadCommands` (P69 fold 3f, `MachOSkippedLoadCommand`): read
+        // by the object reader alone, which is handed `object` documents; each
+        // a command the reader does not read, stated once, with a name and a
+        // reason.
+        for (std::size_t k = 0; k < macho.skippedLoadCommands.size(); ++k) {
+            auto const& s = macho.skippedLoadCommands[k];
+            std::string const path = std::format("/macho/skippedLoadCommands/{}", k);
+            if (macho.filetype != MachOObjectType::Object) {
+                fail(path, std::format("is read by the object READER, which is handed '{}' documents only; this "
+                                       "document's filetype is '{}', so nothing would read it",
+                                       machoObjectTypeName(MachOObjectType::Object),
+                                       machoObjectTypeName(macho.filetype)));
+            }
+            bool const read =
+                std::find(macho::kLoadCommandsTheReaderReads.begin(), macho::kLoadCommandsTheReaderReads.end(),
+                          s.command)
+                    != macho::kLoadCommandsTheReaderReads.end()
+                || (macho.linkerOptions.has_value() && macho.linkerOptions->command == s.command);
+            if (read) {
+                fail(path + "/command",
+                     std::format("names {} (0x{:X}), a command the reader READS: it is never stepped over",
+                                 s.name, s.command));
+            }
+            for (std::size_t j = 0; j < k; ++j) {
+                if (macho.skippedLoadCommands[j].command == s.command) {
+                    fail(path + "/command",
+                         std::format("names 0x{:X} again (row {} names it): one command, one reason", s.command, j));
+                }
+            }
+            if (s.name.empty()) fail(path + "/name", "is empty: every message about the command names it");
+            if (s.reason.empty()) fail(path + "/reason", "is empty: say why nothing a link makes reads the command");
+        }
         // All three MachOObjectType members have walker arms: MH_OBJECT
         // (LK3 cycle 1), MH_EXECUTE (LK3 cycle 2), MH_DYLIB (c153,
         // D-LK3-3 — the Mach-O mirror of ELF ET_DYN c150 + PE Dll
@@ -1056,7 +1572,7 @@ public:
         // type-design Q4 convergence). Validate the packing mask
         // here so JSON typos fail loud at load time.
         constexpr std::uint32_t kMachOReservedBits =
-            (1u << 27) | 0x00FFFFFFu;
+            dss::macho::kRInfoExternBit | dss::macho::kRInfoSymbolnumMask;
         for (std::size_t i = 0; i < relocations.size(); ++i) {
             auto const& r = relocations[i];
             if ((r.nativeId & kMachOReservedBits) != 0) {
@@ -1436,9 +1952,11 @@ public:
                 if (!sawText) {
                     fail("/sections",
                          "Mach-O MH_DYLIB format requires a Text "
-                         "section row (SectionKind::Text) -- a dynamic "
-                         "library without code has nothing to export. "
-                         "D-LK3-3.");
+                         "section row (SectionKind::Text) -- the writer "
+                         "lays the image out from that row's address: "
+                         "`__text` sits at 'image.segmentPageSize', "
+                         "and every section after it is placed from "
+                         "there, a dylib with no function included.");
                 }
                 if (processExit.has_value()
                  || !entryCallingConvention.empty()
@@ -1521,7 +2039,7 @@ public:
     [[nodiscard]] bool
     realizesCoalescingScopeReferences() const noexcept override { return true; }
 
-    [[nodiscard]] std::vector<std::uint8_t>
+    [[nodiscard]] std::optional<std::vector<std::uint8_t>>
     encode(AssembledModule const&    module,
            TargetSchema const&       targetSchema,
            ObjectFormatSchema const& objectFormatSchema,
@@ -1561,6 +2079,32 @@ public:
                           CompilationUnitId             cuId) const override {
         return macho::readRelocatableObject(bytes, targetSchema,
                                          objectFormatSchema, reporter, cuId);
+    }
+
+    // P69 fold 3f: a compiled unit's `#pragma comment(linker, ...)` texts -- each ONE string, as clang writes it --
+    // read through the ONE home the object reader reads an LC_LINKER_OPTION through
+    // (`macho::readMachOLinkerOption`), so the unit's module is the one its object would read back as.
+    [[nodiscard]] std::optional<bool>
+    applyUnitLinkerOptions(AssembledModule&          module,
+                           ObjectFormatSchema const& objectFormatSchema,
+                           DiagnosticReporter&       reporter) const override {
+        auto& stated = module.linkerRequests.linkerOptions;
+        if (stated.empty()) return true;
+        auto const& block = objectFormatSchema.macho().linkerOptions;
+        if (!block.has_value()) {
+            report(reporter, DiagnosticCode::K_LinkerDirectiveUnhonourable, DiagnosticSeverity::Error,
+                   std::format("macho: the unit states the linker option '{}', and format '{}' states no "
+                               "'macho.linkerOptions' to read it by.",
+                               spelledLinkerOption(stated.front()), objectFormatSchema.name()));
+            return false;
+        }
+        std::vector<std::vector<std::string>> options = std::move(stated);
+        stated.clear();
+        for (auto& words : options) {
+            macho::readMachOLinkerOption(std::move(words), *block, module.linkerRequests,
+                                         "a unit's `#pragma comment(linker, ...)`");
+        }
+        return true;
     }
 
 };

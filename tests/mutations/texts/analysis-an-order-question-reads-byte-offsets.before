@@ -1,0 +1,3 @@
+[[nodiscard]] std::uint32_t streamRank(EngineState const& s, Tree const& tree, NodeId n) {
+    return streamRanksOf(s, tree).at(n.v);
+}

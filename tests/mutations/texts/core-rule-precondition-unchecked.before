@@ -1,0 +1,2 @@
+    if (n.kind != NodeKind::Internal) treeFatal("Tree::rule on non-Internal node");
+    return n.rule;

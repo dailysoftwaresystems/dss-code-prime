@@ -1,0 +1,1 @@
+    ++work_;   // a snapshot: it marks every trail and copies nothing (`Snapshot::Fields`)

@@ -150,14 +150,15 @@ readImportsFromBytes(std::span<std::uint8_t const> bytes,
 std::expected<std::vector<ImportSurface>, BinaryReadError>
 readImports(std::filesystem::path const& libraryPath,
             DiagnosticReporter&          reporter) {
-    std::ifstream in(libraryPath, std::ios::binary);
-    if (!in) {
+    auto opened = core::openInputStream(libraryPath, std::ios::binary);   // at any length (the home)
+    if (!opened) {
         return std::unexpected(emitAndReturn(
             BinaryReadErrorKind::FileOpenFailed,
             "readImports: failed to open '"
-            + core::genericSpelling(libraryPath) + "' for reading",
+            + core::genericSpelling(libraryPath) + "' for reading: " + core::reasonText(opened.error()),
             reporter));
     }
+    std::ifstream& in = *opened;
     std::vector<std::uint8_t> bytes{
         std::istreambuf_iterator<char>(in),
         std::istreambuf_iterator<char>()};

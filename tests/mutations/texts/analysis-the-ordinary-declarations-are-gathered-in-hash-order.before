@@ -1,0 +1,2 @@
+        for (auto const* declRoot : substrate::entriesInKeyOrder(treeRootScope)) {
+            auto const& [treeV, scope] = *declRoot;

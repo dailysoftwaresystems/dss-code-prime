@@ -202,6 +202,19 @@ private:
     //     guessed at (see the gate in the .cpp). Those calls get no coverage.
     void checkCallSignatures(DiagnosticReporter& reporter) const;
 
+    // P69 (lane `cs`, fold f26d — review-csf26c2 N2): every function's `Arg`s are DENSE under the
+    // counting discipline the module STATES (`Mir::argCounting`) — I_ArgOrdinalGap,
+    // I_ArgOrdinalRepeated — and a module that holds an `Arg` and states none is refused
+    // (I_ArgCountingUnstated). The per-class rule is interner-gated.
+    void checkArgDensity(DiagnosticReporter& reporter) const;
+
+    // P69 (lane `cs`, fold f26d — review-csf26c2 N2, main's ruling of ledger 597): a call stamped
+    // `MirInstFlags::PassesByItsDefinition` is held to its callee's receptions — each `Arg` and
+    // stamped `RecvByValueStackParam` finds the call's operand at its position, fixed, of its
+    // carrier and type (I_CallDisagreesWithItsDefinition). An unstamped call is not judged.
+    // Interner-gated.
+    void checkCallsAgainstTheirDefinitions(DiagnosticReporter& reporter) const;
+
     // FC17.9(d) cycle 1b (D-CSUBSET-ATOMIC): the atomic-lowering belt. A plain
     // `Load` (accessed type = its result type) or `Store` (accessed type = the
     // pointee of its address operand) whose accessed type `isAtomicQualified` is a
@@ -232,6 +245,49 @@ private:
     // level down, and it lives at the seam rather than in the notion because it
     // is a fact about what a `void` pointee MEANS.
     void checkStoreValueTypes(DiagnosticReporter& reporter) const;
+
+    // P69 (lane `xa`): the LINKAGE RECORD of every function and every global is
+    // well formed — a weak definition states its kind, a kind stands beside no
+    // other binding, and the tentative mark sits only on an external global
+    // that states no initializer. The rule itself is `mirLinkageDefect`
+    // (mir/mir_node.hpp), the ONE statement the builders and the text reader
+    // ask too; this check exists for a module that reached the verifier by a
+    // road that asked neither (a decoded body, a pass that writes a record of
+    // its own). Emits I_VerifierFailure, naming the definition and carrying the
+    // rule's sentence.
+    void checkLinkageRecords(DiagnosticReporter& reporter) const;
+
+    // P69 (lane `cs`): every ALIAS the module states (`Mir::aliases`) is one the
+    // object producer can write — one more symbol row on a definition — so its
+    // TARGET is a function or a global this module defines, and its linkage record
+    // is well formed and not tentative (an alias has no storage). That its NAME is
+    // defined by nothing else here is `checkSymbolIdsDefinedOnce`'s, the rule of
+    // every definition. `MirBuilder::addAlias` refuses what one statement alone can
+    // show; this is the module-wide half, for every road a module reaches the
+    // verifier by. Emits I_VerifierFailure, naming the alias.
+    void checkAliases(DiagnosticReporter& reporter) const;
+
+    // P69 (lane `cs`, fold f26b): ONE ID, ONE DEFINITION — no symbol id is given by
+    // two of the module's definitions (a function, a global, an alias's name, a
+    // `blockaddress_export`), by the one list the writer and the reader read
+    // (`symbolIdsDefinedTwice`, mir/mir_symbols_named.hpp). The `.dssir` reader
+    // holds every text to it through this check, which it runs on what it reads.
+    // Emits I_VerifierFailure, naming the id and both definitions.
+    void checkSymbolIdsDefinedOnce(DiagnosticReporter& reporter) const;
+
+    // THE SYMBOL-ID SPACE (D-MIR-SYNTHESIZED-SYMBOL-MINTED-INSIDE-THE-NAME-TABLE):
+    // every symbol id the module NAMES is below the end it STATES. The end is
+    // where the next synthesized symbol is minted, so an id the module names at
+    // or past it is one a later mint hands out again — two things under one id,
+    // which nothing downstream can tell apart. The builder keeps the end past
+    // every id the module DEFINES; an id it only names (a `globaladdr`, a
+    // `blockaddress_export`'s symbol, a symbol address in a literal) is below the
+    // end only because whoever made the module said so, and this rule is what
+    // reads that statement back. The list of places is `forEachSymbolIdNamed`
+    // (mir/mir_symbols_named.hpp), the one the `.dssir` writer and reader also
+    // read. A module whose end is only COUNTED makes no statement to hold it to,
+    // and cannot be minted for. Emits I_VerifierFailure.
+    void checkSymbolIdsBelowTheStatedEnd(DiagnosticReporter& reporter) const;
 
     Mir const&          mir_;
     TypeInterner const* interner_;

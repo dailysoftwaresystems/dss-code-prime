@@ -15,6 +15,10 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cstdint>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 using namespace dss;
 
@@ -23,14 +27,26 @@ namespace {
 // Shipped-target params: natural alignment, 16-byte ISA cap, LP64.
 constexpr AggregateLayoutParams kNatural16{ScalarAlignmentRule::Natural, 16};
 
+// ★ P69 (lane `cs`, fold f26d — D-TARGET-A-WIDE-BITINT-TAKES-THE-X86-64-ALIGNMENT-ON-ARM64):
+// a wide `_BitInt` leaf is sized by the TARGET's chunk, so each convention classifies
+// under its own target's: x86_64 (SysV, Win64) 8, arm64 (AAPCS64) 16.
+[[nodiscard]] constexpr AggregateLayoutParams withBitPreciseChunk(AggregateLayoutParams p,
+                                                                  std::uint32_t chunk) noexcept {
+    p.bitPreciseChunk = chunk;
+    return p;
+}
+constexpr AggregateLayoutParams kX86_64Layout = withBitPreciseChunk(kNatural16, 8);
+constexpr AggregateLayoutParams kArm64Layout  = withBitPreciseChunk(kNatural16, 16);
+
 [[nodiscard]] TypeInterner makeInterner(std::uint32_t owner) {
     return TypeInterner{CompilationUnitId{owner}};
 }
 
 [[nodiscard]] std::optional<AbiPassing>
-classifySysV(TypeId t, TypeInterner const& ti) {
-    return classifyAggregate(AggregateClassKind::SysVEightbyte, 16, t, ti,
-                             kNatural16, DataModel::Lp64);
+classifySysV(TypeId t, TypeInterner const& ti,
+             AggregatePosition position = AggregatePosition::Argument) {
+    return classifyAggregate(AggregateConventionRules{AggregateClassKind::SysVEightbyte, 16}, t, ti,
+                             kX86_64Layout, DataModel::Lp64, position);
 }
 
 [[nodiscard]] TypeId structOf(TypeInterner& ti, std::string_view name,
@@ -71,29 +87,222 @@ TEST(AggregateAbiSysV, TwoLongs_TwoGprEightbytes) {
 }
 
 // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): a long-double (F80|F128) LEAF forces
-// the SysV x87 MEMORY class → the WHOLE aggregate goes BY REFERENCE (X87/X87UP →
+// the SysV x87 MEMORY class → the WHOLE aggregate is passed IN MEMORY (X87/X87UP →
 // MEMORY, regardless of size). INVERTED from the FC17.9(e) nullopt-fail-loud pin:
 // the real rule is now modeled. NOT the SSE/INTEGER eightbyte merge (a float-kind
 // join would say SSE → XMM pieces; a non-join says INTEGER = a silent 2-GPR pass,
-// ABI-divergent at FFI). Inherits the pre-existing D-FC7 hidden-pointer path.
-TEST(AggregateAbiSysV, LongDoubleLeafStructIsByReference) {
+// ABI-divergent at FFI). As an ARGUMENT (the position below); a RESULT of class X87
+// is the next test's.
+TEST(AggregateAbiSysV, LongDoubleLeafStructIsPassedInMemory) {
     auto ti = makeInterner(1);
     auto r80 = classifySysV(structOf(ti, "LD", {ti.primitive(TypeKind::F80)}), ti);
     ASSERT_TRUE(r80.has_value());
-    EXPECT_EQ(r80->kind, AbiPassing::Kind::ByReference)
-        << "an F80 (x87 long double) leaf → the SysV MEMORY class (ByReference)";
+    EXPECT_EQ(r80->kind, AbiPassing::Kind::Memory)
+        << "an F80 (x87 long double) leaf → the SysV MEMORY class";
     EXPECT_TRUE(r80->pieces.empty())
-        << "a ByReference pass carries NO register pieces (a hidden pointer)";
+        << "a Memory pass carries NO register pieces";
     auto r128 = classifySysV(structOf(ti, "LQ", {ti.primitive(TypeKind::F128)}), ti);
     ASSERT_TRUE(r128.has_value());
-    EXPECT_EQ(r128->kind, AbiPassing::Kind::ByReference)
+    EXPECT_EQ(r128->kind, AbiPassing::Kind::Memory)
         << "an F128 (binary128) leaf → MEMORY too (X87/X87UP → the whole agg)";
     // Nested: the leaf walk must see THROUGH an inner struct.
     TypeId const inner = structOf(ti, "In", {ti.primitive(TypeKind::F80)});
     auto nested = classifySysV(structOf(ti, "Out", {inner}), ti);
     ASSERT_TRUE(nested.has_value());
-    EXPECT_EQ(nested->kind, AbiPassing::Kind::ByReference)
+    EXPECT_EQ(nested->kind, AbiPassing::Kind::Memory)
         << "a NESTED F80 leaf → MEMORY — the check is leaf-deep";
+}
+
+// ★ P69 (lane `cs`, fold f26c — D-TARGET-SYSV-AMD64-MEMORY-CLASS-ARGUMENTS-GO-BY-POINTER-AND-X87-RESULTS-BY-SRET):
+// SysV psABI 3.2.3 classes an aggregate whose two eightbytes are X87 and X87UP — its
+// ONLY content one x87 `long double` at offset 0 — as passed IN MEMORY but RETURNED in
+// %st0 ("If the class is X87, the value is returned on the X87 stack in %st0"). The
+// classifier answers by POSITION: X87 for a result — its ONE x87 value at offset 0 the
+// piece (f26c2: an X87 result states its x87 values, as a COMPLEX_X87 one does, the next
+// test's) — Memory for an argument. Any other leaf merged in, or a size over two
+// eightbytes, is MEMORY in both positions. ✔MEASURED 2026-10-07 (lane `lm`'s two-unit
+// witness, gcc 13.3.0 and clang 18.1.3): both leave `struct { long double x; }` on the
+// x87 stack; a DSS caller read a wrong value through the hidden pointer it assumed.
+TEST(AggregateAbiSysV, AnX87OnlyAggregateIsReturnedInX87AndPassedInMemory) {
+    auto ti = makeInterner(1);
+    TypeId const ld = ti.primitive(TypeKind::F80);
+    std::array<TypeId, 2> const twoLd{ld, ld};
+    std::array<TypeId, 2> const ldInt{ld, ti.primitive(TypeKind::I32)};
+    struct Cell { char const* what; TypeId type; AbiPassing::Kind asResult; };
+    std::array<Cell, 7> const cells{{
+        {"struct { long double x; }", structOf(ti, "X1", {ld}), AbiPassing::Kind::X87},
+        {"struct { long double a[1]; }", structOf(ti, "XA", {ti.array(ld, 1)}),
+         AbiPassing::Kind::X87},
+        {"union { long double a; long double b; }", ti.unionType("XU", twoLd),
+         AbiPassing::Kind::X87},
+        {"struct { struct { long double x; } in; }",
+         structOf(ti, "XN", {structOf(ti, "XI", {ld})}), AbiPassing::Kind::X87},
+        // controls: another leaf in the eightbyte, a second eightbyte pair, a binary128
+        // leaf (no x87 class) — MEMORY as a result too. (The bare `_Complex long double`
+        // is COMPLEX_X87, the next test's.)
+        {"union { long double a; int i; }", ti.unionType("XUI", ldInt),
+         AbiPassing::Kind::Memory},
+        {"struct { long double a; long b; }",
+         structOf(ti, "XL", {ld, ti.primitive(TypeKind::I64)}), AbiPassing::Kind::Memory},
+        {"struct { binary128 q; }", structOf(ti, "XQ", {ti.primitive(TypeKind::F128)}),
+         AbiPassing::Kind::Memory},
+    }};
+    for (Cell const& c : cells) {
+        auto const asArg = classifySysV(c.type, ti, AggregatePosition::Argument);
+        auto const asRes = classifySysV(c.type, ti, AggregatePosition::Result);
+        ASSERT_TRUE(asArg.has_value()) << c.what;
+        ASSERT_TRUE(asRes.has_value()) << c.what;
+        EXPECT_EQ(asArg->kind, AbiPassing::Kind::Memory)
+            << c.what << ": passed IN MEMORY (X87/X87UP and MEMORY alike)";
+        EXPECT_EQ(asRes->kind, c.asResult) << c.what << ": returned";
+        EXPECT_TRUE(asArg->pieces.empty()) << c.what;
+        if (c.asResult != AbiPassing::Kind::X87) {
+            EXPECT_TRUE(asRes->pieces.empty()) << c.what;
+            continue;
+        }
+        ASSERT_EQ(asRes->pieces.size(), 1u) << c.what << ": one x87 value, in %st0";
+        EXPECT_EQ(asRes->pieces[0].cls, AbiPieceClass::Fpr) << c.what;
+        EXPECT_EQ(asRes->pieces[0].byteOffset, 0u) << c.what;
+        EXPECT_EQ(asRes->pieces[0].widthBytes, 16u) << c.what;
+    }
+}
+
+// ★ P69 (lane `cs`, fold f26c2 — review-csf26c F3): psABI 3.2.3's COMPLEX_X87. A bare
+// `long double _Complex` is RETURNED on the x87 stack as two values — "the real part of
+// the value is returned in %st0 and the imaginary part in %st1" — and PASSED in memory
+// ("If the class is X87, X87UP or COMPLEX_X87, it is passed in memory"). The class is the
+// complex TYPE's: an aggregate holding one is 32 bytes, MEMORY by size in both positions.
+// The X87UP rule (`memory` psABI, `sse` Apple's x86_64) does not touch it. Controls: the
+// SSE complexes. ✔MEASURED 2026-11-05 (probe cx, -O1 and -O0 asm): gcc 13.3.0 and clang
+// 18.1.3 on Linux, Apple clang 21.0.0 for x86_64 — the result in %st0 (real) / %st1
+// (imaginary) with no hidden pointer, the argument as 32 stacked bytes, a struct holding
+// one through the hidden pointer and on the stack, `float _Complex` in %xmm0, `double
+// _Complex` in %xmm0:%xmm1. Before this fold the result went through sret (MEMORY by size).
+TEST(AggregateAbiSysV, AComplexLongDoubleIsReturnedAsTwoX87ValuesAndPassedInMemory) {
+    auto ti = makeInterner(1);
+    TypeId const ld = ti.primitive(TypeKind::F80);
+    TypeId const cld = ti.complex(ld);
+    using K = AbiPassing::Kind;
+    for (X87UpWithoutX87 const rule : {X87UpWithoutX87::Memory, X87UpWithoutX87::Sse}) {
+        AggregateConventionRules const rules{AggregateClassKind::SysVEightbyte, 16,
+                                             AggregateMemoryArgument::Stack, false, rule};
+        auto const classify = [&](TypeId t, AggregatePosition pos) {
+            return classifyAggregate(rules, t, ti, kNatural16, DataModel::Lp64, pos);
+        };
+        SCOPED_TRACE(x87UpWithoutX87Name(rule));
+        // The bare type: two x87 values as a result, %st0 the real part at 0, %st1 the
+        // imaginary at 16; memory as an argument.
+        auto const res = classify(cld, AggregatePosition::Result);
+        ASSERT_TRUE(res.has_value());
+        EXPECT_EQ(res->kind, K::X87) << "COMPLEX_X87 is returned on the x87 stack, not through sret";
+        ASSERT_EQ(res->pieces.size(), 2u) << "the real part in %st0, the imaginary in %st1";
+        for (std::size_t k = 0; k < 2; ++k) {
+            EXPECT_EQ(res->pieces[k].cls, AbiPieceClass::Fpr) << "piece " << k;
+            EXPECT_EQ(res->pieces[k].byteOffset, 16u * k) << "piece " << k << " (x87 stack ordinal " << k << ")";
+            EXPECT_EQ(res->pieces[k].widthBytes, 16u) << "piece " << k;
+        }
+        auto const arg = classify(cld, AggregatePosition::Argument);
+        ASSERT_TRUE(arg.has_value());
+        EXPECT_EQ(arg->kind, K::Memory) << "COMPLEX_X87 is passed in memory";
+        EXPECT_TRUE(arg->pieces.empty());
+        // An aggregate holding one: MEMORY by size, both positions.
+        std::array<TypeId, 2> const cldLong{cld, ti.primitive(TypeKind::I64)};
+        for (auto const& [what, t] :
+             {std::pair{"struct { long double _Complex z; }", structOf(ti, "SZ", {cld})},
+              std::pair{"struct { long double _Complex z[1]; }", structOf(ti, "SZA", {ti.array(cld, 1)})},
+              std::pair{"union { long double _Complex z; long l; }", ti.unionType("UZL", cldLong)}}) {
+            for (AggregatePosition const pos : {AggregatePosition::Argument, AggregatePosition::Result}) {
+                auto const r = classify(t, pos);
+                ASSERT_TRUE(r.has_value()) << what;
+                EXPECT_EQ(r->kind, K::Memory) << what << ": MEMORY by size, "
+                                              << (pos == AggregatePosition::Result ? "result" : "argument");
+                EXPECT_TRUE(r->pieces.empty()) << what;
+            }
+        }
+        // Controls: the SSE complexes, in registers in both positions.
+        auto const cf = classify(ti.complex(ti.primitive(TypeKind::F32)), AggregatePosition::Result);
+        ASSERT_TRUE(cf.has_value());
+        EXPECT_EQ(cf->kind, K::InRegisters) << "float _Complex: %xmm0";
+        ASSERT_EQ(cf->pieces.size(), 1u);
+        EXPECT_EQ(cf->pieces[0].cls, AbiPieceClass::Fpr);
+        auto const cd = classify(ti.complex(ti.primitive(TypeKind::F64)), AggregatePosition::Result);
+        ASSERT_TRUE(cd.has_value());
+        EXPECT_EQ(cd->kind, K::InRegisters) << "double _Complex: %xmm0:%xmm1";
+        ASSERT_EQ(cd->pieces.size(), 2u);
+        EXPECT_EQ(cd->pieces[0].cls, AbiPieceClass::Fpr);
+        EXPECT_EQ(cd->pieces[1].cls, AbiPieceClass::Fpr);
+    }
+}
+
+// ★ P69 (lane `cs`, fold f26c, main's ledger 454): AN x87-BEARING AGGREGATE IS CLASSED BY psABI's MERGE, AND AN
+// X87UP EIGHTBYTE NOT PRECEDED BY X87 IS THE CONVENTION'S. The universe: a union of `long double` and a member of
+// eight bytes or less -- int, long, pointer (INTEGER), double, float (SSE) -- and the two controls whose second
+// eightbyte holds that member's type too (long[2], double[2]), as an argument and as a result, under the psABI rule
+// (`memory`, sysv_amd64) and Apple's (`sse`, sysv_amd64_darwin). The merge: X87 with INTEGER is INTEGER, X87 with
+// SSE is MEMORY; X87UP with INTEGER is INTEGER. ✔MEASURED (probe su, -O1 asm): gcc 13.3.0 and clang 18.1.3 on Linux pass and return the int /
+// long / pointer unions in memory, Apple clang 21.0.0 for x86_64 in an integer register and %xmm0; the double and
+// float unions and double[2] in memory on all three; long[2] in two integer registers on all three.
+TEST(AggregateAbiSysV, AnX87UpEightbyteWithoutX87IsTheConventionsAndTheMergeDecidesTheRest) {
+    auto ti = makeInterner(1);
+    TypeId const ld = ti.primitive(TypeKind::F80);
+    auto const unionOf = [&ti, ld](char const* name, TypeId other) {
+        std::array<TypeId, 2> const v{ld, other};
+        return ti.unionType(name, v);
+    };
+    using K = AbiPassing::Kind;
+    using P = AbiPieceClass;
+    struct Cell {
+        char const*        what;
+        TypeId             type;
+        K                  psabi;     // sysv_amd64 (`memory`): either position
+        K                  apple;     // sysv_amd64_darwin (`sse`): either position
+        std::array<P, 2>   pieces;    // when InRegisters
+    };
+    std::array<Cell, 7> const cells{{
+        {"union { long double a; int i; }", unionOf("UI", ti.primitive(TypeKind::I32)), K::Memory,
+         K::InRegisters, {P::Gpr, P::Fpr}},
+        {"union { long double a; long l; }", unionOf("UL", ti.primitive(TypeKind::I64)), K::Memory,
+         K::InRegisters, {P::Gpr, P::Fpr}},
+        {"union { long double a; void *p; }", unionOf("UP", ti.pointer(ti.primitive(TypeKind::I8))),
+         K::Memory, K::InRegisters, {P::Gpr, P::Fpr}},
+        {"union { long double a; double d; }", unionOf("UD", ti.primitive(TypeKind::F64)), K::Memory,
+         K::Memory, {P::Gpr, P::Gpr}},
+        {"union { long double a; float f; }", unionOf("UF", ti.primitive(TypeKind::F32)), K::Memory,
+         K::Memory, {P::Gpr, P::Gpr}},
+        {"union { long double a; long l2[2]; }", unionOf("UL2", ti.array(ti.primitive(TypeKind::I64), 2)),
+         K::InRegisters, K::InRegisters, {P::Gpr, P::Gpr}},
+        {"union { long double a; double d2[2]; }", unionOf("UD2", ti.array(ti.primitive(TypeKind::F64), 2)),
+         K::Memory, K::Memory, {P::Gpr, P::Gpr}},
+    }};
+    for (X87UpWithoutX87 const rule : {X87UpWithoutX87::Memory, X87UpWithoutX87::Sse}) {
+        AggregateConventionRules const rules{AggregateClassKind::SysVEightbyte, 16,
+                                             AggregateMemoryArgument::Stack, false, rule};
+        for (Cell const& c : cells) {
+            K const want = rule == X87UpWithoutX87::Memory ? c.psabi : c.apple;
+            for (AggregatePosition const pos : {AggregatePosition::Argument, AggregatePosition::Result}) {
+                auto const r = classifyAggregate(rules, c.type, ti, kNatural16, DataModel::Lp64, pos);
+                ASSERT_TRUE(r.has_value()) << c.what;
+                EXPECT_EQ(r->kind, want) << c.what << " under '" << x87UpWithoutX87Name(rule) << "', "
+                                         << (pos == AggregatePosition::Result ? "result" : "argument");
+                if (want != K::InRegisters) {
+                    EXPECT_TRUE(r->pieces.empty()) << c.what;
+                    continue;
+                }
+                ASSERT_EQ(r->pieces.size(), 2u) << c.what;
+                for (std::size_t e = 0; e < 2; ++e) {
+                    EXPECT_EQ(r->pieces[e].cls, c.pieces[e]) << c.what << ", eightbyte " << e;
+                    EXPECT_EQ(r->pieces[e].byteOffset, 8u * e) << c.what;
+                    EXPECT_EQ(r->pieces[e].widthBytes, 8u) << c.what;
+                }
+            }
+        }
+        // The x87 value alone stays what it was under either rule: st0 as a result, memory as an argument.
+        TypeId const x1 = structOf(ti, rule == X87UpWithoutX87::Memory ? "XM" : "XS", {ld});
+        EXPECT_EQ(classifyAggregate(rules, x1, ti, kNatural16, DataModel::Lp64, AggregatePosition::Result)->kind,
+                  K::X87);
+        EXPECT_EQ(classifyAggregate(rules, x1, ti, kNatural16, DataModel::Lp64, AggregatePosition::Argument)->kind,
+                  K::Memory);
+    }
 }
 
 // D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI (LD-4): AAPCS64 — a binary128 (F128) leaf is
@@ -105,8 +314,8 @@ TEST(AggregateAbiAapcs64, Binary128LeafStructIsHfaFpr) {
     // Single binary128 member → a 1-element HFA in ONE Q-register (v0): a 16-byte
     // Fpr piece at offset 0 (NEVER an 8-byte piece — that would move 8 of 16 bytes).
     TypeId const s1 = structOf(ti, "LQ", {ti.primitive(TypeKind::F128)});
-    auto r1 = classifyAggregate(AggregateClassKind::Aapcs64Hfa, 16, s1, ti,
-                                kNatural16, DataModel::Lp64);
+    auto r1 = classifyAggregate(AggregateConventionRules{AggregateClassKind::Aapcs64Hfa, 16}, s1, ti,
+                                kNatural16, DataModel::Lp64, AggregatePosition::Argument);
     ASSERT_TRUE(r1.has_value());
     EXPECT_EQ(r1->kind, AbiPassing::Kind::InRegisters);
     ASSERT_EQ(r1->pieces.size(), 1u);
@@ -117,8 +326,8 @@ TEST(AggregateAbiAapcs64, Binary128LeafStructIsHfaFpr) {
     // Two binary128 members → a 2-element HFA in v0/v1: two 16-byte Fpr pieces.
     TypeId const s2 = structOf(ti, "LQ2",
         {ti.primitive(TypeKind::F128), ti.primitive(TypeKind::F128)});
-    auto r2 = classifyAggregate(AggregateClassKind::Aapcs64Hfa, 16, s2, ti,
-                                kNatural16, DataModel::Lp64);
+    auto r2 = classifyAggregate(AggregateConventionRules{AggregateClassKind::Aapcs64Hfa, 16}, s2, ti,
+                                kNatural16, DataModel::Lp64, AggregatePosition::Argument);
     ASSERT_TRUE(r2.has_value());
     EXPECT_EQ(r2->kind, AbiPassing::Kind::InRegisters);
     ASSERT_EQ(r2->pieces.size(), 2u) << "a 2-binary128 aggregate = a 2-piece HFA";
@@ -133,8 +342,9 @@ TEST(AggregateAbiAapcs64, Binary128LeafStructIsHfaFpr) {
 TEST(AggregateAbiAapcs64, F80LeafStructStillRefuses) {
     auto ti = makeInterner(1);
     TypeId const s = structOf(ti, "LD", {ti.primitive(TypeKind::F80)});
-    EXPECT_FALSE(classifyAggregate(AggregateClassKind::Aapcs64Hfa, 16, s, ti,
-                                   kNatural16, DataModel::Lp64).has_value())
+    EXPECT_FALSE(classifyAggregate(AggregateConventionRules{AggregateClassKind::Aapcs64Hfa, 16}, s, ti,
+                                   kNatural16, DataModel::Lp64,
+                                   AggregatePosition::Argument).has_value())
         << "AAPCS64: an x87 F80 leaf has no fundamental-FP register class — must "
            "refuse (F80 only arises from a hand-built type here; arm64 long double "
            "is F128), never emit an 8-byte FPR piece over a 16-byte x87 value";
@@ -190,13 +400,13 @@ TEST(AggregateAbiSysV, DoubleComplex_TwoFprEightbytes) {
 // binary128 _Complex → 2 binary128 leaves @0/@16 → a 2-element HFA (v0/v1, two
 // 16-byte Fpr pieces) — INVERTED from the FC17.9(e) refusal. An F80-element complex
 // → 2 F80 leaves → still refuses (no AAPCS64 x87 register class). On SysV a 32-byte
-// long-double-complex is MEMORY (ByReference) by the >16B rule (which runs first) —
-// a VALID by-reference pass (the value moves; VALUE arithmetic walls at the ops).
+// long-double-complex is MEMORY by the >16B rule (which runs first) — a VALID
+// memory pass (the value moves; VALUE arithmetic walls at the ops).
 TEST(AggregateAbiAapcs64, Binary128ComplexIsTwoPieceHfa) {
     auto ti = makeInterner(1);
     TypeId const cq = ti.complex(ti.primitive(TypeKind::F128));
-    auto r = classifyAggregate(AggregateClassKind::Aapcs64Hfa, 16, cq, ti,
-                               kNatural16, DataModel::Lp64);
+    auto r = classifyAggregate(AggregateConventionRules{AggregateClassKind::Aapcs64Hfa, 16}, cq, ti,
+                               kNatural16, DataModel::Lp64, AggregatePosition::Argument);
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(r->kind, AbiPassing::Kind::InRegisters);
     ASSERT_EQ(r->pieces.size(), 2u) << "a binary128 _Complex = a 2-element HFA";
@@ -208,18 +418,20 @@ TEST(AggregateAbiAapcs64, Binary128ComplexIsTwoPieceHfa) {
     EXPECT_EQ(r->pieces[1].widthBytes, 16u);
 }
 
-TEST(AggregateAbiAapcs64, F80ComplexStillRefusesAndSysVIsByReference) {
+TEST(AggregateAbiAapcs64, F80ComplexStillRefusesAndSysVIsMemory) {
     auto ti = makeInterner(1);
     TypeId const cld = ti.complex(ti.primitive(TypeKind::F80));
-    EXPECT_FALSE(classifyAggregate(AggregateClassKind::Aapcs64Hfa, 16, cld, ti,
-                                   kNatural16, DataModel::Lp64).has_value())
+    EXPECT_FALSE(classifyAggregate(AggregateConventionRules{AggregateClassKind::Aapcs64Hfa, 16}, cld, ti,
+                                   kNatural16, DataModel::Lp64,
+                                   AggregatePosition::Argument).has_value())
         << "AAPCS64: an F80-element complex has F80 leaves → must refuse (no x87 "
            "register class), never a guessed piece";
-    // SysV: a 32-byte long-double-complex is MEMORY (ByReference) — the >16B rule
-    // runs first (the value moves; arithmetic walls elsewhere).
+    // SysV: a long-double complex ARGUMENT is MEMORY — its class is COMPLEX_X87, which
+    // is passed in memory (a RESULT of it is two x87 values: AggregateAbiSysV's
+    // AComplexLongDoubleIsReturnedAsTwoX87ValuesAndPassedInMemory).
     auto sysv = classifySysV(cld, ti);
     ASSERT_TRUE(sysv.has_value());
-    EXPECT_EQ(sysv->kind, AbiPassing::Kind::ByReference);
+    EXPECT_EQ(sysv->kind, AbiPassing::Kind::Memory);
 }
 
 // {float,float} = 8 bytes, BOTH floats in eightbyte 0 → SSE → one FPR piece.
@@ -285,13 +497,13 @@ TEST(AggregateAbiSysV, FloatArrayTwo_OneSseEightbyte) {
     EXPECT_EQ(r->pieces[0].cls, AbiPieceClass::Fpr);
 }
 
-// 24 bytes (> 16) → MEMORY (by reference for args; sret for returns).
-TEST(AggregateAbiSysV, TwentyFourBytes_ByReference) {
+// 24 bytes (> 16) → MEMORY (an argument by the convention's carrier; sret for returns).
+TEST(AggregateAbiSysV, TwentyFourBytes_Memory) {
     auto ti = makeInterner(1);
     TypeId const l = ti.primitive(TypeKind::I64);
     auto r = classifySysV(structOf(ti, "LLL", {l, l, l}), ti);
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(r->kind, AbiPassing::Kind::ByReference);
+    EXPECT_EQ(r->kind, AbiPassing::Kind::Memory);
     EXPECT_TRUE(r->pieces.empty());
 }
 
@@ -316,8 +528,9 @@ TEST(AggregateAbiSysV, UnimplementedStrategyIsNullopt) {
                  {ti.primitive(TypeKind::I32), ti.primitive(TypeKind::I32)});
     // Only the `None` sentinel is unimplemented → nullopt (the caller fails
     // loud). SysV (C1), Win64 (C2), AAPCS64 (C3) are all implemented now.
-    EXPECT_FALSE(classifyAggregate(AggregateClassKind::None, 16, s, ti,
-                                   kNatural16, DataModel::Lp64).has_value());
+    EXPECT_FALSE(classifyAggregate(AggregateConventionRules{AggregateClassKind::None, 16}, s, ti,
+                                   kNatural16, DataModel::Lp64,
+                                   AggregatePosition::Argument).has_value());
 }
 
 TEST(AggregateAbiSysV, ImplementedFlagMatchesC1C2C3Scope) {
@@ -334,9 +547,10 @@ TEST(AggregateAbiSysV, ImplementedFlagMatchesC1C2C3Scope) {
 // not. maxRegBytes = 8 (a single register).
 namespace {
 [[nodiscard]] std::optional<AbiPassing>
-classifyWin64(TypeId t, TypeInterner const& ti) {
-    return classifyAggregate(AggregateClassKind::Win64BySize, 8, t, ti,
-                             kNatural16, DataModel::Lp64);
+classifyWin64(TypeId t, TypeInterner const& ti,
+              AggregatePosition position = AggregatePosition::Argument) {
+    return classifyAggregate(AggregateConventionRules{AggregateClassKind::Win64BySize, 8}, t, ti,
+                             kX86_64Layout, DataModel::Lp64, position);
 }
 }  // namespace
 
@@ -371,7 +585,7 @@ TEST(AggregateAbiWin64, ThreeByteStruct_ByReference) {
     // {char,char,char} = 3 bytes — NOT a power of two → BY REFERENCE.
     auto r = classifyWin64(structOf(ti, "CCC", {c, c, c}), ti);
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(r->kind, AbiPassing::Kind::ByReference)
+    EXPECT_EQ(r->kind, AbiPassing::Kind::Memory)
         << "a 3-byte struct is not power-of-two → by reference on Win64";
 }
 
@@ -382,7 +596,7 @@ TEST(AggregateAbiWin64, TwelveByteStruct_ByReference) {
     // eightbytes; Win64 always passes > 8 by reference).
     auto r = classifyWin64(structOf(ti, "III", {i, i, i}), ti);
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(r->kind, AbiPassing::Kind::ByReference);
+    EXPECT_EQ(r->kind, AbiPassing::Kind::Memory);
 }
 
 TEST(AggregateAbiWin64, OneByteStruct_OneGprWidthOne) {
@@ -400,9 +614,10 @@ TEST(AggregateAbiWin64, OneByteStruct_OneGprWidthOne) {
 // width (NOT size-limited to 16B). Non-HFA ≤16B → 1-2 GPR pieces; >16B → by-ref.
 namespace {
 [[nodiscard]] std::optional<AbiPassing>
-classifyAapcs64(TypeId t, TypeInterner const& ti) {
-    return classifyAggregate(AggregateClassKind::Aapcs64Hfa, 16, t, ti,
-                             kNatural16, DataModel::Lp64);
+classifyAapcs64(TypeId t, TypeInterner const& ti,
+                AggregatePosition position = AggregatePosition::Argument) {
+    return classifyAggregate(AggregateConventionRules{AggregateClassKind::Aapcs64Hfa, 16}, t, ti,
+                             kArm64Layout, DataModel::Lp64, position);
 }
 }  // namespace
 
@@ -456,6 +671,84 @@ TEST(AggregateAbiAapcs64, SingleFloat_OneFprPiece) {
     EXPECT_EQ(r->pieces[0].widthBytes, 4u);
 }
 
+// ★ P69 (lane `cs`, fold f26c2 — review-csf26c F14): THE CLASSIFIER STATES AN HFA'S ELEMENT SIZE, because a
+// convention may place a stacked HFA by its element's alignment instead of its own (Apple arm64:
+// `homogeneousAggregateAlignmentOf: element`). ✔MEASURED (lane `cs`, probe f14): Apple clang 21 puts
+// `struct { _Alignas(32) double a, b, c, d; }` on an 8-byte slot, aarch64 gcc 13.3.0 and clang 18.1.3 on a
+// 16-aligned one. Every HFA states its element (a float's 4, a double's 8, a binary128's 16); a non-HFA, an
+// aggregate passed by reference, and every SysV answer state 0.
+//
+// RED-ON-DISABLE: drop the `homogeneousElementBytes` line of the AAPCS64 arm and every HFA states 0.
+TEST(AggregateAbiAapcs64, AnHfaStatesItsElementSizeAndNothingElseDoes) {
+    auto ti = makeInterner(1);
+    TypeId const f = ti.primitive(TypeKind::F32);
+    TypeId const d = ti.primitive(TypeKind::F64);
+    TypeId const q = ti.primitive(TypeKind::F128);
+    TypeId const i = ti.primitive(TypeKind::I64);
+    struct Cell {
+        char const*   what;
+        TypeId        type;
+        std::uint32_t element;
+    };
+    for (Cell const& c : {Cell{"three floats", structOf(ti, "HF3", {f, f, f}), 4},
+                          Cell{"four doubles", structOf(ti, "HD4", {d, d, d, d}), 8},
+                          Cell{"two binary128", structOf(ti, "HQ2", {q, q}), 16},
+                          Cell{"two longs (not an HFA)", structOf(ti, "NL2", {i, i}), 0},
+                          Cell{"a double and a long (not an HFA)", structOf(ti, "NDL", {d, i}), 0},
+                          Cell{"five doubles (by reference)", structOf(ti, "ND5", {d, d, d, d, d}), 0}}) {
+        auto const r = classifyAapcs64(c.type, ti);
+        ASSERT_TRUE(r.has_value()) << c.what;
+        EXPECT_EQ(r->homogeneousElementBytes, c.element) << c.what;
+    }
+    auto const sysv = classifySysV(structOf(ti, "SD2", {d, d}), ti);
+    ASSERT_TRUE(sysv.has_value());
+    EXPECT_EQ(sysv->kind, AbiPassing::Kind::InRegisters) << "two SSE eightbytes";
+    EXPECT_EQ(sysv->homogeneousElementBytes, 0u) << "SysV classifies eightbytes, and states no element";
+}
+
+// ★ P69 (lane `cs`, fold f26c2 — F14's neighbour): A COMPOSITE OF ONE FLOATING TYPE IS AN HFA ONLY WHERE ITS ELEMENTS
+// TILE IT. ✔MEASURED (lane `cs`, probe hp, -O1 assembly of a callee and a caller of each shape): aarch64 gcc 13.3.0,
+// clang 18.1.3 and Apple clang agree, shape for shape -- a member alignment that pads the composite makes it no HFA:
+// in general registers at 16 bytes, by reference past them; the two controls, which tile their bytes, are HFAs.
+//
+// RED-ON-DISABLE: drop the tiling test of the AAPCS64 arm and the four padded shapes are HFAs of 2 or 4 elements.
+TEST(AggregateAbiAapcs64, APaddedCompositeOfOneFloatingTypeIsNoHfa) {
+    auto ti = makeInterner(1);
+    TypeId const f = ti.primitive(TypeKind::F32);
+    TypeId const d = ti.primitive(TypeKind::F64);
+    auto const aligned = [&](std::string_view name, std::vector<TypeId> fields, std::vector<std::uint32_t> aligns) {
+        return ti.structType(name, fields, {}, {}, aligns);
+    };
+    struct Cell {
+        char const*      what;
+        TypeId           type;
+        AbiPassing::Kind kind;
+        std::size_t      pieces;
+        AbiPieceClass    cls;   // of every piece
+    };
+    for (Cell const& c : {
+             Cell{"struct { _Alignas(16) double a; } (x0, x1)", aligned("P1", {d}, {16}),
+                  AbiPassing::Kind::InRegisters, 2, AbiPieceClass::Gpr},
+             Cell{"struct { float a; _Alignas(8) float b; } (x0, x1)", aligned("P2", {f, f}, {0, 8}),
+                  AbiPassing::Kind::InRegisters, 2, AbiPieceClass::Gpr},
+             Cell{"struct { _Alignas(16) float a; float b; } (x0, x1)", aligned("P3", {f, f}, {16, 0}),
+                  AbiPassing::Kind::InRegisters, 2, AbiPieceClass::Gpr},
+             Cell{"struct { double a; _Alignas(16) double b; } (by reference)", aligned("P4", {d, d}, {0, 16}),
+                  AbiPassing::Kind::Memory, 0, AbiPieceClass::Gpr},
+             Cell{"CONTROL: struct { double a, b; } (d0, d1)", structOf(ti, "P5", {d, d}),
+                  AbiPassing::Kind::InRegisters, 2, AbiPieceClass::Fpr},
+             Cell{"CONTROL: struct { _Alignas(32) double a, b, c, d; } (d0..d3)",
+                  aligned("P6", {d, d, d, d}, {32, 0, 0, 0}), AbiPassing::Kind::InRegisters, 4, AbiPieceClass::Fpr},
+         }) {
+        auto const r = classifyAapcs64(c.type, ti);
+        ASSERT_TRUE(r.has_value()) << c.what;
+        EXPECT_EQ(r->kind, c.kind) << c.what;
+        ASSERT_EQ(r->pieces.size(), c.pieces) << c.what;
+        for (AbiPiece const& p : r->pieces) EXPECT_EQ(p.cls, c.cls) << c.what;
+        EXPECT_EQ(r->homogeneousElementBytes, c.cls == AbiPieceClass::Fpr ? 8u : 0u) << c.what;
+    }
+}
+
 TEST(AggregateAbiAapcs64, ThreeInts_TwoGprPieces) {
     auto ti = makeInterner(1);
     TypeId const i = ti.primitive(TypeKind::I32);
@@ -486,7 +779,7 @@ TEST(AggregateAbiAapcs64, TwentyByteStruct_ByReference) {
     // {int, long, long} = 24B (> 16, non-HFA) → by reference.
     auto r = classifyAapcs64(structOf(ti, "ILL", {i, l, l}), ti);
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(r->kind, AbiPassing::Kind::ByReference);
+    EXPECT_EQ(r->kind, AbiPassing::Kind::Memory);
 }
 
 // ── FC12a-core (D-FC12A-VARIADIC-CALLEE): va_arg scalar-class pins ────────────
@@ -541,12 +834,12 @@ TEST(AggregateAbiBitInt, WideBitInt128AndBitInt200AllStrategies) {
         EXPECT_EQ(r->pieces[0].cls, AbiPieceClass::Gpr);
         EXPECT_EQ(r->pieces[1].cls, AbiPieceClass::Gpr);
         EXPECT_EQ(r->pieces[1].byteOffset, 8u);
-        EXPECT_EQ(classifySysV(b200, ti)->kind, AbiPassing::Kind::ByReference);
+        EXPECT_EQ(classifySysV(b200, ti)->kind, AbiPassing::Kind::Memory);
     }
     // Win64: a 16-byte value is NOT a power-of-two ≤ 8 → by reference; 200b likewise.
     {
-        EXPECT_EQ(classifyWin64(b128, ti)->kind, AbiPassing::Kind::ByReference);
-        EXPECT_EQ(classifyWin64(b200, ti)->kind, AbiPassing::Kind::ByReference);
+        EXPECT_EQ(classifyWin64(b128, ti)->kind, AbiPassing::Kind::Memory);
+        EXPECT_EQ(classifyWin64(b200, ti)->kind, AbiPassing::Kind::Memory);
     }
     // AAPCS64: 128b is a non-HFA ≤16B → two GPRs; 200b >16B → by reference.
     {
@@ -556,6 +849,74 @@ TEST(AggregateAbiBitInt, WideBitInt128AndBitInt200AllStrategies) {
         ASSERT_EQ(r->pieces.size(), 2u);
         EXPECT_EQ(r->pieces[0].cls, AbiPieceClass::Gpr);
         EXPECT_EQ(r->pieces[1].cls, AbiPieceClass::Gpr);
-        EXPECT_EQ(classifyAapcs64(b200, ti)->kind, AbiPassing::Kind::ByReference);
+        EXPECT_EQ(classifyAapcs64(b200, ti)->kind, AbiPassing::Kind::Memory);
+    }
+}
+
+// The position is SysV's question alone: Win64 and AAPCS64 answer a result exactly
+// as an argument (their F80-free axes cannot form an X87 class).
+TEST(AggregateAbiWin64AndAapcs64, APositionChangesNoClassOutsideSysV) {
+    auto ti = makeInterner(1);
+    TypeId const l = ti.primitive(TypeKind::I64);
+    TypeId const d = ti.primitive(TypeKind::F64);
+    std::array<TypeId, 3> const shapes{
+        structOf(ti, "PL", {l}), structOf(ti, "PLLL", {l, l, l}), structOf(ti, "PDD", {d, d})};
+    for (TypeId const t : shapes) {
+        auto const wa = classifyWin64(t, ti, AggregatePosition::Argument);
+        auto const wr = classifyWin64(t, ti, AggregatePosition::Result);
+        ASSERT_TRUE(wa.has_value() && wr.has_value());
+        EXPECT_EQ(wa->kind, wr->kind);
+        EXPECT_EQ(wa->pieces.size(), wr->pieces.size());
+        auto const aa = classifyAapcs64(t, ti, AggregatePosition::Argument);
+        auto const ar = classifyAapcs64(t, ti, AggregatePosition::Result);
+        ASSERT_TRUE(aa.has_value() && ar.has_value());
+        EXPECT_EQ(aa->kind, ar->kind);
+        EXPECT_EQ(aa->pieces.size(), ar->pieces.size());
+    }
+}
+
+// ★ P69 (lane `cs`, fold f26e — D-TARGET-WIN64-INT128-RESULT-GOES-THROUGH-A-HIDDEN-POINTER-NOT-XMM0): A 128-BIT
+// INTEGER RESULT COMES BACK WHERE ITS CONVENTION STATES. Under `integer128Result: first_fpr` (Win64's `ms_x64`) an
+// `__int128` / `unsigned __int128` RESULT is ONE 16-byte FPR piece -- XMM0, the low limb in lane 0, where MinGW-w64
+// gcc and clang return it -- before the by-size rule, which sends every other 16-byte value through the hidden
+// pointer. THE UNIVERSE: {I128, U128} x {result, argument} x {first_fpr, the aggregate rule}; against it the types
+// that keep the by-size rule under first_fpr (a `_BitInt(128)`, a 16-byte struct of two longs), and SysV's own
+// answer for the same two types (two GPRs, RAX:RDX) as the control that the rule reads nothing it does not state.
+TEST(AggregateAbiWin64, A128BitIntegerResultComesBackInTheFirstFprWhereTheConventionStatesIt) {
+    auto ti = makeInterner(10);
+    AggregateConventionRules stated{AggregateClassKind::Win64BySize, 8};
+    stated.integer128Result = Integer128Result::InTheFirstFpr;
+    AggregateConventionRules const unstated{AggregateClassKind::Win64BySize, 8};
+    auto const classify = [&](AggregateConventionRules const& rules, TypeId t, AggregatePosition pos) {
+        return classifyAggregate(rules, t, ti, kX86_64Layout, DataModel::Lp64, pos);
+    };
+    for (TypeKind const k : {TypeKind::I128, TypeKind::U128}) {
+        TypeId const t = ti.primitive(k);
+        auto const r = classify(stated, t, AggregatePosition::Result);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_EQ(r->kind, AbiPassing::Kind::InRegisters) << "a 128-bit integer result under first_fpr";
+        ASSERT_EQ(r->pieces.size(), 1u) << "a 128-bit integer result under first_fpr";
+        EXPECT_EQ(r->pieces[0].cls, AbiPieceClass::Fpr);
+        EXPECT_EQ(r->pieces[0].byteOffset, 0u);
+        EXPECT_EQ(r->pieces[0].widthBytes, 16u);
+        auto const arg = classify(stated, t, AggregatePosition::Argument);
+        ASSERT_TRUE(arg.has_value());
+        EXPECT_EQ(arg->kind, AbiPassing::Kind::Memory) << "an argument keeps the by-size rule: Win64 passes it by "
+                                                          "reference";
+        auto const plain = classify(unstated, t, AggregatePosition::Result);
+        ASSERT_TRUE(plain.has_value());
+        EXPECT_EQ(plain->kind, AbiPassing::Kind::Memory) << "unstated, a result takes the by-size rule";
+        auto const sysv = classifySysV(t, ti, AggregatePosition::Result);
+        ASSERT_TRUE(sysv.has_value());
+        EXPECT_EQ(sysv->kind, AbiPassing::Kind::InRegisters);
+        ASSERT_EQ(sysv->pieces.size(), 2u) << "SysV's RAX:RDX, the rule unstated there";
+        EXPECT_EQ(sysv->pieces[0].cls, AbiPieceClass::Gpr);
+        EXPECT_EQ(sysv->pieces[1].cls, AbiPieceClass::Gpr);
+    }
+    TypeId const l = ti.primitive(TypeKind::I64);
+    for (TypeId const t : {ti.bitInt(128, true), structOf(ti, "W2", {l, l})}) {
+        auto const r = classify(stated, t, AggregatePosition::Result);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_EQ(r->kind, AbiPassing::Kind::Memory) << "a type that is no 128-bit integer keeps the by-size rule";
     }
 }

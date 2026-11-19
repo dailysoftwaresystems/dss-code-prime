@@ -1,0 +1,32 @@
+// GENERATED -- DO NOT EDIT BY HAND. P69 H6c: the spawn's working directory AT ITS LENGTH BOUNDARY -- a drive's and a
+// share's directory spelled 250 to 262 characters long, handed as written, as the DOS container spelling with its
+// separator and as the verbatim container reference (78 answers) -- MEASURED by probe-reference-cc (cl,
+// windows-x86_64-release, u3 part 4; the g++ 13.2 run answering identically), OS 10.0.26300. Written by
+// .orchestrators/p69/work/hm/h6c/gen_typed_cells_u3.py. Fields: kind, the directory's length; then per form whether a
+// child STARTED in it (the child printed it; a child past 258 characters with the separator was refused ERR 267).
+    {"abs", 250, true, true, true},
+    {"abs", 251, true, true, true},
+    {"abs", 252, true, true, true},
+    {"abs", 253, true, true, true},
+    {"abs", 254, true, true, false},
+    {"abs", 255, true, true, false},
+    {"abs", 256, true, true, false},
+    {"abs", 257, true, true, false},
+    {"abs", 258, true, false, false},
+    {"abs", 259, false, false, false},
+    {"abs", 260, false, false, false},
+    {"abs", 261, false, false, false},
+    {"abs", 262, false, false, false},
+    {"share", 250, true, true, true},
+    {"share", 251, true, true, true},
+    {"share", 252, true, true, false},
+    {"share", 253, true, true, false},
+    {"share", 254, true, true, false},
+    {"share", 255, true, true, false},
+    {"share", 256, true, true, false},
+    {"share", 257, true, true, false},
+    {"share", 258, true, false, false},
+    {"share", 259, false, false, false},
+    {"share", 260, false, false, false},
+    {"share", 261, false, false, false},
+    {"share", 262, false, false, false},

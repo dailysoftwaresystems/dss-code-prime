@@ -78,8 +78,12 @@ WATCHDOG_BUDGET_S = 90
 PROBE_DEFAULT_S = 5
 SCAN_FLOOR = 1500
 BINARY_PROBE = 8000     # git's own binary heuristic: a NUL in the first 8000 bytes
-EXPECTED_SELFTEST_ARMS = 35
+EXPECTED_SELFTEST_ARMS = 37
 EXPECTED_WATCHDOG_ARMS = 6
+# The self-test's verdict line, one per arm, on standard output: `<marker>ok <name>` or
+# `<marker>FAILED <name> -- <detail>` -- the grammar the ctest entry `harness/line_endings_selftest`
+# reads each arm of into a gtest case (tests/test_support/script_selftest.hpp).
+SELFTEST_MARKER = "line-endings self-test: "
 
 # Check C's pinned set: the paths whose ATTRIBUTE column says `eol=lf` (git applied
 # `.gitattributes` -- config-driven), UNION the glob list the twins spelled out, so the
@@ -123,11 +127,19 @@ REGION_END = MARKER + ":END"
 #   ⇒ This program counts CR as BYTES (`bytes.count(b"\r")`), and check F refuses the blind
 #     spellings repo-wide; `--files` exists so nobody needs to hand-roll one.
 #
-# THE REFUSED SHAPE: a DETECTOR VERB and a CR PATTERN on one line, in either order. The verb
-# co-requirement keeps prose out: `.gitattributes` discusses `$'\r'` with no verb, and a
-# Windows path `'Z:\home\<user>\test'` carries a bare `\r` that is no CR pattern. These are
-# the ERE the twins handed to `git grep -E`, byte for byte.
-CR_VERB = "(grep|egrep|fgrep|rg|awk|sed|findstr|Select-String)"
+# THE REFUSED SHAPE: a DETECTOR VERB, AS A WORD, and a CR PATTERN on one line, in either order.
+# The verb co-requirement keeps prose out: `.gitattributes` discusses `$'\r'` with no verb, and
+# a Windows path `'Z:\home\<user>\test'` carries a bare `\r` that is no CR pattern. The verb
+# counts only as a WORD -- not preceded or followed by a letter, a digit or `_` -- because a
+# verb inside an identifier runs nothing: `target.back() == '\r'` holds `rg` in `target`,
+# `merge` holds `rg`, `sedan` holds `sed`, `hawk` holds `awk`, and none of them measures a CR.
+# CR_VERBS states "a verb" ONCE: `git grep -E` is asked the twins' UNANCHORED ERE below (ERE
+# has no lookaround, so it cannot say "a word"), which finds every candidate and more, and
+# each hit is then a candidate only when `is_candidate` -- the same word rule the exemptions
+# scope by -- says so. The pattern is the same text in both readers: ERE and Python's `re`
+# read it alike.
+CR_VERBS = ("grep", "egrep", "fgrep", "rg", "awk", "sed", "findstr", "Select-String")
+CR_VERB = "(" + "|".join(CR_VERBS) + ")"
 CR_PAT = "(\\$'(\\\\r|\\\\015)'|['\"/]\\\\r\\$|['\"/]\\\\r['\"/])"
 CR_BLIND = "(" + CR_VERB + ".*" + CR_PAT + "|" + CR_PAT + ".*" + CR_VERB + ")"
 # THE EXEMPTIONS — measured-safe forms, not conveniences: `git grep/ls-files/diff/cat-file`
@@ -150,10 +162,19 @@ CR_EXEMPTIONS = (
 # it is kept (it names the converter a reader writes) and declared here so the self-test's
 # "every alternative is live" arm knows which one cannot be.
 SUBSUMED_EXEMPTIONS = {"gsub": "sub"}
-# A detector verb as a WORD, for scoping exemptions to the command that holds it. (The
-# blindness test itself stays the twins' unanchored ERE, run by `git grep`.)
-_VERB_WORD_RE = re.compile(r"(?<![A-Za-z0-9_])(?:grep|egrep|fgrep|rg|awk|sed|findstr|Select-String)"
+# A detector verb as a WORD, from CR_VERBS: what makes a `git grep` hit a candidate at all
+# (`is_candidate`), and what scopes an exemption to the command that holds the verb.
+_VERB_WORD_RE = re.compile(r"(?<![A-Za-z0-9_])(?:" + "|".join(re.escape(v) for v in CR_VERBS) + r")"
                            r"(?![A-Za-z0-9_])")
+_CR_PAT_RE = re.compile(CR_PAT)
+
+
+def is_candidate(content):
+    """True when `content` holds a detector verb AS A WORD and a CR pattern -- check F's
+    refused shape. The two never share a character -- a pattern's one letter is an `r` between
+    a backslash and a quote, a slash or `$`, and no verb holds an `r` so placed -- so "in
+    either order" is "both on the line"."""
+    return _VERB_WORD_RE.search(content) is not None and _CR_PAT_RE.search(content) is not None
 
 
 class Unmeasured(Exception):
@@ -482,8 +503,8 @@ def command_segments(content):
 def exempt_by_token(content, exemptions=CR_EXEMPTIONS):
     """True when EVERY command segment of `content` that holds a detector verb (as a word)
     also carries an exemption token outside a trailing comment. Content only: the PATH never
-    exempts. A line whose verb appears only inside a word (the blindness ERE is unanchored)
-    has no command to scope to, so there the token may sit anywhere in its code.
+    exempts. Asked of a candidate (`is_candidate`), which holds a verb as a word, so there is
+    always a segment to scope to; a line with none is no candidate, and is not exempted here.
 
     ⚠ Never weaker than the twins' line-level rule: whatever this exempts carries a token in
     its content, which the twins exempted too. What it no longer exempts is a token in the
@@ -491,14 +512,11 @@ def exempt_by_token(content, exemptions=CR_EXEMPTIONS):
     negatives)."""
     token_res = [re.compile(rx) for _name, rx in exemptions]
     verb_segments = [s for s in command_segments(content) if _VERB_WORD_RE.search(s)]
-    if not verb_segments:
-        code = _drop_trailing_comment(content)
-        return any(t.search(code) for t in token_res)
     for seg in verb_segments:
         code = _drop_trailing_comment(seg)
         if not any(t.search(code) for t in token_res):
             return False
-    return True
+    return bool(verb_segments)
 
 
 def region_state(lines, line_no):
@@ -551,6 +569,8 @@ def instrument_audit(ident, exemptions=CR_EXEMPTIONS, env_extra=None, positive_c
                                                                           REGION_END))
     offences = []
     for path, line_no, content in raw:
+        if not is_candidate(content):
+            continue   # the ERE's verb sat inside a word: no detector runs on this line
         if MARKER in content or exempt_by_token(content, exemptions):
             continue
         inside, _open = region_state(lines_of(path), line_no)
@@ -583,8 +603,8 @@ These spellings do not measure what they appear to measure on this host
   · `awk '/\\r$/'`, `sed -n '/\\r/p'`, `grep -P '\\r$'` return 0 over a
     file that is entirely CRLF, because the reader strips the CR first.
 Use instead:
-  (a) `python3 .harness-config/runner/actions/check-line-endings/check-line-endings.py --files PATH...`
-      — the supported way to ask about specific files; or
+  (a) `dssharness run check-line-endings --manual-step files --input list=FILE` (FILE names the paths,
+      one per line) — the supported way to ask about specific files; or
   (b) count CR BYTES (`tr -dc '\\r' < f | wc -c`, expect 0) if you must inline it; or
   (c) `git grep`/`git ls-files --eol`, which read blobs and are unaffected.
 If the line is DOCUMENTATION that quotes the idiom on purpose, put the marker
@@ -862,6 +882,21 @@ def _fragments():
     return blind, safe
 
 
+def _word_fragments():
+    """S18 and S19's lines, ASSEMBLED like `_fragments`. `in_word`: a CR pattern beside a
+    detector verb that stands only INSIDE an identifier -- a C++ trim of a trailing CR (`rg`
+    inside `target`), three words of English (`merge`, `sedan`, `hawk`), then every verb of
+    CR_VERBS between two letters; `as_word`: the same pattern beside the verb as a word."""
+    q, d, b = "'", "$", "\\"
+    cr = q + b + "r" + q
+    in_word = ["while (!m.target.empty() && (m.target.back() == %s || m.target.back() == %s %s))"
+               % (cr, q, q)]
+    in_word += ["%s = s.back() == %s;" % (w, cr) for w in ("merge", "sedan", "hawk")]
+    in_word += ["x%sy = s.back() == %s;" % (v, cr) for v in CR_VERBS]
+    as_word = ["rg %s f" % cr, "n=%s(grep -c %s%s%sr%s f)" % (d, d, q, b, q)]
+    return in_word, as_word
+
+
 def _fixture_repo(ot, box, name, files, add=True):
     repo = os.path.join(box, name)
     for rel, data in files.items():
@@ -889,9 +924,10 @@ def selftest(ident, quiet=False):
         ran.append(label)
         if not ok:
             failed.append(label)
-            print("  FAIL %s   [%s]" % (label, detail), file=sys.stderr)
+            print("%sFAILED  %s -- %s" % (SELFTEST_MARKER, label,
+                                          (detail or "no detail").replace("\n", " ")[:600]))
         elif not quiet:
-            print("  ok   %s" % label)
+            print("%sok      %s" % (SELFTEST_MARKER, label))
 
     def silent(fn, *a, **k):
         sink = io.StringIO()
@@ -925,6 +961,7 @@ def selftest(ident, quiet=False):
 
         # ── check F, through the AUDIT'S OWN engine: one fixture repository ──────────
         blind, safe = _fragments()
+        in_word, as_word = _word_fragments()
         marked_line = blind[1] + "   " + MARKER
         # a blind reader whose ONLY exemption token sits in another pipeline stage
         pipeline_line = "n=$(" + blind[0].split("$(", 1)[1].rstrip(")") + " | tr -d ' ')"
@@ -937,6 +974,8 @@ def selftest(ident, quiet=False):
                           + "\n" + blind[0] + "\n",
             "sub(path-is-not-content).txt": blind[1] + "\n",
             "pipeline.txt": pipeline_line + "\n",
+            "in-word.txt": "\n".join(in_word) + "\n",
+            "as-word.txt": "\n".join(as_word) + "\n",
             # the audit's own positive control needs this guard's source in the fixture index
             self_rel(): raw_bytes(os.path.realpath(__file__)),
         }
@@ -1009,6 +1048,14 @@ def selftest(ident, quiet=False):
             return old_rule and len(offences_in("pipeline.txt")) == 1, "old-rule-exempted=%s" % old_rule
         arm("S7g an exemption token in ANOTHER pipeline stage does not exempt (the twins' rule did)",
             s7g)
+        arm("S18 a CR pattern beside a detector verb only INSIDE a word is no CR instrument: each "
+            "such line is a hit of the query, and none is refused",
+            lambda: (len(hits_in("in-word.txt")) == len(in_word) and not offences_in("in-word.txt"),
+                     "hits %d of %d, refused %d" % (len(hits_in("in-word.txt")), len(in_word),
+                                                    len(offences_in("in-word.txt")))))
+        arm("S19 the same pattern beside the verb AS A WORD is refused, rg and grep -c alike (the control)",
+            lambda: (len(offences_in("as-word.txt")) == len(as_word),
+                     "refused %d of %d" % (len(offences_in("as-word.txt")), len(as_word))))
 
         # ── one root ──────────────────────────────────────────────────────────────
         def s8a():

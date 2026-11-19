@@ -20,6 +20,7 @@ rule:root
                     rule:declHeadForParam
                       rule:typeSpecifierSeq
                         tok:"int"
+                    rule:declAttrRun
                     rule:declarator
                       rule:directDeclarator
                         tok:"fmt"
@@ -57,7 +58,7 @@ rule:root
               tok:"g_buffer"
               rule:arrayDeclSuffix
                 tok:"["
-                rule:expression
+                rule:assignmentExpr
                   rule:operand
                     tok:"256"
                 tok:"]"
@@ -97,6 +98,7 @@ rule:root
                     rule:declHeadForParam
                       rule:typeSpecifierSeq
                         tok:"int"
+                    rule:declAttrRun
                     rule:declarator
                       rule:directDeclarator
                         tok:"x"
@@ -134,6 +136,7 @@ rule:root
                     rule:declHeadForParam
                       rule:typeSpecifierSeq
                         tok:"int"
+                    rule:declAttrRun
                     rule:declarator
                       rule:directDeclarator
                         tok:"a"
@@ -143,6 +146,7 @@ rule:root
                       rule:declHeadForParam
                         rule:typeSpecifierSeq
                           tok:"int"
+                      rule:declAttrRun
                       rule:declarator
                         rule:directDeclarator
                           tok:"b"
@@ -180,6 +184,7 @@ rule:root
                     rule:declHeadForParam
                       rule:typeSpecifierSeq
                         tok:"int"
+                    rule:declAttrRun
                     rule:declarator
                       rule:directDeclarator
                         tok:"a"
@@ -189,6 +194,7 @@ rule:root
                       rule:declHeadForParam
                         rule:typeSpecifierSeq
                           tok:"int"
+                      rule:declAttrRun
                       rule:declarator
                         rule:directDeclarator
                           tok:"b"
@@ -198,6 +204,7 @@ rule:root
                       rule:declHeadForParam
                         rule:typeSpecifierSeq
                           tok:"int"
+                      rule:declAttrRun
                       rule:declarator
                         rule:directDeclarator
                           tok:"c"
@@ -300,6 +307,7 @@ rule:root
                     rule:declHeadForParam
                       rule:typeSpecifierSeq
                         tok:"int"
+                    rule:declAttrRun
                     rule:declarator
                       rule:directDeclarator
                         tok:"arr"
@@ -309,6 +317,7 @@ rule:root
                       rule:declHeadForParam
                         rule:typeSpecifierSeq
                           tok:"int"
+                      rule:declAttrRun
                       rule:declarator
                         rule:directDeclarator
                           tok:"len"
@@ -426,6 +435,7 @@ rule:root
                     rule:declHeadForParam
                       rule:typeSpecifierSeq
                         tok:"int"
+                    rule:declAttrRun
                     rule:declarator
                       rule:directDeclarator
                         tok:"n"
@@ -497,6 +507,7 @@ rule:root
                     rule:declHeadForParam
                       rule:typeSpecifierSeq
                         tok:"int"
+                    rule:declAttrRun
                     rule:declarator
                       rule:directDeclarator
                         tok:"n"
@@ -579,6 +590,7 @@ rule:root
                     rule:declHeadForParam
                       rule:typeSpecifierSeq
                         tok:"int"
+                    rule:declAttrRun
                     rule:declarator
                       rule:directDeclarator
                         tok:"x"
@@ -637,6 +649,7 @@ rule:root
                     rule:declHeadForParam
                       rule:typeSpecifierSeq
                         tok:"int"
+                    rule:declAttrRun
                     rule:declarator
                       rule:directDeclarator
                         tok:"value"
@@ -779,6 +792,7 @@ rule:root
                     rule:declHeadForParam
                       rule:typeSpecifierSeq
                         tok:"int"
+                    rule:declAttrRun
                     rule:declarator
                       rule:directDeclarator
                         tok:"ptr"
@@ -814,6 +828,7 @@ rule:root
                     rule:declHeadForParam
                       rule:typeSpecifierSeq
                         tok:"int"
+                    rule:declAttrRun
                     rule:declarator
                       rule:directDeclarator
                         tok:"a"
@@ -823,6 +838,7 @@ rule:root
                       rule:declHeadForParam
                         rule:typeSpecifierSeq
                           tok:"int"
+                      rule:declAttrRun
                       rule:declarator
                         rule:directDeclarator
                           tok:"b"
@@ -879,6 +895,7 @@ rule:root
                     rule:declHeadForParam
                       rule:typeSpecifierSeq
                         tok:"int"
+                    rule:declAttrRun
                     rule:declarator
                       rule:directDeclarator
                         tok:"x"
@@ -888,6 +905,7 @@ rule:root
                       rule:declHeadForParam
                         rule:typeSpecifierSeq
                           tok:"int"
+                      rule:declAttrRun
                       rule:declarator
                         rule:directDeclarator
                           tok:"lo"
@@ -897,6 +915,7 @@ rule:root
                       rule:declHeadForParam
                         rule:typeSpecifierSeq
                           tok:"int"
+                      rule:declAttrRun
                       rule:declarator
                         rule:directDeclarator
                           tok:"hi"
@@ -956,6 +975,7 @@ rule:root
                     rule:declHeadForParam
                       rule:typeSpecifierSeq
                         tok:"int"
+                    rule:declAttrRun
                     rule:declarator
                       rule:directDeclarator
                         tok:"a"
@@ -965,6 +985,7 @@ rule:root
                       rule:declHeadForParam
                         rule:typeSpecifierSeq
                           tok:"int"
+                      rule:declAttrRun
                       rule:declarator
                         rule:directDeclarator
                           tok:"b"
@@ -974,6 +995,7 @@ rule:root
                       rule:declHeadForParam
                         rule:typeSpecifierSeq
                           tok:"int"
+                      rule:declAttrRun
                       rule:declarator
                         rule:directDeclarator
                           tok:"limit"
@@ -1080,6 +1102,7 @@ rule:root
                     rule:declHeadForParam
                       rule:typeSpecifierSeq
                         tok:"int"
+                    rule:declAttrRun
                     rule:declarator
                       rule:directDeclarator
                         tok:"a"
@@ -1089,6 +1112,7 @@ rule:root
                       rule:declHeadForParam
                         rule:typeSpecifierSeq
                           tok:"int"
+                      rule:declAttrRun
                       rule:declarator
                         rule:directDeclarator
                           tok:"b"
@@ -1098,6 +1122,7 @@ rule:root
                       rule:declHeadForParam
                         rule:typeSpecifierSeq
                           tok:"int"
+                      rule:declAttrRun
                       rule:declarator
                         rule:directDeclarator
                           tok:"c"
@@ -1268,7 +1293,7 @@ rule:root
                         tok:"local_buf"
                         rule:arrayDeclSuffix
                           tok:"["
-                          rule:expression
+                          rule:assignmentExpr
                             rule:operand
                               tok:"16"
                           tok:"]"

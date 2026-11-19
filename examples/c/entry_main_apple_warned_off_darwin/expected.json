@@ -1,0 +1,17 @@
+{
+  "$comment": "D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE (P69 fold 3e, lane `xa`, class C's N3; renamed from entry_main_apple_refused_off_darwin): Darwin's four-parameter `int main(int, char**, char**, char**)` built for the ELF and pe formats is the program's ENTRY, called with the richest row those formats realize (`argc-argv-envp`), and WARNED at main's declarator (S_EntryShapeNotDeclared). MEASURED 2026-09-24: clang 18.1.3 rejects the form on x86_64 Linux, gcc 13.3.0 accepts it with -Wmain (glibc leaves garbage in the fourth parameter), MSVC 19.51 compiles it (garbage there too). DECIDED in fold 3e by the rule of `int main(int, double)`, which gcc and MSVC link and run (MEASURED, d131): the rows that count on a format are the ones it realizes; the program reads no fourth value and runs to 7. Mach-O realizes the four-value verb, so its witness stays examples/c/entry_main_envp_apple. RED-ON-DISABLE: add \"argc-argv-envp-apple\" to elf64-x86_64-linux-exec's `entryVerbs` -> refused at FORMAT LOAD (the stack-vector mechanism produces at most three values); drop the richest-row stamp -> K_ProgramEntryUndefined on every target.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 7,
+  "expectWarnings": [
+    { "code": "S_EntryShapeNotDeclared", "line": 26, "col": 5 }
+  ],
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": false }
+  ]
+}

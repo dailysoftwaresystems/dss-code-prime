@@ -40,6 +40,7 @@
 #include "lsp_test_helpers.hpp"
 #include "program/program.hpp"
 #include "scratch_dir.hpp"
+#include "driver_diagnostics_listener.hpp"   // AskedDriverCodes
 
 #include <nlohmann/json.hpp>
 
@@ -240,6 +241,7 @@ TEST(LspWorkspaceBuildAgreement, PeWorkspaceAcceptsWindowsHeaderSpelledAnyCase) 
 }
 
 TEST(LspWorkspaceBuildAgreement, ElfWorkspaceRefusesStdioHeaderSpelledWrongCase) {
+    dss::test_support::AskedDriverCodes const asked{dss::DiagnosticCode::F_ShippedHeaderNotFound};   // the refused header IS the subject, for the build and the editor
     OneFileWorkspace ws{"lsp-wba-elf-stdio",
                         "#include <Stdio.h>\nint main(void) { puts(\"r\"); return 0; }\n",
                         {std::string{kElf}}};
@@ -302,6 +304,7 @@ TEST(LspWorkspaceBuildAgreement, LongDoubleAndSizeofFoldPerPair) {
 // rule clangd uses (`Candidates.front()`) would accept `<Windows.h>` here under
 // pe64 while the elf build fails — and must say WHICH pair refused.
 TEST(LspWorkspaceBuildAgreement, EveryPairIsCheckedAndTheRefusingPairIsNamed) {
+    dss::test_support::AskedDriverCodes const asked{dss::DiagnosticCode::F_ShippedHeaderNotFound};   // the refused header IS the subject, for the build and the editor
     OneFileWorkspace ws{"lsp-wba-multi",
                         "#include <Windows.h>\nint main(void) { return 0; }\n",
                         {std::string{kPe64}, std::string{kElf}}};
@@ -326,6 +329,7 @@ TEST(LspWorkspaceBuildAgreement, EveryPairIsCheckedAndTheRefusingPairIsNamed) {
 // `sources[]` expansion — not under every manifest in the folder, which would
 // refuse `a.c` for an elf pair no build compiles it for.
 TEST(LspWorkspaceBuildAgreement, AFileIsCheckedUnderTheManifestsThatListIt) {
+    dss::test_support::AskedDriverCodes const asked{dss::DiagnosticCode::F_ShippedHeaderNotFound};   // the refused header IS the subject, for the build and the editor
     dss::test_support::ScratchDir scratch{dss::test_support::Location::InsideRepo,
                                           "lsp-wba-membership"};
     auto const a = scratch.path() / "a.c";

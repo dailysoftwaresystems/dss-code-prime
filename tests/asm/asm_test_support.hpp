@@ -282,10 +282,12 @@ roundTripVerify(TargetSchema const&            schema,
             // oracle reporting SUCCESS on an instruction it never verified.
             // They are distinguished from the drift arm above because they are
             // not "an encoder consumer that has not landed yet": both are
-            // CONSUMED by `materializeCallingConvention` before the encoder is
-            // ever reached (`ByValueStackAgg` becomes an overflow-area byte
-            // copy; `SpillSlotRef` becomes a `frame_load` into the ABI arg
-            // register), so reaching an ENCODER-OUTPUT oracle means a pass
+            // CONSUMED before the encoder is ever reached (`ByValueStackAgg` by
+            // `lowerWideCallArgs`, which copies the aggregate into its outgoing
+            // bytes before allocation — the LIR verifier's stage rule;
+            // `SpillSlotRef` by `materializeCallingConvention`, as a
+            // `frame_load` into the ABI arg register), so reaching an
+            // ENCODER-OUTPUT oracle means a pass
             // LEAKED one into the final instruction stream. The encoder has no
             // slot semantics for either, so any `expected` invented here would
             // be fiction — refuse instead.
@@ -296,7 +298,7 @@ roundTripVerify(TargetSchema const&            schema,
                        std::format("round-trip: opcode '{}' wire {} carries "
                                    "pass-internal LirOperandKind ordinal {} "
                                    "({}) — this marker must be CONSUMED by "
-                                   "the callconv pass before encoding; "
+                                   "a pass before encoding; "
                                    "reaching the encoder means a pass leaked "
                                    "it into the final inst stream",
                                    info->mnemonic, wire.index,

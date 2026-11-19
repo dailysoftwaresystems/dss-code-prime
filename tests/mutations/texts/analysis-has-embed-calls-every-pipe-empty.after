@@ -1,0 +1,1 @@
+            return size->pipe ? 0 : size->bytes;

@@ -11,8 +11,8 @@
 //
 // THE STATIC-INITIALIZER SCHEDULE, TURNED INTO AN ORDER.
 //
-// A module arrives carrying `AssembledModule::staticInitSchedule` — an unordered
-// set of (function symbol, priority-per-channel) facts the front end folded from
+// A module arrives carrying `AssembledModule::staticInitSchedule` — a list, in
+// definition order, of (function symbol, priority-per-channel) facts the front end folded from
 // `__attribute__((constructor))` / `((destructor))`. Which one runs first is a
 // WHOLE-PROGRAM question: the answer depends on every translation unit at once,
 // so it is computed once, at the only tier that has them all.
@@ -26,11 +26,29 @@
 // that same sequence walked BACKWARD. So there is ONE `staticInitOrder` and the
 // phase decides how it is consumed — never two orderings that can drift apart.
 //
-// ⚠⚠ ORDER AMONG EQUAL PRIORITIES IS NOT PORTABLE AND IS NOT PROMISED. ✔MEASURED:
-// two bare same-priority constructors run 1,2 under Linux gcc and clang and 2,1
-// under mingw-w64 gcc. DSS therefore breaks ties by merged SymbolId — DETERMINISM
-// is the contract (the same input must give the same image), not agreement with
-// any one reference, and no test may assert a sequence for equal priorities.
+// ★★ EQUAL PRIORITIES RUN IN THE UNITS' INPUT ORDER, THEN EACH UNIT'S DEFINITION
+// ORDER -- ONE RULE FOR EVERY FORMAT (P69 fold f26d; the coordinator's decision,
+// which the operator may veto). The schedule carries that order already: a unit
+// states its constructors as it defines them (HIR->MIR adds each function as it
+// lowers it, MIR->LIR one entry per function in that order), an object reader as
+// its table lists them, and the link's merge appends the units' schedules in input
+// order -- so a tie keeps its place (a STABLE sort, no SymbolId read).
+//   * DOCUMENTED: no vendor documents a tie -- GCC and Clang state only that a
+//     smaller priority runs first, Microsoft only the alphabetical merge of the
+//     `.CRT$` subsections -- so any deterministic order conforms.
+//   * MEASURED (probe-reference-cc, runs 20261116-201121-47a61e0c and
+//     20261116-201510-1d84face): this is the order of cl 19.52 + link.exe
+//     (`.CRT$XCU`; DSS's PE runtime is UCRT, cl's), clang 18 on ELF and Apple
+//     clang 21 on Mach-O in every cell, and gcc 13.3 on ELF at the default
+//     priority.
+//   * THE REFUSAL COST: MinGW-w64 gcc 13.2 on PE runs the exact reverse (its
+//     runtime's `.ctors` walk, which DSS does not ship; cl disagrees on the same
+//     format), and gcc 13.3 on ELF with an EXPLICIT equal priority runs
+//     first-DECLARATION order, where clang on the same format runs definition order.
+// Until this fold a tie was broken by SymbolId: first-DECLARATION order within a
+// unit (its front end numbers at the first declaration), and across units the
+// merged id, minted in the hash order of names -- an order that differed by the
+// standard library that built DSS.
 //
 // ⓘ THERE IS DELIBERATELY NO EMITTED TABLE HERE, AND THAT REFUTES THE OBVIOUS
 // DESIGN. `.init_array` / `__mod_init_func` / `.CRT$XCU` are how a program tells

@@ -22,6 +22,8 @@
 //
 // Runs natively on the x86_64-Linux CI leg.
 
+#include <stdarg.h>
+
 struct LL { long a; long b; };   // 16B -> InRegisters (2 GPR)
 
 long combine(int n, ...) {

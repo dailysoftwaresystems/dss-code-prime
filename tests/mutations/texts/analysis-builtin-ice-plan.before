@@ -1,0 +1,2 @@
+            -> std::optional<CstBuiltinCall> {
+            return builtinCallPlan(s, *cfg, tree, node, fromScope);

@@ -1,14 +1,19 @@
 #pragma once
 
 // Declaration mutability side-table value. Attached per-node via
-// `HirAttribute<MutabilityAttr>` to a NATIVE declaration HIR node (Global) that
-// carried a source-level CONST qualifier — C `const int g = 5;` → `isConst =
-// true`. Populated by CST→HIR lowering from the bound symbol's
-// `SymbolRecord.isConst` (set by the semantic phase from the language's
-// `constMarker` token); read at HIR→MIR lowering and stamped onto the
-// `MirGlobal.isConst` bit, which the assembler's section-selection
+// `HirAttribute<MutabilityAttr>` to a NATIVE declaration HIR node (a Global, a
+// block-scope VarDecl, a static UnnamedObject) that carried a source-level CONST
+// qualifier — C `const int g = 5;` → `isConst = true`. Populated by CST→HIR
+// lowering from the bound symbol's `SymbolRecord.isConst` (set by the semantic
+// phase from the language's `constMarker` token). Two readers at HIR→MIR
+// lowering: a Global's (and a static unnamed object's) bit is stamped onto
+// `MirGlobal.isConst`, which the assembler's section-selection
 // (`lowerMirGlobalsToDataItems`) consults to route an initialized global to
-// read-only `.rodata` (const) vs writable `.data` (mutable).
+// read-only `.rodata` (const) vs writable `.data` (mutable); and ANY node's bit
+// decides whether a static initializer may READ that object's value (the
+// language's `constObjectRead` form — P69, lane `cs`, for a block-scope object:
+// D-C-A-BLOCK-SCOPE-CONST-OBJECTS-VALUE-IN-A-STATIC-INITIALIZER-IS-REFUSED). A
+// VarDecl is never PLACED by this bit — it stays a stack slot.
 //
 // Deliberately distinct from `LinkageAttr` (binding/visibility): const-ness is
 // NOT linkage — a `static const` global is BOTH internally-bound AND read-only,

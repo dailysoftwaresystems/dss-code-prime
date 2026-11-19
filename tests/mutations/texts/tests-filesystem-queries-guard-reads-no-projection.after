@@ -1,0 +1,1 @@
+        for (auto const form : {&Scanner::qualified, &Scanner::member, &Scanner::option}) {

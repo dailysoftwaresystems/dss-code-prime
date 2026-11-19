@@ -16,6 +16,7 @@
 #include "link/object_format_schema.hpp"
 #include "scratch_dir.hpp"
 #include "shipped_schema_or_throw.hpp"
+#include "driver_diagnostics_listener.hpp"   // AskedDriverCodes
 
 #include <gtest/gtest.h>
 
@@ -27,6 +28,7 @@
 #include <string>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -141,6 +143,7 @@ TEST(CompilationUnit, BuildSingleTreeMatchesContract) {
 // `compilation_unit.cpp::parseAndAdd_`, or drop the
 // `establishResultContract(...)` call from `preprocess()`'s single exit.
 TEST(CompilationUnit, TFC115CollidingPredefineDiagnosesInsteadOfCrashing) {
+    dss::test_support::AskedDriverCodes const asked{dss::DiagnosticCode::C_ConflictingPredefinedMacro};   // the colliding predefine IS the subject
     auto loaded = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(loaded.has_value());
     std::shared_ptr<GrammarSchema const> schema = *loaded;
@@ -188,6 +191,7 @@ TEST(CompilationUnit, TFC115CollidingPredefineDiagnosesInsteadOfCrashing) {
 // silently ignore the user's macros. RED-ON-DISABLE: drop the guard in
 // parseAndAdd_'s non-preprocess arm → zero driver diagnostics → this fails.
 TEST(CompilationUnit, UserDefinesWithoutPreprocessBlockFailLoud) {
+    dss::test_support::AskedDriverCodes const asked{dss::DiagnosticCode::D_DefineRequiresPreprocess};   // the refused define IS the subject
     auto schema = loadToySchema();
     UnitBuilder b{schema, DiagnosticBudget::libraryDefault()};
     b.setUserDefines({"FOO=1"});
@@ -475,6 +479,7 @@ TEST(CompilationUnitCU2, AddFileReadsParsesAndAdds) {
 }
 
 TEST(CompilationUnitCU2, AddFileMissingEmitsFileNotFoundAndContinues) {
+    dss::test_support::AskedDriverCodes const asked{dss::DiagnosticCode::D_FileNotFound};   // the missing file IS the subject
     auto schema = loadToySchema();
     UnitBuilder b{schema, DiagnosticBudget::libraryDefault()};
     b.addFile("definitely/does/not/exist_a8f3.toy");   // → D_FileNotFound, skip
@@ -657,4 +662,62 @@ TEST(CompilationUnitPPGate, UnresolvedIncludeStillParsesRestOfFile) {
     EXPECT_TRUE(sawFunc)
         << "a recoverable PP error must NOT gate the parse — the rest of "
            "the file must still parse";
+}
+
+// ── THE UNIT'S OWN STREAMS AND ITS OWN VERDICT: ONE HOME ─────────────────────────
+// `forEachOwnDiagnosticStream` is the one place a channel learns which streams a
+// unit carries and whether any carried an Error — the build's drain, the FFI
+// header reader and the editor all read through it. The second tree is where a
+// reader of `trees()[0]` alone goes blind, so every row has two trees.
+namespace {
+struct OwnStreams {
+    std::vector<DiagnosticReporter const*> seen;
+    bool                                   failed = false;
+};
+[[nodiscard]] OwnStreams ownStreamsOf(CompilationUnit const& cu) {
+    OwnStreams o;
+    o.failed = cu.forEachOwnDiagnosticStream(
+        [&o](DiagnosticReporter const& s) { o.seen.push_back(&s); });
+    return o;
+}
+[[nodiscard]] CompilationUnit twoTreeUnit(std::string first, std::string second) {
+    UnitBuilder b{dss::test_support::shippedSchemaOrThrow("c"),
+                  DiagnosticBudget::libraryDefault()};
+    b.addInMemory(std::move(first), "<first>");
+    b.addInMemory(std::move(second), "<second>");
+    return std::move(b).finish();
+}
+} // namespace
+
+TEST(CompilationUnit, AUnitsOwnStreamsAreTheDriversThenEveryTreesWithTheirVerdict) {
+    // A syntax error the parser recovers from, on the SECOND tree only.
+    auto const cu = twoTreeUnit("int ok(void) { return 0; }\n",
+                                "int broken(void) { return 1 + ; }\n");
+    ASSERT_EQ(cu.trees().size(), 2u);
+    ASSERT_FALSE(cu.trees()[0].diagnostics().hasErrors());
+    ASSERT_TRUE(cu.trees()[1].diagnostics().hasErrors());
+    auto const o = ownStreamsOf(cu);
+    ASSERT_EQ(o.seen.size(), 3u) << "the driver's stream, then one per tree";
+    EXPECT_EQ(o.seen[0], &cu.driverDiagnostics());
+    EXPECT_EQ(o.seen[1], &cu.trees()[0].diagnostics());
+    EXPECT_EQ(o.seen[2], &cu.trees()[1].diagnostics());
+    EXPECT_TRUE(o.failed) << "the second tree's error is the unit's own";
+}
+
+TEST(CompilationUnit, AUnitWithNoErrorOfItsOwnSaysSo) {
+    auto const cu = twoTreeUnit("int a(void) { return 0; }\n",
+                                "int b(void) { return 1; }\n");
+    auto const o = ownStreamsOf(cu);
+    EXPECT_EQ(o.seen.size(), 3u);
+    EXPECT_FALSE(o.failed);
+}
+
+TEST(CompilationUnit, ADriverErrorAloneFailsTheUnit) {
+    dss::test_support::AskedDriverCodes const asked{DiagnosticCode::F_ShippedHeaderNotFound};
+    auto const cu = twoTreeUnit("int a(void) { return 0; }\n",
+                                "#include <zz_no_such_shipped_header.h>\nint b(void) { return 1; }\n");
+    ASSERT_TRUE(cu.driverDiagnostics().hasErrors());
+    for (Tree const& t : cu.trees()) ASSERT_FALSE(t.diagnostics().hasErrors());
+    auto const o = ownStreamsOf(cu);
+    EXPECT_TRUE(o.failed) << "an include no directory resolves is the unit's own error";
 }

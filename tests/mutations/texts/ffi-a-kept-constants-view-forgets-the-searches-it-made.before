@@ -1,0 +1,6 @@
+            reads->noteSearch(DescriptorSearchRecord{std::string{filename},
+                                                     {dirs.begin(), dirs.end()},
+                                                     spellingsOf(dirs),
+                                                     matching,
+                                                     found.status,
+                                                     searchAnswer(found)});

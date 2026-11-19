@@ -1,0 +1,3 @@
+                elements = elementsOf(inner);
+            }
+            return;   // `{}` at some level: the zero value

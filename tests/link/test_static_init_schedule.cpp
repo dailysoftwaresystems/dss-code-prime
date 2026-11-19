@@ -87,11 +87,13 @@ makeElfExecFormat(std::string const& staticInitBlock) {
       "entryPoint": "",
       "externCallDispatch": "direct-plt",
       "elf": {
+        "dynamicRelocationTypes": {"globDat": 6, "jumpSlot": 7, "relative": 8},
         "class": "elf64", "data": "lsb", "osabi": "sysv", "machine": 62,
         "type": "exec", "pageAlign": 4096,
         "interpreter": "/lib64/ld-linux-x86-64.so.2", "bindNow": true
       },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "jumped",
       "entryVerbs": ["none","argc-argv"],
       "processExit": {
         "mechanism": "syscall",
@@ -201,29 +203,55 @@ TEST(StaticInitSchedule, AChannelOnlyOrdersTheDeclarationsThatJoinedIt) {
               (std::vector<std::uint32_t>{2}));
 }
 
-// ⚠⚠ EQUAL PRIORITIES ARE ORDERED DETERMINISTICALLY, AND THIS PIN ASSERTS
-// DETERMINISM RATHER THAN A PARTICULAR SEQUENCE. ✔MEASURED: two bare
-// same-priority constructors run 1,2 under Linux gcc and clang and 2,1 under
-// mingw-w64 gcc — the references DISAGREE, so DSS owes no specific order and a
-// test that demanded one would be asserting a fact nobody honours. What DSS does
-// owe is the same answer twice for the same input, which a hash-order or
-// address-order tie-break would not give.
-TEST(StaticInitSchedule, EqualPrioritiesAreBrokenDeterministically) {
+// ★★ EQUAL PRIORITIES KEEP THE SCHEDULE'S ORDER, WHICH IS THE DEFINITION ORDER
+// (the decision and its measurement are in `link/static_init_tables.hpp`): a
+// unit states its constructors as it defines them and the link's merge appends
+// the units in input order, so a tie is settled by the schedule's position and
+// never by a SymbolId. The ids below run AGAINST the schedule (40, 20, 30), so a
+// tie broken by id reads 20 30 40 and this pin goes red; the same input asked
+// twice gives the same answer.
+TEST(StaticInitSchedule, EqualPrioritiesRunInTheScheduleOrderWhichIsTheDefinitionOrder) {
     auto const a = scheduleOnly({
         LirStaticInitEntry{SymbolId{40}, before(101)},
         LirStaticInitEntry{SymbolId{20}, before(101)},
         LirStaticInitEntry{SymbolId{30}, before(101)},
     });
+    auto const oa = symbolsOf(staticInitOrder(a, StaticInitPhase::BeforeEntry));
+    EXPECT_EQ(oa, (std::vector<std::uint32_t>{40, 20, 30}))
+        << "a tie keeps its place in the schedule -- no SymbolId is read";
+    EXPECT_EQ(oa, symbolsOf(staticInitOrder(a, StaticInitPhase::BeforeEntry)))
+        << "the same input gives the same answer";
+    EXPECT_EQ(symbolsOf(staticInitOrder(a, StaticInitPhase::AfterEntry)),
+              (std::vector<std::uint32_t>{}))
+        << "a channel nobody joined stays empty";
+
+    // A schedule order that is NOT the id order, the opposite direction.
     auto const b = scheduleOnly({
         LirStaticInitEntry{SymbolId{30}, before(101)},
         LirStaticInitEntry{SymbolId{40}, before(101)},
         LirStaticInitEntry{SymbolId{20}, before(101)},
     });
-    auto const oa = symbolsOf(staticInitOrder(a, StaticInitPhase::BeforeEntry));
-    EXPECT_EQ(oa, symbolsOf(staticInitOrder(b, StaticInitPhase::BeforeEntry)))
-        << "the same set must order identically however it was collected";
-    EXPECT_EQ(oa, (std::vector<std::uint32_t>{20, 30, 40}))
-        << "…by merged SymbolId, which is the one stable key at this tier";
+    EXPECT_EQ(symbolsOf(staticInitOrder(b, StaticInitPhase::BeforeEntry)),
+              (std::vector<std::uint32_t>{30, 40, 20}));
+}
+
+// Priorities still decide first, and only a TIE keeps the schedule's order: the
+// two priorities interleaved in the schedule come out grouped, each group in its
+// schedule order -- and the after-entry channel is that sequence walked backward.
+TEST(StaticInitSchedule, APriorityDecidesFirstAndOnlyATieKeepsTheScheduleOrder) {
+    auto const m = scheduleOnly({
+        LirStaticInitEntry{SymbolId{40}, before(102)},
+        LirStaticInitEntry{SymbolId{20}, before(101)},
+        LirStaticInitEntry{SymbolId{30}, before(102)},
+        LirStaticInitEntry{SymbolId{10}, before(101)},
+        LirStaticInitEntry{SymbolId{50}, after(101)},
+        LirStaticInitEntry{SymbolId{15}, after(101)},
+        LirStaticInitEntry{SymbolId{35}, after(102)},
+    });
+    EXPECT_EQ(symbolsOf(staticInitOrder(m, StaticInitPhase::BeforeEntry)),
+              (std::vector<std::uint32_t>{20, 10, 40, 30}));
+    EXPECT_EQ(symbolsOf(staticInitOrder(m, StaticInitPhase::AfterEntry)),
+              (std::vector<std::uint32_t>{35, 15, 50}));
 }
 
 // ── the RUNNER ──────────────────────────────────────────────────────────────

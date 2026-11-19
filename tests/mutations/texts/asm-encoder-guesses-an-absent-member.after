@@ -1,0 +1,2 @@
+        if (isUnion && !agg.fields.empty() && agg.unionMember.has_value()) {
+            if (!agg.unionMember.has_value()) {

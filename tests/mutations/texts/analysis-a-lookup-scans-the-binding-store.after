@@ -1,0 +1,1 @@
+    Binding const b = ((void)bindings_.begin(), bindings_[it->second]);

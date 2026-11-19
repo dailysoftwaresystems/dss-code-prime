@@ -35,6 +35,20 @@
 //      marker, and bss padding. The residual may be negative or run past the
 //      atom, and it is exact because every atom keeps its offset;
 //   3. otherwise refuse, saying why.
+//
+// ★★ WHICH TARGETS ARE SECTION-RELATIVE — a section's own symbol is only the
+// shape gas writes. The rule applies to ANY relocation target that is DEFINED
+// in a section and owns no reconstructed body: a section-definition symbol, a
+// size-0 marker, and an INTERIOR LABEL — a block label inside a function. DSS's
+// own COFF and Mach-O writers name every jump-table slot and every `&&label`
+// through such a label (class STATIC type 0 / N_ALT_ENTRY in the code section),
+// and cl.exe names its `$LN` case targets with class LABEL. Each reader decides
+// "defined in a section, and no atom" in its own symbol vocabulary; everything
+// after that decision — the search offset, the atom, the residual — is this
+// file's (D-LINK-OBJECT-READERS-DROP-INTERIOR-SYMBOL-OFFSET: until P69 the COFF
+// reader rebound only section-definition symbols and the Mach-O reader nothing,
+// so a DSS static library holding a dense switch could not be linked into a pe
+// or Mach-O image — `K_SymbolUndefined` once per table slot).
 
 #include "link/object_format_schema.hpp"
 
@@ -44,6 +58,7 @@
 #include <expected>
 #include <span>
 #include <string>
+#include <vector>
 
 namespace dss::link::format {
 
@@ -72,6 +87,37 @@ struct SectionRelativeBinding {
     bool         isFunction = false;  // which of the two `outIdx` indexes
     std::int64_t residual   = 0;      // the addend, from that atom's start
 };
+
+// The atoms one section reconstructed, in the shape the rule reads. Every reader
+// keeps its atoms per section as records carrying `start`, `len` and `outIdx`;
+// `bySection` maps the reader's own section key to a vector of them.
+template <class IntervalsBySection, class SectionKey>
+[[nodiscard]] std::vector<SectionAtomSpan>
+sectionAtomSpans(IntervalsBySection const& bySection, SectionKey key) {
+    std::vector<SectionAtomSpan> spans;
+    if (auto const it = bySection.find(key); it != bySection.end()) {
+        for (auto const& v : it->second) {
+            spans.push_back(SectionAtomSpan{v.start, v.len, v.outIdx});
+        }
+    }
+    return spans;
+}
+
+// The offset that CHOOSES the atom: the reference's target offset in its
+// section, `bindBase` — except for a DATA-section PC-relative SELF-reference (a
+// relative jump table), whose displacement is based at its own table, i.e. at
+// the referencing atom's start, not at the next instruction. Its target is then
+// `bindBase + addendBias - offsetInReferencingAtom`. The residual is still
+// measured from `bindBase` whatever atom is chosen.
+[[nodiscard]] constexpr std::int64_t
+sectionRelativeSearchOffset(std::int64_t bindBase, bool pcRelative,
+                            bool referenceIsInData, std::int64_t addendBias,
+                            std::int64_t offsetInReferencingAtom) noexcept {
+    if (pcRelative && referenceIsInData) {
+        return bindBase + addendBias - offsetInReferencingAtom;
+    }
+    return bindBase;
+}
 
 // `bindBase`: the section offset the reference names (section symbol value +
 // recovered addend). The residual is measured from it, whatever atom is chosen.

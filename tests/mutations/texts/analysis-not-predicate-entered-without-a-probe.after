@@ -1,0 +1,2 @@
+        return schema->typeNameCommitRule(rule).valid()
+            || !schema->followedBy(rule).empty();

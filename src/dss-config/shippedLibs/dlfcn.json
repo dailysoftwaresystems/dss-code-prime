@@ -1,5 +1,6 @@
 {
   "$comment": "Neutral shipped <dlfcn.h> (POSIX) — c16 (SQLite extension loading, sqlite3_load_extension via os_unix unixDlOpen/Sym/Close). dlopen/dlsym/dlclose/dlerror + RTLD_NOW + RTLD_GLOBAL — the two RTLD_ names SQLite spells (✔MEASURED 2026-09-24 over sqlite f544d3599a10's src/, ext/ and generated amalgamation). Verified against glibc bits/dlfcn.h + Darwin dyld/dlfcn.h: the prototypes are IDENTICAL on both. ★ RTLD_GLOBAL DIVERGES per object-format and there is a COLLISION TRAP — 0x100=256 is RTLD_GLOBAL on glibc but RTLD_FIRST on Darwin; 0x8 is RTLD_DEEPBIND on glibc but RTLD_GLOBAL on Darwin — so RTLD_GLOBAL MUST be a per-format `variants` (elf 256 / macho 8), never flat. RTLD_LAZY=1 + RTLD_NOW=2 AGREE → flat. RTLD_LOCAL diverges too (elf 0 / macho 4) → variant (shipped for completeness though SQLite uses NOW|GLOBAL). The dl* symbols: on Linux glibc 2.34+ MERGED libdl into libc.so.6 (the WSL run target is modern glibc) → library elf=libc.so.6; on macOS they're in libSystem (dyld-backed). Gated availableObjectFormats:[elf,macho].",
+  "$rtldHandlesComment": "★ P69 (lane lm): the pseudo-handles `dlsym` takes in place of a library handle, each library's own pointer constant, ✔MEASURED by the references' preprocessors (the macro text and its value at run time). glibc 2.39 (gcc 13.3.0, clang 18.1.3, aarch64-linux-gnu-gcc; run 20261001-001859-4272f01e): RTLD_DEFAULT `((void *) 0)`, RTLD_NEXT `((void *) -1l)` — in EVERY mode measured, -std=c2x and the GNU default alike, with or without _GNU_SOURCE, so glibc 2.39 does NOT gate them behind __USE_GNU. Apple's libSystem (Apple clang 21, arm64 and x86_64; run 20261001-002530-6e4eca44): RTLD_DEFAULT `((void *) -2)`, RTLD_NEXT `((void *) -1)`, and two more, RTLD_SELF `((void *) -3)` and RTLD_MAIN_ONLY `((void *) -5)` — in the default and -std=c2x modes; Apple's <dlfcn.h> hides all four when _POSIX_C_SOURCE is defined without _DARWIN_C_SOURCE (measured). DSS models no feature-test gate, so on Mach-O they are visible in that mode too: an acceptance superset that changes no program's meaning except one defining those names itself. The VALUES differ by format (glibc's RTLD_DEFAULT is the NULL handle; Apple's is -2) — so a per-format variant, never one flat spelling.",
   "header": "dlfcn.h",
   "standard": "posix",
   "availableObjectFormats": ["elf", "macho"],
@@ -9,6 +10,18 @@
     { "name": "dlsym",   "signature": "fn(ptr<void>, ptr<const<char>>) -> ptr<void>", "kind": "function", "linkage": "external" },
     { "name": "dlclose", "signature": "fn(ptr<void>) -> i32",              "kind": "function", "linkage": "external" },
     { "name": "dlerror", "signature": "fn() -> ptr<char>",                 "kind": "function", "linkage": "external" }
+  ],
+  "macros": [
+    { "name": "RTLD_DEFAULT", "variants": [
+      { "when": { "format": "elf" },   "replacement": "((void *) 0)" },
+      { "when": { "format": "macho" }, "replacement": "((void *) -2)" } ] },
+    { "name": "RTLD_NEXT", "variants": [
+      { "when": { "format": "elf" },   "replacement": "((void *) -1l)" },
+      { "when": { "format": "macho" }, "replacement": "((void *) -1)" } ] },
+    { "name": "RTLD_SELF", "availableObjectFormats": ["macho"], "variants": [
+      { "when": { "format": "macho" }, "replacement": "((void *) -3)" } ] },
+    { "name": "RTLD_MAIN_ONLY", "availableObjectFormats": ["macho"], "variants": [
+      { "when": { "format": "macho" }, "replacement": "((void *) -5)" } ] }
   ],
   "constants": [
     { "name": "RTLD_LAZY", "value": 1, "type": "i32" },

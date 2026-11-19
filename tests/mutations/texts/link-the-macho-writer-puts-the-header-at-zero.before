@@ -1,0 +1,2 @@
+            module.imageDefinedSymbols, im.pageZeroSize, symbolVa,
+            "macho::encodeExecDynamic", reporter)) {

@@ -130,7 +130,6 @@ enum class CompilePhase : std::uint8_t {
     PreprocessExpand,  // macro table build + stream expansion + conditional elision
     Tokenize,        // standalone tokenize (languages without a preprocess block)
     Parse,           // first parse of each tree
-    Reparse,         // the type-name-oracle reparse (counted SEPARATELY so its 2x shows)
     ResolveImports,  // per-schema import resolution (both passes)
     Semantic,        // semantic analysis (symbols / types / diagnostics)
     LowerHir,        // CST -> HIR

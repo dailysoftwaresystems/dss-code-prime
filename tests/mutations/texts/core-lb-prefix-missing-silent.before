@@ -1,0 +1,2 @@
+                        coll.emit(DiagnosticCode::C_MissingField, lbPath + "/prefix",
+                                  "'prefix' is required and must be a non-empty string");

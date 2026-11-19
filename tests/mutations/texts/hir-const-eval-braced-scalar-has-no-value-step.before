@@ -1,0 +1,2 @@
+            if (parts != 1) return {};
+            cur = value;

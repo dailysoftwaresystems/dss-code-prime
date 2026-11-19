@@ -71,6 +71,14 @@
 // every leg of the matrix rather than only where its output is used.
 #include "../../src/core/substrate/windows_command_line.hpp"
 
+// THE IMAGE IS STARTED BY THE SUBSTRATE (P69 H6c): the Windows arm hands the image as a VALUE to the substrate's one
+// image start (`substrate::startImageInheriting`), whose form of it is the spawn's own -- never this header's text,
+// which the OS's plain rule resolves to a listed `e.`'s twin, or to nothing past MAX_PATH. Every consumer of this
+// header compiles or links process_spawn.cpp and path_identity.cpp (integrated_tests compiles both and carries src/
+// on its include path), so the rule has no second, header-only home.
+#include "../../src/core/substrate/process_spawn.hpp"
+#include "../../src/core/substrate/path_identity.hpp"
+
 // The suite's wall-clock budget vocabulary — `kRunBudget` (this header's default
 // timeout) and `kAdmissionBudget` are DEFINED there, with the measurements that
 // sized them. Reachable by this bare spelling from every consumer, including
@@ -713,21 +721,23 @@ spawnAndWait(std::filesystem::path const&     binaryPath,
         return out;
     }
 
-    // `lpApplicationName` — the emulator when there is a launcher prefix, else
-    // the binary itself (byte-identical routing to the pre-share code, which
-    // picked `launcherPrefix.front()` or `pathStr`). The binary's wide form
-    // comes straight off the `path`, so it needs no decode at all; the launcher
-    // is a caller-supplied `std::string` and goes through the SAME strict
-    // decoder as the command line, because two wide strings handed to one
-    // `CreateProcessW` call must not be produced by two different widenings.
-    std::wstring appName;
-    if (launcherPrefix.empty()) {
-        appName = binaryPath.wstring();
-    } else if (!::dss::substrate::decodeUtf8ToWide(launcherPrefix.front(),
-                                                   appName, encodeError)) {
-        out.diagnostic = "runBinary: launcher path '" + launcherPrefix.front()
-                       + "' is not valid UTF-8 (" + encodeError + ")";
-        return out;
+    // THE IMAGE — the emulator when there is a launcher prefix, else the binary
+    // itself (byte-identical routing to the pre-share code, which picked
+    // `launcherPrefix.front()` or `pathStr`) — as a VALUE (P69 H6c): the
+    // substrate's image start hands the spawn's own form of it, at any length.
+    // The binary's comes straight off the `path`, so it needs no decode at all;
+    // the launcher is a caller-supplied `std::string` and goes through the SAME
+    // strict decoder as the command line, because two wide strings handed to
+    // one `CreateProcessW` call must not be produced by two different widenings.
+    ::dss::core::HostPath image{binaryPath};
+    if (!launcherPrefix.empty()) {
+        std::wstring launcher;
+        if (!::dss::substrate::decodeUtf8ToWide(launcherPrefix.front(), launcher, encodeError)) {
+            out.diagnostic = "runBinary: launcher path '" + launcherPrefix.front()
+                           + "' is not valid UTF-8 (" + encodeError + ")";
+            return out;
+        }
+        image = ::dss::core::HostPath{std::filesystem::path{launcher}};
     }
 
     // Pipe for capturing child stdout (+ stderr merged). The
@@ -791,26 +801,15 @@ spawnAndWait(std::filesystem::path const&     binaryPath,
     }
     PROCESS_INFORMATION pi{};
 
-    // `lpCommandLine` is WRITTEN THROUGH by CreateProcessW, so it must be a
-    // mutable, NUL-terminated buffer we own — never the `wstring`'s own storage
-    // on a const path. (`appName` / `cmdline` were built at the top of this arm.)
-    std::vector<wchar_t> commandBuffer(cmdline.begin(), cmdline.end());
-    commandBuffer.push_back(L'\0');
+    // THE SUBSTRATE'S ONE IMAGE START (P69 H6c): the image a value, its form the
+    // spawn's own; inheriting handles, no current directory, no environment of
+    // its own -- the call this arm made itself before. (`image` / `cmdline` were
+    // built at the top of this arm.)
+    DWORD const createError =
+        static_cast<DWORD>(::dss::substrate::startImageInheriting(image, cmdline, &si, &pi));
 
-    BOOL const ok = ::CreateProcessW(
-        appName.c_str(),
-        commandBuffer.data(),
-        /*lpProcessAttributes*/ nullptr,
-        /*lpThreadAttributes*/  nullptr,
-        /*bInheritHandles*/     TRUE,
-        /*dwCreationFlags*/     0,
-        /*lpEnvironment*/       nullptr,
-        /*lpCurrentDirectory*/  nullptr,
-        &si,
-        &pi);
-
-    if (!ok) {
-        DWORD const err = ::GetLastError();
+    if (createError != ERROR_SUCCESS) {
+        DWORD const err = createError;
         if (captureStdout) {
             ::CloseHandle(pipeRead);
             ::CloseHandle(pipeWrite);

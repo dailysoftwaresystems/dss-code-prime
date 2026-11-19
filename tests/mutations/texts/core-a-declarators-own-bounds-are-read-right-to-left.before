@@ -1,0 +1,1 @@
+            for (std::size_t i = kids.size(); i-- > 0;) {

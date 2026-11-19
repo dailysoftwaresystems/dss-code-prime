@@ -1,0 +1,2 @@
+                builder.addUnreachable(
+                    static_cast<MirUnreachableKind>(mir.instPayload(term)));

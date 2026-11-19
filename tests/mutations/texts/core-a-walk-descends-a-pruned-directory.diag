@@ -1,0 +1,1 @@
+a, a/b, a/b/c.json, a/skip -- and nothing under the pruned a/skip

@@ -1,0 +1,1 @@
+        bool const hasInitializer = mir_.globalInitLiteralIndex(g) != UINT32_MAX

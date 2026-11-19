@@ -1,0 +1,1 @@
+dss-python selftest: FAILED  configure: a PATH entry inside the App Execution Alias directory is left out of the search after an entry ending in a separator

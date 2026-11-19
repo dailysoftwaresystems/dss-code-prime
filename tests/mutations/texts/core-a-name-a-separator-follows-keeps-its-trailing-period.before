@@ -1,0 +1,1 @@
+        if (component.size() >= 2 && component.back() == C('.') && component[component.size() - 2] != C('.'))

@@ -1,0 +1,1 @@
+                builder.addSwitch(*disc, cases, blockOf.at(succs[0].v));

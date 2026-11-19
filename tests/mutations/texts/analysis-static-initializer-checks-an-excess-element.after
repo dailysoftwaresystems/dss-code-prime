@@ -1,0 +1,2 @@
+        if (placed.kind != initializer_cursor::Placement::Kind::Assign
+            && placed.kind != initializer_cursor::Placement::Kind::Excess) continue;

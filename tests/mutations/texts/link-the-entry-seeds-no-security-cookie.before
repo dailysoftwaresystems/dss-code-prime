@@ -1,0 +1,2 @@
+        LirOperand const cookieOps[] = { LirOperand::makeSymbolRef(cookieInitializer->v) };
+        (void)b.addInst(*callOp, InvalidLirReg, cookieOps);

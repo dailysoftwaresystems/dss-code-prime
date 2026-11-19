@@ -1,0 +1,2 @@
+    // alive sees a descriptor rewritten between two of its operations.
+    // the arm: no snapshot for this parse

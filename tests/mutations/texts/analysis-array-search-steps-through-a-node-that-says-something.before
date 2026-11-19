@@ -1,0 +1,2 @@
+        if (nodeSaysSomethingItself(semCfg, hirCfg, tree, c)) break;
+        auto const inner = internalChildrenOf(tree, c);

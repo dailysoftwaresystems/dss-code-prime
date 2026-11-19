@@ -1,0 +1,1 @@
+    spans = [m.span() for m in marks.finditer(text)]

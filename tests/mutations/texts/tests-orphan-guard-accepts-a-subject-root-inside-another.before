@@ -1,0 +1,1 @@
+                 if r == root or r.startswith(root + "/") or root.startswith(r + "/")]

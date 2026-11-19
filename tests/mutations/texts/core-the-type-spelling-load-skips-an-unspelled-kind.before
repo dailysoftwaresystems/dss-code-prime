@@ -1,0 +1,1 @@
+        if (!out.kind(k).empty() || !refused.insert(k).second) continue;

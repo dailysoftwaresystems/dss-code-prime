@@ -1,0 +1,1 @@
+            out.insert(out.end(), b.sources.begin(), b.sources.end());

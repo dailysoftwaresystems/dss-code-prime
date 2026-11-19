@@ -1,0 +1,2 @@
+                                if (!row.contains("conventions")) {
+                                    if (owns) {

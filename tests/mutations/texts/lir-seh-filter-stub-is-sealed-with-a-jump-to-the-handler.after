@@ -1,0 +1,5 @@
+        emitBr(*opcode(MnemonicSlot::Jmp), lirSucc(succs[0]));
+        return true;
+    }
+
+    bool lowerReturn(MirInstId id) {

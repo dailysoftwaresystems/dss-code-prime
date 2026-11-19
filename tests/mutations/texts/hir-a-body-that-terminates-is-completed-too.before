@@ -1,0 +1,3 @@
+        if (pathTerminates(builder, body)) return body;
+
+        NodeId const end = lastTokenUnder(bodyNode.valid() ? bodyNode : node);

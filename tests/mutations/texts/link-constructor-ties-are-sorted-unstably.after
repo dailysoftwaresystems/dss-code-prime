@@ -1,0 +1,4 @@
+    std::sort(out.begin(), out.end(), [](StaticInitOrderEntry const& a,
+                                         StaticInitOrderEntry const& b) {
+        return a.priority < b.priority;
+    });

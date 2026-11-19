@@ -1,0 +1,1 @@
+            if (e != nullptr && (e->target == "PreInc" || e->target == "PreDec")) {

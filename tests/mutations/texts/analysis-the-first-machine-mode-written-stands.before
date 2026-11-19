@@ -1,0 +1,2 @@
+                out.machineModeClause = clauseNode;
+                out.machineModeRow    = row;

@@ -1,0 +1,2 @@
+        TypeId vt = reprOf(model.braceElementValueTypeFor(core));
+        if (!vt.valid()) vt = semTypeAt(core);

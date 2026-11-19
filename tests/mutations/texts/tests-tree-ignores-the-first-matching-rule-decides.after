@@ -1,0 +1,1 @@
+                return None if rule.negated else rule.text

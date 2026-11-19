@@ -1,16 +1,20 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/attribute_naming.hpp"   // stripDunder (linkageFacetsOfAttribute)
 #include "core/types/constant_form.hpp"   // ConstantForms (StaticInitializerRule)
 #include "core/types/variant_when.hpp"   // WhenSpec — a builtin signature arm's `when`
 #include "core/types/data_model.hpp"
 #include "core/types/entry_shape.hpp"     // EntryFunctionShape (program-entry vocabulary)
 #include "core/types/enum_name_table.hpp"  // EnumNameTable (kDeclarationKindTable)
+#include "core/types/object_format_kind.hpp"   // ObjectFormatKind (AttributeSpelling; a leaf header)
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/core_type.hpp"
+#include "core/types/type_spelling.hpp"   // TypeSpelling (semantics.typeSpelling)
 #include "core/types/type_lattice/type_layout.hpp"  // NonObjectTypeSizes (operand sizes)
 
+#include <algorithm>   // std::lower_bound (LibraryBuiltins::libraryFunctionOf)
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -241,6 +245,45 @@ nameMatchModeFromName(std::string_view s) noexcept {
     return kNameMatchModeTable.fromName(s);
 }
 
+// ── WHAT A VALUE-RETURNING FUNCTION DOES WHEN ITS END IS REACHED ──────────────
+// (D-C-A-NON-VOID-FUNCTION-WHOSE-END-IS-REACHABLE-IS-REFUSED)
+//
+// `semantics.declarations[].nonVoidFunctionEndReached`: the rule a language
+// gives a function that returns a value and whose body can be left without
+// returning one — control reaches the end of the body.
+//   refused                 — such a function is not a program of the language:
+//                             the HIR verifier's return-completeness check
+//                             refuses it. Row 0 and the answer of a document
+//                             that does not state the key: the strict reading
+//                             is what an unstated rule means.
+//   returnsUnspecifiedValue — the function is well-formed. A call that ends
+//                             there returns to its caller, and the value it
+//                             returns is one nothing specifies (C23 6.9.2p13:
+//                             only USING that value is undefined). The
+//                             lowering completes the body and reports the
+//                             function once, as a warning.
+// A function named in `implicitReturnZeroForFunctionNames` is answered by THAT
+// rule first (C's `main` returns 0), so the two never compete for one function.
+enum class NonVoidFunctionEndRule : std::uint8_t {
+    Refused,
+    ReturnsUnspecifiedValue,
+};
+
+inline constexpr EnumNameTable<NonVoidFunctionEndRule, 2> kNonVoidFunctionEndRuleTable{{{
+    { NonVoidFunctionEndRule::Refused,                 "refused"                 },
+    { NonVoidFunctionEndRule::ReturnsUnspecifiedValue, "returnsUnspecifiedValue" },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kNonVoidFunctionEndRuleTable);
+
+[[nodiscard]] constexpr std::string_view
+nonVoidFunctionEndRuleName(NonVoidFunctionEndRule r) noexcept {
+    return kNonVoidFunctionEndRuleTable.name(r);
+}
+[[nodiscard]] constexpr std::optional<NonVoidFunctionEndRule>
+nonVoidFunctionEndRuleFromName(std::string_view s) noexcept {
+    return kNonVoidFunctionEndRuleTable.fromName(s);
+}
+
 // A kind-discriminator facet: lets a single declaration shape decide its
 // effective `kind` at analysis time by inspecting a child sub-rule. Used
 // by grammars (like c's `topLevelDecl`) that factor the common
@@ -406,6 +449,7 @@ struct DSS_EXPORT FieldChildrenDescriptor {
 // `core/types/symbol_attrs.hpp`, included by the .cpp consumers that read VALUES.
 enum class SymbolBinding : std::uint8_t;
 enum class SymbolVisibility : std::uint8_t;
+enum class WeakDefinitionKind : std::uint8_t;
 
 // D-CSUBSET-LINKAGE-SPECIFIERS (pre-OPT7 P1, 2026-06-04): the effect a single
 // declaration-specifier token has on the declared symbol's linkage. A language
@@ -431,6 +475,16 @@ enum class SymbolVisibility : std::uint8_t;
 // scan folds every axis rather than duplicating the prefix walk.
 struct DSS_EXPORT LinkageSpecifierEffect {
     std::optional<SymbolBinding>    binding;
+    // P69 (lane `cs`): WHICH KIND of weak definition a weak binding makes — a default
+    // any other definition of the name replaces (`overridable`: the GNU `weak`
+    // attribute, `#pragma weak`), or one of several interchangeable copies of which
+    // the link keeps one (`select-any`: `selectany` in either spelling). Carried
+    // beside the binding as a second axis, never as a fourth binding value
+    // (`core/types/symbol_attrs.hpp`, `WeakDefinitionKind`). The loader REQUIRES it on
+    // an entry whose `binding` is weak and REFUSES it on any other, so a weak
+    // definition that reaches the lowering always says which it is and the key can
+    // never sit where nothing reads it.
+    std::optional<WeakDefinitionKind> weakKind;
     std::optional<SymbolVisibility> visibility;
     // Block-scope static storage duration (C 6.2.4/6.7.1): the object gets
     // static (module-global) storage, not an automatic stack slot. Folded by
@@ -449,6 +503,17 @@ struct DSS_EXPORT LinkageSpecifierEffect {
     // co-present static's binding/staticStorage (the noreturn
     // linkage-clobber lesson: each axis folds independently).
     bool                            threadStorage = false;
+    // P69 (lane `cs`): WHAT A THREAD-STORAGE REQUEST FROM THIS SPECIFIER DOES WHEN
+    // ANOTHER DECLARATION OF THE SAME OBJECT DOES NOT MAKE IT. False (every entry
+    // that does not say otherwise): the disagreement is the constraint violation C
+    // 6.7.1p3 makes it, and the redeclaration merge refuses it. True (config key
+    // `yieldsOnMismatch`): the request is IGNORED and WARNED, and the object is one
+    // shared object — the answer both toolchains that have the specifier give
+    // (cl's `__declspec(thread)`: `extern __declspec(thread) int e; int e = 1;`
+    // builds on cl and on mingw-w64 gcc, and a second thread's write is seen by
+    // the first on both). Read only beside `threadStorage`; the loader refuses it
+    // anywhere else, so it can never sit where nothing reads it.
+    bool                            threadStorageYieldsOnMismatch = false;
     // D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS (P53): the NON-DEFINING
     // axis — the 5th ORTHOGONAL one. A specifier carrying it declares that the
     // declaration it appears on ANNOUNCES a name whose storage/body lives
@@ -473,6 +538,17 @@ struct DSS_EXPORT LinkageSpecifierEffect {
     // declaration to the extern/import lowering on THIS fact rather than on the
     // rule name. OR-only across a prefix, like the two storage axes.
     bool                            nonDefining = false;
+    // P69 (lane `cs`, fold f26b): the IMPORTED axis — the declaration names a
+    // definition ANOTHER IMAGE holds, read as an import of it (c: cl's and
+    // mingw-w64's `__declspec(dllimport)`, keyed by the clause's qualified name).
+    // Only beside a TRUE `nonDefining` (the loader refuses it anywhere else): an
+    // import is first of all a declaration that defines nothing here. Read by the
+    // semantic tier's record-time attribute scan (→ `SymbolRecord::
+    // isImportedDeclaration`), per DECLARATOR, at every position the declaration's
+    // attributes are read at; what the import may not be (an initializer, internal
+    // linkage, thread storage) and what a redeclaration does to it are the
+    // analyzer's rules, stated there.
+    bool                            imported = false;
     // ★★ C 6.7.1p2 AS CONFIG, NOT AS ENGINE `if`s
     // (D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS, P53). The name of a
     // MUTUAL-EXCLUSION group this specifier belongs to: at most ONE DISTINCT
@@ -972,6 +1048,35 @@ struct DSS_EXPORT DeclaratorConfig {
     std::vector<std::string> arraySuffixModifierTokenNames;   // VLA C4c D-CSUBSET-VLA
     std::vector<std::string> arraySuffixOutermostOnlyTokenNames;   // P68 round 10
     std::string   arrayStarSuffixRuleName;                    // VLA C4c D-CSUBSET-VLA-PARAM-STAR
+    // ★★ P69 (lane `cs`, fold f26c — D-C-A-NAME-USED-BEFORE-ITS-DECLARATION-BINDS-THE-LATER-ONE):
+    // `scopeBeginsAfterDeclarator` — an ordinary identifier's scope begins just after the
+    // completion of its declarator (an enumeration constant's after its enumerator), C 6.2.1p7,
+    // so a USE sees only a declaration written before it, in the order the unit is read; a
+    // binding not yet begun is passed over for the enclosing scope's. Off (the default) ⇒ a
+    // scope's bindings are seen from its start, the language's names order-free (a language
+    // whose declarations may follow their uses: the toy language, the synthetic grammars).
+    bool          scopeBeginsAfterDeclarator = false;
+    // ★ P69 L2b2 (lane `lm`): `emptyDeclarationWarns` — a declaration with NO declarator that
+    // declares no tag and no enumeration constant (`int;`, `T;`, `const T;`, `struct { int a; };`)
+    // declares nothing (C 6.7p2), and the language diagnoses that as a WARNING rather than an
+    // error; either way it lowers to nothing. ✔MEASURED 2026-11-05 (probes l2b2e, l2b2i): gcc
+    // 13.3.0, clang 18.1.3 and Apple clang warn and cl accepts in silence, at file and block scope
+    // and as a for-init. Off (the default) ⇒ an error. An ABSTRACT declarator (`int *;`) is no
+    // empty declaration: every reference refuses it, and `requireNamedDeclarators` keeps it one.
+    bool          emptyDeclarationWarns = false;
+    // ★ P69 (lane `cs`, fold f26e) [[D-C-A-C23-SEQUENCE-AFTER-A-WIDTH-OR-AFTER-A-GNU-RUN-IS-ACCEPTED-OTHERWISE-THAN-THE-REFERENCES]]:
+    // WHERE AN ASM LABEL MAY STAND, read by its one reader (`readAsmLabel`), which refuses
+    // anything else with S_AsmLabelMisplaced. `asmLabelLeadingFunctionOnlyRules`: the runs
+    // that, written BETWEEN a declarator and its label, are taken only on the FIRST declarator
+    // of a declaration that declares a FUNCTION (✔MEASURED, probes n5o and n5t: clang and Apple
+    // clang take `int f(void) __attribute__((unused)) __asm__("g");`, gcc and MinGW-w64 gcc
+    // refuse it, and all four refuse such a run on an object, an array, a pointer to a function
+    // and a later declarator). `asmLabelRefusedOnDefinition`: no label on a function DEFINITION
+    // (all four refuse it; GCC's manual forbids it). Empty / false: nothing is judged. Both keys
+    // need `asmLabelRule` -- the loader refuses either one without it.
+    std::vector<RuleId>      asmLabelLeadingFunctionOnlyRules;
+    std::vector<std::string> asmLabelLeadingFunctionOnlyRuleNames;
+    bool          asmLabelRefusedOnDefinition = false;
 };
 
 // VLA C4c (D-CSUBSET-VLA-PARAM-STAR): is rule `r` a FUNCTION suffix — either the
@@ -1268,11 +1373,31 @@ struct DSS_EXPORT DeclarationRule {
     //       symbol — ld's behavior).
     // false ⇒ the pre-c86 shape: an unabsorbed proto emits nothing and a call to
     // it fails loud at HIR→MIR (H0009 Ref to unbound symbol). Per-declaration
-    // opt-in (c's `topLevelDecl` + `varDecl`), source-agnostic — the
+    // opt-in (c's `topLevelDecl`, `varDecl` and, since P69 fold f26c2, the
+    // typedef-headed block row `identVarDecl`), source-agnostic — the
     // engine reads only this flag, never a rule name. Internal-linkage (`static`)
     // and weak protos never synthesize (their reference must NOT bind another
     // TU's public symbol); they keep the loud H0009. Default false.
     bool            prototypeSynthesizesExtern = false;
+    // ★★ P69 (lane `cs`, fold f26c2 — review-csf26c F9): the row whose linkage
+    // tables this row's ATTRIBUTE SPECIFIERS are folded with (config key
+    // `attributeLinkageTablesFrom`, the rule's name; its index into `declarations`
+    // is resolved once every row is read). A row that skips its attribute
+    // specifiers in its own fold — c's block-scope rows, where an attribute gives
+    // an object no linkage — still owes them a reading PER DECLARATOR: one WITH
+    // linkage (a function declared in a block, C 6.2.2p5) takes its binding and
+    // visibility from them as the `extern` declaration it is, and one WITHOUT may
+    // take no binding from them at all. No index = this row's attribute specifiers
+    // reach no linkage fold.
+    std::string                  attributeLinkageRuleName;
+    std::optional<std::uint32_t> attributeLinkageRow;
+    // ★★ P69 (lane `cs`, fold f26d — review-csf26c2 N5): config `"linkage": "none"` (the
+    // key's only value) — this row's declarators NEVER have linkage (C 6.2.2p6: a
+    // member, a parameter, an enumeration constant, a tag, a typedef name), so no
+    // linkage table reads their attribute specifiers, and an attribute one keys is
+    // ignored there and said (`attributeTableOf` answers `NoLinkage`). Refused at load
+    // beside a table that reads the row's attribute specifiers. Absent ⇒ false.
+    bool                         declaresNoLinkage = false;
     // D-LK10-ENTRY-MAIN-IMPLICIT-RETURN: HIR-tier implicit-return
     // insertion rule (source-agnostic). When this declaration is a
     // FUNCTION declaration AND the declared symbol's name appears
@@ -1286,9 +1411,9 @@ struct DSS_EXPORT DeclarationRule {
     // (Pascal's `program`, Rust's `fn main`, etc.) WITHOUT touching
     // shared HIR substrate. Empty ⇒ no implicit insertion for any
     // function of this declaration form (every non-terminating non-
-    // void function then falls through to the verifier's
-    // checkReturnCompleteness loud-fail, which is the language-
-    // strict default).
+    // void function is then answered by `nonVoidFunctionEndReached`
+    // below, whose default is the verifier's checkReturnCompleteness
+    // loud-fail — the language-strict reading).
     //
     // Both the synthetic ReturnStmt AND a fresh wrapping Block are
     // appended (both flagged `HirFlags::Synthetic`); the original
@@ -1298,13 +1423,21 @@ struct DSS_EXPORT DeclarationRule {
     // built bottom-up immutable). Restricted to integer return
     // types (Bool / I8..I128 / U8..U128 / Char / Byte) so a non-
     // conformant `float main()` or `struct S main()` doesn't get a
-    // silently wrong-typed synthetic return — those fall through
-    // to the verifier's loud-fail. The verifier then sees a
-    // terminating body and downstream MIR/LIR see a defined return
-    // value at the function's exit register — preventing the
-    // "garbage-rax-at-exit" downstream of the runnable-binary
-    // trampoline (D-LK10-ENTRY).
+    // silently wrong-typed synthetic return — those are answered
+    // by `nonVoidFunctionEndReached` like any other function. For a
+    // listed name the verifier then sees a terminating body and
+    // downstream MIR/LIR see a defined return value at the
+    // function's exit register — preventing the "garbage-rax-at-
+    // exit" downstream of the runnable-binary trampoline
+    // (D-LK10-ENTRY).
     std::vector<std::string> implicitReturnZeroForFunctionNames;
+    // What a function of this declaration form does when it returns a value and
+    // control reaches the end of its body — see `NonVoidFunctionEndRule`. Read
+    // by the HIR lowering AFTER the list above has had its say, so a name that
+    // list answers never reaches this rule. The default is the strict one: a
+    // language document that does not state the key keeps the verifier's
+    // refusal.
+    NonVoidFunctionEndRule nonVoidFunctionEndReached = NonVoidFunctionEndRule::Refused;
     // FC5 (D-LK10-ENTRY-MAIN-IMPLICIT-RETURN) + D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE:
     // the program ENTRY declarations — for each name this language spells a
     // program entry with, the SIGNATURES that spelling may have and the
@@ -1338,11 +1471,16 @@ struct DSS_EXPORT DeclarationRule {
     // config declarations IS the conformance documentation artifact.
     //
     // ★ THE PER-DEFINITION CHECK AGAINST THESE ROWS IS A SINGLE-TU FACT WITH A
-    // SPAN and the semantic tier owns it (`S_EntryShapeNotDeclared`): "a function
-    // named `main` is defined here with a signature no declared row for `main`
-    // has". Whole-program facts — "this program defines no entry at all",
-    // "two rival entries are realizable" — are NOT per-definition and live at
-    // entry resolution instead, where every CU is in hand.
+    // SPAN and the semantic tier owns it (`S_EntryShapeNotDeclared`, a WARNING
+    // since P69 fold 3e): "a function named `main` is defined here with a
+    // signature none of the rows the format realizes for `main` has" -- the
+    // definition is entered all the same, with the richest of them, as every
+    // reference's startup calls any `main`; the rows that count are the ones
+    // `realizedEntryNames` (entry_names.hpp) gives for the format, the same
+    // vocabulary entry resolution reads. Whole-program facts — "this program
+    // defines no entry at all", "two rival entries are realizable" — are NOT
+    // per-definition and live at entry resolution instead, where every CU is in
+    // hand.
     //
     // A name legitimately appears on SEVERAL rows: C's `main` is both
     // `fn() -> i32` (verb `none`) and `fn(i32, ptr-ptr-char) -> i32` (verb
@@ -1473,6 +1611,19 @@ struct DSS_EXPORT CallRule {
     // (e.g. c) whose `postfixExpr` is shared across `++`/`--`/`[]`
     // AND call shapes; the call site is the one with `(`.
     std::optional<SchemaTokenId> operatorToken;
+    // P69 (lane `cs`, fold f26c): non-empty ⇒ a call whose callee names NO declaration
+    // in scope at the call declares it implicitly — a function returning this builtin
+    // type (`implicitDeclarationResult`; C: `int`, C90 6.3.2.2), its parameters the
+    // call's arguments after the default argument promotions, warned
+    // (S_ImplicitFunctionDeclaration). Empty ⇒ such a call names an undeclared
+    // identifier.
+    std::string   implicitDeclarationResult;
+    // …except for a callee spelled with one of these prefixes (C: the builtin FAMILIES the
+    // references implement inside the compiler — `__builtin_`, `__atomic_`, `__sync_`,
+    // `__c11_atomic_`): a builtin this implementation does not declare stays undeclared, never
+    // a function the program declared (`__builtin_frame_address`, an unshipped `__atomic_*`
+    // spelling).
+    std::vector<std::string> implicitDeclarationBuiltinPrefixes;
     std::string   ruleName;
 };
 
@@ -1654,6 +1805,59 @@ enum class BuiltinLowering : std::uint16_t {
     // never a fall-through; code the expression still emits lowers into a fresh
     // dead block the unreachable-prune drops.
     Unreachable,
+    // ── P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN): the GNU
+    // builtins DSS's own GNU-dialect predefine routes real code into. Each verb is named for what
+    // it COMPUTES, never for a spelling; the `.lang.json` rows bind spellings to them.
+    // APPENDED, so every earlier ordinal keeps its value (the BuiltinCall payload prints
+    // numerically in `.dsshir` text — the AtomicLoad/Store precedent).
+    //
+    // `FirstArgument`: the call's value is its FIRST operand converted to the result type.
+    // Every operand is still evaluated — they are arguments (C 6.5.2.2) — and the call is
+    // constant when its operands are. `__builtin_expect`, `__builtin_expect_with_probability`
+    // (a branch-probability HINT) and `__builtin_assume_aligned` (an alignment PROMISE): DSS
+    // exploits neither, so what remains of each is its first operand.
+    FirstArgument,
+    // `Parity`: popcount(x) & 1, over the Popcount primitive (`__builtin_parity{,l,ll}`).
+    Parity,
+    // `Trap`: ENDS the block in a DELIBERATE trap — MIR's `Unreachable` terminator marked
+    // `MirUnreachableKind::Trap`, which no transformation may treat as undefined behaviour
+    // the way `__builtin_unreachable`'s `Assumed` one may be.
+    Trap,
+    // `Prefetch`: a cache HINT. The operands are evaluated (their side effects happen) and no
+    // instruction is emitted: no target can declare a prefetch encoding yet (the target
+    // schema has no such row), so the hint is dropped on every target.
+    Prefetch,
+    // `Infinity`: the result type's positive infinity (`__builtin_inf*`, `__builtin_huge_val*`)
+    // — a constant, lowered to a literal before HIR.
+    Infinity,
+    // `QuietNan`: the result type's QUIET NaN whose payload a STRING-LITERAL operand spells
+    // (strtol's syntax — gcc's documented rule), a constant lowered to a literal before HIR.
+    // With any other operand the call is the row's `libraryFallback` function instead.
+    QuietNan,
+    // `Alloca`: `size` bytes of the CALLING function's frame, aligned for any object, live
+    // until it returns — the runtime-sized frame allocation a variable-length array uses,
+    // without the VLA's scope teardown; and it PINS every enclosing VLA scope, whose teardown
+    // would free it.
+    Alloca,
+    // `ObjectSize`: `__builtin_object_size(p, type)` — a COMPILE-TIME answer the semantic tier
+    // computes (the bytes from `p` to the end of the object or subobject it designates, or
+    // the documented unknown answer). Its operands are never evaluated.
+    ObjectSize,
+    // `AddOverflow` / `SubOverflow` / `MulOverflow`: the INFINITE-PRECISION result of the
+    // operation over the two operands' own types, stored modulo the result object's width
+    // through the third operand; the call yields whether the stored value differs from the
+    // infinite-precision one. Lowered to ordinary HIR arithmetic before HIR→MIR.
+    AddOverflow,
+    SubOverflow,
+    MulOverflow,
+    // `AddOverflowP` / `SubOverflowP` / `MulOverflowP` (gcc's `__builtin_*_overflow_p(a, b,
+    // c)`): the same infinite-precision result, cast to the THIRD operand's type — its own,
+    // unpromoted, or a bit-field's precision — and the call yields whether the cast changed
+    // it. Nothing is stored; the third operand's value is never read (its side effects are
+    // evaluated). An integer constant expression when `a` and `b` are.
+    AddOverflowP,
+    SubOverflowP,
+    MulOverflowP,
 };
 
 // ── THE ONE OWNER OF THE `lowering` SPELLINGS ────────────────────────────
@@ -1678,7 +1882,7 @@ enum class BuiltinLowering : std::uint16_t {
 // `enum_name_table.hpp`'s `nameOrEmpty` note describes, so the projection below
 // uses `nameOrEmpty`: an unlisted value renders EMPTY rather than wearing row
 // 0's spelling (`"umulh"`), which is what `name()` would have done.
-inline constexpr EnumNameTable<BuiltinLowering, 38> kBuiltinLoweringTable{{{
+inline constexpr EnumNameTable<BuiltinLowering, 52> kBuiltinLoweringTable{{{
     { BuiltinLowering::UMulHigh,              "umulh"                    },
     // c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS)
     { BuiltinLowering::AtomicCas,             "atomic_cas"               },
@@ -1734,6 +1938,21 @@ inline constexpr EnumNameTable<BuiltinLowering, 38> kBuiltinLoweringTable{{{
     { BuiltinLowering::AtomicFetchAnd,        "atomic_fetch_and"         },
     { BuiltinLowering::AtomicExchange,        "atomic_exchange"          },
     { BuiltinLowering::AtomicCompareExchange, "atomic_compare_exchange"  },
+    // P69 (lane `cs`): the GNU builtins the GNU-dialect predefine routes real code into.
+    { BuiltinLowering::FirstArgument,         "first_argument"           },
+    { BuiltinLowering::Parity,                "parity"                   },
+    { BuiltinLowering::Trap,                  "trap"                     },
+    { BuiltinLowering::Prefetch,              "prefetch"                 },
+    { BuiltinLowering::Infinity,              "infinity"                 },
+    { BuiltinLowering::QuietNan,              "quiet_nan"                },
+    { BuiltinLowering::Alloca,                "alloca"                   },
+    { BuiltinLowering::ObjectSize,            "object_size"              },
+    { BuiltinLowering::AddOverflow,           "add_overflow"             },
+    { BuiltinLowering::SubOverflow,           "sub_overflow"             },
+    { BuiltinLowering::MulOverflow,           "mul_overflow"             },
+    { BuiltinLowering::AddOverflowP,          "add_overflow_p"           },
+    { BuiltinLowering::SubOverflowP,          "sub_overflow_p"           },
+    { BuiltinLowering::MulOverflowP,          "mul_overflow_p"           },
 }}};
 // ★ THE UNDER-FILL GUARD, and for a hand-written table this long it is not
 // ceremony: `EnumNameTable<BuiltinLowering, N>` with N-1 initializers is legal
@@ -1767,6 +1986,24 @@ builtinLoweringFromName(std::string_view name) noexcept {
 [[nodiscard]] inline constexpr std::string_view
 builtinLoweringName(BuiltinLowering lowering) noexcept {
     return kBuiltinLoweringTable.nameOrEmpty(lowering);
+}
+
+// P69 (lane `cs`): the verbs whose CONSTANT form has a precondition the call may not meet,
+// and that are then an ordinary call of a library function instead — the row's
+// `libraryFallback` (`__builtin_nan(s)` with a non-literal `s` calls libm's `nan`, as gcc
+// and clang do). A `libraryFallback` on a row whose verb has no such precondition would be
+// a knob that does nothing, and the loader refuses it there.
+[[nodiscard]] inline constexpr bool
+builtinLoweringHasLibraryFallback(BuiltinLowering lowering) noexcept {
+    return lowering == BuiltinLowering::QuietNan;
+}
+
+// P69 (lane `cs`): the three `_p` checked-arithmetic predicates (`AddOverflowP`…).
+[[nodiscard]] inline constexpr bool
+builtinLoweringIsOverflowPredicate(BuiltinLowering lowering) noexcept {
+    return lowering == BuiltinLowering::AddOverflowP
+        || lowering == BuiltinLowering::SubOverflowP
+        || lowering == BuiltinLowering::MulOverflowP;
 }
 
 // SE6: a built-in function the engine binds into a CU-wide "builtins"
@@ -1889,6 +2126,42 @@ struct DSS_EXPORT BuiltinFunctionMapping {
     // struct above documents. Absent (the default) ⇒ the declared signature binds
     // verbatim, exactly as every pre-existing row does.
     std::optional<BuiltinGenericPointee> genericPointee;
+    // P69 (lane `cs`): OPTIONAL — the C library function a call of this builtin IS when the
+    // verb's constant form does not apply (`builtinLoweringHasLibraryFallback`): the semantic
+    // tier then binds the call to that library function exactly as `__builtin_<name>`
+    // binds a library builtin (`SemanticConfig::libraryBuiltins`). Empty ⇒ none.
+    std::string libraryFallback;
+};
+
+// P69 (lane `cs`, D-CSUBSET-GNUC-PREDEFINE-SELECTS-UNIMPLEMENTED-BUILTIN): GCC's LIBRARY
+// builtins — `<prefix><name>` for each C library function `name` the dialect documents
+// ("Other Built-in Functions Provided by GCC": `__builtin_strlen`, `__builtin_memcpy`,
+// `__builtin_ceil`, `__builtin_printf`, …). A call of one IS a call of the library function:
+// the semantic tier binds the spelling, on its first use in a translation unit, to the
+// function the unit itself declares under that name at file scope, or else to the
+// platform's realization of it (the shipped-descriptor corpus — the realization a bare
+// prototype of the name gets), minted import-only and bound in no scope, so the library
+// name itself stays undeclared. The list is the DIALECT's; whether a platform provides a
+// function is the corpus's, and a use of one it does not provide is refused at the use,
+// naming the function — so `__has_builtin` answers 1 for a listed spelling exactly where
+// the platform provides the function on the active target (P69 review M3), never for the
+// listing alone.
+struct DSS_EXPORT LibraryBuiltins {
+    std::string              prefix;      // `__builtin_`; empty ⇒ the language declares none
+    std::vector<std::string> functions;   // the library names, sorted and unique (load-checked)
+    // The library function `spelled` names, or empty when it names none.
+    [[nodiscard]] std::string_view libraryFunctionOf(std::string_view spelled) const noexcept {
+        if (prefix.empty() || spelled.size() <= prefix.size()
+            || spelled.substr(0, prefix.size()) != prefix)
+            return {};
+        std::string_view const name = spelled.substr(prefix.size());
+        auto const it = std::lower_bound(functions.begin(), functions.end(), name,
+                                         [](std::string const& a, std::string_view b) {
+                                             return std::string_view{a} < b;
+                                         });
+        return (it != functions.end() && std::string_view{*it} == name)
+                   ? std::string_view{*it} : std::string_view{};
+    }
 };
 
 // D5.1: a member-access expression rule. When Pass 2 sees a node with this
@@ -1952,16 +2225,38 @@ struct DSS_EXPORT CastRule {
 // checks). Deliberately a SEPARATE vocabulary from `CastRule`: a
 // compound literal is C 6.5.2.5 postfix syntax, NOT a conversion — no
 // operand child exists and the explicit-cast matrix must never run
-// against the brace-init (the per-element checks live in the HIR
-// brace-init lowering, contextually typed by the stamped type).
+// against the brace-init (each ELEMENT is judged against the subobject it
+// initializes, by the semantic tier's brace-element check since P69, and
+// placed by the HIR brace-init lowering, contextually typed by the
+// stamped type).
 // Pre-sweep only struct-ref type children worked (the struct-name
 // resolution stamped them as a side effect); builtin keywords and
 // typedef names in compound-literal position resolved to NOTHING and
 // the HIR lowering fail-louded.
+//
+// P69 (D-C-A-STORAGE-CLASS-SPECIFIER-IN-A-COMPOUND-LITERAL-IS-A-PARSE-ERROR, C23
+// 6.5.3.6): a row may also name a STORAGE-CLASS SPECIFIER child (`storageChild`) —
+// C23's `( storage-class-specifiers type-name ) braced-initializer`. The standard
+// judges those specifiers "as if" the literal were the definition `SC typeof(T) ID =
+// { IL };` in its own scope (6.5.3.6p4), so the row names the two DECLARATION rows
+// that definition would be — `storageAsFileScopeDeclaration` outside every function
+// body, `storageAsBlockScopeDeclaration` inside one — and the semantic tier reads
+// THEIR `linkageSpecifiers` (the same facets, exclusion groups and exceptions a
+// declaration's own specifier prefix is judged by). A specifier the named row does
+// not map is one that scope's declaration does not admit (C 6.9p2's file-scope
+// `register`). `repeatedStorageSpecifierRefused` states C23 6.5.3.6's footnote 97: a
+// literal naming one storage-class specifier twice violates the constraint, whatever
+// a declaration's own leniency is.
 struct DSS_EXPORT CompoundLiteralRule {
     RuleId        rule{};
     std::uint32_t typeChild = 0;      // visible-child index of the type subtree
     std::string   ruleName;           // source spelling, for diagnostics
+    std::optional<std::uint32_t> storageChild;   // visible-child index of the specifiers
+    RuleId        storageAsFileScopeDeclaration{};
+    std::string   storageAsFileScopeDeclarationName;
+    RuleId        storageAsBlockScopeDeclaration{};
+    std::string   storageAsBlockScopeDeclarationName;
+    bool          repeatedStorageSpecifierRefused = false;
 };
 
 // Identifier-use recognition. The named rule (whose RuleId the loader
@@ -2459,6 +2754,18 @@ struct DSS_EXPORT IntegerLiteralTypingRule {
     // in scope. Absent ⇒ one of the other two shapes.
     std::optional<DataModelTypeRef> fixedType;
     IntegerLiteralOutOfRange        outOfRange = IntegerLiteralOutOfRange::Wrap;
+    // P69 (lane `cs`, D-C-DECIMAL-CONSTANT-PAST-LONG-LONG-IS-REFUSED-WHERE-EVERY-REFERENCE-ACCEPTS-IT):
+    // a LADDER rule's reading of a DECIMAL magnitude past every `decimal` candidate
+    // (`9223372036854775808`, `...L`, `...LL` in C). Present ⇒ the literal is typed as this
+    // type when it holds the magnitude, and the typing REPORTS the reinterpretation
+    // (`IntegerLadderResult::reinterpretedUnsigned`, `PhaseFourLiteral`'s twin), which each
+    // tier turns into a warning: the constant has no type in its own list, a constraint
+    // violation (C 6.4.4p2) whose diagnostic is required. The loader admits it only on a
+    // ladder rule whose every `decimal` candidate is SIGNED, and only an UNSIGNED integer
+    // type at least as wide as each of them, under every data model — so "past the list"
+    // is exactly "reinterpreted as unsigned". Absent ⇒ such a magnitude has no type:
+    // S_IntegerLiteralTooLarge, and phase 4 refuses it too.
+    std::optional<DataModelTypeRef> decimalPastRange;
 };
 
 // ── FC3.5 sweep-c2: float-literal typing (`semantics.floatLiteralTyping`) ──
@@ -2685,7 +2992,10 @@ struct DSS_EXPORT LoopControlRule {
 // unknown verb — a typo can never silently disarm a row).
 //
 // ── DECLARATION-ATTACHED vs. inert (read by the loader's drift cross-check) ──
-// Every verb EXCEPT `None` names an effect on the DECLARED ENTITY, so such an
+// Every verb EXCEPT `None` and the two judged once per attribute SPECIFIER
+// (`CallingConvention`, `Unsupported`: their answer is the same wherever they are
+// written, so they carry no declaration-kind axis) names an effect on the
+// DECLARED ENTITY, so such an
 // attribute must be WRITABLE in a declaration's specifier prefix. `None` names
 // vocabulary that may be statement-attached (`fallthrough`, `likely`) or
 // type-attached (`packed`) and therefore need not be. The loader's
@@ -2854,8 +3164,116 @@ enum class AttributeEffect : std::uint8_t {
     // place that can express it. That is the same posture the config's un-kinded
     // `none` names already take, held for a measured reason rather than a shrug.
     PackField,
+    // P69 (lane `cs`): the declared function or object is a SECOND NAME of a
+    // definition of this unit — the clause's string operand names the target by
+    // its SYMBOL name (an asm label's when it has one, the C identifier's
+    // otherwise: ✔MEASURED, gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc 13.2.0 all
+    // refuse `alias("g")` of a `g` labelled `gg` and accept `alias("gg")`). The
+    // declaration is itself the definition: a body or an initializer beside it, a
+    // second alias of the name and a later definition of it are judged by the
+    // analyzer at the end of the unit, where the target must be defined. Refused by
+    // name on a format whose platform compilers refuse an alias
+    // (`symbolAliasUnsupportedReason`).
+    SymbolAlias,
+    // P69 (lane `cs`): `common` — the tentative definition MAY be a common, which is
+    // what every tentative definition of an external, strong, non-thread-local
+    // object already is on a format whose document states commons: the verb adds
+    // nothing there, wins over a `nocommon` beside it (gcc's reading, warned), and
+    // is refused by name on a format whose document states none, and on a variable
+    // an alias names (a common cannot be equated to a second name: every reference
+    // refuses it).
+    TentativeMayBeCommon,
+    // P69 (lane `cs`): `nocommon` — the tentative definition is a DEFINITION, never
+    // a common (`.bss` storage of this unit). Clears the tentative mark.
+    TentativeNeverCommon,
+    // ★ P69 round 4 (lane `cs`) — TWO VERBS WHOSE ANSWER DOES NOT DEPEND ON WHAT IS
+    // DECLARED, so they carry no kind axis and are judged ONCE PER ATTRIBUTE
+    // SPECIFIER wherever it is written (a declaration, a declarator, a type name, a
+    // pointer level), never inside a declaration's fold.
+    //
+    // `CallingConvention`: the name selects a calling convention — one of the ids in
+    // the row's `conventions`, whichever the ACTIVE TARGET's document knows. The
+    // answer is three-valued and read from the pair being compiled for, never from
+    // an architecture name: the pair's ACTIVE convention ⇒ accepted, no effect,
+    // silent (it states what the call already is — gcc and clang do the same);
+    // ANOTHER convention the target's references emit — a second row of the target,
+    // or an entry of its `unimplementedCallingConventions` ⇒ refused by name (the
+    // call sequence would be the wrong one; ✔MEASURED before this verb: `ms_abi` on
+    // an ELF function was warned as an unknown linkage specifier and the function
+    // called with the SysV sequence); an id the target's document does not know at
+    // all ⇒ the name is a word that target's toolchains do not have, and it takes
+    // the unknown-attribute path they take (`sysv_abi` on arm64 gcc: "attribute
+    // directive ignored").
+    //
+    // `Unsupported`: a KNOWN attribute that changes the declared TYPE and that this
+    // compiler has no mechanism to honour (`vector_size`, `mode`). Refused by name,
+    // with the row's `reason`, at every position — ✔MEASURED before this verb:
+    // `typedef int v4 __attribute__((vector_size(16)));` was warned as unknown and
+    // `sizeof(v4)` was 4 where gcc and clang give 16. A warning beside a wrong size
+    // is still a wrong size.
+    CallingConvention,
+    Unsupported,
+    // ★ P69 (lane `cs`, fold f26c): GNU `mode(M)` — the declared entity's type
+    // REPLACED by the type of the named machine mode, as the row's `machineModes`
+    // table maps it (an integer of N bytes keeping the declared type's signedness,
+    // or the floating type of a format). Applied by ONE substitution
+    // (`machineModeType`) at the two places a declarator's type is formed; a mode
+    // the table does not map, or a type the mode cannot replace, is refused by name.
+    MachineMode,
     None,
 };
+
+// ★ P69 (lane `cs`, fold f26c): ONE row of a `machineMode` effects row's
+// `machineModes` table — the machine-mode names (`QI`, `DI`, `SF`, `word`, …) that
+// select ONE replacement. Exactly one of the two answers is stated:
+//   • an INTEGER mode: `integerBytes` (1, 2, 4, 8, 16), or `pointerWidth` — the
+//     target's pointer width (gcc's `pointer`, `word` and `unwind_word`; ✔MEASURED
+//     8 on every reference for every shipped pair). The replacement keeps the
+//     declared type's signedness (plain `char` by the target's own);
+//   • a FLOATING mode: `floatCore`, the representation the replacement has
+//     (F32 / F64 / F80 / F128); a target with no C floating type of that
+//     representation refuses the mode by name.
+// A name is written WITHOUT surrounding double underscores; the operand is
+// dunder-normalized (`__DI__` ≡ `DI`) before it is looked up.
+struct DSS_EXPORT MachineModeRow {
+    std::vector<std::string> names;
+    std::uint32_t            integerBytes = 0;
+    bool                     pointerWidth = false;
+    TypeKind                 floatCore    = TypeKind::Void;   // Void ⇒ an integer mode
+
+    [[nodiscard]] bool isFloat() const noexcept { return floatCore != TypeKind::Void; }
+};
+
+// Whether a row of this verb ADVERTISES its names — what a program that asks first
+// ("does this implementation have attribute X?", the has-attribute operator) is
+// told. The two verbs judged once per specifier exist so that a name can be
+// REFUSED BY NAME: always (`Unsupported`), or on every pair whose convention the
+// name does not select (`CallingConvention`). They are vocabulary, not capability,
+// and a program that asks before it uses must never be answered into that refusal:
+// its fallback arm is written for exactly the answer "no".
+//
+// The answer of a `CallingConvention` row is the same on every pair because the
+// operator is evaluated where no convention is in scope; on the one pair whose own
+// convention the name selects that costs a program the redundant spelling of what
+// its calls already are, and nothing else.
+[[nodiscard]] constexpr bool attributeEffectAdvertisesItsNames(AttributeEffect e) noexcept {
+    return e != AttributeEffect::Unsupported && e != AttributeEffect::CallingConvention;
+}
+
+// ★ P69 (lane `cs`, fold f26b): WHETHER A LIST OF OBJECT FORMATS ADMITS `format` — the
+// one rule of every row that names the formats it exists for (`availableObjectFormats`
+// of an attribute spelling and of an effects row). An empty list admits every format.
+// With no format in scope a list that names formats admits NONE: the answer is
+// unknown, and "unknown" must never read as "yes".
+[[nodiscard]] inline bool objectFormatListAdmits(std::vector<ObjectFormatKind> const& formats,
+                                                 std::optional<ObjectFormatKind> format) noexcept {
+    if (formats.empty()) return true;
+    if (!format.has_value()) return false;
+    for (ObjectFormatKind f : formats)
+        if (f == *format) return true;
+    return false;
+}
+
 struct DSS_EXPORT AttributeSemanticsRow {
     std::vector<std::string> names;                        // dunder-normalized match set
     AttributeEffect          effect = AttributeEffect::None;
@@ -2900,7 +3318,210 @@ struct DSS_EXPORT AttributeSemanticsRow {
     // the CONFIG (`appliesTo.empty()`), never the verb, and a future verb
     // inherits the gate by being required to declare its kinds.
     std::vector<AttributeAppliesKind> appliesTo;
+    // P69 round 4 (lane `cs`): `CallingConvention` rows only — the ids of the
+    // conventions the name can select, ONE PER TARGET FAMILY that has it, each as a
+    // TARGET document spells it (a row of `callingConventions`, or an entry of
+    // `unimplementedCallingConventions`). A list because the source-level name is
+    // not the convention: `ms_abi` is `ms_x64` on x86_64 and a different sequence,
+    // `ms_arm64`, on arm64. On a pair the analyzer takes the ids the active target
+    // KNOWS (`TargetSchema::callingConventionStanding`); none known ⇒ the name is a
+    // word that target's toolchains do not have. REQUIRED (non-empty) on such a row
+    // and refused on any other; an id no shipped target document knows is refused
+    // by the shipped-configuration guard, never left to match nothing in silence.
+    std::vector<std::string> conventions;
+    // P69 round 4 (lane `cs`): `Unsupported` rows only — WHY the attribute cannot be
+    // honoured, in the language document's own words; it is the second half of the
+    // refusal's text (the first is the attribute's name). REQUIRED on such a row and
+    // refused on any other, so a refusal can never be issued without its reason.
+    std::string reason;
+    // ★★ P69 round 4 (lane `cs`) — WHOSE THE ATTRIBUTE IS WHEN IT IS WRITTEN INSIDE A
+    // DECLARATOR, BESIDE THE DECLARED NAME (`int * __attribute__((X)) p;`, `int
+    // (__attribute__((X)) arr)[2];`). Config key `withinDeclarator`, whose one value
+    // is `"type"`; absent ⇒ false ⇒ the attribute is the DECLARED ENTITY's, exactly as
+    // if it had been written after the declarator.
+    //
+    // It is gcc's own documented rule — "an attribute that only applies to
+    // declarations, applied to the type of a declaration, is treated as applying to
+    // that declaration" — and both references follow it for every such name.
+    // ✔MEASURED (lane `cs`'s probes ta7 and ta8; gcc 13.3.0, clang 18.1.3, Apple
+    // clang): `int * __attribute__((weak)) p = 0, q = 0;` is `V p` / `B q` in `nm`;
+    // `static void * __attribute__((constructor)) init(void)` runs before `main`;
+    // `static int * __attribute__((warn_unused_result)) f(void)` warns at a discarded
+    // call. TRUE marks the rows gcc keeps on the TYPE that position forms instead:
+    // `aligned` (the POINTER is aligned — `struct { char c; int * __attribute__
+    // ((aligned(16))) m, n; }` puts `m` at 16 and the `int` `n` at 24), `packed`
+    // (gcc: "ignored for type 'int *'", and the member stays at 8 — clang packs it;
+    // this compiler takes gcc's layout and warns by name), `unused` and `deprecated`
+    // (silent; gcc does not deprecate a function whose return type's `*` carries it,
+    // clang does).
+    //
+    // It is a property of the NAME, so it lives on the row; the engine reads the
+    // boolean and never a spelling. A name with no row is never a type attribute.
+    bool staysWithTypeInDeclarator = false;
+    // ★★ P69 (lane `cs`) — THE FOUR WAYS ONE `Align` ROW MAY DIFFER FROM ANOTHER.
+    // `Align` rows only (the loader refuses each key on any other verb); every
+    // default is what the verb did before the keys existed, i.e. GNU `aligned`.
+    //
+    // `alignWithoutOperandIsIgnored` (config `withoutOperand: "ignored"`; absent ⇒
+    // false ⇒ a request with no operand asks for the target's largest useful
+    // alignment, GNU's documented meaning of a bare `aligned`): a request with no
+    // operand asks for NOTHING and is warned as ignored — for a spelling in which
+    // no toolchain gives the bare form a meaning, so that the engine does not
+    // invent one.
+    //
+    // `alignOnTypeAliasOnlyRaises` (config `onTypeAlias: "raises"`; absent ⇒ false
+    // ⇒ the alias takes EXACTLY the requested alignment, weaker than natural
+    // included): on a type alias the request can only RAISE the aliased type's
+    // alignment; a smaller one is no request at all. On an object and on a member
+    // every row only raises, so the key has nothing to say there.
+    //
+    // `alignRepeatTakesLast` (config `repeated: "last"`; absent ⇒ false ⇒ of several
+    // requests on one declaration the LARGEST stands): the one written LAST stands,
+    // and each earlier one is warned as discarded.
+    //
+    // `leadingDecoratesDefinitionOf` (config: an array of declaration-row shape
+    // names; absent ⇒ empty): the request, written among a declaration's specifiers
+    // BEFORE a type specifier that DEFINES one of these shapes, aligns THE DEFINED
+    // TYPE (and through it every object of that type), not only the objects that
+    // declaration declares. A tag that is merely referred to, or one defined deeper
+    // inside the body, is not the declaration's own definition and is untouched.
+    bool                     alignWithoutOperandIsIgnored = false;
+    bool                     alignOnTypeAliasOnlyRaises = false;
+    bool                     alignRepeatTakesLast       = false;
+    std::vector<RuleId>      leadingDecoratesDefinitionOf;
+    std::vector<std::string> leadingDecoratesDefinitionOfNames;   // loader diagnostics
+    // P69 (lane `cs`, fold f26b): non-empty ⇒ on a declaration that DEFINES what it
+    // declares (a function with its body, an object with its initializer) the attribute
+    // is refused by name, this text being the reason (`refusedOnDefinition`). Read by
+    // the declaration-kind gate; the loader refuses it on a row with no kind axis.
+    std::string              refusedOnDefinition;
+    // P69 (lane `cs`, fold f26b): non-empty ⇒ on a declaration that is an ALIAS (one
+    // that keeps an `alias` clause) the attribute is ignored, said with this text as
+    // the reason, and its effect is not applied (`ignoredOnAlias`). Read beside
+    // `refusedOnDefinition`, and refused by the loader on a row with no kind axis.
+    std::string              ignoredOnAlias;
+    // P69 (lane `cs`, fold f26c): non-empty ⇒ on an INLINE function definition the
+    // attribute is ignored, said with this text as the reason, and its effect is not
+    // applied (`ignoredOnInlineDefinition`) — where `refusedOnDefinition` would refuse
+    // any other definition. Read beside it, and refused by the loader on a row with no
+    // kind axis.
+    std::string              ignoredOnInlineDefinition;
+    // ★★ P69 (lane `cs`, fold f26d — review-csf26c2 N5): non-empty ⇒ on an OBJECT
+    // declared without linkage (C 6.2.2p6: in a block without `extern`, automatic or
+    // `static`, a for-init declaration) the attribute is refused by name, this text
+    // being the reason (`refusedWithoutLinkage`), on the object formats
+    // `refusedWithoutLinkageOn` lists (sorted, unique; empty ⇒ every format). Anywhere
+    // else — and on every declarator that never has linkage (a row stating
+    // `"linkage": "none"`) — an attribute a linkage table keys is ignored there, and
+    // said. Read by the declaration-kind gate; the loader refuses it on a row whose
+    // names no linkage table keys, which nothing would read.
+    std::string                   refusedWithoutLinkage;
+    std::vector<ObjectFormatKind> refusedWithoutLinkageOn;
+    // ★★ P69 (lane `cs`, fold f26b): non-empty ⇒ the row's names are attribute
+    // vocabulary ONLY for these object formats (`availableObjectFormats`, sorted,
+    // unique). On any other format — and where no format is in scope, so the question
+    // has no answer — a clause naming one is read as if no row named it: an unknown
+    // attribute, warned, conferring nothing, and `__has_attribute` answers 0. A name
+    // is a format's vocabulary when the toolchains of the other formats do not have
+    // it: `dllimport` written in the GNU spelling is imported by mingw-w64 gcc on pe
+    // and warned and ignored by gcc, clang and Apple clang everywhere else (✔MEASURED,
+    // lane `cs` probe di5). Empty (every row before the key) ⇒ every format.
+    std::vector<ObjectFormatKind> availableObjectFormats;
+    // ★ P69 (lane `cs`, fold f26c): the `machineMode` verb's table (required on
+    // that verb, refused on every other). See `MachineModeRow`.
+    std::vector<MachineModeRow> machineModes;
+
+    // Whether the row's names are vocabulary for `format` — the spelling rows' rule:
+    // with no format in scope a row that names its formats is NOT available.
+    [[nodiscard]] bool availableFor(std::optional<ObjectFormatKind> format) const noexcept {
+        return objectFormatListAdmits(availableObjectFormats, format);
+    }
 };
+
+// ★★ P69 (lane `cs`) — ONE SPELLING OF THE ATTRIBUTE-SPECIFIER SHAPE
+// (`attributeSemantics.spellings`): one frame of `attrSpecRule`, identified by the
+// token that opens it. A language with one frame may declare none; then every
+// specifier has no spelling row and reads exactly as it did before rows existed.
+//
+// Nothing in the engine names a spelling. It asks a specifier node for its row
+// (`attributeSpellingOf`, `core/types/decl_prefix_strip.hpp`) and reads three facts:
+//   * `qualifier` — non-empty ⇒ a clause written in this spelling is looked up as
+//     `<qualifier>(<name>)` BEFORE its plain name, in the effects table, in a
+//     declaration row's linkage map and in the by-name ignore list derived from
+//     both. So a name that means something else in this spelling has its own row,
+//     and every name the spellings share needs none;
+//   * `availableObjectFormats` — non-empty ⇒ the spelling exists only for those
+//     object formats; anywhere else (and where no format is in scope, so the
+//     question cannot be answered) a specifier written in it is refused by name;
+//   * `afterCompositeBodyIsTheDeclarations` (config `afterCompositeBody:
+//     "declaration"`; absent or `"type"` ⇒ false) — a specifier written after a
+//     composite's BODY and before the declarators decorates the DECLARED entities,
+//     where the default is the type just defined;
+//   * `standardNamespaces` — ★★ P69 (lane `cs`, fold f26d — review-csf26c2 N5): the
+//     attribute NAMESPACES whose items of the standard form (`stdAttrRule`) are
+//     clauses of this spelling: `[[gnu::weak]]` is the GNU spelling's `weak`, read by
+//     every table and fold that reads that spelling (`standardItemClause`,
+//     core/types/decl_prefix_strip.hpp). Matched dunder-normalized (`__gnu__` is
+//     `gnu`). An item with no namespace, or one no spelling lists, is the standard
+//     form's own attribute. ✔MEASURED (lane `cs` probes n5p, n5q; gcc 13.3.0, clang
+//     18.1.3, Apple clang 21, mingw-w64 gcc 13.2.0, clang-cl): `[[gnu::weak]]`,
+//     `[[__gnu__::weak]]`, `[[gnu::visibility("hidden")]]`, `[[gnu::dllimport]]` and
+//     `[[gnu::selectany]]` confer exactly what their GNU spelling confers at the
+//     declaration's leading sequence and after an identifier declarator; `[[weak]]`
+//     and `[[clang::weak]]` confer nothing anywhere and are warned ignored;
+//   * `impliedClause` — ★ P69 (lane `cs`, fold f26e): non-empty ⇒ the introducer ALONE is
+//     one clause, named this (c's calling-convention keywords: `__vectorcall` is the
+//     clause `vectorcall`), so the keyword is judged exactly as its row is. The loader
+//     refuses one beside a qualifier or claimed namespaces, and one naming no effects row.
+// The introducer of every other declared spelling is never read as a clause name.
+struct DSS_EXPORT AttributeSpelling {
+    SchemaTokenId               introducer{};
+    std::string                 introducerName;   // loader diagnostics
+    std::string                 qualifier;
+    std::vector<ObjectFormatKind> availableObjectFormats;   // sorted, unique
+    bool                        afterCompositeBodyIsTheDeclarations = false;
+    std::vector<std::string>    standardNamespaces;   // dunder-normalized, unique across rows
+    std::string                 impliedClause;        // non-empty: the introducer is this clause
+
+    // Whether the spelling exists for `format`. No format in scope ⇒ false for a
+    // spelling that names its formats: the answer is unknown, and "unknown" must
+    // never read as "yes" (`objectFormatListAdmits`).
+    [[nodiscard]] bool availableFor(std::optional<ObjectFormatKind> format) const noexcept {
+        return objectFormatListAdmits(availableObjectFormats, format);
+    }
+
+    // The name a clause of this spelling is looked up under first: `q(name)`, or
+    // empty when the spelling declares no qualifier.
+    [[nodiscard]] std::string qualified(std::string_view name) const {
+        if (qualifier.empty()) return {};
+        std::string out;
+        out.reserve(qualifier.size() + name.size() + 2);
+        out += qualifier;
+        out += '(';
+        out += name;
+        out += ')';
+        return out;
+    }
+};
+
+// Whether `name` is a QUALIFIED attribute name a clause of some declared spelling
+// can be looked up under: exactly `<qualifier>(<name>)` — one pair of parentheses,
+// the closing one last, a non-empty name between them — with the qualifier one
+// that `spellings` declares. The loader asks it of every table key that carries a
+// parenthesis (an effects-table name, a linkage-map key): one that is not would
+// load clean and match no clause ever written.
+[[nodiscard]] inline bool isQualifiedAttributeName(
+    std::vector<AttributeSpelling> const& spellings, std::string_view name) noexcept {
+    auto const open = name.find('(');
+    if (open == std::string_view::npos || open == 0) return false;
+    if (name.back() != ')' || name.size() <= open + 2) return false;
+    if (name.find('(', open + 1) != std::string_view::npos) return false;
+    if (name.find(')') != name.size() - 1) return false;
+    std::string_view const qualifier = name.substr(0, open);
+    for (AttributeSpelling const& spelling : spellings)
+        if (spelling.qualifier == qualifier) return true;
+    return false;
+}
 
 // Literal token-kind → core TypeKind. Pass 2 reads the token-kind of a
 // matched literal leaf and assigns the corresponding lattice type via
@@ -2952,9 +3573,21 @@ struct DSS_EXPORT LiteralTypeMapping {
 // is not a qualification the rule removes (C 6.2.5p27), and a `void` parameter keeps
 // its skin (see `normalizeSoleVoidParams`). Default false ⇒ a function type carries
 // its parameters' declared types exactly.
+//
+// `emptyListDeclaresNoPrototype` (P69, lane `cs`, fold f26c2) — a function declarator
+// with an EMPTY parameter list on a declaration that is not a definition (`int f();`)
+// declares the function WITHOUT A PROTOTYPE: a call through it passes each argument after
+// the default argument promotions and is typed by them (C 6.5.2.2p6), and a later
+// prototype of it is its composite (C 6.2.7p3). C23 reads `()` as `(void)`; every
+// reference builds the program the older reading allows -- gcc and clang at their default
+// standard, cl at every one (✔MEASURED, lane `cs` probe np2). The home is the analyzer's
+// "a function declared without a prototype" (`callHasNoPrototypeAt`), which the implicit
+// declaration of C90 6.3.2.2 (`extern int name();`) shares. Default false ⇒ `()` declares
+// a prototype of no parameters.
 struct DSS_EXPORT ParametersConfig {
     bool soleVoidMeansEmpty = false;
     bool unqualifiedParameterTypes = false;
+    bool emptyListDeclaresNoPrototype = false;
 };
 
 // ── inline-asm P1 (`semantics.inlineAsm`, D-CSUBSET-INLINE-ASM +
@@ -3244,6 +3877,17 @@ struct DSS_EXPORT SemanticConfig {
     RuleId        sizeofTypeRule{};   std::string sizeofTypeRuleName;
     std::uint32_t sizeofTypeChild = 0;
     RuleId        sizeofValueRule{};  std::string sizeofValueRuleName;
+    // P69 (lane `cs`): what `sizeof` of an ARRAY OF UNKNOWN SIZE yields
+    // (`sizeof.incompleteArraySize`). ISO C makes the operand a constraint violation
+    // (6.5.3.4p1) and gcc 13.3.0 and clang 18.1.3 refuse it; MSVC 19.51 accepts it
+    // and yields 0, its documented warning C4034 (✔MEASURED, probe sz) — and the
+    // disjunction decides acceptance. Present ⇒ the operand folds to this value at
+    // every tier and the analyzer warns `S_SizeofIncompleteArrayIsZero`; nullopt (a
+    // language that states none) ⇒ refused by name, `S_SizeofIncompleteType`. ZERO
+    // is a meaningful value here, unlike `nonObjectTypeSizes`: it is never a stride
+    // (`operandLayout` does not read it — pointer arithmetic on a pointer to an array
+    // of unknown size keeps its refusal).
+    std::optional<std::uint64_t> sizeofIncompleteArraySize;
     // C11/C23 6.5.3.4: `_Alignof`/`alignof` typing. `alignofTypeRule` = the
     // `_Alignof ( type-name )` form; pass 2 resolves + stamps its
     // `alignofTypeChild` castTypeRef child (so the HIR lowering recovers the type
@@ -3290,6 +3934,11 @@ struct DSS_EXPORT SemanticConfig {
     // the language's 6.6p10 constant forms — see `StaticInitializerRule`. nullopt ⇒ the
     // constraint is not checked.
     std::optional<StaticInitializerRule> staticInitializers;
+    // Cycle P69 L2 (lane `lm`): the 6.6p10 forms the language admits in an integer constant
+    // expression, PER POSITION (`semantics.integerConstantExpressions.otherConstantForms`;
+    // `IntegerConstantPosition`, `constant_form.hpp`, says why per position). Undeclared ⇒
+    // empty ⇒ the standard's forms at every position.
+    IntegerConstantForms integerConstantExpressions;
 
     // ── P31: the three GNU compile-time OPERATORS ────────────────────────────
     // All three are OPERATORS, not builtin FUNCTIONS, and the distinction is
@@ -3516,6 +4165,25 @@ struct DSS_EXPORT SemanticConfig {
     RuleId attrSpecRule{};          std::string attrSpecRuleName;
     RuleId stdAttrRule{};           std::string stdAttrRuleName;
     RuleId attrBareStatementRule{}; std::string attrBareStatementRuleName;
+    // P69 round 4 (lane `cs`): the rule that WRAPS an attribute run written AMONG A
+    // TYPE'S SPECIFIERS (`attributeSemantics.specifierRunRule`; c:
+    // `specifierAttrRun`, the run in `unsigned __attribute__((aligned(16))) int`).
+    // It is a ROLE, declared by the language and read by rule id: the readers of a
+    // specifier run skip a child of this rule (`isAttributeRunRule` below), and a
+    // declaration folds its attributes at declaration grain. OPTIONAL — a language
+    // whose specifier runs take no attributes declares nothing, and the id stays
+    // invalid (no node can match it).
+    RuleId attrSpecifierRunRule{};  std::string attrSpecifierRunRuleName;
+    // P69 round 4 (lane `cs`): the rule of a TYPE NAME (`attributeSemantics.
+    // typeNameRule`; c: `castTypeRef`, what a cast, `sizeof`, `_Alignof`, a
+    // `_Generic` association, a compound literal, `typeof`, `va_arg`, `offsetof` and
+    // `alignas` all take). A ROLE, read by rule id, for two readers: an attribute
+    // written in a type name declares nothing, so it is the named TYPE's (an
+    // `aligned` there aligns the type; everything else the table knows changes no
+    // size, alignment or identity in either reference and is not diagnosed); and the
+    // walk that classifies an attribute's position stops at the first such node.
+    // OPTIONAL — invalid ⇒ the language's type names take no attributes.
+    RuleId attrTypeNameRule{};      std::string attrTypeNameRuleName;
     // D-CSUBSET-GNU-ATTRIBUTE-LEADING-ARG-SOUP: the attribute-ARGUMENT group rule
     // (c `attrArgs` — the balanced `( … )` holding one clause's arguments,
     // NESTED arg groups included). `linkageFrom` flags every token reached THROUGH
@@ -3578,6 +4246,11 @@ struct DSS_EXPORT SemanticConfig {
     // silently, which is strictly worse than the parse error it replaced.
     std::vector<SchemaTokenId>      attributeClauseNameTokens;
     std::string                     attributeClauseNameTokenClassName;
+    // P69 (lane `cs`): the spellings of `attrSpecRule` (`attributeSemantics.
+    // spellings`), in document order — see `AttributeSpelling`. EMPTY (a language
+    // that declares none) ⇒ no specifier has a spelling row: no qualified lookup,
+    // no format gate, and the name reader behaves exactly as before the rows existed.
+    std::vector<AttributeSpelling>  attributeSpellings;
     std::vector<AttributeSemanticsRow> attributeEffects;
     // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): the nodiscard DISCARD-CONTEXT rule
     // ids (the `semantics.nodiscard` block). A WarnOnDiscard-flagged call's
@@ -3650,6 +4323,18 @@ struct DSS_EXPORT SemanticConfig {
     std::uint32_t vaStartApChild = 0;
     RuleId        vaEndRule{};        std::string vaEndRuleName;
     std::uint32_t vaEndApChild   = 0;
+    // P69 (lane `cs`, D-C-STDARG-VA-COPY-MISSING): `va_copy(dest, src)` (C 7.16.1.2) —
+    // stamped `void`, both operands type-checked as va_lists. Optional inside the block:
+    // absent, the language has no copy surface; present, both child indices are required.
+    RuleId        vaCopyRule{};       std::string vaCopyRuleName;
+    std::uint32_t vaCopyDestinationChild = 0;
+    std::uint32_t vaCopySourceChild      = 0;
+    // P69 L2b2 (lane `lm`): the spellings the source names the va_list TYPE by with no declaration
+    // of its own (`semantics.variadic.vaListTypeNames`). The analyzer binds each, in its builtin
+    // scope, to the active strategy's list type (`vaListTypes`); the parser's binder sketch knows
+    // each as a type name before the parse. Required, non-empty and distinct with `variadic`. The
+    // strategy's RECORD has no spelling here: no reference binds it by any name.
+    std::vector<std::string> vaListTypeNames;
     // C11/C23 6.7.10 (D-CSUBSET-STATIC-ASSERT): the `_Static_assert`/`static_assert`
     // static-assertion DECLARATION rule. When Pass 2 visits a node of this rule it
     // const-evaluates the FIRST meaningful child (the condition — the `assignmentExpr`
@@ -3727,6 +4412,7 @@ struct DSS_EXPORT SemanticConfig {
     // (D-CSUBSET-COMPOUND-LITERAL-TYPEDEF). See CompoundLiteralRule.
     std::vector<CompoundLiteralRule> compoundLiteralRules;
     std::vector<BuiltinFunctionMapping> builtinFunctions;  // SE6 builtins
+    LibraryBuiltins                     libraryBuiltins;   // P69: `__builtin_<libfn>`
     std::vector<ReturnRule>         returnRules;       // GAP A return-type checking
     // Rules that establish a break/continue-valid context (while/for/do/
     // switch). Bundled rule+ruleName via ScopeRule — same house pattern.
@@ -3779,6 +4465,11 @@ struct DSS_EXPORT SemanticConfig {
     // Absent (nullopt) ⇒ the language has no `_Atomic` qualifier. Source-agnostic: the
     // engine reads THIS, never a hardcoded token name.
     std::optional<SchemaTokenId>    atomicMarker;
+    // P69 fold f26d (lane `cs`, ruling 617): how this language's diagnostics SPELL a
+    // type — read from `semantics.typeSpelling` by the grammar loader, which refuses an
+    // incomplete table; `declared` false = the language's diagnostics name no types.
+    // The ONE renderer over it is `spellType` (core/types/type_spelling.hpp).
+    TypeSpelling                    typeSpelling;
     // P68 round 9 (lane `cs`): the language's `const`- and `restrict`-class qualifier
     // tokens (c: `ConstKeyword`, `RestrictKeyword`). NEITHER IS INTERNED, so both ride
     // the qualifier spine beside a TypeId — a declaration's (the declarator walk, which
@@ -4184,16 +4875,141 @@ struct DSS_EXPORT SemanticConfig {
     // `type_lattice/type_layout.hpp`, next to the `operandLayout` query that is
     // its ONLY consumer.
     //
-    // Read at TWO tiers from this ONE declaration: the semantic const-fold
-    // (`resolveSizeof` / `resolveAlignof` — array dimensions, `_Static_assert`)
-    // and, threaded through `MirLoweringConfig` by `compile_pipeline`, the HIR→MIR
-    // lowering (the `SizeOf`/`AlignOf` cases and `elementStride`). Same shape as
+    // Read at every tier that sizes an operand, from this ONE declaration: the
+    // semantic const-fold (`resolveSizeof` / `resolveAlignof` — array dimensions,
+    // `_Static_assert`); the CST→HIR lowering's own constant evaluator, which
+    // holds this config and folds the same two questions for a condition and an
+    // index designator (`foldLayoutQuery`); and, threaded through
+    // `MirLoweringConfig` by `compile_pipeline`, the HIR→MIR lowering (the
+    // `SizeOf`/`AlignOf` cases and `elementStride`). Same shape as
     // `pointerAliasing.charTypesAliasAll`, which is threaded the same way for the
-    // same reason: one schema fact, two tiers, no second rule to drift.
+    // same reason: one schema fact, no second rule to drift.
     //
     // Defaults to both-absent, so every schema that declares nothing — toy, tsql,
     // the assembly dialects — keeps the strict-ISO refusal byte-for-byte.
     NonObjectTypeSizes nonObjectTypeSizes;
 };
+
+// ★★ P69 round 4 (lane `cs`) — AN ATTRIBUTE SPECIFIER IS NOT PART OF WHAT IT
+// DECORATES, AND EVERY READER ASKS THAT HERE.
+//
+// A reader that walks a type-bearing shape — a specifier run, a pointer layer, a
+// parenthesized declarator, a type name, a tag reference — for a MARKER TOKEN, for
+// "the last identifier", or for "the child at position N" must not find its answer
+// inside an attribute written there. ✔MEASURED before these two predicates existed
+// (gcc 13.3.0, clang 18.1.3 and Apple clang agreeing on every cell): with a
+// `struct aligned { char c[64]; };` in the unit, `struct S __attribute__((aligned(16)))
+// w;` had `sizeof w == 64` — the tag was read from the attribute's clause name, in
+// silence — and without that structure the declaration was refused as naming an
+// incomplete `struct aligned`.
+//
+// The ROLE is the language document's (`attributeSemantics.attrSpecRule`,
+// `stdAttrRule`, `specifierRunRule`); nothing here names a rule. Shared by the
+// semantic tier, the CST→HIR lowering and the parser's binder sketch, because the
+// three read the same shapes and a reader that skipped an attribute in one tier
+// and read it in another would be this defect again with a different symptom.
+//
+// `isAttributeSpecifierRule`: ONE attribute specifier (`__attribute__((…))`,
+// `[[…]]`) — the subtree a scan must be OPAQUE to.
+[[nodiscard]] inline bool
+isAttributeSpecifierRule(SemanticConfig const& cfg, RuleId rule) noexcept {
+    return rule.valid()
+        && ((cfg.attrSpecRule.valid() && rule.v == cfg.attrSpecRule.v)
+            || (cfg.stdAttrRule.valid() && rule.v == cfg.stdAttrRule.v));
+}
+// `isAttributeRunRule`: a child a POSITIONAL reader must not count — one specifier,
+// or the declared wrapper of a run among a type's specifiers.
+[[nodiscard]] inline bool
+isAttributeRunRule(SemanticConfig const& cfg, RuleId rule) noexcept {
+    return isAttributeSpecifierRule(cfg, rule)
+        || (rule.valid() && cfg.attrSpecifierRunRule.valid()
+            && rule.v == cfg.attrSpecifierRunRule.v);
+}
+
+// ★★ THE TOKEN KINDS THAT SPELL AN ATTRIBUTE CLAUSE'S NAME. `cfg.attributeClauseNameTokens`
+// is resolved from `tokenClasses.<clauseNameTokenClass>` — the SAME declaration the
+// `{"tokenClass": …}` grammar slot compiles from — so the parser and every reader of a
+// clause name cannot disagree about what a name is: `__attribute__((__const__))` spells
+// its name with a KEYWORD token, and a reader that looked for `identifierToken` alone
+// would let the clause parse, match no row and DISAPPEAR. The loader refuses a config
+// where only one side moved. EMPTY class ⇒ `identifierToken` alone (every language that
+// declares no class). One definition for the semantic tier and the shared item reader
+// (`standardItemClause`) — P69 fold f26d moved it here from the semantic tier's own copy.
+[[nodiscard]] inline bool isAttrClauseNameToken(SemanticConfig const& cfg,
+                                                SchemaTokenId kind) noexcept {
+    if (!cfg.attributeClauseNameTokens.empty()) {
+        for (SchemaTokenId const k : cfg.attributeClauseNameTokens)
+            if (k.v == kind.v) return true;
+        return false;
+    }
+    return cfg.identifierToken.valid() && kind == cfg.identifierToken;
+}
+
+// ★★★ P69 (lane `cs`, fold f26d — review-csf26c2 N5) — WHICH TABLE READS A ROW'S
+// DECLARATORS' ATTRIBUTE SPECIFIERS, THE ONE ANSWER. Every facet a declarator's
+// attribute specifiers reach — the binding, the visibility, `selectany`, `imported`,
+// thread storage — is decided by the table this names, in EVERY tier that reads a
+// facet: the semantic tier's record-time scan (`declaratorAttributeStorage`: `imported`,
+// a qualified thread request), the lowering's linkage folds (`linkageFrom`,
+// `attributeLinkageOf`: binding, visibility, `selectany`), and which tier judges the
+// row's unknown attribute NAMES (`linkageTierJudgesAttributeNames`: the row's own fold,
+// exactly when the answer is `Own`). Before it, each tier decided for itself: the
+// semantic tier read the row's OWN table, so a typedef-named block head (no table)
+// read `__declspec(dllimport)` with nothing and lowered an import as an automatic
+// object, and a for-init row with a typedef-named head read no table in either tier.
+//   * `Own`       — the row's own fold reads its attribute specifiers: its table is
+//                   non-empty and it does not skip `attrSpecRule`; the table is the row;
+//   * `Borrowed`  — `attributeLinkageTablesFrom`: the named row's table (c's block rows,
+//                   which skip the specifiers in their own fold because an attribute
+//                   gives a block object no linkage, borrow `externDecl`'s);
+//   * `NoLinkage` — `"linkage": "none"`: the declarators never have linkage; no table;
+//   * `Unread`    — none of these: refused at load in a language that declares an
+//                   attribute-specifier rule (its specifiers would be read by nobody).
+enum class AttributeTableAnswer : std::uint8_t { Own, Borrowed, NoLinkage, Unread };
+struct AttributeTableOfRow {
+    AttributeTableAnswer   answer = AttributeTableAnswer::Unread;
+    DeclarationRule const* table  = nullptr;   // `Own` and `Borrowed` only
+};
+[[nodiscard]] inline AttributeTableOfRow
+attributeTableOf(SemanticConfig const& cfg, DeclarationRule const& row) noexcept {
+    if (row.declaresNoLinkage) return {AttributeTableAnswer::NoLinkage, nullptr};
+    if (row.attributeLinkageRow.has_value() && *row.attributeLinkageRow < cfg.declarations.size())
+        return {AttributeTableAnswer::Borrowed, &cfg.declarations[*row.attributeLinkageRow]};
+    if (!row.linkageSpecifiers.empty() && cfg.attrSpecRule.valid()) {
+        bool skipsAttributes = false;
+        for (RuleId r : row.linkageSpecifierIgnoredRules)
+            if (r.v == cfg.attrSpecRule.v) skipsAttributes = true;
+        if (!skipsAttributes) return {AttributeTableAnswer::Own, &row};
+    }
+    return {AttributeTableAnswer::Unread, nullptr};
+}
+
+// ★★ P69 (lane `cs`, fold f26d — review-csf26c2 N5): WHAT THE TABLES THAT READ
+// ATTRIBUTE SPECIFIERS KEY UNDER ONE OF AN ATTRIBUTE ROW'S NAMES — the closed set of
+// linkage attributes, derived from the data (every key of every `Own` table, the
+// tables every other row borrows), never listed. `keyed`: some entry; `linkage`: one
+// that decides a binding or a visibility (the facets a declarator without linkage
+// cannot have; thread storage is a storage duration's, `imported` gives the declarator
+// linkage). Names compared dunder-normalized, a composite key by its base name.
+struct AttributeLinkageFacets {
+    bool keyed   = false;
+    bool linkage = false;
+};
+[[nodiscard]] inline AttributeLinkageFacets
+linkageFacetsOfAttribute(SemanticConfig const& cfg, AttributeSemanticsRow const& attribute) {
+    AttributeLinkageFacets out;
+    for (DeclarationRule const& d : cfg.declarations) {
+        if (attributeTableOf(cfg, d).answer != AttributeTableAnswer::Own) continue;
+        for (auto const& [key, effect] : d.linkageSpecifiers) {
+            std::string_view const base = stripDunder(linkageSpecifierBaseName(key));
+            for (std::string const& name : attribute.names) {
+                if (stripDunder(name) != base) continue;
+                out.keyed = true;
+                if (effect.binding.has_value() || effect.visibility.has_value()) out.linkage = true;
+            }
+        }
+    }
+    return out;
+}
 
 } // namespace dss

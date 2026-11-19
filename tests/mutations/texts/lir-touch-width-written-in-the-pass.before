@@ -1,0 +1,4 @@
+    auto const flags = wholeRegisterAccessFlags(
+        schema, LirRegClass::GPR, "callconv: guard-page touch", reporter);
+    if (!flags.has_value()) return std::nullopt;
+    return ProbeTouch{lirInstWidthBits(*flags) / 8u, *flags};

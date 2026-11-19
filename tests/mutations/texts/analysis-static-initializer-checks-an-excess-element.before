@@ -1,0 +1,1 @@
+        if (placed.kind != initializer_cursor::Placement::Kind::Assign) continue;

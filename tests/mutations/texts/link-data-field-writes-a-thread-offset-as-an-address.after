@@ -1,0 +1,1 @@
+            if (tri->tls && tri->widthBytes == 0) {

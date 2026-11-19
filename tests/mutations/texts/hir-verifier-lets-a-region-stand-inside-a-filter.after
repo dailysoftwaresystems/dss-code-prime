@@ -1,0 +1,2 @@
+                if (false) {
+                    reportAt(reporter, DiagnosticCode::H_SehRegionInsideAFilter, id,

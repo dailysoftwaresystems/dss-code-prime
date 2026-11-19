@@ -207,8 +207,35 @@ TEST(IncompatiblePointerConversion, ASameRepresentationIntegerPointeeKeepsItsOwn
 }
 
 // ── an integer and a pointer, either direction, not a null pointer constant ─
+// EVERY POSITION the assignment constraint reaches, both directions (P69 fold f26e,
+// lane `cs`: the positions the P68 round 9 cases left unpinned are an assignment
+// from a literal and from a non-constant integer, a return of an integer from a
+// pointer-returning function, an argument literal, and an `int` from a pointer).
+// ✔MEASURED 2026-11-17 (lane `cs` probe ip5, object mode, the seven positions and
+// the two controls below as separate units): gcc 15.2, clang and Apple clang REFUSE
+// every position at their default, `-std=c17` and `-std=c2x` (-Wint-conversion is an
+// error since gcc 14 / clang 16; their escape flag makes it a warning); mingw-w64
+// gcc 13.2 WARNS at all three dialects and MSVC 19.52 warns C4047 — both build every
+// one. So the union ACCEPTS, and every reference SAYS something at every position:
+// DSS owes the warning at each, and silence on `int *p = 0;` and `(int *)5`.
 TEST(IncompatiblePointerConversion, AnIntegerAndAPointerConvertWithAWarning) {
     expectAdmittedWith({
+        {"an assignment from a NON-ZERO literal (`p = 5;`)",
+         "int main(void) { int x = 42; int *p = &x; p = 5; return p ? 42 : 0; }\n", kInt, 1},
+        {"an assignment from a non-constant integer (`p = argc;`)",
+         "int main(int argc, char **argv) { (void)argv; int x = 42; int *p = &x; p = argc;\n"
+         "  return p ? 42 : 0; }\n", kInt, 1},
+        {"a return: a NON-ZERO literal from a pointer-returning function",
+         "static int *f(void) { return 5; }\nint main(void) { return f() ? 42 : 0; }\n", kInt, 1},
+        {"an argument: a NON-ZERO literal for `int *`",
+         "static int g(int *q) { return q ? 42 : 0; }\nint main(void) { return g(5); }\n", kInt, 1},
+        {"an `int` object from `int *`",
+         "int main(void) { int x = 42; int *p = &x; int i = p; return i ? 42 : 0; }\n", kInt, 1},
+        {"a return: an `int` from a pointer",
+         "static int *gp;\nstatic int f(void) { return gp; }\nint main(void) { return f() ? 0 : 42; }\n",
+         kInt, 1},
+        {"the control `int *p = (int *)5;` (a cast)",
+         "int main(void) { int *p = (int *)5; return p ? 42 : 0; }\n", kInt, 0},
         {"`int *` from an integer object",
          "int main(void) { int x = 42; long v = (long)&x; int *p = v; return *p; }\n", kInt, 1},
         {"an integer object from `int *`",
@@ -491,4 +518,70 @@ TEST(IncompatiblePointerConversion, TheConfigKeysAreTheSwitch) {
     stale["semantics"]["pointerConversions"]["directCallIntPointeeCompat"] = true;
     EXPECT_FALSE(GrammarSchema::loadFromText(stale.dump(), "<stale-key>").has_value())
         << "`directCallIntPointeeCompat` was retired; a config still naming it must fail loud";
+}
+
+// ── P69 (lane `cs`): a pair the TypeIds call ONE type, and C does not ───────────
+// D-C-GENERIC-MATCHES-FUNCTION-TYPES-DIFFERING-IN-A-POINTEE-CONST's conversions. `const`
+// is not interned, so `int (*)(char *)` / `int (*)(const char *)` and `char **` /
+// `const char **` are one TypeId, and every site of the constraint admitted such a pair
+// in silence. The pointed-to types are incompatible (C 6.7.6.1p2, 6.7.6.3p15), so it is
+// the IncompatiblePointer class at every site. ✔MEASURED (lane `cs`'s probes r4d
+// t11-t14 and r4f, every build RUN): gcc 13.3.0 `-std=c2x` warns on every refusal below
+// and runs it; clang 18.1.3 refuses the function-pointer ones and warns on the others;
+// MSVC 19.51 builds every one (C4090 on some). The controls are silent on all three.
+TEST(IncompatiblePointerConversion, APointeeQualifierTheTypeIdsDoNotCarryIsStillIncompatible) {
+    std::string const fns =
+        "static int f_plain(char *s) { return s[0] == 'x' ? 42 : 1; }\n"
+        "static int f_const(const char *s) { return s[0] == 'x' ? 42 : 2; }\n";
+    auto const with = [&fns](char const* body) { return fns + body; };
+    auto const init = with("int main(void) { int (*p)(const char *) = f_plain; (void)f_const; return p(\"x\"); }\n");
+    auto const viaTypedef = "typedef int F(const char *);\n"
+        + with("int main(void) { F *p = f_plain; (void)f_const; return p(\"x\"); }\n");
+    auto const assign = with("int main(void) { int (*p)(const char *) = f_const; p = f_plain; return p(\"x\"); }\n");
+    auto const reverse = with("int main(void) { int (*p)(char *) = f_const; char b[] = \"x\"; (void)f_plain;\n"
+                              "  return p(b); }\n");
+    auto const arg = with("static int call(int (*p)(const char *)) { return p(\"x\"); }\n"
+                          "int main(void) { (void)f_const; return call(f_plain); }\n");
+    auto const ret = with("static int (*pick(void))(const char *) { return f_plain; }\n"
+                          "int main(void) { (void)f_const; return pick()(\"x\"); }\n");
+    auto const cmp = with("int main(void) { return &f_plain == &f_const ? 1 : 42; }\n");
+    auto const fileScope = with("int (*gp)(const char *) = f_plain;\n"
+                                "int main(void) { (void)f_const; return gp(\"x\"); }\n");
+    expectAdmittedWith({
+        {"t11 an initialization through a function typedef", viaTypedef.c_str(), kPtr, 1},
+        {"an initialization", init.c_str(), kPtr, 1},
+        {"t12 an assignment", assign.c_str(), kPtr, 1},
+        {"t13 the other direction", reverse.c_str(), kPtr, 1},
+        {"v02 an argument", arg.c_str(), kPtr, 1},
+        {"v03 a return", ret.c_str(), kPtr, 1},
+        {"v01 `&f_plain == &f_const`", cmp.c_str(), kPtr, 1},
+        {"a file-scope initializer", fileScope.c_str(), kPtr, 1},
+        {"v06 `const char **` from `char **`",
+         "int main(void) { char *a = \"x\"; char **pp = &a; const char **qq = pp; return qq != 0 ? 42 : 1; }\n",
+         kPtr, 1},
+        {"v05 a `char **` argument into `const char **`",
+         "static int h(const char **p) { return p != 0 ? 42 : 1; }\n"
+         "int main(void) { char *a = \"x\"; char **pp = &a; return h(pp); }\n", kPtr, 1},
+        {"v04 `pp == qq`",
+         "int main(void) { char *a = \"x\"; const char *b = \"y\"; char **pp = &a; const char **qq = &b;\n"
+         "  return pp == qq ? 1 : 42; }\n", kPtr, 1},
+        {"u08 a conditional of the two, converted to `void *`",
+         "static int f_plain(char *s) { return s[0] == 'x' ? 42 : 1; }\n"
+         "static int f_const(const char *s) { return s[0] == 'x' ? 42 : 2; }\n"
+         "int main(int argc, char **argv) { (void)argv; void *v = argc > 0 ? &f_plain : &f_const;\n"
+         "  int (*p)(char *) = (int (*)(char *))v; char b[] = \"x\"; return p(b); }\n", kPtr, 1},
+        // THE CONTROLS — silent on every reference too.
+        {"t14/v08 a parameter's own top-level const",
+         "static int g(char *s) { return s[0]; }\n"
+         "int main(void) { int (*p)(char *const) = g; char b[] = \"*\"; return p(b); }\n", kPtr, 0},
+        {"v07 `char *const *` from `char **` (the pointee's OWN qualifier)",
+         "int main(void) { char *a = \"x\"; char **pp = &a; char *const *cq = pp; return cq != 0 ? 42 : 1; }\n",
+         kPtr, 0},
+        {"the same signature",
+         "static int f_const(const char *s) { return s[0] == 'x' ? 42 : 2; }\n"
+         "int main(void) { int (*p)(const char *) = f_const; return p(\"x\"); }\n", kPtr, 0},
+        {"`const char *` from `char *` (a qualifier ADDED at the pointee's own level)",
+         "int main(void) { char a[] = \"x\"; char *p = a; const char *c = p; return c[0] == 'x' ? 42 : 1; }\n",
+         kPtr, 0},
+    });
 }

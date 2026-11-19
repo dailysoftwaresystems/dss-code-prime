@@ -44,7 +44,7 @@ fixed `/tmp` path) -- and it is LEFT in place, holding every source, object, exe
 and error log for inspection.
 
 Usage:
-  python3 .harness-config/runner/actions/macho-alias-ld64-matrix/macho-alias-ld64-matrix.py
+  dssharness run macho-alias-ld64-matrix      # on the leg its runner names (a macOS host)
 Exit codes: 0 every cell passed · 1 a cell failed (MATRIX_FAIL=1) · 2 refused (not macOS,
 a tool missing, an argument given) · 90 the scratch directory could not be created or
 filled.

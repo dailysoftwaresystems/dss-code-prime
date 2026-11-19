@@ -1,0 +1,1 @@
+        out.push_back(TreeEntry{HostPathAccess::listed(text, at, name), std::move(names), kind, kind, depth});

@@ -1,0 +1,1 @@
+    return fs::is_regular_file(core::HostPathAccess::text(candidate), ec) && !ec

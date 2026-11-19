@@ -1,0 +1,1 @@
+        switch (discardLaterSectionGroups(judged, stated, objectFormatSchema, groupBoundStorage, reporter)) {

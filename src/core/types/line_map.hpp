@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/substrate/walk_steps.hpp"
 #include "core/types/source_buffer.hpp"
 #include "core/types/source_span.hpp"
 #include "core/types/strong_ids.hpp"
@@ -204,13 +205,15 @@ public:
         // site, so hop to the site and resolve THAT. The site is a prefix offset
         // by construction (the expander propagates the ORIGINAL invoking token's
         // offset down through every nested and chained expansion), so one hop
-        // suffices; the bound is defence against a malformed record, and it
-        // refuses rather than looping.
+        // suffices. Each hop lands in another record, so the records bound the
+        // climb (`substrate::WalkSteps`; P69 L2): only a malformed, cyclic chain of
+        // records takes more hops, and that stops the process loud. It was a fixed
+        // 64 hops that answered Unmapped past them.
         MacroExpansionSite const* minted = nullptr;
         ByteOffset                at     = synthOffset;
         if (hasProductBase_) {
-            constexpr int kMaxHops = 64;
-            for (int hop = 0; hop <= kMaxHops; ++hop) {
+            for (substrate::WalkSteps hops{expansions_.size(), "originOf's climb through the expansion sites"};;
+                 hops.step()) {
                 if (at < productBase_) break;
                 MacroExpansionSite const* const e = expansionFor(at);
                 if (e == nullptr) {
@@ -229,9 +232,8 @@ public:
                 if (e->siteOffset == at) break;   // no progress -> refuse to spin
                 at = e->siteOffset;
             }
-            // The walk either reached a prefix offset or ran out of hops; the ONE
-            // test decides both, so an offset that became resolvable on the last
-            // hop is not thrown away for arriving late.
+            // The walk reached a prefix offset or a record that makes no progress;
+            // the ONE test decides both.
             if (at >= productBase_) return {};    // Unmapped: still not a prefix offset
         }
 

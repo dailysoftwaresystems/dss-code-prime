@@ -1,0 +1,2 @@
+      "$p69FollowerComment": "P69 L2b2 (lane lm): the same follower test as typeNameEmptyForDecl's, for the same reason: terminator-less and probed before forDecl, this form took `const T` of `for (const T i = 0; …)` (T a typedef) as a declarator named T, and the for's `;` then failed at `i`.",
+      "followedByFirstOf": "identDeclHead"

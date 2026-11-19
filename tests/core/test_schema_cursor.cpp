@@ -5,7 +5,9 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <string>
 #include <string_view>
+#include <vector>
 
 using namespace dss;
 
@@ -444,16 +446,49 @@ TEST(SchemaCursor, DefaultConstructedCursorIsInvalid) {
     EXPECT_FALSE(c.valid());
 }
 
-// ── All-nullable cycle: FIRST stays empty, fixed-point still converges ──
+// ── All-nullable cycles: the fixed points converge on both ──
 
-TEST(SchemaCursor, AllNullableCycleTerminates) {
-    // a → repeat[optional[b]] is nullable from every step (both `repeat`
-    // and `optional` are nullable). b → optional[a] is nullable too. The
-    // grammar has no token references at all, so FIRST stays empty
-    // throughout. Fixed-point termination relies on `(firstSet, nullable)`
-    // reaching a stable pair, NOT on FIRST growing. If a future refactor
-    // ever made convergence depend on FIRST monotonicity alone, this test
-    // would hang during load.
+TEST(SchemaCursor, ANullableCycleThroughATokenLoadsWithItsFixedPointConverged) {
+    // a → optional[sequence[PlusOp, b]] and b → sequence[a]: both shapes are
+    // nullable and each reaches the other, but `b` stands after a token, so
+    // the cycle is no left recursion and the grammar loads. Convergence
+    // relies on `(firstSet, nullable)` reaching a stable pair across the
+    // cycle; a refactor that broke it would hang the load or leave a value
+    // short, and the values are read here.
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 1,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { "+": [{ "kind": "PlusOp" }], "*": [{ "kind": "StarOp" }] },
+      "shapes": {
+        "root": { "sequence": [ "a", "StarOp" ] },
+        "a":    { "optional": { "sequence": [ "PlusOp", "b" ] } },
+        "b":    { "sequence": [ "a" ] }
+      }
+    })JSON";
+    auto schema = load(kCfg);
+    ASSERT_NE(schema, nullptr);
+    EXPECT_TRUE(schema->isNullable(ruleId(*schema, "a")));
+    EXPECT_TRUE(schema->isNullable(ruleId(*schema, "b")));
+    auto firstA = schema->firstSetOf(ruleId(*schema, "a"));
+    auto firstB = schema->firstSetOf(ruleId(*schema, "b"));
+    EXPECT_EQ(firstA.size(), 1u);
+    EXPECT_EQ(firstB.size(), 1u);
+    EXPECT_TRUE(firstSetContains(firstA, kindId(*schema, "PlusOp")));
+    EXPECT_TRUE(firstSetContains(firstB, kindId(*schema, "PlusOp")));
+}
+
+TEST(SchemaCursor, ATokenlessNullableCycleConvergesThenIsRefusedAsALeftRecursion) {
+    // a → repeat[b] and b → optional[a]: both nullable, no token anywhere in
+    // the cycle, so FIRST stays empty throughout and the fixed points'
+    // convergence rests on the `(firstSet, nullable)` pair alone, NOT on
+    // FIRST growing. Such a cycle reaches each of its shapes before consuming
+    // a token: a left recursion, which the loader refuses by name. Every
+    // fixed point (FIRST and nullable, the nullable tails, the alternatives'
+    // expected sets, FOLLOW) still runs on it before the refusal is returned,
+    // so a refactor that broke convergence still hangs this test; the
+    // values the fixed points reach are not observable, since no schema
+    // comes back (the one route that builds a schema without the loader takes
+    // them precomputed and runs no fixed point).
     constexpr std::string_view kCfg = R"JSON({
       "dssSchemaVersion": 1,
       "language": { "name": "X", "version": "0.1.0" },
@@ -464,12 +499,22 @@ TEST(SchemaCursor, AllNullableCycleTerminates) {
         "b":    { "optional": "a" }
       }
     })JSON";
-    auto schema = load(kCfg);
-    ASSERT_NE(schema, nullptr);
-    EXPECT_TRUE(schema->isNullable(ruleId(*schema, "a")));
-    EXPECT_TRUE(schema->isNullable(ruleId(*schema, "b")));
-    EXPECT_EQ(schema->firstSetOf(ruleId(*schema, "a")).size(), 0u);
-    EXPECT_EQ(schema->firstSetOf(ruleId(*schema, "b")).size(), 0u);
+    auto const loaded = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(loaded.has_value()) << "a tokenless nullable cycle loaded";
+    std::vector<std::string> said;
+    std::string other;
+    for (auto const& d : loaded.error()) {
+        if (d.code == DiagnosticCode::C_CircularShape) said.push_back(d.message);
+        // A left recursion through an `alt` (`repeat` and `optional` are
+        // ones) may also be said as the alternatives' shared FIRST.
+        else if (d.code != DiagnosticCode::C_AmbiguousAlternatives)
+            other += d.path + ": " + d.message + "\n";
+    }
+    EXPECT_EQ(other, "") << "the left recursion is the load's one refusal";
+    ASSERT_EQ(said.size(), 1u);
+    EXPECT_NE(said[0].find("the shape 'a' can reach itself before consuming any token (a → b → a)"),
+              std::string::npos)
+        << said[0];
 }
 
 // ── AltChoice ambiguity is a load error ──────────────────────────────────

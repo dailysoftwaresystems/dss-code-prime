@@ -1,0 +1,1 @@
+        if (nodeSaysSomethingItself(cfg, hirCfg, tree, cur)) return {};

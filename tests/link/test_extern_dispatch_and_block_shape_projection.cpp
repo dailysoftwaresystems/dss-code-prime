@@ -69,6 +69,7 @@
 
 #include "repo_root.hpp"
 #include "vocabulary_message_probe.hpp"
+#include "first_convention.hpp"   // dss::test::kFirstConventionOfTheTarget -- the convention a test states
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
@@ -355,7 +356,7 @@ TEST(LinkVocabularyProjection, FormatBitFieldStrategySentinelIsRefusedByName) {
 
 TEST(LinkVocabularyProjection, TlsAccessShapeNamesEveryKey) {
     static constexpr std::string_view kKeys[] = {
-        "model", "segmentPrefixByte", "baseDisplacement", "tlsIndexSlotName"};
+        "model", "segmentPrefixByte", "baseDisplacement", "tlsIndexSlotName", "bootstrap"};
     constexpr char const* kIgnore[] = {"tlsAccess", "model"};
     auto doc = shippedFormatDoc(kPeExecFormat);
     ASSERT_TRUE(doc.is_object());
@@ -384,7 +385,8 @@ TEST(LinkVocabularyProjection, RuntimeLibraryRowShapeNamesEveryKey) {
     // half of that: it must be restated whenever the row's key set moves, so a
     // key added to the loader without being added here reds rather than passing
     // quietly, and a message quoting a key the loader does not accept reds too.
-    static constexpr std::string_view kKeys[] = {"role", "image", "source"};
+    // P69 H5: `sources`, a body of two or more shipped units (one unit stays `source`).
+    static constexpr std::string_view kKeys[] = {"role", "image", "source", "sources"};
     constexpr char const* kIgnore[] = {"runtimeLibraries"};
     // The ROW arm: a non-object entry inside a well-formed array.
     auto doc = shippedFormatDoc(kElfExecFormat);
@@ -427,6 +429,20 @@ TEST(LinkVocabularyProjection, SehPersonalityShapeNamesEveryKey) {
     ASSERT_FALSE(messages.empty())
         << "a non-object sehPersonality must be REFUSED";
     expectNamesExactly(messages, kKeys, kIgnore, "sehPersonality shape");
+}
+
+// P69 H5: the `compilerSupport` block's refusal names its whole key set and no other.
+TEST(LinkVocabularyProjection, CompilerSupportShapeNamesEveryKey) {
+    static constexpr std::string_view kKeys[] = {"role", "securityCookieInitializer"};
+    constexpr char const* kIgnore[] = {"compilerSupport"};
+    auto doc = shippedFormatDoc(kPeExecFormat);
+    ASSERT_TRUE(doc.is_object());
+    ASSERT_TRUE(doc.contains("compilerSupport")) << "the pe exec document declares the block";
+    doc["compilerSupport"] = kBadSpelling;
+    auto const messages = refusalMessages(doc, "compilerSupport-shape");
+    ASSERT_FALSE(messages.empty())
+        << "a non-object compilerSupport must be REFUSED";
+    expectNamesExactly(messages, kKeys, kIgnore, "compilerSupport shape");
 }
 
 TEST(LinkVocabularyProjection, LibrarySynthesisShapeNamesEveryKeyAndVehicle) {
@@ -492,6 +508,7 @@ TEST(LinkVocabularyProjection,
     fn.symbol = dss::SymbolId{1};
     fn.bytes  = {0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3};   // mov eax,42 ; ret
     mod.functions.push_back(std::move(fn));
+    mod.userEntrySymbol = dss::SymbolId{1};   // a program's module states its entry (the build's election)
 
     dss::DiagnosticReporter rep;
     bool const ok = dss::linker::injectEntryTrampoline(mod, **target, **format,
@@ -534,6 +551,7 @@ void runExternGateProbe(ExternGateProbe&                       probe,
                                            dss::CallConv::CcMS64);
 
     dss::MirBuilder mb;
+    mb.stateDataModel(dss::DataModel::Llp64);
     mb.addFunction(sig, dss::SymbolId{kCallerSym});
     {
         auto const bb = mb.createBlock(dss::StructCfMarker::EntryBlock);
@@ -554,7 +572,7 @@ void runExternGateProbe(ExternGateProbe&                       probe,
     ext.mangledName = "extern_fn";
     ext.libraryPath = "fictional.lib";
 
-    (void)dss::lowerToLir(m, target, probe.interner, probe.reporter,
+    (void)dss::lowerToLir(m, target, probe.interner, probe.reporter, dss::test::kFirstConventionOfTheTarget,
                           std::vector<dss::ExternImport>{ext}, dispatch);
     for (auto const& d : probe.reporter.all()) {
         probe.messages.emplace_back(d.actual);

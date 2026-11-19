@@ -147,6 +147,7 @@
 
 #include "diagnostic_count.hpp"
 #include "scratch_dir.hpp"
+#include "spawn_image.hpp"   // the image argv[0] names, as build_scripts.cpp names it (H6c)
 
 #include <gtest/gtest.h>
 
@@ -664,7 +665,7 @@ TEST(BuildScripts, SignalKilledChildIsNotReportedAsTheScriptsOwnVerdict) {
     // signal wording would pin this test to that platform, and dropping the
     // interpolation would then still pass on the others.
     dss::substrate::SpawnResult const direct =
-        dss::substrate::spawnAndWaitInherit(entry.run, scratch.path());
+        dss::test_support::spawnArgvInherit(entry.run, scratch.path());
     ASSERT_TRUE(direct.spawned);
     ASSERT_EQ(direct.exitCode, kSignalStatus)
         << "the fixture did not die by signal " << kSigKill;
@@ -898,7 +899,7 @@ TEST(BuildScripts, SpawnFailureIsItsOwnCode) {
     // errno prose, and dropping the interpolation would then still pass on the
     // others.
     dss::substrate::SpawnResult const direct =
-        dss::substrate::spawnAndWaitInherit(entry.run, scratch.path());
+        dss::test_support::spawnArgvInherit(entry.run, scratch.path());
     ASSERT_FALSE(direct.spawned)
         << "'" << absent << "' unexpectedly spawned; pick a different name";
     ASSERT_FALSE(direct.diagnostic.empty())

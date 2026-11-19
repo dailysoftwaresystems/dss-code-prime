@@ -1,0 +1,1 @@
+                std::uint64_t const chunk = params.bitPreciseChunk == 0 ? 0 : 8;

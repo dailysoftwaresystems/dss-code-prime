@@ -25,15 +25,30 @@
 // unmeasured.
 
 #include "core/types/include_path_resolve.hpp"
+#include "core/substrate/path_identity.hpp"   // rootSpelling: where the volume root a rooted name is searched from ends
 
 #include "scratch_dir.hpp"
 #include "unc_spelling.hpp"
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <filesystem>
+#include <cstring>
 #include <fstream>
+#include <span>
 #include <string>
+#include <string_view>
+
+#ifdef _WIN32
+    #ifndef WIN32_LEAN_AND_MEAN
+        #define WIN32_LEAN_AND_MEAN
+    #endif
+    #ifndef NOMINMAX
+        #define NOMINMAX
+    #endif
+    #include <windows.h>   // GetVolumeNameForVolumeMountPointW: the scratch volume's GUID name
+#endif
 
 namespace fs = std::filesystem;
 
@@ -245,6 +260,186 @@ TEST_P(RootedIncludeResolution, AUncSearchDirectoryResolvesARelativeHeader) {
         }
     }
     expectEachDirectoryListedOnce(tally);
+}
+
+// ── THE BASE OF A ROOTED NAME IS ITS VOLUME ROOT, AND EVERY COMPONENT BELOW IT IS CASE-CHECKED (P69 H6) ────────
+//
+// The review of H5 (F6): the base used to be the leading run of ancestors no listing holds BYTE-EXACTLY, so a
+// MIS-CASED FIRST component joined the "root" and was never checked -- `C:\SOURCE\...` for `C:\Source\...` resolved
+// under the case-sensitive policy. Since H6 the base is `core::rootSpelling`'s volume root, so the first component is
+// matched like every other: refused case-sensitively, folded case-insensitively, on every host.
+TEST_P(RootedIncludeResolution, AMisCasedFirstComponentIsCaseChecked) {
+    dss::test_support::ScratchDir sd{kFixtureRoot, "rooted-include-case"};
+    fs::path const header = sd.path() / "rooted_probe.h";
+    { std::ofstream f{header}; f << "int rooted_marker = 7;\n"; }
+    fs::path::string_type spelled = header.native();
+    std::size_t const     at      = dss::core::rootSpelling(header).volume;
+    std::size_t           end     = at;
+    while (end < spelled.size() && spelled[end] != fs::path::preferred_separator && spelled[end] != '/') ++end;
+    bool flipped = false;
+    for (std::size_t i = at; i < end; ++i) {
+        auto& c = spelled[i];
+        if (c >= 'a' && c <= 'z') { c = static_cast<fs::path::value_type>(c - 'a' + 'A'); flipped = true; }
+        else if (c >= 'A' && c <= 'Z') { c = static_cast<fs::path::value_type>(c - 'A' + 'a'); flipped = true; }
+    }
+    if (!flipped) GTEST_SKIP() << "the header's first component below its root has no letter to mis-case";
+    dss::HeaderSearchCache compile;
+    auto const r = resolveIncludePath(fs::path{spelled}.string(), {}, {}, GetParam(), compile);
+    if (GetParam() == HeaderNameMatching::CaseSensitive) {
+        EXPECT_EQ(r.status, HeaderSearchStatus::NotFound)
+            << "a mis-cased first component was accepted under the case-sensitive policy: " << r.path.string();
+    } else {
+        EXPECT_EQ(r.status, HeaderSearchStatus::Found) << "the case-insensitive policy folds every component";
+    }
+}
+
+// Windows: a header named from each NAMESPACE spelling of its volume -- `\\?\` and `\\.\` with the drive, the
+// forward-slash `//?/` and `//./`, the GUID name under `\\?\` and `\\.\` -- resolves from that volume's root, as an
+// include NAME and as an `-I` directory; a `..` below a NORMALIZED prefix is a step, and below the VERBATIM one a name
+// (Win32 opens `\\?\...\sub\..\x.h` literally: ERROR_INVALID_NAME, ✔MEASURED run 20261104-204243-d5c02d5f).
+TEST_P(RootedIncludeResolution, ANamespaceSpelledHeaderResolvesFromItsVolumeRoot) {
+#if !defined(_WIN32)
+    GTEST_SKIP() << "a POSIX path has one spelling of its root; the Windows legs ask this";
+#else
+    dss::test_support::ScratchDir sd{kFixtureRoot, "rooted-include-namespace"};
+    fs::path const header = sd.path() / "rooted_probe.h";
+    { std::ofstream f{header}; f << "int rooted_marker = 7;\n"; }
+    fs::create_directories(sd.path() / "sub");
+    std::wstring const dir = sd.path().native();
+    if (dir.size() < 3 || dir[1] != L':') GTEST_SKIP() << "the scratch lies on no drive letter";
+    wchar_t guid[MAX_PATH]{};
+    ASSERT_TRUE(::GetVolumeNameForVolumeMountPointW(sd.path().root_path().c_str(), guid, MAX_PATH));
+    std::wstring const below = dir.substr(3);
+    std::wstring       forward = dir;
+    std::replace(forward.begin(), forward.end(), L'\\', L'/');
+    std::wstring const spellings[] = {L"\\\\?\\" + dir, L"\\\\.\\" + dir, L"//?/" + forward, L"//./" + forward,
+                                      std::wstring{guid} + below, L"\\\\.\\" + std::wstring{guid}.substr(4) + below};
+    dss::HeaderSearchCache compile;
+    for (std::wstring const& d : spellings) {
+        fs::path const asDir{d};
+        SCOPED_TRACE(asDir.string());
+        bool const slashed = d.starts_with(L"//");
+        auto const named   = resolveIncludePath((asDir / "rooted_probe.h").string(), {}, {}, GetParam(), compile);
+        EXPECT_EQ(named.status, HeaderSearchStatus::Found) << "as an include name";
+        auto const searched = resolveInDir(asDir, "rooted_probe.h", GetParam(), compile);
+        EXPECT_EQ(searched.status, HeaderSearchStatus::Found) << "as an -I directory";
+        if (!slashed) {
+            auto const stepped = resolveIncludePath(fs::path{d + L"\\sub\\..\\rooted_probe.h"}.string(), {}, {},
+                                                    GetParam(), compile);
+            bool const verbatim = d.starts_with(L"\\\\?\\");
+            EXPECT_EQ(stepped.status, verbatim ? HeaderSearchStatus::NotFound : HeaderSearchStatus::Found)
+                << (verbatim ? "below \\\\?\\ a `..` is a name no listing holds" : "below \\\\.\\ a `..` is a step");
+        }
+    }
+#endif
+}
+
+// ── [B1] A TYPED #include NAME OPENS WHAT cl AND gcc OPEN (P69 H6c) ───────
+//
+// A quote include below the including file's directory, and `<config.h.>` below an `-I` given plain and given
+// VERBATIM: each case's LITERAL object (`config.h.`, a directory `sub.`, `x.h `, a directory `sub `) and its TRIMMED
+// twin (`config.h`, `sub`, `x.h`) present or absent, made so their bytes stand (through `\\?\` on Windows) -- and
+// what the search finds is the object whose MARK the found file holds, read as the preprocessor reads a header, or
+// none. The expected answers are cl's and gcc's MEASURED ones (`include_name_cells.inc`, generated from the u4 logs;
+// clang and clang-cl UNMEASURED, absent on both Windows legs): below a DOS-text directory a typed name takes the OS's
+// plain rule by position (`core::typedNameBelow`). Below a verbatim `-I` both references open NOTHING in every state;
+// DSS takes the whole verbatim spelling's, the name as typed (DECIDED: the table's `dss` column). POSIX resolves no
+// name by its position, so there each name is its bytes and the literal is found where it stands (the home's POSIX
+// rule; no reference was measured on POSIX for this table), and there is no verbatim form.
+namespace {
+struct IncludeNameCell {
+    char const* form;    // "quote", "-I plain", "-I verbatim"
+    char const* typed;   // the name between the delimiters
+    char const* lit;     // the literal object
+    char const* twin;    // its trimmed twin
+    bool        dir;     // the objects are directories, `x.h` below each
+    bool        hasLit;
+    bool        hasTwin;
+    char const* cl;      // what cl 19.52 opened: "LIT", "TWIN" or "none"
+    char const* gcc;     // what MinGW gcc 13.2 opened
+    char const* dss;     // what DSS opens
+};
+constexpr IncludeNameCell kIncludeNameCells[] = {
+#include "include_name_cells.inc"
+};
+
+// The named object below `holder`, made so that its bytes stand as written (through `\\?\` on Windows).
+[[nodiscard]] bool placeLiterally(fs::path const& holder, char const* name, bool dir, char const* mark) {
+    std::size_t const markSize = std::strlen(mark);
+#if defined(_WIN32)
+    std::wstring const at   = L"\\\\?\\" + holder.native() + L"\\" + std::wstring(name, name + std::strlen(name));
+    std::wstring const file = dir ? at + L"\\x.h" : at;
+    if (dir && !::CreateDirectoryW(at.c_str(), nullptr)) return false;
+    HANDLE const h = ::CreateFileW(file.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD      wrote = 0;
+    BOOL const ok    = ::WriteFile(h, mark, static_cast<DWORD>(markSize), &wrote, nullptr);
+    ::CloseHandle(h);
+    return ok && wrote == markSize;
+#else
+    fs::path const  at = holder / name;
+    std::error_code ec;
+    if (dir && !fs::create_directory(at, ec)) return false;
+    std::ofstream out{dir ? at / "x.h" : at, std::ios::binary};
+    out.write(mark, static_cast<std::streamsize>(markSize));
+    return static_cast<bool>(out);
+#endif
+}
+
+// Which object a found header is: the MARK it holds, read through the home, as the preprocessor reads a header.
+[[nodiscard]] std::string markOf(fs::path const& found) {
+    std::ifstream in = dss::core::openInputStream(dss::core::HostPath{found}, std::ios::binary).value_or(std::ifstream{});
+    std::string   line;
+    std::getline(in, line);
+    return line == "LIT_MARK" ? "LIT" : line == "TWIN_MARK" ? "TWIN" : "(unreadable: `" + line + "`)";
+}
+}  // namespace
+
+TEST_P(RootedIncludeResolution, ATypedIncludeNameOpensWhatTheReferencesOpen) {
+    dss::test_support::ScratchDir sd{kFixtureRoot, "typed-include-name"};
+    fs::path const scratch = sd.path();
+    ASSERT_TRUE(scratch.is_absolute()) << scratch.string();
+    std::size_t made  = 0;
+    std::size_t asked = 0;
+    for (IncludeNameCell const& c : kIncludeNameCells) {
+        std::string_view const form{c.form};
+        SCOPED_TRACE(std::string{c.form} + " `" + c.typed + "`, literal " + (c.hasLit ? "present" : "absent")
+                     + ", twin " + (c.hasTwin ? "present" : "absent"));
+#if !defined(_WIN32)
+        if (form == "-I verbatim") continue;   // no verbatim spelling on POSIX
+        std::string const expected = c.hasLit ? "LIT" : "none";
+#else
+        std::string const expected = c.dss;
+#endif
+        fs::path const cell = scratch / ("c" + std::to_string(++made));
+        ASSERT_TRUE(fs::create_directory(cell));
+        fs::path const holder = form == "quote" ? cell : cell / "inc";
+        if (form != "quote") ASSERT_TRUE(fs::create_directory(holder));
+        if (c.hasLit) ASSERT_TRUE(placeLiterally(holder, c.lit, c.dir, "LIT_MARK\n"));
+        if (c.hasTwin) ASSERT_TRUE(placeLiterally(holder, c.twin, c.dir, "TWIN_MARK\n"));
+        dss::HeaderSearchCache compile;
+        auto const             r = [&] {
+            if (form == "quote") return resolveIncludePath(c.typed, cell, {}, GetParam(), compile);
+#if defined(_WIN32)
+            fs::path const dir = form == "-I verbatim" ? fs::path{L"\\\\?\\" + holder.native()} : holder;
+#else
+            fs::path const dir = holder;
+#endif
+            return resolveIncludePath(c.typed, {}, std::span<fs::path const>{&dir, 1}, GetParam(), compile);
+        }();
+        ASSERT_TRUE(r.status == HeaderSearchStatus::Found || r.status == HeaderSearchStatus::NotFound)
+            << "the search ended neither found nor absent (status " << static_cast<int>(r.status) << ")";
+        std::string const opened = r.status == HeaderSearchStatus::Found ? markOf(r.path) : "none";
+        EXPECT_EQ(opened, expected) << "cl opened " << c.cl << ", gcc " << c.gcc
+                                    << (r.status == HeaderSearchStatus::Found ? "; DSS found `" + r.path.string() + "`"
+                                                                              : std::string{});
+        ++asked;
+    }
+#if defined(_WIN32)
+    EXPECT_EQ(asked, 22u) << "the table is 22 measured cells";
+#else
+    EXPECT_EQ(asked, 19u) << "the table's 22 cells less its 3 verbatim ones";
+#endif
 }
 
 // ── THE COST PIN: the tree every arm walks is the TEST's own ───────────────

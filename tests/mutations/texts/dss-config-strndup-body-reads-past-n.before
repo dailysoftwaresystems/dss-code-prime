@@ -1,0 +1,1 @@
+    while (len < n && s[len] != '\0') ++len;

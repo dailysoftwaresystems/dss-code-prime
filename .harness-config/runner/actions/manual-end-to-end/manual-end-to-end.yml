@@ -39,8 +39,15 @@ steps:
     # than derived by counting `..` segments in the program — the layout rule is enforced by the
     # tool, but a path built out of its enforcement is a second place the rule lives.
     workingDirectoryRoot: action
+    inputs:
+      only:
+        description: "one entry: its path under the corpus root (c/branch_island_arm64_edge), or its bare leaf name when that is unambiguous; empty runs every entry that declares manualRun"
+        default: ''
+      dsscp:
+        description: "the compiler to run, a path; empty finds the tree's own built dsscp"
+        default: ''
     run: |
-      python3 ./manual-end-to-end.py --tree-root ../../../.. --heartbeat 15
+      python3 ./manual-end-to-end.py --tree-root ../../../.. --heartbeat 15 --only="{only}" --dsscp="{dsscp}"
     # ⚠ THE STALL BOUND, AND WHY IT IS NOT A WALL-CLOCK BUDGET. DssHarness deliberately does not
     # apply wall-clock timeouts to phases and legs: a time budget is a guess about workload size,
     # and an honest run that exceeds it gets killed. What it bounds instead is a STALL — no output

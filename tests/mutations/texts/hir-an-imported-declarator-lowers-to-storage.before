@@ -1,0 +1,1 @@
+ir != nullptr && ir->isImportedDeclaration && ir->isExternDeclaration

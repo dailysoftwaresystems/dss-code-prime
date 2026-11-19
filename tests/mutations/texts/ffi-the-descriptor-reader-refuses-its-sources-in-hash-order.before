@@ -1,0 +1,3 @@
+                for (auto const* entry : substrate::entriesInKeyOrder(real)) {
+                    std::string const& fmt = entry->first;
+                    std::string const& src = entry->second;

@@ -1,0 +1,1 @@
+            if (false && finishedOnAValue) result = valueConversion(interner, result);

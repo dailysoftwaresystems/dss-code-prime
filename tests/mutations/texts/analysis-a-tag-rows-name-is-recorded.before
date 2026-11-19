@@ -1,0 +1,1 @@
+        row.namesATag = decl.fieldChildren.has_value();

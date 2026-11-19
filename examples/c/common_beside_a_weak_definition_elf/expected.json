@@ -1,0 +1,46 @@
+{
+  "$comment": "★★ A COMMON BESIDE A WEAK DEFINITION OF ITS NAME ON ELF: THE COMMON STANDS (P69 send-back 5, review-xa4 MINOR 4; D-LK-COMMON-OUTRANKED-A-WEAK-DEFINITION-IN-EVERY-FORMAT) -- the ELF documents' `commonYieldsTo: strongDefinition`, on the reference compiler's own objects. The two objects named to the link are gcc's builds of `int dss_tentative; int dss_read_tentative(void) { return dss_tentative; }` under `-fcommon` (the symbol is `OBJECT GLOBAL COM`) and of `__attribute__((weak)) int dss_tentative = 5;` (`OBJECT WEAK`, in `.data`). ✔MEASURED 2026-10-08 (the same main.c built by gcc 13.3.0, GNU ld 2.42; natively on x86_64 and as the aarch64 cross under qemu-aarch64): in both object orders the common outranks the weak definition and the program reads 0, exit 37, as the common object alone does. Apple's ld and both PE linkers on cl's select-any answer the opposite -- the definition replaces the common, 5 (`examples/c/common_beside_a_weak_definition_macho`, `examples/c/common_beside_a_selectany_definition_pe`) -- which is why the answer is a key of the format document rather than a rule of the link. main.c is DSS's; the 37 it adds keeps either answer apart from the exit code of a program that did nothing -- a link that let the 5 through would exit 42. The `release` arm pins that optimizing the DSS half changes nothing about which of the two the program reads.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 37,
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "prebuiltLibraries": [
+        {
+          "$comment": "The COMMON, and the function that reads it. Source and rebuild command: `tests/link/data/tentative_common.source.c` (gcc 13.3.0 `-O2 -fno-pie -fcommon -c`; md5 9789b039773dc107bf3e48f9a84dafc9). A relocatable object named to the link is an OBJECT INPUT, linked eagerly. The witness is the reader's name.",
+          "path": "tests/link/data/tentative_common_x86_64_elf.o",
+          "containerWitness": "dss_read_tentative"
+        },
+        {
+          "$comment": "The WEAK definition. Source and rebuild command: `tests/link/data/tentative_weak.source.c` (gcc 13.3.0 `-O2 -fno-pie -c`; md5 47baacfa4638b51806f3ad9a40dcaf5e). The witness is the name both objects state.",
+          "path": "tests/link/data/tentative_weak_x86_64_elf.o",
+          "containerWitness": "dss_tentative"
+        }
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "prebuiltLibraries": [
+        {
+          "$comment": "The COMMON, and the function that reads it -- through an ADRP page and a low-12 load, where its x86_64 sibling reads PC-relative. Source and rebuild command: `tests/link/data/tentative_common.source.c` (aarch64-linux-gnu-gcc 13.3.0 `-O2 -fno-pie -fcommon -c`; md5 65e3c03cee0e8f34a0c5748057ec22f9).",
+          "path": "tests/link/data/tentative_common_aarch64_elf.o",
+          "containerWitness": "dss_read_tentative"
+        },
+        {
+          "$comment": "The WEAK definition. Source and rebuild command: `tests/link/data/tentative_weak.source.c` (aarch64-linux-gnu-gcc 13.3.0 `-O2 -fno-pie -c`; md5 d81e328e09a5e382bc6ea90ce52f856e).",
+          "path": "tests/link/data/tentative_weak_aarch64_elf.o",
+          "containerWitness": "dss_tentative"
+        }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

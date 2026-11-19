@@ -24,6 +24,7 @@
 #include "mir/summary/mir_body_codec.hpp"
 #include "mir/summary/mir_summary.hpp"
 #include "mir/summary/summary_index.hpp"
+#include "link_facts.hpp"   // ordinaryLinkFormat (P69: the summary index and the lazy import read the link's document)
 
 #include <gtest/gtest.h>
 
@@ -63,6 +64,7 @@ TestCu makeLink(std::uint32_t cuIdx, std::string self, std::string callee,
     TypeId const i32 = cu.lattice->interner().primitive(TypeKind::I32);
     TypeId const sig = cu.lattice->interner().fnSig({}, i32, CallConv::CcSysV);
     MirBuilder mb;
+    mb.stateDataModel(DataModel::Lp64);
     mb.addFunction(sig, SymbolId{100});
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(e);
@@ -288,12 +290,14 @@ TEST(MirBodyCodec, ADecodedBodyImportsIdenticallyToTheInMemoryOne) {
 
         SummaryIndexPolicy policy;
         policy.maxImportDepth = 4;
-        auto index = buildSummaryIndex(summaries, policy, rep);
+        auto index = buildSummaryIndex(summaries, policy,
+                                       dss::test_support::ordinaryLinkFormat(), rep);
         EXPECT_TRUE(index.has_value());
         EXPECT_TRUE(summariesDescribeModules(views, summaries, rep));
 
         auto const outcome = lazyImportOptimize(
             0, views, summaries, *index, policy, "c",
+            dss::test_support::ordinaryLinkFormat(),
             [](Mir&, TypeInterner const&, std::span<ExternImport const>) {
                 return true;
             },

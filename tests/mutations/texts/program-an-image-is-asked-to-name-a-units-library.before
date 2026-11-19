@@ -1,0 +1,1 @@
+                if (format.isImageFlavor()) break;   // an image link searches no library a unit names

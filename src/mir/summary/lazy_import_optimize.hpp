@@ -56,9 +56,12 @@
 //
 //   OUTER — RE-OPTIMIZE ON NEW DEMAND. After `optimizeOne` runs, the module may
 //   name callees it did not name before (the devirtualization case above). If it
-//   does, close availability again and optimize again. Bounded by
+//   does, close availability again and optimize again. Demand is a callee the
+//   closure would TAKE -- one rule decides both (P69 H6): a callee the budget
+//   refused is no demand, since no later round can take it. Bounded by
 //   `kMaxImportRounds` — deliberately NOT by the prefetch knob — and a round that
-//   hits the bound with demand outstanding is REPORTED, never silently dropped.
+//   hits the bound with demand outstanding is RETURNED to the driver, which reports it
+//   as a compiler defect (`kMaxImportRounds` below) -- never silently dropped.
 //
 // ★★★ AND THAT IS WHAT DISSOLVES THE §B TRANSITIVE-IMPORT FORK rather than
 // settling it. The fork (A: a depth-bounded closure at K; B: a ThinLTO-style
@@ -111,9 +114,14 @@ namespace dss::mirsum {
 // prefetch knob would make a latency setting decide how much cross-CU inlining a
 // program gets, which is exactly the property this arc has to guarantee it does
 // NOT do. So it is a substrate constant with its own argument, on the same
-// footing as `kMaxPipelineIterations`: a program that needs a ninth cascade is
-// pathological, and hitting the cap is REPORTED (X_OptFixpointTruncated) rather
-// than silently costing quality with no witness.
+// footing as `kMaxPipelineIterations`. ★ AND NO PROGRAM REACHES IT (P69 H6, the
+// orchestrator's ledgers 500 and 506): the closure takes every direct callee a module
+// names, transitively, before the first optimize, and a callee whose address escapes
+// is never importable, so each importing unit converges in ONE round. Reaching the
+// bound means that closure rule is broken. It is RETURNED
+// (`LazyImportOutcome::demandLeftAtBound`; this MIR-tier leaf reports nothing), and the
+// driver reports it as the compiler defect it is -- `importBoundReached`,
+// compile_pipeline.hpp, X_OptImportBoundReached (Error), the stage stopping.
 inline constexpr std::uint32_t kMaxImportRounds = 8;
 
 // One TU as the lazy import edge sees it. DECOMPOSED for the same reason
@@ -237,6 +245,13 @@ using LazyOptimizeFn =
 // calls may run concurrently over one `SummaryIndex` and one set of summaries.
 // `reporter` must be per-importer (the driver's established scratch-reporter
 // shape) — it is the one shared-mutable sink otherwise.
+//
+// `linkFormat` is the document of the link these units are bound for — the one
+// `buildSummaryIndex` was handed. Each import batch is a cross-unit merge
+// (`mergeCuMirs`), and a merge reads from it what a weak definition's kind
+// means beside the other definitions of its name; a batch that read another
+// document than the index did could elect another definition than the index
+// planned for.
 [[nodiscard]] DSS_EXPORT LazyImportOutcome
 lazyImportOptimize(std::uint32_t                   importer,
                    std::span<LazyImportCu const>   cus,
@@ -244,6 +259,7 @@ lazyImportOptimize(std::uint32_t                   importer,
                    SummaryIndex const&             index,
                    SummaryIndexPolicy const&       policy,
                    std::string_view                sourceLanguage,
+                   ObjectFormatSchema const&       linkFormat,
                    LazyOptimizeFn const&           optimizeOne,
                    DiagnosticReporter&             reporter);
 

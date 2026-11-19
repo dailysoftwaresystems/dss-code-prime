@@ -1,0 +1,2 @@
+            // D-CSUBSET-PACKED-ATOMIC-MEMBER: the format's atomics-runtime block.
+            std::nullopt);

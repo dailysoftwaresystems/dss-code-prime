@@ -1,0 +1,1 @@
+    Handle const entry = entryHandle(reference, FILE_READ_ATTRIBUTES, ec);

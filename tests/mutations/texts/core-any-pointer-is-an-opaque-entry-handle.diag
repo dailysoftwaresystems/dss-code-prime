@@ -1,0 +1,1 @@
+classifyEntryParam(in, in.pointer(i32)).has_value()

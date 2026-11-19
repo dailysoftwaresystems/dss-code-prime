@@ -39,6 +39,7 @@
 #include "core/types/section_kind.hpp"
 #include "link/object_format_schema.hpp"
 #include "repo_root.hpp"
+#include "shipped_read_pairs.hpp"   // shippedFormatNames -- the one home
 
 #include <gtest/gtest.h>
 
@@ -63,31 +64,8 @@ namespace {
 //
 // From the directory rather than from a list, for the reason the file header
 // gives: a format added tomorrow is measured the day it lands.
-[[nodiscard]] std::vector<std::string> shippedFormatNames() {
-    std::vector<std::string> out;
-    auto const root = dss::test::findConfigRoot();
-    if (!root) {
-        ADD_FAILURE() << dss::test::configRootDiagnostic();
-        return out;
-    }
-    auto const     dir = *root / "object-formats";
-    std::error_code ec;
-    for (auto const& entry : fs::directory_iterator{dir, ec}) {
-        auto const filename = entry.path().filename().string();
-        constexpr std::string_view kSuffix{".format.json"};
-        if (filename.size() <= kSuffix.size()) continue;
-        if (filename.compare(filename.size() - kSuffix.size(), kSuffix.size(),
-                             kSuffix) != 0) {
-            continue;
-        }
-        out.push_back(filename.substr(0, filename.size() - kSuffix.size()));
-    }
-    std::sort(out.begin(), out.end());
-    EXPECT_FALSE(out.empty())
-        << "no shipped .format.json documents found under " << dir.string()
-        << " — every assertion in this file would then be vacuous";
-    return out;
-}
+// P69 fold f26d (review-csf26c2 N3): every shipped format document's name has ONE home.
+using dss::test_support::shippedFormatNames;
 
 struct LoadedFormat {
     std::string                        name;

@@ -1,0 +1,2 @@
+        if (false && ot.valid() && interner.kind(ot) == TypeKind::NullptrT
+            && unaryRefusesNullptrOperand(e->target)) {

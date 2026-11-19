@@ -1,0 +1,1 @@
+        if (container && aContainerTakesTheRootSeparator(root.shape)) return twin + L'\\';   // H5: the volume's root

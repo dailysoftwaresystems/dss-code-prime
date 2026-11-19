@@ -1,0 +1,5 @@
+                    quoteCollision = true;
+                    emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError,
+                           BufferId{}, SourceSpan::empty(0),
+                           std::string{"quote include "} + filename + ": "
+                               + describeUnexaminable(unexaminable));

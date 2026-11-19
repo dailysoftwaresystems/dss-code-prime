@@ -17,6 +17,7 @@
 //     accepts any path the caller gives it.
 
 #include "asm/asm.hpp"
+#include "core/substrate/path_identity.hpp"   // the cell below reads back through `\\?\` (H6c)
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
@@ -33,6 +34,13 @@
 #include <iostream>
 #include <string>
 #include <vector>
+
+#if !defined(_WIN32)
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace fs = std::filesystem;
 using namespace dss;
@@ -307,6 +315,74 @@ TEST(LinkWriter, RejectsPathIsADirectory) {
     EXPECT_TRUE(sawCode);
 }
 
+// A TARGET THAT NAMES NO LAST NAME IS REFUSED BY NAME, NEVER THROWN (P69 H6c2, H1): its staging sibling is cut from
+// its last name (`withSuffix`), and `C:\absent\..` reaches the volume's ROOT on Windows (GetFullPathNameW folds the
+// `..` before any name is read), `<dir>/..` ends in `..` on POSIX -- neither has one. Until H6c2 the cut threw,
+// uncaught. Nothing is written: the refusal comes before any staging file is claimed.
+TEST(LinkWriter, RejectsATargetThatNamesNoLastName) {
+    ScratchDir scratch{Location::Temp, "link-writer-no-last-name"};
+#if defined(_WIN32)
+    fs::path const target = fs::absolute(scratch.path()).root_path() / "dss-h6c2-absent-level" / "..";
+#else
+    fs::path const target = scratch.path() / "..";
+#endif
+    auto const         image = makeImage({0x01});
+    DiagnosticReporter rep;
+    bool               written = true;
+    ASSERT_NO_THROW(written = linker::writeImage(image, target, rep));
+    EXPECT_FALSE(written);
+    bool named = false;
+    for (auto const& d : rep.all())
+        if (d.code == DiagnosticCode::K_ImageWriteOpenFailed && d.actual.find("names no last name") != std::string::npos)
+            named = true;
+    EXPECT_TRUE(named) << "the write of `" << target.string() << "` was not refused for naming no last name";
+}
+
+// A TARGET THE FILE SYSTEM REFUSES IS REFUSED BY NAME (P69 H6c2, the sibling of the universe's NotUtf8 cells): POSIX
+// takes a name as bytes, and a file system that stores UTF-8 names alone (APFS) refuses one that is no UTF-8 (EILSEQ).
+// The writer reports that refusal NAMING the target -- by its own bytes, the home's lossless rendering of a POSIX
+// name (never an escape, which another name could spell) -- and writes nothing. Where the file system takes the
+// name, the refusal cannot arise; the case says so.
+TEST(LinkWriter, ATargetTheFileSystemRefusesIsRefusedByName) {
+#if defined(_WIN32)
+    GTEST_SKIP() << "a Windows name is UTF-16, never refused by the file system for its bytes";
+#else
+    ScratchDir scratch{Location::Temp, "link-writer-refused-name"};
+    // Does this file system take the name? Asked of the OS itself, beside the target.
+    std::string const probe = (scratch.path() / std::string{"probe\xFF"}).string();
+    int const         fd    = ::open(probe.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+    int const         why   = errno;
+    if (fd >= 0) {
+        ::close(fd);
+        GTEST_SKIP() << "this file system takes a name that is no UTF-8: the refusal cannot arise here";
+    }
+    ASSERT_EQ(why, EILSEQ) << "the probe was refused for another reason: " << std::strerror(why);
+    fs::path const     target = scratch.path() / std::string{"out\xFF.o"};
+    auto const         image  = makeImage({0x01});
+    DiagnosticReporter rep;
+    bool               written = true;
+    ASSERT_NO_THROW(written = linker::writeImage(image, target, rep));
+    EXPECT_FALSE(written);
+    std::string const quoted = "'" + target.native() + "'";   // the whole target, as POSIX hands it
+    // ... and the HOST'S OWN REASON, by number first, its text the system's (P69 H6c2): the probe's errno, never a
+    // list of guesses.
+    std::string const reason   = "errno=" + std::to_string(why) + ": " + std::strerror(why);
+    bool              named    = false;
+    bool              reasoned = false;
+    std::string       said;
+    for (auto const& d : rep.all()) {
+        if (d.actual.find(quoted) != std::string::npos) named = true;
+        if (d.actual.find(reason) != std::string::npos) reasoned = true;
+        said += "\n  [" + std::to_string(static_cast<unsigned>(d.code)) + "] " + d.actual;
+    }
+    EXPECT_TRUE(named) << "no diagnostic of the refused write names its whole target by its own bytes:" << said;
+    EXPECT_TRUE(reasoned) << "no diagnostic of the refused write names the host's reason `" << reason << "`:" << said;
+    std::error_code ec;
+    EXPECT_EQ(dss::core::entryKind(dss::core::HostPath{target}, dss::core::Use::Leaf, ec), dss::core::EntryKind::Absent)
+        << "the refused write left something behind";
+#endif
+}
+
 // ── End-to-end pipeline: c source → ELF .o on disk ───────────
 
 TEST(LinkWriter, EndToEndAssembleLinkWriteToDisk) {
@@ -358,4 +434,54 @@ TEST(LinkWriter, EndToEndAssembleLinkWriteToDisk) {
     EXPECT_EQ(hdr[1], 'E');
     EXPECT_EQ(hdr[2], 'L');
     EXPECT_EQ(hdr[3], 'F');
+}
+
+// ── P69 H6c (plan section 6 #23, #24, #4): AN IMAGE BELOW A DIRECTORY THE PLAIN RULE WOULD TRIM AS A LEAF ──────
+//
+// `S\d \a.bin` names the image in the directory `d ` (a MIDDLE name keeps its trailing space), so the write asks
+// that directory as the level of the image's own leaf reference (#23), stages its sibling there (`withSuffix`, #4)
+// and commits by the target's leaf reference (#24) -- with the trimmed twin `d` absent, and present: the bytes land
+// in `d `, nothing is left beside them, and the twin stays empty. Read back through `\\?\`, the one spelling with no
+// second reading.
+TEST(LinkWriter, AnImageBelowADirectoryEndingInASpaceIsWrittenThere) {
+#if !defined(_WIN32)
+    GTEST_SKIP() << "POSIX resolves no name by its position: `d ` is its bytes in every use";
+#else
+    auto const namesIn = [](std::wstring const& dir) {
+        std::vector<std::string> names;
+        static_cast<void>(core::walkTree(fs::path{dir}, [&](core::TreeEntry const& e) {
+            names.push_back(e.at.filename().string());
+            return core::WalkStep::Prune;
+        }));
+        return names;
+    };
+    for (bool const twin : {false, true}) {
+        SCOPED_TRACE(twin ? "the twin `d` present" : "the twin `d` absent");
+        ScratchDir         scratch{Location::Temp, twin ? "link-writer-space-twin" : "link-writer-space"};
+        std::wstring const S       = scratch.path().native();
+        std::wstring const literal = L"\\\\?\\" + S + L"\\d ";
+        std::wstring const twinDir = L"\\\\?\\" + S + L"\\d";
+        std::error_code    ec;
+        static_cast<void>(core::createDirectories(fs::path{literal}, ec));
+        ASSERT_FALSE(ec) << ec.message();
+        if (twin) {
+            static_cast<void>(core::createDirectories(fs::path{twinDir}, ec));
+            ASSERT_FALSE(ec) << ec.message();
+        }
+        auto const         image = makeImage({0xD5, 0x20, 0x0A});
+        DiagnosticReporter rep;
+        bool const         wrote = linker::writeImage(image, fs::path{S + L"\\d \\a.bin"}, rep);
+        std::string        said;
+        for (auto const& d : rep.all()) said += "\n  " + std::string{diagnosticCodeName(d.code)} + ": " + d.actual;
+        ASSERT_TRUE(wrote) << "the image below `d ` was refused:" << said;
+        EXPECT_EQ(rep.errorCount(), 0u) << said;
+        std::ifstream             in =
+            core::openInputStream(fs::path{literal + L"\\a.bin"}, std::ios::binary).value_or(std::ifstream{});
+        std::vector<std::uint8_t> read{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+        EXPECT_EQ(read, image.bytes) << "the image is not in `d `";
+        EXPECT_EQ(namesIn(literal), std::vector<std::string>{"a.bin"})
+            << "`d ` holds something besides the image (a staging sibling left), or not the image";
+        if (twin) EXPECT_TRUE(namesIn(twinDir).empty()) << "the twin `d` received a file";
+    }
+#endif
 }

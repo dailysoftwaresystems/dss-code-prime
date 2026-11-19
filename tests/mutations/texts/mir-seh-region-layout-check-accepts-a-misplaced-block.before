@@ -1,0 +1,1 @@
+        if (want < nb && mir.funcBlockAt(fn, want).v == members[k].v) continue;

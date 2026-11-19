@@ -1,0 +1,3 @@
+              [](Row const& a, Row const& b) {
+                  return a.pc != b.pc ? a.pc < b.pc : a.fde < b.fde;
+              });

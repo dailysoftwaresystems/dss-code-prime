@@ -1,9 +1,13 @@
 #include "program/input_resolver.hpp"
 
-#include "core/substrate/path_identity.hpp"  // genericSpelling
+#include "core/substrate/every_unit.hpp"     // runEveryUnit -- every input, every directory
+#include "core/substrate/path_identity.hpp"  // genericSpelling, walkTree
+#include "core/substrate/silent_unit.hpp"    // namingSilentUnits -- an input that fails having said nothing is named
 #include "core/types/parse_diagnostic.hpp"
 
 #include <algorithm>
+#include <optional>
+#include <set>
 #include <system_error>
 
 namespace dss {
@@ -41,63 +45,80 @@ bool InputResolver::resolveDirectory(
         Mode                           mode,
         std::vector<std::string>&      out,
         DiagnosticReporter&            reporter) {
-    std::error_code ec;
-    if (!fs::exists(directoryPath, ec) || !fs::is_directory(directoryPath, ec)) {
+    std::error_code       ec;
+    // A CONTAINER (H6c, A2): the directory the inputs are listed from.
+    core::EntryKind const root = core::reachedKind(directoryPath, core::Use::Container, ec);
+    // What the directory REACHES cannot be examined (a looping link, a refusal): that is no
+    // absence, and saying "does not exist" would send the reader after the wrong cause.
+    if (ec) {
+        emit(reporter, DiagnosticCode::D_DirectoryScanFailed,
+             "InputResolver: what '" + core::genericSpelling(directoryPath)
+             + "' reaches cannot be examined: " + core::reasonText(ec));
+        return false;
+    }
+    if (root != core::EntryKind::Directory) {
         emit(reporter, DiagnosticCode::D_FileNotFound,
              "InputResolver: '" + core::genericSpelling(directoryPath)
              + "' does not exist or is not a directory.");
         return false;
     }
 
-    // Two iterator shapes — recursive and flat — share the same
-    // extension-filter + ec-handling. The closed-enum `Mode` keeps
-    // the dispatch explicit at the call site (caller passes the
-    // policy; resolver doesn't infer from path / cwd / env).
-    std::vector<std::string> matched;
-    auto const captureMatches = [&](auto& iter) -> bool {
-        using IterT = std::decay_t<decltype(iter)>;
-        IterT const end{};
-        for (; iter != end; iter.increment(ec)) {
-            if (ec) {
-                emit(reporter, DiagnosticCode::D_DirectoryScanFailed,
-                     "InputResolver: directory-scan interrupted after "
-                     "partial enumeration of '"
-                     + core::genericSpelling(directoryPath) + "': "
-                     + ec.message());
-                return false;
-            }
-            if (!iter->is_regular_file()) continue;
-            if (extensionMatches(iter->path(), fileExtensions)) {
-                // Not a message — the INPUT LIST the compiler goes on to open.
-                // `iter` walks `directoryPath`, so every entry inherits that
-                // path's root, authority included.
-                matched.push_back(core::genericSpelling(iter->path()));
-            }
+    // ONE walk for both shapes — the substrate's (`core::walkTree`), which never
+    // descends a LINK on any build: the flat shape prunes every directory, the
+    // recursive one descends every real one. The closed-enum `Mode` keeps the
+    // dispatch explicit at the call site (caller passes the policy; resolver
+    // doesn't infer from path / cwd / env).
+    // ✔MEASURED 2026-10-20 (the substrate's header): libstdc++ on Windows cannot
+    // tell a link from what it reaches, so the MinGW build's
+    // `recursive_directory_iterator` DESCENDED a directory link the MSVC build's
+    // did not, and took a dangling file link for a regular file — one directory,
+    // two input lists. A link is an input by what it REACHES: a link to a regular
+    // file is that file under its name here; a dangling one is no input.
+    // ★ A LINK WHOSE REACH CANNOT BE EXAMINED (a loop, a refusal) is handed out by the walk and
+    // asked about ONLY when its name is an input's (the configured extensions): an unrelated one
+    // (`docs/self`) leaves the scan whole, as bash, Python's glob and CMake's GLOB_RECURSE list
+    // such a tree; one NAMED like a source is an input nobody can read, refused naming it --
+    // what gcc and clang answer for a candidate they cannot open (✔MEASURED 2026-10-28, a
+    // looping include candidate: both fatal, naming it).
+    std::vector<std::string>       matched;
+    std::optional<core::TreeEntry> unreadable;
+    auto const walk = core::walkTree(directoryPath, [&](core::TreeEntry const& entry) {
+        if (entry.kind == core::EntryKind::Directory)
+            return mode == Mode::Recursive ? core::WalkStep::Continue : core::WalkStep::Prune;
+        if (entry.reachError) {
+            if (!extensionMatches(entry.at.filename(), fileExtensions)) return core::WalkStep::Continue;
+            unreadable = entry;
+            return core::WalkStep::Stop;
         }
-        return true;
-    };
-
-    bool scanOk = false;
-    if (mode == Mode::Recursive) {
-        fs::recursive_directory_iterator it(directoryPath, ec);
-        if (ec) {
-            emit(reporter, DiagnosticCode::D_DirectoryScanFailed,
-                 "InputResolver: failed to open directory '"
-                 + core::genericSpelling(directoryPath) + "': " + ec.message());
-            return false;
+        if (entry.reaches != core::EntryKind::File) return core::WalkStep::Continue;
+        if (extensionMatches(entry.at.filename(), fileExtensions)) {
+            // Not a message — the INPUT LIST the compiler goes on to open.
+            // The walk joins `directoryPath` with each name, so every entry
+            // inherits that path's root, authority included.
+            matched.push_back(core::genericSpelling(entry.storeRoutePath));
         }
-        scanOk = captureMatches(it);
-    } else {
-        fs::directory_iterator it(directoryPath, ec);
-        if (ec) {
-            emit(reporter, DiagnosticCode::D_DirectoryScanFailed,
-                 "InputResolver: failed to open directory '"
-                 + core::genericSpelling(directoryPath) + "': " + ec.message());
-            return false;
-        }
-        scanOk = captureMatches(it);
+        return core::WalkStep::Continue;
+    }, core::TreeWalkOptions{.handOutUnreadableLinks = true});
+    if (unreadable) {
+        emit(reporter, DiagnosticCode::D_DirectoryScanFailed,
+             "InputResolver: '" + unreadable->at.spelling().generic()
+             + "' is named like an input of '" + core::genericSpelling(directoryPath)
+             + "', and what it reaches cannot be examined: " + core::reasonText(unreadable->reachError));
+        return false;
     }
-    if (!scanOk) return false;
+    if (walk.error) {
+        // The directory itself, or one under it: the two remediations differ, so
+        // the two messages do.
+        emit(reporter, DiagnosticCode::D_DirectoryScanFailed,
+             walk.root != core::WalkRoot::Listed   // the walk's own report of its root (H6c, A2)
+                 ? "InputResolver: failed to open directory '"
+                       + core::genericSpelling(directoryPath) + "': " + core::reasonText(walk.error)
+                 : "InputResolver: directory-scan interrupted after "
+                   "partial enumeration of '"
+                       + core::genericSpelling(directoryPath) + "' (at '"
+                       + walk.where.spelling().generic() + "'): " + core::reasonText(walk.error));
+        return false;
+    }
 
     if (matched.empty()) {
         emit(reporter, DiagnosticCode::D_EmptyInput,
@@ -127,11 +148,26 @@ bool InputResolver::validateFiles(
     // vector is reused across multiple resolve cycles. Mirrors the
     // append-semantics of `resolveDirectory` for consistency.
     // (code-reviewer F5 post-fold: documented explicitly.)
-    bool allOk = true;
+    // ★ EVERY INPUT IS VALIDATED, OR SAYS WHY NOT, BEFORE THE STEP FAILS
+    // (`substrate::runEveryUnit`, the several-unit class's one home, P69 H6c2).
+    // Netted: each refusal names its input by its path; an input named twice
+    // meets the refusal its first mention reported, and answers true.
     out.reserve(out.size() + inputs.size());
-    for (auto const& path : inputs) {
-        std::error_code ec;
-        bool const isRegular = fs::is_regular_file(path, ec);
+    std::set<std::string> refused;
+    return substrate::runEveryUnit(
+        inputs.size(),
+        substrate::namingSilentUnits(
+            reporter, "the input validation", [&](std::size_t i) { return "input '" + inputs[i] + "'"; },
+            [&](std::size_t i) {
+        std::string const& path = inputs[i];
+        if (refused.contains(path)) return true;   // said once, by its first mention
+        // What the path REACHES, asked of the substrate (a dangling link reaches nothing, on every
+        // build); a clean absence is the missing-file arm, as `status` reported it with ENOENT.
+        std::error_code       ec;
+        core::EntryKind const reached = core::reachedKind(path, core::Use::Leaf, ec);   // an input FILE
+        if (!ec && reached == core::EntryKind::Absent)
+            ec = std::make_error_code(std::errc::no_such_file_or_directory);
+        bool const isRegular = reached == core::EntryKind::File;
         if (ec) {
             // Distinguish ENOENT (file truly missing — D_FileNotFound)
             // from other filesystem errors (permission denied, broken
@@ -145,22 +181,22 @@ bool InputResolver::validateFiles(
             } else {
                 emit(reporter, DiagnosticCode::D_DirectoryScanFailed,
                      "InputResolver: filesystem error checking source "
-                     "file '" + path + "': " + ec.message());
+                     "file '" + path + "': " + core::reasonText(ec));
             }
-            allOk = false;
-            continue;
+            refused.insert(path);
+            return false;
         }
         if (!isRegular) {
             emit(reporter, DiagnosticCode::D_FileNotFound,
                  "InputResolver: source file '" + path
                  + "' exists but is not a regular file (directory, "
                    "device, or socket).");
-            allOk = false;
-            continue;
+            refused.insert(path);
+            return false;
         }
         out.push_back(path);
-    }
-    return allOk;
+        return true;
+    }));
 }
 
 bool InputResolver::checkSearchDirectoriesUsable(
@@ -170,8 +206,13 @@ bool InputResolver::checkSearchDirectoriesUsable(
     // See the header for WHY this warns instead of refusing (a measured
     // gcc/MSVC survey) and why absoluteness is never asked.
     std::string const opt{optionSpelling};
-    bool allOk = true;
-    for (auto const& dir : directories) {
+    // ★ EVERY DIRECTORY IS ASKED (`substrate::runEveryUnit`, the several-unit
+    // class's one home, P69 H6c2), behaviour kept. NOT netted: a unit's answer
+    // here is a WARNING, never an error (both callers discard the step's
+    // answer), and the net counts errors -- it would name every unusable
+    // directory silent.
+    return substrate::runEveryUnit(directories.size(), [&](std::size_t d) {
+        std::string const& dir = directories[d];
         // An EMPTY argument is its own case and would otherwise be reported
         // as "the current directory is fine": `fs::directory_iterator("")`
         // fails, but `exists("")` is false, so it would land in the absent
@@ -183,24 +224,31 @@ bool InputResolver::checkSearchDirectoriesUsable(
                  "header to the search path. It is IGNORED; a header that "
                  "was meant to be found through it will be reported as "
                  "missing at its `#include`.");
-            allOk = false;
-            continue;
+            return false;
         }
         std::error_code ec;
         // ★ ONE QUESTION, ASKED OF THE FILESYSTEM DIRECTLY: can this be
-        //   enumerated? `directory_iterator`'s own failure is the authority,
-        //   because it is the exact operation the include search performs.
+        //   enumerated? The substrate's listing's own failure is the authority,
+        //   because it is the exact operation the include search performs
+        //   (`core::walkTree`, at any length -- P69 H6). It is asked to stop at
+        //   the first entry: listing the directory whole is what proves it
+        //   enumerates, and nothing below it is asked.
         //   The `exists` / `is_directory` split below runs only to CLASSIFY
         //   a failure that already happened, so a directory that enumerates
         //   fine is never described by anything but success — and no
         //   pre-check can disagree with the operation it is predicting.
-        fs::directory_iterator const probe(dir, ec);
-        if (!ec) continue;                     // enumerable — nothing to say
+        core::TreeWalkOptions handOut;
+        handOut.handOutUnreadableLinks = true;   // as the include search lists: by name
+        ec = core::walkTree(fs::path{dir}, [](core::TreeEntry const&) { return core::WalkStep::Stop; }, handOut)
+                 .error;
+        if (!ec) return true;                  // enumerable — nothing to say
 
         std::error_code       existsEc;
-        bool const            present = fs::exists(dir, existsEc);
-        std::error_code       dirEc;
-        bool const            isDir   = fs::is_directory(dir, dirEc);
+        // A CONTAINER (H6c, A2): an include directory, searched below.
+        core::EntryKind const reached = core::reachedKind(dir, core::Use::Container, existsEc);
+        bool const            present = reached != core::EntryKind::Absent;
+        std::error_code const dirEc   = existsEc;
+        bool const            isDir   = reached == core::EntryKind::Directory;
         if (!present && !existsEc) {
             warn(reporter, DiagnosticCode::D_FileNotFound,
                  "InputResolver: " + opt + " names '" + dir
@@ -218,18 +266,20 @@ bool InputResolver::checkSearchDirectoriesUsable(
             // Present, a directory, and STILL not enumerable — permission
             // denied, an I/O error, an unreachable network authority. This
             // is the arm the row was filed for, and the one whose cause is
-            // invisible from a missing-header message.
+            // invisible from a missing-header message. ★ It is NOT passed
+            // over by the search: a header search that reaches it ENDS there,
+            // naming it (the search reads a listing to answer the case
+            // question, and a listing it cannot read is no absence) -- as gcc
+            // and clang end theirs at a candidate they cannot open.
             warn(reporter, DiagnosticCode::D_DirectoryScanFailed,
                  "InputResolver: " + opt + " names '" + dir
-                 + "', which cannot be enumerated: " + ec.message()
-                 + ". It contributes no header to the search path and is "
-                   "IGNORED; a header that was meant to be found through it "
-                   "will be reported as missing at its `#include` rather "
-                   "than here.");
+                 + "', which cannot be enumerated: " + core::reasonText(ec)
+                 + ". A header search that reaches it ends there and is "
+                   "refused, naming it; a header found in an earlier "
+                   "directory never asks it.");
         }
-        allOk = false;
-    }
-    return allOk;
+        return false;
+    });
 }
 
 } // namespace dss

@@ -279,7 +279,6 @@ namespace {
     if (!cfg) throw std::runtime_error(dss::test::configRootDiagnostic());
     auto schema = loadShippedSchema("c");
     UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
-    builder.addSystemDir(*cfg / "shippedLibs");
     builder.setActiveFormat(fmt);
     builder.addInMemory(std::move(src), "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());

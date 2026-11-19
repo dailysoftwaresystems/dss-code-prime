@@ -1,0 +1,1 @@
+                    { "optional": { "sequence": [ "declarator", { "repeat": "stdAttr" } ] } },

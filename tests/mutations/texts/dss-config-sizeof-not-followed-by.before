@@ -1,0 +1,4 @@
+      "sequence": [ "SizeofKeyword", "ParenOpen", "castTypeRef", "ParenClose" ],
+      "commitRequiresTypeName": { "rule": "castTypeRef", "polarity": "requireKnownType" },
+      "notFollowedBy": [ "BlockOpen" ]
+    },

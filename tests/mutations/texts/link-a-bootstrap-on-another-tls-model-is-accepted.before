@@ -1,0 +1,1 @@
+            if (ok && info.model != TlsAccessModel::MachoTlv && ta.contains("bootstrap")) {

@@ -47,6 +47,7 @@
 #include "program/runtime_object_cache.hpp"
 
 #include "diagnostic_count.hpp"
+#include "repo_root.hpp"
 #include "scoped_env.hpp"
 #include "scratch_dir.hpp"
 
@@ -175,6 +176,9 @@ struct ManifestSpec {
     // ([[D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT]]);
     // the object now has two members and nothing left to choose between.
     bool                     declareCache = false;
+    // empty ⇒ no `artifactName`: the artifact is named after the FIRST source's
+    // stem, which is a key term of its own.
+    std::string              artifactName;
 };
 
 [[nodiscard]] std::string renderManifest(ManifestSpec const& m) {
@@ -194,6 +198,9 @@ struct ManifestSpec {
         out += ",\n  \"dependencyArtifactCache\": {"
                "\"enabled\": true, \"rootOverrideVariable\": "
              + jsonQuote(kCacheDirVar) + "}";
+    }
+    if (!m.artifactName.empty()) {
+        out += ",\n  \"artifactName\": " + jsonQuote(m.artifactName);
     }
     out += "\n}\n";
     return out;
@@ -621,6 +628,46 @@ TEST(DependencyArtifactCacheStore, ASecondKeyLEAVESTheFirstEntryIntact) {
     EXPECT_TRUE(fs::exists(artifactBeside(first.front())))
         << "and so must its artifact — the artifact is the file a concurrent "
            "build opens, and the sidecar surviving alone would still fail it.";
+}
+
+// P69 fold 3d (D-LK-THE-LINK-ORDER-IS-NOT-THE-COMMAND-LINE-ORDER): an object input's PLACE among the dependency's
+// sources is a term of the key. The same files in another order are another archive -- its members in that order,
+// which decides the definition an archive search finds first -- so `lib.c` before an object and the object before
+// `lib.c` store two entries. The units' closure and the object's bytes are the same in both orders, and the manifest
+// NAMES the artifact, so its name -- a key term, else the first source's stem -- is the same too; only the place
+// tells them apart. (✔MEASURED by checkpoint 39's macos-arm64-debug sweep: with no `artifactName` the two orders'
+// stems, `lib` and `helper`, kept the keys apart, and the arm below survived.) RED-ON-DISABLE: leave the place out of
+// the object's link-input entry -> the second order's key is the first's, one entry, and the second build is served
+// the first order's archive.
+TEST(DependencyArtifactCacheStore, AnObjectInputsPlaceAmongTheSourcesIsATermOfTheKey) {
+    ScratchDir scratch{Location::Temp, "dep-artifact-cache-object-place"};
+    fs::path const cacheRoot = scratch.path() / "cache";
+    ScopedEnv const cacheEnv{kCacheDirVar, cacheRoot.string()};
+
+    Fixture const fx{scratch.path() / "tree", /*declareCache=*/true};
+    std::error_code ec;
+    fs::copy_file(dss::test::repoRoot() / "tests" / "link" / "data" / "object_entry_helper_x86_64_elf_gcc_O2.o",
+                  fx.depDir / "helper.o", fs::copy_options::overwrite_existing, ec);
+    ASSERT_FALSE(ec) << ec.message();
+    auto const depSources = [&](std::vector<std::string> sources) {
+        writeText(fx.depDir / std::string{dss::kDependencyManifestName},
+                  renderManifest({.profile      = "staticlib",
+                                  .targets      = {std::string{"x86_64:"} + std::string{kDepFormatName}},
+                                  .sources      = std::move(sources),
+                                  .artifactName = "dep"}));
+    };
+
+    depSources({"lib.c", "helper.o"});
+    DiagnosticReporter first;
+    ASSERT_EQ(fx.build(first), 0);
+    ASSERT_EQ(keyDocumentsUnder(cacheRoot).size(), 1u);
+
+    depSources({"helper.o", "lib.c"});
+    DiagnosticReporter second;
+    ASSERT_EQ(fx.build(second), 0);
+    EXPECT_EQ(keyDocumentsUnder(cacheRoot).size(), 2u)
+        << "the object before `lib.c` is another archive, and its key is another key; one entry means the second "
+           "order was served the first order's archive";
 }
 
 // ⛔ A BUILD THAT REPORTED AN ERROR MUST NOT ENTER THE CACHE. Storing one would

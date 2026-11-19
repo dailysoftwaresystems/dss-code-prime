@@ -255,6 +255,27 @@ TEST_F(DeclAttributeSequencePosition, MidRunSequenceIsRefusedInAParameter) {
     expectRefused("int h(const [[maybe_unused]] int *p);\n");
 }
 
+// ── A MEMBER DECLARATOR: where the `[[…]]` sequence sits, and its order with the GNU run ─────────────────────
+// ✔MEASURED (probe n5r, 2026-11-17: gcc 13.3.0 and clang 18.1.3 run 20261117-110052-5e3095b0, MinGW-w64 gcc 13.2.0 run 20261117-110102-b8fedec1, cl 19.52 run 20261117-110106-485264c6, Apple clang run 20261117-110136-7167bf9b): each
+// accepted cell below is built by gcc, clang, Apple clang and MinGW-w64 gcc (the `deprecated` ones warn at the
+// use); cl builds the `[[…]]`-only cells (C5030) and refuses every `__attribute__`. The refused cell is refused by
+// all five. RED-ON-DISABLE: the sequence after the width instead of before it (the bit-field cell is refused); the
+// sequence admitted after the GNU run (the refused cell is accepted).
+TEST_F(DeclAttributeSequencePosition, AMemberTakesTheSequenceAfterItsDeclaratorAndBeforeItsWidth) {
+    expectAccepted("struct S { int x [[deprecated]] : 3; int y; };\n");
+    expectAccepted("struct S { int x [[maybe_unused]] [[deprecated]] : 3, z [[deprecated]] : 2; };\n");
+    expectAccepted("struct S { int x [[deprecated]]; int y; };\n");
+    expectAccepted("struct S { int x : 3 __attribute__((deprecated)); int y; };\n");
+    expectAccepted("struct S { int x [[deprecated]] __attribute__((aligned(8))); int y; };\n");
+}
+
+TEST_F(DeclAttributeSequencePosition, AMemberTakesNoSequenceAfterItsGnuRun) {
+    expectRefused("struct S { int x __attribute__((aligned(8))) [[deprecated]]; int y; };\n");
+    expectRefused("struct S { int x : 3 __attribute__((packed)) [[deprecated]]; int y; };\n");
+    // CONTROL: the same two attributes in the order the references take.
+    expectAccepted("struct S { int x [[deprecated]] __attribute__((aligned(8))); int y; };\n");
+}
+
 TEST_F(DeclAttributeSequencePosition, MidRunSequenceIsRefusedAroundAnInferredAuto) {
     expectRefused("static [[maybe_unused]] auto g = 1;\n");
     expectRefused("auto [[maybe_unused]] static g = 1;\n");

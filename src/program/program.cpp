@@ -1,11 +1,14 @@
 #include "program/program.hpp"
 
 #include "core/crypto/sha256.hpp"  // the ONE content digest — the artifact cache's input closure
+#include "core/substrate/bounded_retry.hpp"  // retryUpTo: a fresh staging directory
 #include "core/substrate/path_identity.hpp"
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/preprocess/preprocessor.hpp"   // PreScanMemoCounters, for the --time report
 #include "core/substrate/large_stack_call.hpp"  // D-PARSE-DEEP-FRONTEND-STACK: build CUs on a large stack
+#include "core/substrate/key_order.hpp"  // entriesInKeyOrder -- the merged recipe partition's order
+#include "core/substrate/mint_monotonic_id.hpp"  // the startup module's unit id (an all-object link's)
 #include "core/substrate/phase_timers.hpp"      // c97: --time per-phase breakdown
 #include "core/substrate/thread_pool.hpp"       // D-PERF-4-CU-PARALLELISM: per-CU build pool
 #include "core/types/config_path_walk.hpp"      // findShippedConfigDir — shared src/dss-config/<dir> resolver
@@ -23,7 +26,6 @@
 #include "link/object_format_schema.hpp"
 #include "mir/merge/mir_merge.hpp"  // MergeCuInput, mergeCuMirs (N>1 whole-program merge)
 #include "mir/merge/synth_pe_startup.hpp"  // realizeEntryShape (the argv spine)
-#include "mir/merge/synth_stdio_shim.hpp"  // synthesizeStdioShim (D-FFI-PE-CRT-UCRT-MIGRATION Phase 3)
 #include "mir/merge/synth_threads_shim.hpp"  // synthesizeThreadsShim (FC17.9a D-CSUBSET-C11-THREADS-HEADER)
 #include "lsp/lsp_server.hpp"
 #include "lsp/schema_cache.hpp"
@@ -48,6 +50,8 @@
 #include "program/cross_validate_language_target.hpp"
 #include "program/cross_validate_target_format.hpp"
 #include "program/dependency_resolver.hpp"  // AP6: `dependsOn` resolution
+#include "core/substrate/every_unit.hpp"           // runEveryUnit: every unit's step, before a several-unit build fails
+#include "core/substrate/silent_unit.hpp"          // namingSilentUnits: the net bound to the run's reporter
 #include "program/git_acquire.hpp"          // SystemGitRunner — the default git seam
 #include "program/input_resolver.hpp"
 #include "core/types/project_sources.hpp"  // D-AP2-SOURCES-GLOB + AP6 M4: sources[] → files
@@ -70,6 +74,8 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>    // std::fprintf — the link order's internal-breach stop
+#include <cstdlib>   // std::abort
 // D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION (C):
 // `serveArtifactFromCache` and `buildDependencyArtifactKey` return
 // `std::expected`. It arrived transitively through `runtime_object_cache.hpp`
@@ -111,10 +117,10 @@ namespace dss {
 // which builds a `UnitBuilder` per open document, could not call them and grew
 // no system dirs at all, while `dump_predefined_macros.cpp` re-walked
 // `shippedLibDirs` with a private loop. The walk now lives once in
-// `core/types/config_path_walk.hpp` (`resolveSystemDirs`) and its builder
-// binding once beside `UnitBuilder::addSystemDir`
-// (`analysis/compilation_unit/compilation_unit.hpp`, `applySystemDirs`) — both
-// reached through includes this file already had.
+// `core/types/config_path_walk.hpp` (`resolveSystemDirs`), and a unit takes its
+// language's dirs at construction (`UnitBuilder`, `LanguageSystemDirs` in
+// `analysis/compilation_unit/compilation_unit.hpp`) — both reached through
+// includes this file already had.
 
 namespace {
 
@@ -291,8 +297,9 @@ void drainDiagnosticsToStderr(DiagnosticReporter const& rep,
 // it.
 [[nodiscard]] std::string artifactPathForReport(fs::path const& p) {
     // `generic_string()` throws for a path the current locale cannot encode;
-    // the u8 fallback mirrors `link/writer.cpp`'s `pathForDiag`, which the
-    // write-failure diagnostics for this very artifact already use. Forward
+    // `core::genericSpelling` is TOTAL since P69 H6c2 (T4: lossless UTF-8, an
+    // unpaired surrogate as WTF-8, never the code page), so the u8 fallback
+    // that stood here went with the throw. Forward
     // slashes on every host — that is what this codebase prints, and every
     // consumer of the line (POSIX shell, PowerShell, .NET `Path`) takes them.
     // [[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]]: `core::genericSpelling`,
@@ -301,12 +308,7 @@ void drainDiagnosticsToStderr(DiagnosticReporter const& rep,
     // local drive root. The exported spelling substitutes the model's OWN
     // separator per character and leaves the run intact, giving the same
     // forward-slash result this line has always printed for an ordinary path.
-    try {
-        return core::genericSpelling(p);
-    } catch (...) {
-        auto const u8 = p.u8string();
-        return std::string(reinterpret_cast<char const*>(u8.data()), u8.size());
-    }
+    return core::genericSpelling(p);
 }
 
 // Called ONCE per artifact, and ONLY after the write path reported success.
@@ -323,13 +325,13 @@ void reportArtifactWritten(std::string const& targetSpec,
     // this line reported `C:\host\share\…` for an artifact written to
     // `\\host\share\…` — a diagnostic naming a file that is not there, which is
     // worse than losing the absolute guarantee it was written to protect.
-    fs::path abs = core::absoluteKeepingRoot(outPath, ec);
+    core::HostPath abs = core::absoluteKeepingRoot(outPath, core::Use::Leaf, ec);   // the artifact: a FILE
     // Not a silent fallback: `outPath` IS the path the writer committed to, so
     // the line stays TRUE either way. Only the ABSOLUTE guarantee is lost, and
     // only when the process has no usable cwd to resolve against.
     if (ec) abs = outPath;
     std::cerr << "dsscp: artifact " << targetSpec << ' '
-              << artifactPathForReport(core::normalizeKeepingRoot(abs))
+              << core::normalizeKeepingRoot(abs, core::Use::Leaf).spelling().generic()
               << '\n';
 }
 
@@ -438,25 +440,14 @@ void emitStoppedBeforeCuBuild(DiagnosticReporter& rep,
 void mergeWithTargetContext(DiagnosticReporter const& src,
                             std::string const&        targetSpec,
                             DiagnosticReporter&       dst) {
-    // ★★ THE BUFFERS TRAVEL WITH THE DIAGNOSTICS, AND FIRST. A diagnostic
-    // whose `BufferId` names a buffer only `src` retains renders as
-    // `--> <unknown-buffer:N>:offset K` at `dst` — the whole failure mode the
-    // reporter-side retention exists to end (see
-    // `DiagnosticReporter::sourceBuffers()`). Every mid-compile fragment
-    // buffer — today an embedded assembly template, tomorrow any other tier
-    // that parses text the CUs do not own — is registered on THIS scratch
-    // reporter, so a merge that carried only `all()` would move the
-    // diagnostics out of reach of their own source.
-    // ⚠ Ordered before the diagnostic loop so a `dst` that is already capped
-    // still gains the buffers: the cap drops diagnostics, not sources, and a
-    // partial render must not also lose its context.
-    dst.sourceBuffers().addAll(src.sourceBuffers());
+    // ★★ THE BUFFERS TRAVEL WITH THE DIAGNOSTICS, AND FIRST -- and so does the
+    // count of what `src`'s gates dropped (D9(c)). Both are `relayFrom`'s: a
+    // diagnostic whose `BufferId` names a buffer only `src` retains renders as
+    // `--> <unknown-buffer:N>:offset K` at `dst` (see
+    // `DiagnosticReporter::sourceBuffers()`), and an Error `src` elided that
+    // `dst` never counts is a failed target that reads as a clean one.
     auto const prefix = "[target=" + targetSpec + "] ";
-    for (auto const& d : src.all()) {
-        ParseDiagnostic copy = d;
-        copy.contextPrefix = prefix;
-        dst.report(std::move(copy));
-    }
+    dst.relayFrom(src, [&prefix](ParseDiagnostic& d) { d.contextPrefix = prefix; });
 }
 
 // Map a `TargetSpec::parse` failure kind to a remediation-distinct
@@ -690,7 +681,11 @@ void storeBuiltArtifactInCache(ArtifactCacheTicket const& ticket,
                  ? (*outputDir / formatName)
                  : *outputDir;
     }
-    return fs::current_path() / "target" / formatName;
+    // The home's answer (H6c), as the text the output route keeps until H6d types it.
+    std::error_code ec;
+    fs::path const  cwd = core::storeRouteCurrentDirectory(ec);
+    if (ec) throw fs::filesystem_error("the current directory could not be read", ec);
+    return cwd / "target" / formatName;
 }
 
 // D-AP2-OUTPUT-ROUTING (`output` field): do two output-dir BASES name the same
@@ -715,10 +710,12 @@ void storeBuiltArtifactInCache(ArtifactCacheTicket const& ticket,
 [[nodiscard]] bool sameOutputBase(fs::path const& a, fs::path const& b) {
     std::error_code ecA;
     std::error_code ecB;
-    fs::path const absA = core::absoluteKeepingRoot(a, ecA);
-    fs::path const absB = core::absoluteKeepingRoot(b, ecB);
+    // VALUES (H6c): two output-dir BASES, each a DIRECTORY (Container), compared by their normal forms' text.
+    core::HostPath const absA = core::absoluteKeepingRoot(a, core::Use::Container, ecA);
+    core::HostPath const absB = core::absoluteKeepingRoot(b, core::Use::Container, ecB);
     if (ecA || ecB) return false;
-    return core::normalizeKeepingRoot(absA) == core::normalizeKeepingRoot(absB);
+    return core::normalizeKeepingRoot(absA, core::Use::Container).spelling().display()
+           == core::normalizeKeepingRoot(absB, core::Use::Container).spelling().display();
 }
 
 // Compile one resolved (CU, target, format) triple to one artifact.
@@ -1016,6 +1013,9 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         hirCtx.symbolNames = &hirSymbolNames;
         hirCtx.literalPool   = &front->hir->literalPool;
         hirCtx.inlineAsmPool = &front->hir->inlineAsmPool;
+        // The unit's symbol aliases (`.dsshir` v9's `aliases` section): without them the artifact is the
+        // unit with every second name of its definitions gone.
+        hirCtx.symbolAliases = &front->hir->symbolAliases;
         // Source spans, and the buffer→name table that makes them resolvable
         // OUTSIDE this process. Supplied together, always: `BufferId` is a
         // process-global counter, so `@loc(buf 7, …)` without the table names
@@ -1112,7 +1112,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     fs::path const outDir = resolveArtifactOutputDir(
         outputDir, parsed->formatName, multiTargetBuild, perFormatOutputSubdir);
     std::error_code ec;
-    fs::create_directories(outDir, ec);
+    static_cast<void>(core::createDirectories(outDir, ec));   // at any length (`core::createDirectories`)
     if (ec) {
         // Driver-tier mkdir failure — distinct from the linker's
         // refuse-to-mkdir contract (which uses
@@ -1122,7 +1122,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         // `D_DirectoryScanFailed` (mid-scan failure on input dirs).
         emitDriver(reporter, DiagnosticCode::D_OutputDirCreateFailed,
                    "failed to create output directory '"
-                   + core::genericSpelling(outDir) + "': " + ec.message());
+                   + core::genericSpelling(outDir) + "': " + core::reasonText(ec));
         return std::nullopt;
     }
     auto const outPath =
@@ -1174,13 +1174,19 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // normalises to as well. An artifact name carrying that root would then
     // match the basis and be judged CONTAINED while resolving onto the local
     // drive — the escape this block exists to refuse, admitted by the
-    // comparison rather than by the rule. `normalizeKeepingRoot` is identical to
-    // `lexically_normal()` for every path with a run below 2, so the `--output .`
-    // repair described above is untouched.
-    auto const containmentBasis =
-        core::normalizeKeepingRoot(outDir / "dss-containment-probe")
-            .parent_path();
-    if (core::normalizeKeepingRoot(outPath).parent_path() != containmentBasis) {
+    // comparison rather than by the rule. Both sides of the comparison below take
+    // the SAME normalization, `normalizeKeepingRoot` -- the substrate's one rule,
+    // which since P69 H6 trims what Win32 trims, maps a last `NUL` to its device
+    // and, on Windows, is the OS's own full spelling of a drive path -- so what it
+    // does to one side it does to the other; and it drops a `.` component as
+    // `lexically_normal()` does, so the `--output .` repair described above is
+    // untouched.
+    // VALUES (H6c): the directory each FILE is in -- the one cut, `containingDirectory` -- compared by text.
+    std::string const containmentBasis =
+        core::containingDirectory(core::normalizeKeepingRoot(outDir / "dss-containment-probe", core::Use::Leaf))
+            .spelling().display();
+    if (core::containingDirectory(core::normalizeKeepingRoot(outPath, core::Use::Leaf)).spelling().display()
+        != containmentBasis) {
         emitDriver(reporter, DiagnosticCode::D_ArtifactNameEscapesOutputDir,
                    "artifact name '" + artifactName.value_or(sourceStem)
                    + "' resolves outside the output directory '"
@@ -1370,10 +1376,331 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // channel, so there is one definition of what an object input means and no
     // second engine to keep in step. APPENDED, never assigned: `compileOpts`
     // may already carry objects the source partition routed here.
+    // ── WHERE EACH INPUT STANDS IN THE LINK'S ORDER (P69 fold 3d,
+    //    D-LK-THE-LINK-ORDER-IS-NOT-THE-COMMAND-LINE-ORDER) ──────────────────
+    // `CompileOptions::objectInputPlaces` is parallel to the objects the
+    // operator named among the inputs; an object `--resolve-library` named is
+    // ordered by nothing the operator wrote, so it states no place (a
+    // library's: after every named input). Either list is empty (a caller that
+    // states no order) or one place per input — anything else is a caller that
+    // lost track of what it partitioned, an internal breach no input can cause
+    // (`runCusToTargets` fills both lists in the loop that partitions), so it
+    // stops the process rather than link in an order nobody stated.
+    if ((!perCuOpts.objectInputPlaces.empty()
+         && perCuOpts.objectInputPlaces.size() != perCuOpts.objectInputs.size())
+        || (!perCuOpts.unitPlaces.empty() && perCuOpts.unitPlaces.size() != cus.size())) {
+        std::fprintf(stderr,
+                     "dss::compileOneTarget fatal: target '%s' was handed %zu object input(s) "
+                     "with %zu place(s) and %zu unit(s) with %zu place(s) -- the link's order "
+                     "states one place per input or none at all.\n",
+                     targetSpecStr.c_str(), perCuOpts.objectInputs.size(),
+                     perCuOpts.objectInputPlaces.size(), cus.size(), perCuOpts.unitPlaces.size());
+        std::abort();
+    }
+    if (perCuOpts.objectInputPlaces.empty()) {
+        perCuOpts.objectInputPlaces.resize(perCuOpts.objectInputs.size());
+    }
     perCuOpts.objectInputs.insert(perCuOpts.objectInputs.end(),
                                   resolveLibs.objectInputs.begin(),
                                   resolveLibs.objectInputs.end());
+    perCuOpts.objectInputPlaces.resize(perCuOpts.objectInputs.size());
     perCuOpts.resolveLibraries = std::move(resolveLibs.dynamicLibraries);
+    // The place of unit `i` — none where the caller stated no order.
+    auto const unitPlace = [&perCuOpts](std::size_t i) -> std::optional<std::uint32_t> {
+        if (i < perCuOpts.unitPlaces.size()) return perCuOpts.unitPlaces[i];
+        return std::nullopt;
+    };
+
+    // ── EVERY OBJECT INPUT, READ ONCE, BEFORE ANY ROUTE (P69 fold 3d) ────────
+    //
+    // Each route links the objects; the all-object route also elects among
+    // them, and every route now elects the program's entry over the units AND
+    // the objects (`collectObjectEntryCandidates`). So they are read HERE, once,
+    // by the one reader every object and archive member takes
+    // (`readObjectInputModules`, which also asks the named objects' `/ENTRY:`
+    // directive together), each stamped with its place, and handed to the
+    // route's link as modules. An object that cannot be read fails the target
+    // here, loud, before any unit is lowered.
+    auto objectModules = readObjectInputModules(
+        std::span<std::filesystem::path const>{perCuOpts.objectInputs}, **targetR, **formatR,
+        reporter);
+    if (!objectModules) return std::nullopt;   // read fail-loud already reported
+    for (std::size_t oi = 0; oi < objectModules->size(); ++oi) {
+        (*objectModules)[oi].linkPosition = perCuOpts.objectInputPlaces[oi];
+    }
+    // The program-entry candidates the objects define, with the richest verb of
+    // each name the format realizes — empty for a format that starts no program.
+    // Not const: an archive member the startup pulls for its entry joins them
+    // (`pullEntryFromArchives`, below).
+    std::vector<ForeignEntryCandidate> objectEntries = collectObjectEntryCandidates(
+        std::span<AssembledModule const>{*objectModules}, grammar, **formatR);
+    // What the program's entry election may elect (P69 fold 3e, class C's N5):
+    // the format's entry verbs, restricted by the entry a NAMED object states
+    // (`entryElectionScope`), asked of the named objects before any archive
+    // member joins them -- a pulled member names no entry.
+    EntryElectionScope const entryScope =
+        entryElectionScope(grammar, **formatR, std::span<AssembledModule const>{*objectModules});
+    // Whether a candidate is one the election may elect.
+    auto const electable = [&](EntryCandidate const& c) {
+        return c.verb.has_value()
+            && std::find(entryScope.verbs.begin(), entryScope.verbs.end(), *c.verb) != entryScope.verbs.end();
+    };
+    auto const anyObjectElectable = [&] {
+        return std::any_of(objectEntries.begin(), objectEntries.end(),
+                           [&](ForeignEntryCandidate const& c) { return electable(c.candidate); });
+    };
+
+    // ── AN ENTRY IN AN ARCHIVE MEMBER (P69 fold 3e, the review of fold 3d's X4) ──
+    //
+    // Asked by each route once its NAMED inputs' candidates are known, and only
+    // when none of them is an entry the format realizes: the entry names seed
+    // the archive search, as the startup object every reference links first
+    // references the entry, and each member that answers is linked as an input
+    // and its candidates join `objectEntries`, after the named objects'
+    // (`pullEntryArchiveMembers` states the measurement). A format that starts
+    // no program pulls nothing for an entry. False after reporting a failure.
+    // A stated startup's names alone seed it (P69 fold 3e: ✔MEASURED, link.exe and
+    // lld-link pull `wmain` from an archive for `/ENTRY:wmainCRTStartup` beside a
+    // named `main`), and an entry that elects no C entry pulls nothing.
+    auto const pullEntryFromArchives = [&]() -> bool {
+        if (entryScope.verbs.empty() || entryScope.electsNone || staticArchives.empty()) return true;
+        std::vector<EntryLinkName> const names = entryLinkNames(grammar, **formatR, entryScope.verbs);
+        auto members = pullEntryArchiveMembers(std::span<EntryLinkName const>{names},
+                                               std::span<std::vector<EntryMaterialization> const>{entryScope.precedence},
+                                               std::span<std::filesystem::path const>{staticArchives},
+                                               **targetR, **formatR, reporter);
+        if (!members) return false;   // reported
+        std::size_t const first = objectModules->size();
+        for (auto& member : *members) objectModules->push_back(std::move(member));
+        std::vector<ForeignEntryCandidate> pulled = collectObjectEntryCandidates(
+            std::span<AssembledModule const>{objectModules->data() + first, objectModules->size() - first},
+            grammar, **formatR);
+        for (ForeignEntryCandidate& c : pulled) {
+            c.object += first;   // its index among the link's objects
+            objectEntries.push_back(std::move(c));
+        }
+        return true;
+    };
+    // The one compiled module of a route, as the link's list of compiled modules.
+    auto const soleModule = [](AssembledModule m) {
+        std::vector<AssembledModule> v;
+        v.push_back(std::move(m));
+        return v;
+    };
+    // Whether any of a unit's candidates is an entry the election may elect.
+    auto const anyRealizable = [&](std::span<EntryCandidate const> cands) {
+        return std::any_of(cands.begin(), cands.end(), electable);
+    };
+
+    // The LOWER half of a whole module (the merge's, or the startup's below):
+    // the one call both make, with every format fact the merged route reads.
+    auto const lowerWholeModule = [&](MergedMirModule& whole, CompilationUnitId wholeId,
+                                      std::vector<MirSehScope> sehScopes) {
+        // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the F128 softcall runtime
+        // library, resolved here (the lower body has no ObjectFormatKind in
+        // scope). Empty = the format declares none (F128 softcall fails loud).
+        std::string_view const wfLib = (*targetR)->wideFloatSoftcallLibrary((*formatR)->kind());
+        std::optional<std::string> wideFloatSoftcallLibrary =
+            wfLib.empty() ? std::nullopt : std::optional<std::string>(std::string(wfLib));
+        return lowerMergedToAssembly(whole, grammar, **targetR,
+                                     effectiveBitFieldStrategy(**targetR, **formatR),
+                                     effectiveUnnamedBitFieldAlignment(**targetR, **formatR),
+                                     ccIndex, wholeId,
+                                     (*formatR)->externCallDispatch(),
+                                     (*formatR)->dataImportBinding(),
+                                     // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the
+                                     // format's extern-ADDRESS binding.
+                                     (*formatR)->externAddrBinding(),
+                                     // TLS C1 (D-CSUBSET-THREAD-LOCAL): the format's
+                                     // thread-local access block.
+                                     (*formatR)->tlsAccess(),
+                                     std::move(sehScopes),
+                                     std::move(wideFloatSoftcallLibrary),
+                                     reporter,
+                                     // D-CSUBSET-PACKED-ATOMIC-MEMBER: the format's
+                                     // atomics-runtime block.
+                                     (*formatR)->atomicsRuntime(),
+                                     // P55, anchor
+                                     // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT:
+                                     // the format's narrowing of WHICH bindings the
+                                     // `indirect-slot` dispatch above reaches through the
+                                     // import slot — a whole module lowered without it
+                                     // would disagree with the linker's slot pass, which
+                                     // reads the format DIRECTLY, symbol for symbol.
+                                     (*formatR)->indirectSlotBindings(),
+                                     // D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING:
+                                     // WHICH of this artifact's OWN definitions its loader
+                                     // may replace — lowered without it, the module would
+                                     // branch to its own body for a name the loader has
+                                     // already given the process a different answer for.
+                                     (*formatR)->preemptibleDefinitionBindings(),
+                                     // P68 round 9: the format kind, ONLY as a key into an
+                                     // inline-asm dialect's `symbolParts`. P69 fold 3b (lane
+                                     // `xa`): this call once passed `std::nullopt` — the one
+                                     // field the sole-CU route sets and the merged route
+                                     // dropped — so a program of two sources whose inline
+                                     // asm names an address part (`@PAGE`, `:lo12:`) was
+                                     // refused where one source built (DriverArgumentSupply.
+                                     // MergedMultiCuRouteSuppliesTheAssemblyFormatKind).
+                                     (*formatR)->kind(),
+                                     // P69 fold 3b: how a whole module writes a tentative
+                                     // definition — a COMMON where the document states one
+                                     // and every linker gives it its alignment. Required: a
+                                     // merged object written with `.bss` definitions is
+                                     // refused beside another object of the name where the
+                                     // references' commons fold.
+                                     (*formatR)->commonsStatement(),
+                                     // P69 fold 3d: the names the image will define. A
+                                     // whole module lowered without them reads each one
+                                     // through a slot, and the image link refuses it
+                                     // (DriverArgumentSupply.
+                                     // MergedMultiCuRouteSuppliesTheImageDefinedNames).
+                                     (*formatR)->imageDefinedNames());
+    };
+
+    // ── THE PROGRAM'S STARTUP FOR AN ENTRY AN OBJECT DEFINES (P69 fold 3d,
+    //    D-PROGRAM-AN-OBJECTS-ENTRY-IS-CALLED-WITHOUT-ITS-ARGUMENTS) ─────────
+    //
+    // The all-object link compiles nothing, so an entry whose arguments need a
+    // pre-main init (the CRT accessors of a PE image) had none: ✔MEASURED before
+    // (lane `xa`, `argc_pe.py`, cl 19.44 /O2 objects run as `prog 7 x y`), DSS's
+    // image of `main(argc, argv)` exited 1091911680 and of `main(argc, argv,
+    // envp)` 12, where link.exe's exit 47 and 11 — the trampoline called `main`
+    // on whatever the argument registers held. So the link gets ONE compiled
+    // module of its own, holding only that init (`buildForeignEntryStartup`: the
+    // init synthesized by the pass every route's entry takes, then the two
+    // optimize stages every compiled module receives), lowered here by the call
+    // the merged module takes. It is made ONLY where that pass synthesizes
+    // something; elsewhere the trampoline calls the object's entry itself.
+    // Returns nullopt when it failed (reported); an empty inner optional when no
+    // init was needed.
+    auto const compileForeignEntryStartup =
+        [&](ForeignEntryCandidate const& entry, EntryMaterialization verb)
+        -> std::optional<std::optional<AssembledModule>> {
+        CompilationUnitId const        startupId = substrate::mintMonotonicId<CompilationUnitId>();
+        std::optional<MergedMirModule> startup;
+        if (!buildForeignEntryStartup(entry, verb, startupId, grammar, **targetR, **formatR,
+                                      compileOpts, startup, reporter)) {
+            return std::nullopt;   // reported
+        }
+        if (!startup.has_value()) return std::optional<AssembledModule>{};
+        auto lowered = lowerWholeModule(*startup, startupId, {});
+        if (!lowered) return std::nullopt;   // reported
+        return std::optional<AssembledModule>{std::move(*lowered)};
+    };
+
+    // ── THE ELECTION OF A LINK THAT LOWERS NO MIR UNIT (P69 fold 3e, the review
+    //    of fold 3d's X1) ──────────────────────────────────────────────────────
+    //
+    // The all-object link and the `encode` route (an assembly unit) compile no
+    // MIR unit whose semantic model names an entry, so their candidates are all
+    // read off ASSEMBLED modules, by the one reader (`collectObjectEntryCandidates`,
+    // over the one vocabulary `entryLinkNames`): the assembly unit's first, then
+    // the named objects', then -- where none of those is one -- an archive member
+    // the startup pulls (`pullEntryFromArchives`). The ONE election
+    // (`resolveProgramEntry`) chooses, and the winner is started as the unit
+    // routes start an object's entry: through a compiled startup where its verb
+    // needs a pre-main init (appended to `compiled`), else stated on the module
+    // that defines it. ✔MEASURED before (lane `xa`, fold 3d's bytes): `helper.s
+    // main.o` and objects alone with no `--language` were refused at the startup
+    // on every family where every reference links them; with no `--language` on
+    // PE an image called the wrong function. A format that starts no program
+    // elects nothing. False after reporting.
+    auto const electAssembledEntry = [&](std::vector<AssembledModule>& compiled) -> bool {
+        if ((*formatR)->entryVerbs().empty() || entryScope.electsNone) return true;
+        std::vector<ForeignEntryCandidate> const unitEntries = collectObjectEntryCandidates(
+            std::span<AssembledModule const>{compiled}, grammar, **formatR);
+        bool const unitElectable = std::any_of(unitEntries.begin(), unitEntries.end(),
+                                               [&](ForeignEntryCandidate const& c) { return electable(c.candidate); });
+        if (!unitElectable && !anyObjectElectable() && !pullEntryFromArchives()) {
+            return false;   // reported
+        }
+        std::vector<EntryCandidate> cands;
+        cands.reserve(unitEntries.size() + objectEntries.size());
+        for (ForeignEntryCandidate const& c : unitEntries) cands.push_back(c.candidate);
+        for (ForeignEntryCandidate const& c : objectEntries) cands.push_back(c.candidate);
+        if (cands.empty()) {
+            // ★ NO INPUT DEFINES AN ENTRY THE FORMAT CAN REALIZE — said in the
+            // operator's words, naming the names. gcc, clang and MSVC all refuse
+            // the same link naming the same fact. Where the grammar declares no
+            // entry name the format realizes at all, that is what is said.
+            std::vector<EntryLinkName> const names = entryLinkNames(grammar, **formatR, entryScope.verbs);
+            std::string spelled;
+            for (auto const& n : names) {
+                if (!spelled.empty()) spelled += ", ";
+                spelled += '\'' + n.linkName + '\'';
+            }
+            std::string inputs;
+            if (!compiled.empty()) inputs = "the assembly unit";
+            for (auto const& p : perCuOpts.objectInputs) {
+                if (!inputs.empty()) inputs += ", ";
+                inputs += core::genericSpelling(p);
+            }
+            emitDriver(reporter, DiagnosticCode::K_ProgramEntryUndefined,
+                       names.empty()
+                           ? "no program entry: language '" + std::string{grammar.configName()}
+                                 + "' declares no entry name that format '"
+                                 + std::string{(*formatR)->name()}
+                                 + "' can enter through, and this format starts a "
+                                   "program, so nothing in the link can be its entry."
+                           : "no program entry: none of the link's inputs (" + inputs
+                                 + ") defines an exported function named " + spelled
+                                 + " — the entry name(s) language '"
+                                 + std::string{grammar.configName()} + "' declares that format '"
+                                 + std::string{(*formatR)->name()}
+                                 + "' can enter through"
+                                 + (staticArchives.empty() ? std::string{}
+                                                           : std::string{", nor does any member of "
+                                                                         "the named archives"})
+                                 + (entryScope.restrictedBy.empty()
+                                        ? std::string{}
+                                        : " (" + entryScope.restrictedBy + ")")
+                                 + ". An object records no entry of its own, so the link "
+                                   "has nothing to call.");
+            return false;
+        }
+        bool       entryOk = true;
+        auto const elected = resolveProgramEntry(cands, entryScope, (*formatR)->name(), reporter, entryOk);
+        if (!entryOk) return false;   // two rival entries — reported
+        bool const                   ofUnit = elected->index < unitEntries.size();
+        ForeignEntryCandidate const& winner =
+            ofUnit ? unitEntries[elected->index] : objectEntries[elected->index - unitEntries.size()];
+        auto made = compileForeignEntryStartup(winner, elected->verb);
+        if (!made.has_value()) return false;   // reported
+        if (made->has_value()) {
+            compiled.push_back(std::move(**made));   // the startup calls the winner by its name
+        } else {
+            (ofUnit ? compiled[winner.object] : (*objectModules)[winner.object]).userEntrySymbol =
+                winner.symbol;
+        }
+        return true;
+    };
+
+    // ★★ D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS — WHAT THIS
+    // BUILD'S FINAL MODULE IS TO ITS LINK, decided ONCE here, where the output
+    // format and both input lists are final: a `WholeImage` only when the
+    // output IS an image and its link takes no object input and no archive but
+    // the shipped runtime's (`CompileOptions::shippedRuntimeArchives` says why
+    // those cannot keep a definition of the program alive). Otherwise it is a
+    // `LinkInput`: a relocatable object is completed by a LATER link, and an
+    // image's other inputs may name any of its external-linkage definitions,
+    // hidden ones included. ✔MEASURED before: a release relocatable object
+    // lost both hidden definitions its unit never used, and a release image
+    // linked with an object input that called a hidden function its CU never
+    // called failed K_SymbolUndefined (pe64 and ELF). The static-archive arm
+    // never reads it — a member is always a `LinkInput`.
+    opt::ModuleExtent const imageExtent = [&] {
+        if (!(*formatR)->isImageFlavor()) return opt::ModuleExtent::LinkInput;
+        if (!perCuOpts.objectInputs.empty()) return opt::ModuleExtent::LinkInput;
+        for (std::filesystem::path const& archive : staticArchives) {
+            if (std::find(compileOpts.shippedRuntimeArchives.begin(),
+                          compileOpts.shippedRuntimeArchives.end(), archive)
+                == compileOpts.shippedRuntimeArchives.end()) {
+                return opt::ModuleExtent::LinkInput;
+            }
+        }
+        return opt::ModuleExtent::WholeImage;
+    }();
 
     // Cycle 24/25 build-then-lower sequence. LOOP 1: build EVERY CU's MIR up front
     // (`buildCuMir` — sem→HIR→FFI→MIR→optimize), holding each `CuMirModule` (which keeps
@@ -1398,6 +1725,15 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // driver never exits 1 with ZERO output. A no-op on the happy path and on
     // every genuine (already-reported) failure. Mirrors the optimizer's
     // X_OptReturnFalseWithoutDiagnostic belt-and-suspenders guard.
+    // ★ A SEVERAL-UNIT STEP NAMES EACH SILENT UNIT ITSELF (P69 H6c, R4; H6c2: the net is a STEP):
+    // `substrate::namingSilentFailures` reads the count before EACH unit and calls this for a unit that failed having
+    // said nothing -- one snapshot for the whole build let an earlier unit's error hide a later unit's silence. A
+    // unit's report names its unit by its own source buffer (a CU's diagnostics carry its buffer, which the reporter's
+    // dedup key holds), so no reporting unit is named silent.
+    auto const silentUnitName = [&](std::size_t unit) {
+        std::string_view const name = unit < cus.size() ? cus[unit].primarySourceName() : std::string_view{};
+        return "unit " + std::to_string(unit) + (name.empty() ? std::string{} : " ('" + std::string{name} + "')");
+    };
     auto const errorsBeforeCuBuild = reporter.errorCount();
     auto const emitNullNoDiagnostic = [&](char const* where) {
         if (reporter.errorCount() == errorsBeforeCuBuild) {
@@ -1408,6 +1744,158 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                              "diagnostic — substrate-contract violation: a "
                              "failing tier must say why.");
         }
+    };
+    // ── D-FF1-AR-STATICLIB-DRIVER-WIRING: THE ONE STATIC-ARCHIVE PACKAGING STEP ──────────
+    //
+    // ★★ EVERY UNIT A `container: archive` BUILD PACKAGES ENTERS HERE, WHATEVER TIER BUILT IT (P69 H5).
+    // `unitModules[i]` is the module of `cus[i]` -- lowered from MIR by the static-archive branch below, or
+    // assembled from text by the `encode` route. The `encode` route used to return through
+    // `linkAndWriteWithStaticArchives` whatever the format's container, so a `.s` built for a static-archive
+    // format came out a bare OBJECT under the archive's name, its definitions at default visibility.
+    // ✔MEASURED 2026-11-03: the shipped PE runtime's assembly unit was cached as a COFF object (`d\x86`,
+    // 476 bytes) where its C units are `!<arch>` archives; a link dispatches an input by its magic, so the
+    // unit joined EVERY pe link as an eagerly-merged object input -- a relocatable `-c` object of
+    // `int f(int x)` defined `__chkstk`, two such objects redefined it, and a DSS DLL exported it. One step,
+    // so the archive-wide visibility, the member names, the input archives' members and the object inputs
+    // are answered once for every tier.
+    auto const packageUnitsAsStaticArchive =
+        [&](std::vector<AssembledModule> unitModules) -> std::optional<std::filesystem::path> {
+        // D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES: this line READ
+        // `kind() == ObjectFormatKind::Pe ? ".obj" : ".o"`. The member
+        // extension is a NAMING fact about the ecosystem this archive belongs
+        // to, so the archive format declares it (`archiveMemberExtension`,
+        // presence-paired with `container: archive` and refused on any format
+        // that packages no members).
+        std::string const memberExt{(*formatR)->archiveMemberExtension()};
+        std::vector<AssembledModule> members;
+        std::vector<std::string>     memberNames;
+        members.reserve(unitModules.size());
+        memberNames.reserve(unitModules.size());
+        // ── D-STATICLIB-MEMBER-NAME-DERIVES-FROM-THE-FIRST-SOURCE ──────────
+        //
+        // ★★ A MEMBER IS NAMED AFTER THE SOURCE THAT PRODUCED IT, AND UNTIL
+        // NOW NONE OF THEM WAS. Every CU-derived member took the DRIVER'S
+        // `sourceStem` — `fs::path{sourceFiles.front()}.stem()`, the FIRST file
+        // of the whole command — plus its index, so ✔MEASURED before this
+        // change: `--compile u1.c u2.c --target …-staticlib` emitted `u1_0.obj`
+        // and `u1_1.obj`, and `u2.c`'s member was named after `u1`. The armap
+        // indexes members BY POSITION, so selection was never wrong; what was
+        // wrong is everything a HUMAN reads — an `ar t` listing, and every
+        // member-read refusal, which names the member and so pointed at a file
+        // that did not produce it. A diagnostic that misdirects is worse than
+        // one that says nothing.
+        //
+        // ★ THE NAME COMES FROM THE CU, NOT FROM A STEM LIST THREADED BESIDE
+        // IT. `CompilationUnit::primarySourceName()` answers from the unit's
+        // own first tree; a parallel `std::vector<std::string>` would be a
+        // second owner of that fact, and an index-parallel side list is exactly
+        // what desynchronizes without reddening anything. See the accessor.
+        //
+        // ⓘ The FALLBACK is the old behaviour and is not dead: a CU with no
+        // trees (or a hand-built one with no source buffer) can name nothing,
+        // and `sourceStem` is still the best available answer there.
+        //
+        // ⓘ UNIQUENESS is now earned rather than assumed. The old `_<i>`
+        // suffix made every multi-CU name distinct by construction; real stems
+        // do not (`a/u.c` and `b/u.c` share one), so the suffix is applied ONLY
+        // where a name would otherwise repeat — a two-source archive of
+        // DIFFERENT stems now reads `u1.obj` / `u2.obj`, and one of the SAME
+        // stem reads `u.obj` / `u_1.obj`. Applied to the CU-derived names
+        // alone: an extracted archive member and a `--compile`d object input
+        // carry the name their INPUT gave them, and renaming those would
+        // misdirect in the other direction.
+        auto const uniqueMemberName = [&memberNames](std::string base,
+                                                     std::string const& ext) {
+            auto taken = [&memberNames](std::string const& n) {
+                for (auto const& m : memberNames) if (m == n) return true;
+                return false;
+            };
+            if (!taken(base + ext)) return base + ext;
+            for (std::size_t n = 1;; ++n) {
+                std::string cand = base + "_" + std::to_string(n) + ext;
+                if (!taken(cand)) return cand;
+            }
+        };
+        for (std::size_t i = 0; i < unitModules.size(); ++i) {
+            std::optional<AssembledModule> mod{std::move(unitModules[i])};
+            // D-LK-PE-DLL-EXPORTS-THE-SHIPPED-RUNTIME-IT-LINKS: the build's
+            // archive-wide visibility, restated on every external definition of
+            // the LOWERED member — after the optimizer, whose DCE would otherwise
+            // delete a hidden definition nothing in its own unit calls
+            // (`CompileOptions::archiveDefinitionVisibility`;
+            // D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS). Each
+            // format's member writer spells it in its own vocabulary, and each
+            // image's export gate reads it back through `isExternallyVisible`.
+            if (compileOpts.archiveDefinitionVisibility.has_value()) {
+                for (ModuleSymbol& ms : mod->symbols) {
+                    if (ms.binding == SymbolBinding::Local) continue;
+                    ms.visibility = *compileOpts.archiveDefinitionVisibility;
+                }
+            }
+            members.push_back(std::move(*mod));
+            // Member file name: THIS CU's own source stem (see the block above),
+            // uniquified only where two sources share one stem.
+            std::string_view const own =
+                i < cus.size() ? cus[i].primarySourceName() : std::string_view{};
+            std::string stem = own.empty()
+                ? std::string{sourceStem}
+                : fs::path{own}.stem().string();
+            if (stem.empty()) stem = std::string{sourceStem};
+            memberNames.push_back(uniqueMemberName(std::move(stem), memberExt));
+        }
+        // ── D-FF1-STATICLIB-FAT-ARCHIVE: merge input static archives ──
+        // When this static-library build is also handed INPUT `--resolve-library`
+        // static archives, bundle EVERY member of each INTO this library (a
+        // merged/"fat" archive, à la `libtool -static`). A static library
+        // PACKAGES objects, so all members are carried — NOT the lazy
+        // referenced-subset the exe/final-link path pulls — because a DOWNSTREAM
+        // link against this library must be able to pull any of them (dropping an
+        // unreferenced member would silently ship an incomplete library). Dynamic
+        // `--resolve-library` libraries stay on the per-CU FFI path (a member may
+        // reference libc externs, resolved at the FINAL link against this
+        // library). Fails loud on any open / parse / member-read error (never a
+        // silent member omission). CU-derived members lead; the input archives'
+        // members follow.
+        if (!staticArchives.empty()) {
+            auto extracted = extractStaticArchiveMembers(
+                std::span<std::filesystem::path const>{staticArchives},
+                **targetR, **formatR, reporter);
+            if (!extracted) return std::nullopt;  // fail-loud already reported
+            members.reserve(members.size() + extracted->modules.size());
+            memberNames.reserve(memberNames.size() + extracted->names.size());
+            for (std::size_t i = 0; i < extracted->modules.size(); ++i) {
+                members.push_back(std::move(extracted->modules[i]));
+                memberNames.push_back(std::move(extracted->names[i]));
+            }
+        }
+        // ── D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION:
+        // pre-assembled OBJECT inputs become
+        //    MEMBERS of this library ─────────────────────────────────────────
+        //
+        // ⚠ THIS ARM EXISTS BECAUSE ITS ABSENCE WAS A SILENT DROP. `objectInputs`
+        // is consumed by `linkAndWriteWithStaticArchives`, and a `container:
+        // archive` build never reaches that composition — it routes here. So an
+        // object named on a static-library build would have been accepted,
+        // ignored, and the library shipped without it: rc 0, no diagnostic, a
+        // member the operator asked for simply absent. That is the exact shape
+        // the fat-archive arm above was written to avoid, and it is the reason
+        // an object input has to be answered on EVERY route that produces an
+        // artifact rather than only on the one it was first needed for.
+        //
+        // Packaged, never merged: an archive bundles objects, so each object
+        // input becomes its own member under its own file name, exactly as an
+        // extracted archive member does. CU-derived members lead, then the input
+        // archives' members, then these.
+        // The objects were read once, above, before any route.
+        members.reserve(members.size() + objectModules->size());
+        memberNames.reserve(memberNames.size() + objectModules->size());
+        for (std::size_t i = 0; i < objectModules->size(); ++i) {
+            members.push_back(std::move((*objectModules)[i]));
+            memberNames.push_back(perCuOpts.objectInputs[i].filename().string());
+        }
+        return reported(linkAndWriteStaticArchive(members, memberNames,
+                                                  **targetR, **formatR, outPath,
+                                                  reporter, imageRequest));
     };
     // ── plan 29 P4: THE `encode` PIPELINE ENTRY ────────────────────────────
     //
@@ -1447,11 +1935,45 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         case PipelineTier::Hir:
             break;   // the ordinary path below
         case PipelineTier::Encode: {
+            // A static-archive format packages EVERY unit as its own member, by the one step every unit enters
+            // (`packageUnitsAsStaticArchive`): never a bare object under the archive's name, and never a merge -- a
+            // member keeps its own symbol space, so the refusal below, which is about merging the units into ONE
+            // image, does not hold here. `as` + `ar`, `ml64` + `lib` and `gcc -c a.s b.s` + `ar rcs` build it (P69 H6,
+            // the review of H5's F4). Each unit is assembled as the single-unit route assembles it, in source order,
+            // which is the order the step names its members by.
+            if ((*formatR)->isStaticArchive()) {
+                std::vector<AssembledModule> units;
+                units.reserve(cus.size());
+                // EVERY unit is assembled and reports its own errors before the build fails (the one home: P69 H6b,
+                // the review of H6's N1), and a unit that fails having said nothing is named, per unit (its netted
+                // form, H6c R4).
+                bool const everyUnitAssembled = substrate::runEveryUnit(
+                    cus.size(),
+                    substrate::namingSilentUnits(
+                        reporter, "the assembly unit build (assembleAsmUnit)", silentUnitName,
+                        [&](std::size_t i) {
+                            auto unit = assembleAsmUnit(cus[i], grammar, **targetR, **formatR,
+                                                        reporter, perCuOpts);
+                            if (!unit) return false;
+                            units.push_back(std::move(*unit));
+                            return true;
+                        }));
+                // PACKAGING'S PRECONDITION, NOT A SECOND COPY OF THE WRITER'S DECISION (P69 H6c, ledger 576 (2)):
+                // the step names member i after unit i's source (`packageUnitsAsStaticArchive`), so it takes EVERY
+                // unit's module or none -- packaging the units that assembled would name a member after another
+                // unit's source. A build any unit failed hands the writer nothing, so there is no archive for
+                // `link::writeBytes` to withhold (no K_ArtifactWithheldAfterError);
+                // ArchivePackaging.EveryUnitsErrorsAreReportedAndABuildAnyUnitFailedWritesNoArchive asserts it.
+                if (!everyUnitAssembled) return std::nullopt;
+                if (analysisOnly) return std::nullopt;
+                return packageUnitsAsStaticArchive(std::move(units));
+            }
             if (cus.size() != 1) {
                 emitDriver(reporter, DiagnosticCode::D_PlanNotLanded,
-                           "a multi-CU standalone-assembly build is not yet "
-                           "lowered — each unit's symbol space would have to be "
-                           "namespaced before the modules merge");
+                           "a multi-CU standalone-assembly build into a merged "
+                           "image is not yet lowered — each unit's symbol space "
+                           "would have to be namespaced before the modules merge "
+                           "(a static archive takes several: each is a member)");
                 return std::nullopt;
             }
             // D-ASM-EXTERN-CALL-CANNOT-BIND-A-LIBRARY: the WHOLE format schema
@@ -1485,15 +2007,23 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
             // `linkAndWrite` when the archive list is empty (its documented
             // contract), so the ordinary `.s` build is unchanged and the flag
             // now has an effect on both halves.
+            mod->linkPosition = unitPlace(0);   // the unit stands where its source does
+            // ★ THE UNIT'S ENTRY IS ELECTED WITH THE OBJECTS' (P69 fold 3e, the
+            // review of fold 3d's X1): the unit is one candidate source of the
+            // one election, and where its entry's verb needs a pre-main init that
+            // startup joins the compiled modules.
+            std::vector<AssembledModule> compiled;
+            compiled.push_back(std::move(*mod));
+            if (!electAssembledEntry(compiled)) return std::nullopt;   // reported
             return reported(linkAndWriteWithStaticArchives(
-                std::move(*mod),
+                std::move(compiled),
                 // D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION: an
                 // assembly unit may name
                 // pre-assembled objects exactly as a C unit may — the `encode`
                 // tier reaches the linker through this same composition, which
                 // is why the parameter is threaded here rather than defaulted
                 // away on the route least likely to be exercised.
-                std::span<std::filesystem::path const>{perCuOpts.objectInputs},
+                std::move(*objectModules),
                 std::span<std::filesystem::path const>{staticArchives},
                 // D-LK-ARCHIVE-MEMBER-EXTERN-CANNOT-BIND-A-RESOLVE-LIBRARY: the
                 // DYNAMIC half, so a pulled member's extern can rebind to a
@@ -1591,16 +2121,16 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         // Merge each CU's diagnostics into `reporter` in CU (index) ORDER — deterministic,
         // independent of which CU finished first. Merge EVERY CU BEFORE the failure check so a
         // failing build surfaces every CU's errors deterministically (not just the first-to-
-        // fail's — an improvement the parallel model makes free: every CU is always built).
-        bool allBuilt = true;
-        for (std::size_t i = 0; i < cus.size(); ++i) {
-            copyDiagnostics(cuScratch[i], reporter);
-            if (!cuMirSlots[i].has_value()) allBuilt = false;
-        }
-        if (!allBuilt) {
-            emitNullNoDiagnostic("a per-CU build (buildCuMir)");
-            return std::nullopt;  // ≥1 front-half tier failure — all diagnostics reported
-        }
+        // fail's — an improvement the parallel model makes free: every CU is always built). The verb is
+        // `runEveryUnit`, the one home every several-unit step takes (P69 H6b).
+        // Each unit that failed having said nothing is named (the netted form, H6c R4).
+        bool const allBuilt = substrate::runEveryUnit(
+            cus.size(), substrate::namingSilentUnits(reporter, "a per-CU build (buildCuMir)", silentUnitName,
+                                                     [&](std::size_t i) {
+                                                         reporter.relayFrom(cuScratch[i]);
+                                                         return cuMirSlots[i].has_value();
+                                                     }));
+        if (!allBuilt) return std::nullopt;  // ≥1 front-half tier failure — every unit's diagnostics reported
     }
 
     // ── D-PROGRAM-PROJECT-WIDE-PARSE-GATE-MASKS-CENSUS: THE MEASURE-ONLY STOP ──
@@ -1642,77 +2172,49 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // arm) and `enforceArtifactProfileFormat` already validated the project's
     // `staticlib` profile against this format's served set.
     if ((*formatR)->isStaticArchive()) {
-        // D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES: this line READ
-        // `kind() == ObjectFormatKind::Pe ? ".obj" : ".o"`. The member
-        // extension is a NAMING fact about the ecosystem this archive belongs
-        // to, so the archive format declares it (`archiveMemberExtension`,
-        // presence-paired with `container: archive` and refused on any format
-        // that packages no members).
-        std::string const memberExt{(*formatR)->archiveMemberExtension()};
-        std::vector<AssembledModule> members;
-        std::vector<std::string>     memberNames;
-        members.reserve(cuMirs.size());
-        memberNames.reserve(cuMirs.size());
-        // ── D-STATICLIB-MEMBER-NAME-DERIVES-FROM-THE-FIRST-SOURCE ──────────
-        //
-        // ★★ A MEMBER IS NAMED AFTER THE SOURCE THAT PRODUCED IT, AND UNTIL
-        // NOW NONE OF THEM WAS. Every CU-derived member took the DRIVER'S
-        // `sourceStem` — `fs::path{sourceFiles.front()}.stem()`, the FIRST file
-        // of the whole command — plus its index, so ✔MEASURED before this
-        // change: `--compile u1.c u2.c --target …-staticlib` emitted `u1_0.obj`
-        // and `u1_1.obj`, and `u2.c`'s member was named after `u1`. The armap
-        // indexes members BY POSITION, so selection was never wrong; what was
-        // wrong is everything a HUMAN reads — an `ar t` listing, and every
-        // member-read refusal, which names the member and so pointed at a file
-        // that did not produce it. A diagnostic that misdirects is worse than
-        // one that says nothing.
-        //
-        // ★ THE NAME COMES FROM THE CU, NOT FROM A STEM LIST THREADED BESIDE
-        // IT. `CompilationUnit::primarySourceName()` answers from the unit's
-        // own first tree; a parallel `std::vector<std::string>` would be a
-        // second owner of that fact, and an index-parallel side list is exactly
-        // what desynchronizes without reddening anything. See the accessor.
-        //
-        // ⓘ The FALLBACK is the old behaviour and is not dead: a CU with no
-        // trees (or a hand-built one with no source buffer) can name nothing,
-        // and `sourceStem` is still the best available answer there.
-        //
-        // ⓘ UNIQUENESS is now earned rather than assumed. The old `_<i>`
-        // suffix made every multi-CU name distinct by construction; real stems
-        // do not (`a/u.c` and `b/u.c` share one), so the suffix is applied ONLY
-        // where a name would otherwise repeat — a two-source archive of
-        // DIFFERENT stems now reads `u1.obj` / `u2.obj`, and one of the SAME
-        // stem reads `u.obj` / `u_1.obj`. Applied to the CU-derived names
-        // alone: an extracted archive member and a `--compile`d object input
-        // carry the name their INPUT gave them, and renaming those would
-        // misdirect in the other direction.
-        auto const uniqueMemberName = [&memberNames](std::string base,
-                                                     std::string const& ext) {
-            auto taken = [&memberNames](std::string const& n) {
-                for (auto const& m : memberNames) if (m == n) return true;
-                return false;
-            };
-            if (!taken(base + ext)) return base + ext;
-            for (std::size_t n = 1;; ++n) {
-                std::string cand = base + "_" + std::to_string(n) + ext;
-                if (!taken(cand)) return cand;
-            }
-        };
-        for (std::size_t i = 0; i < cuMirs.size(); ++i) {
+        std::vector<AssembledModule> units;
+        units.reserve(cuMirs.size());
+        // EVERY member is built and reports its own errors before the build
+        // fails (`runEveryUnit`, the several-unit class's one home: P69 H6b, the
+        // review of H6's N1; this loop is site (a) of the orchestrator's ledger
+        // 550, fold 3e), and nothing is packaged when any member failed. A member
+        // that failed having said nothing is named, per unit (the netted form, H6c
+        // R4): the single-unit route names a silent `lowerCuMirToAssembly` null, and
+        // this loop failed the build on one with nothing said.
+        bool const everyMemberBuilt = substrate::runEveryUnit(
+            cuMirs.size(), substrate::namingSilentUnits(
+                reporter, "a static-archive member's build (shims, optimizeModule, lowerCuMirToAssembly)",
+                silentUnitName, [&](std::size_t i) {
             // P10: a static-archive member is the FINAL module of its own
             // artifact (nothing downstream merges it — the foreign linker
             // pulls members whole), so it gets the PROGRAM-stage schedule
             // before lowering, exactly like the N==1 sole CU. Skipping this
             // would silently ship release archives optimized at the unit
             // schedule only — the archive twin of the old double-opt defect.
+            // D-MIR-SYNTH-SHIM-SEAM-OPTIMIZE-PLACEMENT-ASYMMETRY: the member's
+            // library shims are optimizer INPUT, as on every route (the
+            // contract is on `synthesizeLibraryShims`).
+            if (!synthesizeLibraryShims(cuMirs[i], reporter)) {
+                return false;  // internal invariant breach already reported
+            }
             if (!optimizeModule(cuMirs[i].mir, **targetR,
                                 cuMirs[i].model.lattice().interner(), compileOpts,
-                                PipelineStage::Program, reporter,
+                                PipelineStage::Program,
+                                // D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS:
+                                // a member's definitions are named by the OTHER
+                                // inputs of whatever link pulls it.
+                                opt::ModuleExtent::LinkInput, {}, reporter,
                                 cuMirs[i].externImports)) {
-                return std::nullopt;  // optimize-stage failure already reported
+                return false;  // optimize-stage failure already reported
             }
+            std::optional<std::size_t> noOtherInput;   // none can win: no other input stands beside it
             auto mod = lowerCuMirToAssembly(
-                cuMirs[i], (*formatR)->processArgs(), (*formatR)->entryVerbs(),
+                cuMirs[i], (*formatR)->processArgs(),
+                // An archive starts no program: its format's own scope.
+                entryElectionScope(grammar, **formatR, {}),
+                // A member is packaged, not linked: no other input's entry is
+                // elected beside it (an archive starts no program).
+                std::span<ForeignEntryCandidate const>{}, noOtherInput,
                 (*formatR)->sehPersonality(), (*formatR)->name(),
                 cuMirs[i].target->wideFloatSoftcallLibrary(
                     (*formatR)->kind()),
@@ -1720,77 +2222,14 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                 // D-CSUBSET-PACKED-ATOMIC-MEMBER: the format's atomics-runtime
                 // block, read off the schema here exactly as sehPersonality is.
                 (*formatR)->atomicsRuntime());
-            if (!mod) return std::nullopt;  // back-half tier failure already reported
-            members.push_back(std::move(*mod));
-            // Member file name: THIS CU's own source stem (see the block above),
-            // uniquified only where two sources share one stem.
-            std::string_view const own =
-                i < cus.size() ? cus[i].primarySourceName() : std::string_view{};
-            std::string stem = own.empty()
-                ? std::string{sourceStem}
-                : fs::path{own}.stem().string();
-            if (stem.empty()) stem = std::string{sourceStem};
-            memberNames.push_back(uniqueMemberName(std::move(stem), memberExt));
-        }
-        // ── D-FF1-STATICLIB-FAT-ARCHIVE: merge input static archives ──
-        // When this static-library build is also handed INPUT `--resolve-library`
-        // static archives, bundle EVERY member of each INTO this library (a
-        // merged/"fat" archive, à la `libtool -static`). A static library
-        // PACKAGES objects, so all members are carried — NOT the lazy
-        // referenced-subset the exe/final-link path pulls — because a DOWNSTREAM
-        // link against this library must be able to pull any of them (dropping an
-        // unreferenced member would silently ship an incomplete library). Dynamic
-        // `--resolve-library` libraries stay on the per-CU FFI path (a member may
-        // reference libc externs, resolved at the FINAL link against this
-        // library). Fails loud on any open / parse / member-read error (never a
-        // silent member omission). CU-derived members lead; the input archives'
-        // members follow.
-        if (!staticArchives.empty()) {
-            auto extracted = extractStaticArchiveMembers(
-                std::span<std::filesystem::path const>{staticArchives},
-                **targetR, **formatR, reporter);
-            if (!extracted) return std::nullopt;  // fail-loud already reported
-            members.reserve(members.size() + extracted->modules.size());
-            memberNames.reserve(memberNames.size() + extracted->names.size());
-            for (std::size_t i = 0; i < extracted->modules.size(); ++i) {
-                members.push_back(std::move(extracted->modules[i]));
-                memberNames.push_back(std::move(extracted->names[i]));
-            }
-        }
-        // ── D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION:
-        // pre-assembled OBJECT inputs become
-        //    MEMBERS of this library ─────────────────────────────────────────
-        //
-        // ⚠ THIS ARM EXISTS BECAUSE ITS ABSENCE WAS A SILENT DROP. `objectInputs`
-        // is consumed by `linkAndWriteWithStaticArchives`, and a `container:
-        // archive` build never reaches that composition — it routes here. So an
-        // object named on a static-library build would have been accepted,
-        // ignored, and the library shipped without it: rc 0, no diagnostic, a
-        // member the operator asked for simply absent. That is the exact shape
-        // the fat-archive arm above was written to avoid, and it is the reason
-        // an object input has to be answered on EVERY route that produces an
-        // artifact rather than only on the one it was first needed for.
-        //
-        // Packaged, never merged: an archive bundles objects, so each object
-        // input becomes its own member under its own file name, exactly as an
-        // extracted archive member does. CU-derived members lead, then the input
-        // archives' members, then these.
-        if (!perCuOpts.objectInputs.empty()) {
-            auto objects = readObjectInputModules(
-                std::span<std::filesystem::path const>{perCuOpts.objectInputs},
-                **targetR, **formatR, reporter);
-            if (!objects) return std::nullopt;  // fail-loud already reported
-            members.reserve(members.size() + objects->size());
-            memberNames.reserve(memberNames.size() + objects->size());
-            for (std::size_t i = 0; i < objects->size(); ++i) {
-                members.push_back(std::move((*objects)[i]));
-                memberNames.push_back(
-                    perCuOpts.objectInputs[i].filename().string());
-            }
-        }
-        return reported(linkAndWriteStaticArchive(members, memberNames,
-                                                  **targetR, **formatR, outPath,
-                                                  reporter, imageRequest));
+            if (!mod) return false;  // back-half tier failure already reported
+            units.push_back(std::move(*mod));
+            return true;
+        }));
+        if (!everyMemberBuilt) return std::nullopt;
+        // The members are packaged by the one step every unit enters (`packageUnitsAsStaticArchive`,
+        // above the `encode` route): the archive-wide visibility, the names, the input archives and objects.
+        return packageUnitsAsStaticArchive(std::move(units));
     }
 
     // ── D-LK-OBJECT-INPUT-COMPILE-FLAG-SURFACE: THE ALL-OBJECT LINK ─────────
@@ -1803,15 +2242,15 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // arm does not fire, and the N>1 whole-program merge would fold ZERO
     // modules into one and lower the empty result.
     //
-    // ★ THE FIRST OBJECT IS ELECTED CLIENT, THE REST STAY OBJECT INPUTS. The
-    // link composition below is `[client, objects…, pulled…]`, and it needs a
-    // client to seed the archive pull with; with no CU there is no natural one,
-    // so the first object takes the role. That is a NAMING of one of the
-    // inputs, never a promotion: `linkAndWriteWithStaticArchives` merges the
-    // client and the object inputs by the same `mergeModules` that binds a
-    // sibling CU's reference, so which object holds the seat cannot change what
-    // the image contains. ⓘ It is READ HERE and the REST are passed as PATHS —
-    // one read per object, never two.
+    // ★ EVERY OBJECT IS AN OBJECT INPUT, IN THE OPERATOR'S ORDER (P69 fold 3d).
+    // The link composition is `[compiled?, objects…, pulled…]`, and with no CU
+    // nothing is compiled, so the objects ARE the link — none is promoted to a
+    // "client". That role once went to the object defining the entry, which put
+    // it first in the link's order (D-LK-THE-LINK-ORDER-IS-NOT-THE-COMMAND-LINE-ORDER:
+    // `weak1.o mainown.o` kept `mainown.o`'s weak definition where every reference
+    // keeps `weak1.o`'s) and left its library imports unbound
+    // (D-LK-FOREIGN-OBJECT-NAMED-TO-THE-LINK-BINDS-NO-LIBRARY-IMPORT). Each object
+    // was read once, before any route, and stands at its own place.
     //
     // ⓘ The STATIC-ARCHIVE route above already answered this case correctly on
     // its own (zero CU-derived members, the objects packaged as members), which
@@ -1821,15 +2260,13 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         // shipped driver (`compileFiles`/`compileUnits` refuse an empty file
         // list, and a gathered file that is not an object stays a source), so
         // this is the net under a future gathering route, not a live arm.
-        if (perCuOpts.objectInputs.empty()) {
+        if (objectModules->empty()) {
             emitDriver(reporter, DiagnosticCode::D_EmptyInput,
                        "nothing to compile or link for target '" + targetSpecStr
                        + "': the build produced no compilation unit and named "
                          "no pre-assembled object input.");
             return std::nullopt;
         }
-        std::span<std::filesystem::path const> const objectPaths{
-            perCuOpts.objectInputs};
 
         // ── WHICH OBJECT HOLDS THE PROGRAM ENTRY, AND WHY IT MUST BE ASKED BY
         //    NAME ───────────────────────────────────────────────────────────
@@ -1843,142 +2280,28 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         // …-exec` reached the entry trampoline with two functions, no
         // `userEntrySymbol` and an empty format `entryPoint`, and failed loud
         // with `K_SymbolUndefined`. Every ordinary build sidesteps this because
-        // its client is a CU the pipeline stamped.
+        // its entry is a unit the pipeline stamped.
         //
         // ★★ THE NAME IS THE FORMAT-LEVEL IDENTITY, and it is the one the merge
         // ALREADY uses — `ModuleSymbol::name` is the cross-module match key
-        // precisely because `SymbolId` is not portable across units. Resolving
-        // the entry the same way is reuse, not a parallel mechanism.
-        //
-        // ★ THE CANDIDATE SET IS THE DECLARED INTERSECTION, not a `"main"`
-        // literal: the LANGUAGE's `entryFunctions` rows supply the names, the
-        // FORMAT's `entryVerbs` set says which of those verbs it can realize,
-        // and the format's own C decoration spells the on-binary form. That is
-        // the same two-owner intersection `entry_shape.hpp` documents and the
-        // same `applyCMangling` the merge keys on (`_main` on Mach-O, identity
-        // on ELF/PE) — so `wmain` is a candidate on a Windows image and on
-        // nothing else, with no format identity tested anywhere here.
-        //
-        // ⚠ NAME ONLY, NEVER THE SIGNATURE. The CU route intersects the
-        // signature too (`collectEntryCandidates` reads each SemanticModel);
-        // an object carries no prototype, so that half is simply not knowable
-        // here. The name+verb intersection is what the format itself can see.
-        std::vector<std::string> entryNames;
-        {
-            CSymbolDecorationScheme const scheme =
-                (*formatR)->cSymbolDecoration().scheme;
-            for (auto const& decl : grammar.semantics().declarations) {
-                for (auto const& row : decl.entryFunctions) {
-                    if (!(*formatR)->realizesEntryVerb(row.verb)) continue;
-                    std::string mangled =
-                        dss::ffi::applyCMangling(row.name, scheme);
-                    if (std::find(entryNames.begin(), entryNames.end(), mangled)
-                        == entryNames.end()) {
-                        entryNames.push_back(std::move(mangled));
-                    }
-                }
-            }
-        }
-        // Does this module DEFINE one of the candidates as a function? A
-        // `ModuleSymbol` row alone is not enough — the readers mint one for
-        // data and for section symbols too — so the row's `SymbolId` has to
-        // name an actual `AssembledFunction`, which is what the trampoline will
-        // call.
-        auto definedEntryOf =
-            [&entryNames](AssembledModule const& m) -> std::optional<SymbolId> {
-            for (auto const& ms : m.symbols) {
-                if (std::find(entryNames.begin(), entryNames.end(), ms.name)
-                    == entryNames.end()) continue;
-                for (auto const& fn : m.functions) {
-                    if (fn.symbol.v == ms.symbol.v) return ms.symbol;
-                }
-            }
-            return std::nullopt;
-        };
-
-        // ★ THE CLIENT IS THE OBJECT THAT DEFINES THE ENTRY, and the election
-        // is what makes the choice mean something. `linkAndWriteWithStaticArchives`
-        // composes `[client, objects…, pulled…]` and the client is the module
-        // whose `userEntrySymbol` survives the merge, so electing the FIRST
-        // object unconditionally would have made `--compile helper.o main.o`
-        // and `--compile main.o helper.o` two different programs.
-        //
-        // ⓘ ONE READ PER OBJECT. The probe stops at the winner and keeps its
-        // module, so the common case (`main.o` named first) reads one object
-        // here and the rest exactly once more inside the link. Object 0 is
-        // retained on the way past so the no-entry fallback costs no re-read.
-        std::optional<AssembledModule> client;
-        std::optional<AssembledModule> firstObject;
-        std::optional<SymbolId>        entrySymbol;
-        std::size_t                    clientIndex = 0;
-        for (std::size_t oi = 0; oi < objectPaths.size(); ++oi) {
-            auto one = readObjectInputModules(objectPaths.subspan(oi, 1),
-                                              **targetR, **formatR, reporter);
-            if (!one) return std::nullopt;  // fail-loud already reported
-            if (auto sym = definedEntryOf((*one)[0])) {
-                entrySymbol = sym;
-                clientIndex = oi;
-                client      = std::move((*one)[0]);
-                break;
-            }
-            if (oi == 0) firstObject = std::move((*one)[0]);
-        }
-        if (!client) {
-            // ★ NO OBJECT DEFINES AN ENTRY THE FORMAT CAN REALIZE — and when
-            // the language DID name some, that is a refusal this arm owes the
-            // operator IN ITS OWN WORDS. Falling through would reach the
-            // trampoline, whose message talks about a synthesized `sym_<id>`
-            // convention and a SymbolId encoded in the format's `entryPoint`
-            // — true of the mechanism, and about nothing the operator can act
-            // on: they named objects, and none of them has a `main`. gcc,
-            // clang and MSVC all refuse the same link naming the same fact, so
-            // this is the union's answer and not an invented strictness.
-            //
-            // ⓘ GATED ON A NON-EMPTY CANDIDATE SET. With no `--language` the
-            // resolved grammar is the target's assembly dialect, which
-            // declares no entry rows at all — there is then no claim to make
-            // about a missing `main`, and the trampoline's own single-function
-            // fallback stays the answer, unchanged.
-            if (!entryNames.empty() && (*formatR)->isImageFlavor()) {
-                std::string names;
-                for (auto const& n : entryNames) {
-                    if (!names.empty()) names += ", ";
-                    names += '\'' + n + '\'';
-                }
-                std::string objs;
-                for (auto const& p : objectPaths) {
-                    if (!objs.empty()) objs += ", ";
-                    objs += core::genericSpelling(p);
-                }
-                emitDriver(reporter, DiagnosticCode::K_SymbolUndefined,
-                           "no program entry: none of the object inputs ("
-                           + objs + ") defines a function named "
-                           + names + " — the entry name(s) language '"
-                           + std::string{grammar.configName()}
-                           + "' declares that format '"
-                           + std::string{(*formatR)->name()}
-                           + "' can enter through. An object records no entry "
-                             "of its own, so the link has nothing to call.");
-                return std::nullopt;
-            }
-            // The FIRST object is elected and left unstamped, which preserves
-            // the trampoline's own single-function fallback and, for anything
-            // else, its existing loud refusal — this arm neither invents an
-            // entry nor swallows the refusal.
-            client      = std::move(firstObject);
-            clientIndex = 0;
-        }
-        if (entrySymbol.has_value()) client->userEntrySymbol = entrySymbol;
-
-        // Everything except the elected client, IN THE OPERATOR'S ORDER.
-        std::vector<std::filesystem::path> remaining;
-        remaining.reserve(objectPaths.size() - 1);
-        for (std::size_t oi = 0; oi < objectPaths.size(); ++oi) {
-            if (oi != clientIndex) remaining.push_back(objectPaths[oi]);
-        }
+        // precisely because `SymbolId` is not portable across units. The
+        // candidates are `collectObjectEntryCandidates`' — the language's entry
+        // names the format realizes, in the format's C decoration, each with the
+        // richest verb of its name the format realizes (an object carries no
+        // prototype; see the function) — and the SAME election every route
+        // holds decides among them: two objects defining `main` are the
+        // ambiguity `K_ProgramEntryAmbiguous` names, never the first one read.
+        // The ONE election of a link that lowers no MIR unit (`electAssembledEntry`,
+        // above): the objects' candidates, then an archive member the startup
+        // pulls where none of them is one, and the startup the winner's verb needs.
+        // (P69 fold 3e: a link of objects with no `--language` used to elect
+        // nothing here and leave the trampoline its single-function fallback,
+        // which called the wrong function -- the dialect now declares the entry
+        // rows, and the trampoline takes no fallback.)
+        std::vector<AssembledModule> startup;
+        if (!electAssembledEntry(startup)) return std::nullopt;   // reported
         return reported(linkAndWriteWithStaticArchives(
-            std::move(*client),
-            std::span<std::filesystem::path const>{remaining},
+            std::move(startup), std::move(*objectModules),
             std::span<std::filesystem::path const>{staticArchives},
             std::span<ResolveLibrarySpec const>{perCuOpts.resolveLibraries},
             **targetR, **formatR, outPath, reporter, imageRequest));
@@ -1992,16 +2315,43 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // the link-time schedule here exactly as the N>1 merged module does above — no
     // driver `if` on stage content, the site exists and the config decides what runs.
     if (cuMirs.size() == 1) {
+        // D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS: the entry
+        // trampoline names the program's entry, so it is a root whatever its
+        // visibility (✔MEASURED before: a hidden `main` failed its own release
+        // link). Every candidate is kept — the one `lowerCuMirToAssembly`
+        // resolves among them is in the set; on this path a candidate's record
+        // index IS its SymbolId.
+        std::vector<EntryCandidate> entryCands;
+        std::vector<std::uint32_t>  entryCandSym;
+        collectEntryCandidates(cuMirs[0].model, entryCands, entryCandSym);
+        // An entry only an archive member defines (P69 fold 3e, X4): asked only
+        // when neither the unit nor a named object defines one the format starts.
+        if (!anyRealizable(entryCands) && !anyObjectElectable() && !pullEntryFromArchives()) {
+            return std::nullopt;   // reported
+        }
+        std::vector<SymbolId> entryRoots;
+        entryRoots.reserve(entryCandSym.size());
+        for (std::uint32_t const s : entryCandSym) entryRoots.push_back(SymbolId{s});
+        // D-MIR-SYNTH-SHIM-SEAM-OPTIMIZE-PLACEMENT-ASYMMETRY: the sole CU's library
+        // shims are optimizer INPUT, exactly as the merge seam's are.
+        if (!synthesizeLibraryShims(cuMirs[0], reporter)) {
+            return std::nullopt;  // internal invariant breach already reported
+        }
         if (!optimizeModule(cuMirs[0].mir, **targetR,
                             cuMirs[0].model.lattice().interner(), compileOpts,
-                            PipelineStage::Program, reporter,
+                            PipelineStage::Program, imageExtent,
+                            std::span<SymbolId const>{entryRoots}, reporter,
                             // this CU's extern table; lowerCuMirToAssembly moves
                             // it into MIR→LIR only after this call returns.
                             cuMirs[0].externImports)) {
             return std::nullopt;  // optimize-stage failure already reported
         }
+        std::optional<std::size_t> electedObject;   // the election's own answer (X3)
         auto mod = lowerCuMirToAssembly(
-            cuMirs[0], (*formatR)->processArgs(), (*formatR)->entryVerbs(),
+            cuMirs[0], (*formatR)->processArgs(), entryScope,
+            // P69 fold 3d: an object input's entry is elected with this unit's
+            // (D-PROGRAM-ENTRY-IN-AN-OBJECT-INPUT-BESIDE-A-SOURCE-IS-UNDEFINED).
+            std::span<ForeignEntryCandidate const>{objectEntries}, electedObject,
             (*formatR)->sehPersonality(), (*formatR)->name(),
             cuMirs[0].target->wideFloatSoftcallLibrary((*formatR)->kind()),
             reporter,
@@ -2011,6 +2361,17 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
             emitNullNoDiagnostic("back-half lower (lowerCuMirToAssembly)");
             return std::nullopt;
         }
+        mod->linkPosition = unitPlace(0);   // the unit stands where its source does
+        // ★ AN OBJECT WON THE ENTRY AND NEEDED NO INIT: it is stated on that
+        // object, the one THE ELECTION NAMED (P69 fold 3e, the review of fold
+        // 3d's X3 -- it used to be inferred from the unit's module naming none
+        // and one object candidate existing, which a precedence that elects one
+        // of several would have broken). Where its verb needed an init, the init
+        // is the unit's entry and calls the object's function by name.
+        if (electedObject.has_value() && !mod->userEntrySymbol.has_value()) {
+            ForeignEntryCandidate const& won = objectEntries[*electedObject];
+            (*objectModules)[won.object].userEntrySymbol = won.symbol;
+        }
         // c165 (D-LK-STATIC-LINK): link against any `ar` static archives named on
         // `--resolve-library` (pull the referenced members + merge them in). With
         // no static archives this is `linkAndWrite({mod})`, unchanged.
@@ -2018,8 +2379,8 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         // half rides along so a pulled member's extern can rebind to a library
         // the operator named (`perCuOpts` — archives already partitioned out).
         return reported(linkAndWriteWithStaticArchives(
-            std::move(*mod),
-            std::span<std::filesystem::path const>{perCuOpts.objectInputs},
+            soleModule(std::move(*mod)),
+            std::move(*objectModules),
             std::span<std::filesystem::path const>{staticArchives},
             std::span<ResolveLibrarySpec const>{perCuOpts.resolveLibraries},
             **targetR, **formatR, outPath, reporter, imageRequest));
@@ -2070,7 +2431,8 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         }
         if (!runThinLtoImportStage(
                 std::span<CuMirModule>{cuMirs.data(), cuMirs.size()}, **targetR,
-                cSymDecor, targetSpecStr, compileOpts, thinExec, reporter)) {
+                **formatR, cSymDecor, targetSpecStr, compileOpts, thinExec,
+                reporter)) {
             return std::nullopt;   // already reported
         }
     }
@@ -2143,6 +2505,12 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         // clone aborts on a shim GlobalAddr — the multi-CU threads defect).
         // Non-owning; `cuMir` (in `cuMirs`) outlives the merge.
         in.synthRecipes = &cuMir.libraryShimRecipes;
+        // P69 fold 3: the layout rule THIS unit was analyzed under — the one its
+        // model answered `sizeof` from — with which the merge sizes this unit's
+        // tentative definition when another unit defines the same name
+        // tentatively (`MergeCuInput::aggregateLayout`). Each unit hands its
+        // own: a size is a fact of the unit that compiled the definition.
+        in.aggregateLayout = cuMir.model.aggregateLayout();
         mergeInputs.push_back(std::move(in));
     }
 
@@ -2180,10 +2548,31 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     std::vector<EntryCandidate> cands;
     std::vector<std::uint32_t>  candSym;   // per-model record indices; unused here
     for (auto& cu : cuMirs) collectEntryCandidates(cu.model, cands, candSym);
+    // An entry only an archive member defines (P69 fold 3e, X4): asked only when
+    // neither a unit nor a named object defines one the format starts.
+    if (!anyRealizable(cands) && !anyObjectElectable() && !pullEntryFromArchives()) {
+        return std::nullopt;   // reported
+    }
+    // P69 fold 3d (D-PROGRAM-ENTRY-IN-AN-OBJECT-INPUT-BESIDE-A-SOURCE-IS-UNDEFINED):
+    // an object input's entry is elected with the units', after them, so an index
+    // past theirs names an object's.
+    std::size_t const unitCandidates = cands.size();
+    for (ForeignEntryCandidate const& c : objectEntries) cands.push_back(c.candidate);
     bool entryOk = true;
-    auto const resolvedEntry = resolveProgramEntry(
-        cands, (*formatR)->entryVerbs(), (*formatR)->name(), reporter, entryOk);
+    // A named object's stated entry that is no C startup (P69 fold 3e) leaves no
+    // C entry to elect: the link starts the image as the request says, or refuses it.
+    auto resolvedEntry =
+        entryScope.electsNone
+            ? std::optional<ResolvedEntry>{}
+            : resolveProgramEntry(cands, entryScope, (*formatR)->name(), reporter, entryOk);
     if (!entryOk) return std::nullopt;   // undefined / ambiguous entry — already reported.
+    ForeignEntryCandidate const* objectEntry = nullptr;
+    EntryMaterialization         objectEntryVerb = EntryMaterialization::None;
+    if (resolvedEntry.has_value() && resolvedEntry->index >= unitCandidates) {
+        objectEntry     = &objectEntries[resolvedEntry->index - unitCandidates];
+        objectEntryVerb = resolvedEntry->verb;
+        resolvedEntry.reset();   // no unit names the entry: the merge is handed none
+    }
 
     // The winning name, MANGLED to the merge's DEFINITION-KEY convention.
     //
@@ -2199,6 +2588,9 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // identity on elf/pe).
     std::vector<std::string> entryNames;
     EntryMaterialization entryVerb = EntryMaterialization::None;
+    // P69 fold 3e (class C's N3): a definition whose signature is none of its
+    // name's realized rows is called with the elected verb's signature.
+    bool entryCalledWithTheVerbsSignature = false;
     if (resolvedEntry.has_value()) {
         std::string_view const winner = cands[resolvedEntry->index].name;
         for (auto& cu : cuMirs) {
@@ -2208,6 +2600,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                 if (!rec.entryVerb.has_value() || rec.name != winner) continue;
                 entryNames.push_back(dss::ffi::linkNameFor(
                     rec.name, rec.asmName, cSymDecor, rec.linkName));
+                entryCalledWithTheVerbsSignature = rec.entryCalledWithTheVerbsSignature;
                 done = true;
                 break;
             }
@@ -2251,10 +2644,21 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         std::span<MergeCuInput const>{mergeInputs.data(), mergeInputs.size()},
         std::move(host),
         std::span<std::string const>{entryNames.data(), entryNames.size()},
+        // P69 fold 3: the document of THIS link — the rank among weak
+        // definitions, what a common is beside one, what a weak one is beside a
+        // strong one. The merge asks the reader the unit linker asks
+        // (`link/common_yield.hpp`).
+        **formatR,
         reporter);
     // Merge REFUSED (nullopt), or merge SUCCEEDED while reporting a conflict
     // it resolved by election. Both are already reported; both stop here.
     if (!merged || reporter.errorCount() != mergeEntry) return std::nullopt;
+
+    // The merged module's ids are named through `symbolNames` — which also holds ids no
+    // module scan sees (a shim symbol the merge pre-registered, not yet defined). The
+    // merge stated the end of that whole allocation to the merged module
+    // (`Mir::symbolIdEnd`), so the three synthesis passes below ask the module for their
+    // fresh ids and are handed no end here (mir/merge/synth_symbol_floor.hpp).
 
     // UCRT-P4 (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE + D-FFI-PE-CRT-UCRT-MIGRATION):
     // MATERIALIZE the resolved entry's arguments per its verb × the format's declared
@@ -2276,11 +2680,29 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // ran at the SEMANTIC tier, per definition, with a source span
     // (`S_EntryShapeNotDeclared`); candidacy was decided by `resolveProgramEntry`
     // above. This call does exactly one job.
-    if (!realizeEntryShape(merged->mir, merged->host.interner(),
-                           merged->userEntrySymbol, merged->externImports,
-                           entryVerb, (*formatR)->processArgs(), cSymDecor,
-                           (*formatR)->name(), reporter)) {
+    // An OBJECT's entry (P69 fold 3d): its init, where its verb needs one, is
+    // synthesized into the merged module and calls it by name; where none is
+    // needed the object itself names the entry.
+    bool const shaped =
+        objectEntry != nullptr
+            ? realizeForeignEntryShape(merged->mir, merged->host.interner(), objectEntry->linkName,
+                                       merged->userEntrySymbol, merged->externImports,
+                                       objectEntryVerb, (*formatR)->processArgs(), cSymDecor,
+                                       (*formatR)->name(), reporter)
+        : entryCalledWithTheVerbsSignature
+            ? realizeEntryShapeWithTheVerbsSignature(merged->mir, merged->host.interner(),
+                                                     merged->userEntrySymbol, merged->externImports,
+                                                     entryVerb, (*formatR)->processArgs(), cSymDecor,
+                                                     (*formatR)->name(), reporter)
+            : realizeEntryShape(merged->mir, merged->host.interner(),
+                                merged->userEntrySymbol, merged->externImports,
+                                entryVerb, (*formatR)->processArgs(), cSymDecor,
+                                (*formatR)->name(), reporter);
+    if (!shaped) {
         return std::nullopt;  // unusable mechanism — fail-loud already reported.
+    }
+    if (objectEntry != nullptr && !merged->userEntrySymbol.has_value()) {
+        (*objectModules)[objectEntry->object].userEntrySymbol = objectEntry->symbol;
     }
 
     // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER / D-CSUBSET-C11-THREADS-MACHO): whole-program
@@ -2302,14 +2724,18 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // runs → 42" for THREADS, and no such example was ever shipped — every c11_threads /
     // pthread / thread_local example is single-source, so the claim pointed at a witness
     // that does not exist. The real coverage is: for <threads.h>, the unit test
-    // `MirMerge.MultiCuThreadsShimRegistersAndSynthesizes`; for <stdio.h>, a genuine 2-TU
+    // `MirMerge.MultiCuThreadsShimRegistersAndSynthesizes`; for <stdio.h> (until P69, when the
+    // family left this seam for the runtime unit runtime/platform/src/stdio.c — the example
+    // below now witnesses THAT), a genuine 2-TU
     // runtime witness, `examples/c/shipped_sprintf_ucrt_crosscu` (exit 42, release
-    // arm, pe64) — which exercises THIS code path, and is red-on-disable proven: neutering
+    // arm, pe64) — which exercised THIS code path, and was red-on-disable proven: neutering
     // the va-leaf refusal in `opt/passes/inlining.cpp` fails it (exit 50) while the
-    // single-source `shipped_sprintf_ucrt` still passes. That asymmetry matters because
-    // this seam synthesizes PRE-optimize while compile_pipeline's synthesizes POST — see
-    // D-MIR-SYNTH-SHIM-SEAM-OPTIMIZE-PLACEMENT-ASYMMETRY. A shim collapsed onto a real user def is a
-    // DEFINED symbol → filtered out → correctly not re-synthesized.
+    // single-source `shipped_sprintf_ucrt` still passes. That asymmetry USED to matter
+    // because this seam synthesized PRE-optimize while the single-module routes
+    // synthesized POST; since P69 every route synthesizes its library shims before its
+    // final optimize (`synthesizeLibraryShims`, the contract on its declaration;
+    // D-MIR-SYNTH-SHIM-SEAM-OPTIMIZE-PLACEMENT-ASYMMETRY). A shim collapsed onto a real
+    // user def is a DEFINED symbol → filtered out → correctly not re-synthesized.
     {
         std::unordered_set<std::uint32_t> definedOrImported;
         for (std::uint32_t i = 0; i < merged->mir.moduleFuncCount(); ++i)
@@ -2328,8 +2754,11 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         // `D_SynthRecipeFamilyUnknown`, the SAME code the single-CU seam emits, and not
         // the linker's `K_NoMatchingObjectFormat` (which would send an operator to the
         // object-format config for what is a recipe-table defect).
-        std::unordered_map<std::uint32_t, std::string> mergedThreadsRecipes, mergedStdioRecipes;
-        for (auto const& [symV, name] : merged->symbolNames) {
+        std::unordered_map<std::uint32_t, std::string> mergedThreadsRecipes;
+        // ★ IN ASCENDING SYMBOL ID (P69 fold 3f, lane `xa`): the first name with no
+        // family is the one reported, so the walk is the merged module's own order.
+        for (auto const* entry : substrate::entriesInKeyOrder(merged->symbolNames)) {
+            auto const& [symV, name] = *entry;
             std::string const bare = dss::ffi::unapplyCMangling(name, cSymDecor);
             if (!dss::ffi::isKnownSynthesizeRecipe(bare)
                 || definedOrImported.find(symV) != definedOrImported.end()) {
@@ -2351,7 +2780,6 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
             }
             switch (*family) {
             case dss::ffi::ShimFamily::Threads: mergedThreadsRecipes.emplace(symV, bare); break;
-            case dss::ffi::ShimFamily::Stdio:   mergedStdioRecipes.emplace(symV, bare);   break;
             }
         }
         if (!synthesizeThreadsShim(merged->mir, merged->host.interner(),
@@ -2359,28 +2787,9 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                                    cSymDecor, merged->externImports, reporter)) {
             return std::nullopt;  // internal invariant breach (vocab/switch drift) — reported.
         }
-        // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): the <stdio.h> printf-family shim sibling —
-        // see `synth_stdio_shim.hpp` for the full contract. A clean no-op when
-        // `mergedStdioRecipes` is empty. The va_list block is read from the SAME
-        // resolved CC (`abi->cc`, D-FF3-3-RESOLVED-CC-INDEX-THREADED above) the merged module's calling-convention
-        // index was derived from — no second lookup, no format-name branch. It is passed
-        // WHOLE, not narrowed to `.strategy`: `variadicUsesOverflowBase` is what selects
-        // the shim's va leaf, and dropping it here would silently emit the home-base leaf
-        // on an overflow-base target (see `CuMirModule::vaListLayout`). A CC that declares
-        // no `vaListLayout` propagates as `nullopt`, NOT as a default-constructed layout:
-        // "nothing declared" must stay distinguishable from a real declaration all the way
-        // to the synth pass, which refuses it loudly (the single-CU seam threads the same
-        // optional through `CuMirModule::vaListLayout`). Consulted only if a stdio recipe
-        // actually appears.
-        std::optional<VaListLayout> vaListLayout;
-        if (abi->cc != nullptr && abi->cc->vaListLayout.has_value()) {
-            vaListLayout = *abi->cc->vaListLayout;
-        }
-        if (!synthesizeStdioShim(merged->mir, merged->host.interner(),
-                                 mergedStdioRecipes, vaListLayout,
-                                 merged->externImports, reporter)) {
-            return std::nullopt;  // recipe/helper-import/va-strategy mismatch — reported.
-        }
+        // (P69: the <stdio.h> printf-family shim sibling that stood here is RETIRED — the pe
+        // printf/scanf rows are DSS's runtime source, runtime/platform/src/stdio.c, linked
+        // from the runtime archive like any other shipped body.)
     }
 
     // Cycle 26 (D-OPT7-1): optimize the WHOLE-PROGRAM merged module with the configured
@@ -2398,7 +2807,18 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // `["Inlining"]` override still flows here via `compileOpts.pipelineOverride`
     // (an override runs at every site).
     if (!optimizeModule(merged->mir, **targetR, merged->host.interner(),
-                        compileOpts, PipelineStage::Program, reporter,
+                        compileOpts, PipelineStage::Program,
+                        // D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS:
+                        // the merged module is the image's whole program unless
+                        // its link also takes foreign relocatables
+                        // (`imageExtent`); the merge already resolved the entry
+                        // the trampoline names, which is a root whatever its
+                        // visibility.
+                        imageExtent,
+                        merged->userEntrySymbol.has_value()
+                            ? std::span<SymbolId const>{&*merged->userEntrySymbol, 1}
+                            : std::span<SymbolId const>{},
+                        reporter,
                         // D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED:
                         // the MERGED module's extern table.
                         //
@@ -2454,67 +2874,41 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     }
 
     // D-FFI-EXTERN-CALL-DISPATCH: the merged module compiles to ONE
-    // (target, format); pass that format's extern-call shape so MIR→LIR
-    // selects the right call-site opcode for any surviving extern import.
-    // D-CSUBSET-BITFIELD-ABI-EXACT: resolve + pass the FORMAT-determined bit-field
-    // strategy (gnu_packed / msvc_straddle) so a bit-field global in the merged
-    // whole-program image is laid out byte-ABI-exact for the active format.
-    // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): resolve the F128 softcall
-    // runtime library here (the merge lower body has no ObjectFormatKind in
-    // scope) — exactly where externCallDispatch is pre-resolved from the
-    // format. Empty = the format declares none (nullopt → F128 softcall fails
-    // loud).
-    std::string_view const wfLib =
-        (*targetR)->wideFloatSoftcallLibrary((*formatR)->kind());
-    std::optional<std::string> wideFloatSoftcallLibrary =
-        wfLib.empty() ? std::nullopt
-                      : std::optional<std::string>(std::string(wfLib));
-    auto mod = lowerMergedToAssembly(*merged, grammar, **targetR,
-                                     (*formatR)->dataModel(),
-                                     effectiveBitFieldStrategy(**targetR, **formatR),
-                                     effectiveUnnamedBitFieldAlignment(**targetR,
-                                                                       **formatR),
-                                     ccIndex, cuMirs[0].cuId,
-                                     (*formatR)->externCallDispatch(),
-                                     (*formatR)->dataImportBinding(),
-                                     // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT
-                                     // (TF-C52): the format's extern-ADDRESS
-                                     // binding (`got` on arm64 relocatable /
-                                     // static-archive; nullopt elsewhere).
-                                     (*formatR)->externAddrBinding(),
-                                     // TLS C1 (D-CSUBSET-THREAD-LOCAL): the
-                                     // format's thread-local access block.
-                                     (*formatR)->tlsAccess(),
-                                     std::move(sehScopes),
-                                     std::move(wideFloatSoftcallLibrary),
-                                     reporter,
-                                     // D-CSUBSET-PACKED-ATOMIC-MEMBER: the
-                                     // format's atomics-runtime block.
-                                     (*formatR)->atomicsRuntime(),
-                                     // P55, anchor
-                                     // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT:
-                                     // the format's
-                                     // narrowing of WHICH bindings the
-                                     // `indirect-slot` dispatch above reaches
-                                     // through the import slot. Passed here
-                                     // and not left to the default because the
-                                     // merge path emits `.obj`s too, and the
-                                     // linker's slot pass reads the format
-                                     // DIRECTLY — a merged module lowered
-                                     // without the narrowing would disagree
-                                     // with it symbol for symbol.
-                                     (*formatR)->indirectSlotBindings(),
-                                     // D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING:
-                                     // WHICH of this artifact's OWN
-                                     // definitions its loader may replace.
-                                     // Passed here for the same reason the
-                                     // narrowing above is: a merged module
-                                     // lowered without it would branch to
-                                     // its own body for a name the loader
-                                     // has already given the process a
-                                     // different answer for.
-                                     (*formatR)->preemptibleDefinitionBindings());
+    // (target, format); the lowering passes that format's extern-call shape so
+    // MIR→LIR selects the right call-site opcode for any surviving extern import,
+    // and the FORMAT-determined bit-field strategy (D-CSUBSET-BITFIELD-ABI-EXACT)
+    // so a bit-field global in the merged whole-program image is laid out
+    // byte-ABI-exact for the active format — with every other format fact, in the
+    // one call the startup module's lowering makes too (`lowerWholeModule`).
+    // The unit each kept definition came from, read before the lowering takes the
+    // merged module (`MergedMirModule::unitOfDefinition`, stated by the merge).
+    auto const unitOfDefinition = merged->unitOfDefinition;
+    auto mod = lowerWholeModule(*merged, cuMirs[0].cuId, std::move(sehScopes));
     if (!mod) return std::nullopt;  // back-half tier failure already reported via `reporter`
+    // P69 fold 3f: what each unit's source asks of its link, in unit order -- the
+    // order the link reads its precedence from (`appendUnitLinkerRequests`) --
+    // and the options they state applied as their objects would be read back,
+    // through the one object document every unit of the link states its options by.
+    {
+        ObjectFormatSchema const* optionsDocument = nullptr;
+        for (CuMirModule const& cm : cuMirs) {
+            appendUnitLinkerRequests(mod->linkerRequests, cm.linkerRequests);
+            if (optionsDocument == nullptr) optionsDocument = cm.linkerOptionsDocument;
+        }
+        if (!stateUnitLinkerOptions(*mod, optionsDocument, reporter)) return std::nullopt;
+    }
+    // The merged module stands where its first unit's source does (P69 fold 3d,
+    // D-LK-THE-LINK-ORDER-IS-NOT-THE-COMMAND-LINE-ORDER), and each definition it
+    // holds where ITS unit's source does: the merge keys them by the merged
+    // module's own symbols, which the lowering keeps as the assembled module's.
+    // A unit with no stated place states none for its definitions (the module's
+    // then answers, `linkPositionOf`).
+    mod->linkPosition = unitPlace(0);
+    for (auto const& [symbol, unit] : unitOfDefinition) {
+        if (auto const place = unitPlace(unit); place.has_value()) {
+            mod->linkPositionOfDefinition.insert_or_assign(SymbolId{symbol}, *place);
+        }
+    }
     // c165 (D-LK-STATIC-LINK): the merged whole-program client module links
     // against any `ar` static archives named on `--resolve-library` the same way
     // the single-CU path does (pull referenced members + merge). No archives =>
@@ -2524,8 +2918,8 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // all three must answer — a route that kept the old argument list would
     // silently keep the gap for whichever builds happen to take it.
     return reported(linkAndWriteWithStaticArchives(
-        std::move(*mod),
-        std::span<std::filesystem::path const>{perCuOpts.objectInputs},
+        soleModule(std::move(*mod)),
+        std::move(*objectModules),
         std::span<std::filesystem::path const>{staticArchives},
         std::span<ResolveLibrarySpec const>{perCuOpts.resolveLibraries},
         **targetR, **formatR, outPath, reporter, imageRequest));
@@ -2746,14 +3140,21 @@ struct CuBuildKey {
     // Every input must be claimed by the language the TARGET chose. The
     // comparison is case-insensitive on the extension INCLUDING its dot, the
     // same rule `UnitBuilder::schemasForPath_` applies, so `foo.S` and `foo.s`
-    // route identically on every host filesystem.
-    for (auto const& file : sourceFiles) {
+    // route identically on every host filesystem. EVERY unclaimed input is named before the build fails
+    // (`runEveryUnit`, P69 H6b: the several-unit class's one home) -- never the first alone. Netted (H6c2): the
+    // refusal names its input by its path, so a unit that failed having said nothing is named too.
+    bool const everyInputClaimed = substrate::runEveryUnit(
+        sourceFiles.size(),
+        substrate::namingSilentUnits(rep, "the input-language claim",
+                                     [&](std::size_t i) { return "input '" + sourceFiles[i] + "'"; },
+                                     [&](std::size_t i) {
+        std::string const& file = sourceFiles[i];
         std::string const ext = asciiLowerCopy(fs::path{file}.extension().string());
         bool claimed = false;
         for (std::string_view declaredExt : schema->fileExtensions()) {
             if (asciiLowerCopy(declaredExt) == ext) { claimed = true; break; }
         }
-        if (claimed) continue;
+        if (claimed) return true;
         std::string known;
         for (std::string_view declaredExt : schema->fileExtensions()) {
             if (!known.empty()) known += ", ";
@@ -2768,8 +3169,9 @@ struct CuBuildKey {
             + " and not '" + (ext.empty() ? std::string{"<none>"} : ext)
             + "'. Pass --language <name> to name the source language "
               "explicitly.");
-        return nullptr;
-    }
+        return false;
+    }));
+    if (!everyInputClaimed) return nullptr;
     return schema;
 }
 
@@ -2929,8 +3331,9 @@ class LanguageBlockExtensionReader {
 // failure, so a broken sibling document never became a claimant then and does
 // not now.
 [[nodiscard]] std::vector<std::string> declaredFileExtensionsOf(fs::path const& doc) {
-    std::ifstream in{doc, std::ios::binary};
-    if (!in) return {};
+    auto opened = core::openInputStream(doc, std::ios::binary);
+    if (!opened) return {};   // no claimant (above); the document's own load names the OS's reason
+    std::ifstream&               in = *opened;
     LanguageBlockExtensionReader reader;
     // The return value is DELIBERATELY ignored: `false` means either "we aborted
     // on purpose at the end of the `language` block" (the fast path, every
@@ -2981,14 +3384,16 @@ struct ShippedSourceLanguageCache {
 // every run and never written to a side file: a generated index is a second
 // owner too, and this repository treats staleness as a defect class.
 //
-// ⚠ ZERO claimants and TWO claimants both fail LOUD, and the second is not
-// hypothetical: `.s`/`.S` is claimed by BOTH shipped asm dialects, so a
-// hand-written assembly runtime unit — soft-float helpers, setjmp/longjmp
-// bodies, the classic contents of this tier — is genuinely ambiguous by
-// extension. It would need the ARCH to disambiguate, not the language, and the
-// realization key is FORMAT-keyed, so it is a different shape than anything
-// here. Refusing is correct today; building the arch axis now would be the
-// speculative structure the bar rules out.
+// ★ TWO CLAIMANTS ARE DECIDED BY THE TARGET, AND BY NOTHING ELSE. `.s`/`.S` is
+// claimed by EVERY shipped assembly dialect, so a hand-written assembly runtime
+// unit (the PE stack probes and the cookie check a reference compiler's objects
+// call, whose register contract no C function keeps) is ambiguous by extension
+// alone. The unit is compiled FOR A TARGET, and the target declares, by name, the
+// dialect that spells its assembly (`defaultAssemblyLanguage`) -- the very name
+// `resolveGrammarForTarget` reads for a user's `.s`. When that name is one of
+// the claimants it is the answer; otherwise -- no declared dialect, or one that
+// does not claim the extension -- the unit is refused naming every claimant and
+// the target's declaration, exactly as before. Zero claimants are refused too.
 //
 // ⚠ ONE BEHAVIOUR MOVED, DELIBERATELY. "Health is the loader's own business"
 // still holds for every document this resolution does NOT choose — they are no
@@ -3051,6 +3456,7 @@ struct ShippedSourceLanguage {
 
 [[nodiscard]] ShippedSourceLanguage resolveShippedSourceGrammar(
     fs::path const&             path,
+    TargetSchema const&         target,
     ShippedSourceLanguageCache& cache,
     DiagnosticReporter&         rep) {
     std::string const ext = asciiLowerCopy(path.extension().generic_string());
@@ -3099,8 +3505,19 @@ struct ShippedSourceLanguage {
     auto const& claimants =
         found == cache.claimantsByExtension.end() ? kNoClaimants : found->second;
 
+    // The one claimant, or -- among several -- the one the target declares.
+    std::string const declaredDialect{target.defaultAssemblyLanguage()};
+    std::string       chosen;
     if (claimants.size() == 1) {
-        std::string const& name = claimants.front().stem;
+        chosen = claimants.front().stem;
+    } else if (claimants.size() > 1 && !declaredDialect.empty()) {
+        for (auto const& claimant : claimants) {
+            if (claimant.stem == declaredDialect) chosen = claimant.stem;
+        }
+    }
+
+    if (!chosen.empty()) {
+        std::string const& name = chosen;
         auto               got  = cache.grammarByName.find(name);
         if (got == cache.grammarByName.end()) {
             auto loaded = GrammarSchema::loadShipped(name);
@@ -3108,7 +3525,7 @@ struct ShippedSourceLanguage {
                 forwardConfigDiagnostics(loaded.error(), rep);
                 emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
                            "shipped-source realization: shipped language '" + name
-                           + "' is the only one that claims the extension '" + ext
+                           + "' is the one that claims the extension '" + ext
                            + "' of '" + core::genericSpelling(path)
                            + "', but it could not be loaded — the reason is in the "
                              "configuration diagnostic(s) above (config: "
@@ -3138,9 +3555,14 @@ struct ShippedSourceLanguage {
                    : "shipped-source realization: " + std::to_string(claimants.size())
                          + " shipped languages claim the extension '" + ext
                          + "' of '" + core::genericSpelling(path) + "' ("
-                         + claimantDocuments(claimants)
-                         + "), so the extension alone cannot name one — refusing "
-                           "rather than guessing which front end owns this file");
+                         + claimantDocuments(claimants) + "), and target '"
+                         + std::string{target.name()}
+                         + (declaredDialect.empty()
+                                ? std::string{"' declares no 'defaultAssemblyLanguage'"}
+                                : "' declares 'defaultAssemblyLanguage' '" + declaredDialect
+                                      + "', which is none of them")
+                         + ", so nothing names one — refusing rather than guessing "
+                           "which front end owns this file");
     return {};
 }
 
@@ -3263,32 +3685,37 @@ attributeShippedRuntimeUnits(fs::path const&     configRoot,
     if (sources.empty()) return claims;   // this format realizes nothing
 
     std::map<std::string, std::vector<std::string>> declarers;
-    std::error_code ec;
-    fs::recursive_directory_iterator it{descriptorDir, ec};
-    if (ec) {
+    // The descriptors, collected by the substrate's walk -- which never descends a
+    // link on any build (libstdc++ on Windows cannot tell one from what it
+    // reaches: the substrate's header). ANYTHING the walk could not read -- the
+    // corpus root, a directory under it, a link whose reach it cannot examine --
+    // is the refusal below, naming where it stopped: a descriptor beyond that
+    // point was never read, and it may be the very one that declares a unit.
+    std::vector<fs::path> descriptors;
+    auto const walk = core::walkTree(descriptorDir, [&](core::TreeEntry const& entry) {
+        if (entry.reaches == core::EntryKind::File
+            && asciiLowerCopy(entry.at.extension().generic_string()) == ".json")
+            descriptors.push_back(entry.storeRoutePath);   // the descriptor store's text (H6d makes it a value)
+        return core::WalkStep::Continue;
+    });
+    if (walk.error) {
         emitDriver(rep, DiagnosticCode::D_DirectoryScanFailed,
                    "shipped-source realization: the descriptor corpus at '"
                    + core::genericSpelling(descriptorDir)
-                   + "' could not be walked (" + ec.message()
+                   + "' could not be walked (stopped at '"
+                   + walk.where.spelling().generic() + "': " + core::reasonText(walk.error)
                    + "), so the descriptor(s) declaring each shipped runtime "
                      "unit cannot be identified — and the runtime object "
                      "cache keys on their CONTENT (the unit includes their "
                      "declarations). Refusing rather than keying without them.");
         return claims;
     }
-    for (fs::recursive_directory_iterator const end;
-         it != end;
-         it.increment(ec)) {
-        if (ec) break;
-        std::error_code typeEc;
-        if (!it->is_regular_file(typeEc) || typeEc) continue;
-        if (asciiLowerCopy(it->path().extension().generic_string()) != ".json")
-            continue;
+    for (fs::path const& descriptor : descriptors) {
         auto const declared =
-            dss::ffi::readShippedSourcesForFormat(it->path(), formatKey);
+            dss::ffi::readShippedSourcesForFormat(descriptor, formatKey);
         if (declared.empty()) continue;
         std::error_code relEc;
-        fs::path const rel = fs::relative(it->path(), configRoot, relEc);
+        fs::path const rel = core::reachedRelative(descriptor, core::Use::Leaf, configRoot, relEc);
         // A descriptor outside the config root cannot be spelled
         // config-root-relatively, and the key document's whole point is that it
         // is portable between an installed tree and a source tree — so the
@@ -3298,7 +3725,7 @@ attributeShippedRuntimeUnits(fs::path const&     configRoot,
         // and reports the miss where it is real.
         std::string const spelling =
             // The RELATIVE arm has no root to lose; the ABSOLUTE fallback does.
-            (relEc || rel.empty()) ? core::genericSpelling(it->path())
+            (relEc || rel.empty()) ? core::genericSpelling(descriptor)
                                    : rel.generic_string();
         for (auto const& source : declared)
             declarers[source].push_back(spelling);
@@ -3328,13 +3755,15 @@ attributeShippedRuntimeUnits(fs::path const&     configRoot,
 // Read a whole file as bytes. Binary on every host — the cache stores exactly
 // what the writer produced, and a text-mode CR translation would make the
 // stored artifact host-dependent under a key that says it is not.
-[[nodiscard]] std::optional<std::vector<std::uint8_t>>
+// A failed read answers WHY (the OS's reason for a refused open, through `core::reasonText`), never a bare "no".
+[[nodiscard]] std::expected<std::vector<std::uint8_t>, std::string>
 readWholeBinaryFile(fs::path const& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) return std::nullopt;
+    auto opened = core::openInputStream(path, std::ios::binary);
+    if (!opened) return std::unexpected("it could not be opened: " + core::reasonText(opened.error()));
+    std::ifstream&            in = *opened;
     std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(in),
                                     std::istreambuf_iterator<char>()};
-    if (in.bad()) return std::nullopt;
+    if (in.bad()) return std::unexpected(std::string{"an I/O error interrupted its read"});
     return bytes;
 }
 
@@ -3396,9 +3825,9 @@ serveArtifactFromCache(ArtifactCacheTicket const& ticket,
     // indistinguishable from. A crash between the two leaves no artifact, which
     // is the state a crashed link leaves too.
     std::error_code ec;
-    fs::remove(outPath, ec);
+    static_cast<void>(core::removeEntry(outPath, ec));   // at any length, as the copy below
     ec.clear();
-    fs::copy_file(**hit, outPath, fs::copy_options::none, ec);
+    core::copyFile(**hit, outPath, ec);
     if (ec) {
         // ⚠ A HARD FAILURE, NOT A FALL-THROUGH TO COMPILING. The verified entry
         // IS this build's artifact; failing to place it is a failure to produce
@@ -3410,7 +3839,7 @@ serveArtifactFromCache(ArtifactCacheTicket const& ticket,
             "this build's artifact, so this is a failure to produce it rather "
             "than a reason to compile again: make the output path writable.",
             core::genericSpelling(**hit), core::genericSpelling(outPath),
-            ec.message()));
+            core::reasonText(ec)));
         // Anchored: D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION.
     }
     return true;
@@ -3427,7 +3856,7 @@ void storeBuiltArtifactInCache(ArtifactCacheTicket const& ticket,
     if (!bytes.has_value()) {
         reportDriverNote(
             "the artifact '" + core::genericSpelling(artifactPath)
-            + "' could not be read back, so it was not added to the dependency "
+            + "' could not be read back (" + bytes.error() + "), so it was not added to the dependency "
               "artifact cache; the next build will compile it again.");
         return;
     }
@@ -3451,39 +3880,58 @@ class RuntimeArchiveStaging {
 public:
     // EMPTY until first use. A build that hits in the cache for every unit —
     // the steady state — never creates a directory at all.
+    // P69 L2 (lane `lm`): the 64 attempts are the substrate's bounded retry — running out
+    // keeps the sentence saying why (`failure()`), which the caller's report carries.
     [[nodiscard]] fs::path const& dir() {
         if (!dir_.empty()) return dir_;
         std::error_code    ec;
-        fs::path const     base = fs::temp_directory_path(ec);
-        if (ec) return dir_;   // still empty ⇒ the caller reports the failure
-        static std::atomic<unsigned> counter{0u};
-        for (unsigned attempt = 0; attempt < 64u; ++attempt) {
-            fs::path candidate =
-                base / std::format("dsscp-runtime-{:016x}-{}",
-                                   static_cast<std::uint64_t>(
-                                       std::chrono::steady_clock::now()
-                                           .time_since_epoch().count()),
-                                   counter.fetch_add(1u));
-            std::error_code mkEc;
-            // `create_directory` (not `create_directories`) returns FALSE for a
-            // path that already existed, which is exactly the uniqueness probe
-            // this loop needs — `create_directories` would happily adopt
-            // somebody else's directory and two builds would share a staging
-            // area.
-            if (fs::create_directory(candidate, mkEc) && !mkEc) {
-                dir_ = std::move(candidate);
-                return dir_;
-            }
+        fs::path const     base = core::storeRouteTemporaryDirectory(ec);   // the home's answer, the staging route's text (H6d)
+        if (ec) {   // still empty ⇒ the caller reports the failure
+            failure_ = "the system temporary directory is unknown (" + core::reasonText(ec) + ")";
+            return dir_;
         }
-        return dir_;   // empty
+        static std::atomic<unsigned> counter{0u};
+        auto made = substrate::retryUpTo(
+            64, "making a fresh runtime staging directory",
+            [&](std::size_t, std::string& whyNot) -> std::optional<fs::path> {
+                fs::path candidate =
+                    base / std::format("dsscp-runtime-{:016x}-{}",
+                                       static_cast<std::uint64_t>(
+                                           std::chrono::steady_clock::now()
+                                               .time_since_epoch().count()),
+                                       counter.fetch_add(1u));
+                std::error_code mkEc;
+                // `createDirectories` returns FALSE for a path that already existed
+                // (it made no level), which is exactly the uniqueness probe this
+                // needs — taking an existing directory would adopt somebody else's
+                // and two builds would share a staging area. (The parent, the system
+                // temporary directory, exists, so the candidate is the one level it
+                // can make; and it makes it at any length.)
+                if (core::createDirectories(candidate, mkEc) && !mkEc) return candidate;
+                whyNot = "'" + core::genericSpelling(candidate) + "' "
+                       + (mkEc ? "could not be created (" + core::reasonText(mkEc) + ")"
+                               : std::string{"already exists"});
+                return std::nullopt;
+            });
+        if (!made.succeeded()) {
+            failure_ = made.failure();
+            return dir_;   // empty
+        }
+        dir_ = std::move(made.value());
+        return dir_;
     }
+
+    // Why `dir()` answered nothing (empty while it has answered nothing yet, or a directory).
+    [[nodiscard]] std::string const& failure() const noexcept { return failure_; }
 
     ~RuntimeArchiveStaging() {
         if (dir_.empty()) return;
-        std::error_code ec;
-        fs::remove_all(dir_, ec);   // best-effort: a leaked temp dir is not a
-                                    // build failure, and on Windows a file the
-                                    // linker still has open cannot be unlinked.
+        // best-effort: a leaked temp dir is not a build failure, and on Windows a
+        // file the linker still has open cannot be unlinked. The substrate's
+        // removal, never `remove_all`: it takes a link as itself on every build
+        // (libstdc++'s `remove_all` on Windows empties a directory link's TARGET --
+        // the substrate's header has the measurement).
+        static_cast<void>(core::removeTree(dir_));
     }
 
     RuntimeArchiveStaging()                                        = default;
@@ -3491,7 +3939,8 @@ public:
     RuntimeArchiveStaging& operator=(RuntimeArchiveStaging const&) = delete;
 
 private:
-    fs::path dir_;
+    fs::path    dir_;
+    std::string failure_;   // why `dir()` last answered nothing
 };
 
 // Append the documents a loaded schema is a function of: the document itself,
@@ -3509,7 +3958,7 @@ void appendSchemaDocuments(
         std::string{label}, std::move(path), std::string{digest}});
     for (auto const& dep : referenced) {
         std::error_code relEc;
-        fs::path const  rel = fs::relative(fs::path{dep.path}, configRoot, relEc);
+        fs::path const  rel = core::reachedRelative(fs::path{dep.path}, core::Use::Leaf, configRoot, relEc);
         out.push_back(dss::runtime::LoadedConfigDocument{
             std::string{label} + "-ref",
             (relEc || rel.empty()) ? dep.path : rel.generic_string(),
@@ -3568,7 +4017,7 @@ digestLinkInput(std::string_view label, fs::path const& path) {
         bytes.has_value()
             ? dss::crypto::sha256Hex(std::string_view{
                   reinterpret_cast<char const*>(bytes->data()), bytes->size()})
-            : std::string{}};
+            : std::string{}};   // unreadable: the link that reads this input names its reason (H6c2 (d))
 }
 
 // Build ONE target's dependency-artifact cache key, or say why it cannot be
@@ -3606,6 +4055,17 @@ buildDependencyArtifactKey(
             "dependency artifact cache: this build injects an optimizer "
             "pipeline directly, which changes the emitted bytes and carries no "
             "content identity that could enter a cache key. Not cached."));
+    }
+    // ⛔ THE SAME BARGAIN FOR AN ARCHIVE-WIDE DEFINITION VISIBILITY: it changes
+    // the emitted bytes and the key has no term for it. Only the shipped
+    // runtime's nested build sets it, and that build never carries a
+    // dependency policy, so this refuses nothing today; it is here so a future
+    // setter cannot be served an archive built with a different visibility.
+    if (compileOpts.archiveDefinitionVisibility.has_value()) {
+        return std::unexpected(std::format(
+            "dependency artifact cache: this build restates the visibility of "
+            "every definition it archives, which changes the emitted bytes and "
+            "is not a term of the cache key. Not cached."));
     }
 
     std::string const closure = unionInputDigest(cus);
@@ -3729,8 +4189,22 @@ buildDependencyArtifactKey(
         }
         request.linkInputs.push_back(std::move(entry));
     }
-    for (fs::path const& object : compileOpts.objectInputs) {
-        request.linkInputs.push_back(digestLinkInput("object-input", object));
+    // ⚠ EACH NAMED OBJECT'S PLACE RIDES WITH ITS PATH (P69 fold 3d,
+    // D-LK-THE-LINK-ORDER-IS-NOT-THE-COMMAND-LINE-ORDER). The link's order is the
+    // operator's, a source in its place among the objects, and an image's bytes
+    // follow it (the first weak definition and the first COMDAT copy in that
+    // order are the ones kept), while this list and the unit closure each keep
+    // only their own order. The objects' places complete the interleaving — a
+    // unit's place is the gathered index no object takes. An archive packages
+    // its members by kind and reads no order, so for one this term only
+    // over-invalidates, the safe direction (the declared-import-name precedent
+    // above).
+    for (std::size_t oi = 0; oi < compileOpts.objectInputs.size(); ++oi) {
+        auto entry = digestLinkInput("object-input", compileOpts.objectInputs[oi]);
+        if (oi < compileOpts.objectInputPlaces.size() && compileOpts.objectInputPlaces[oi].has_value()) {
+            entry.path += "@" + std::to_string(*compileOpts.objectInputPlaces[oi]);
+        }
+        request.linkInputs.push_back(std::move(entry));
     }
 
     return dss::runtime::computeDependencyArtifactKey(request);
@@ -3853,7 +4327,7 @@ buildDependencyArtifactKey(
                                      / (std::string{buildFormat.name()}
                                         + ".format.json");
             std::error_code relEc;
-            fs::path const  rel = fs::relative(formatDoc, configRoot, relEc);
+            fs::path const  rel = core::reachedRelative(formatDoc, core::Use::Leaf, configRoot, relEc);
             std::string const spelling =
                 (relEc || rel.empty()) ? core::genericSpelling(formatDoc)
                                        : rel.generic_string();
@@ -4013,7 +4487,7 @@ buildDependencyArtifactKey(
         // the claim index is memoized in `grammarCache`, so the common case —
         // a `.c` user file — costs a map lookup.
         auto const unitGrammar =
-            resolveShippedSourceGrammar(resolved.path, grammarCache, rep);
+            resolveShippedSourceGrammar(resolved.path, target, grammarCache, rep);
         if (!unitGrammar) continue;   // already diagnosed
 
         dss::runtime::RuntimeObjectRequest request;
@@ -4078,7 +4552,8 @@ buildDependencyArtifactKey(
         if (stagingRoot.empty()) {
             emitDriver(rep, DiagnosticCode::D_OutputDirCreateFailed,
                        "shipped-source realization: no staging directory could "
-                       "be created under the system temporary directory, so "
+                       "be created under the system temporary directory ("
+                       + staging.failure() + "), so "
                        "the shipped runtime unit '" + claim.source
                        + "' cannot be compiled for target '" + siblingSpec
                        + "'. The build stops here rather than continuing "
@@ -4093,13 +4568,14 @@ buildDependencyArtifactKey(
         fs::path const unitDir =
             stagingRoot / fs::path{claim.source}.stem();
         std::error_code mkEc;
-        fs::create_directories(unitDir, mkEc);
-        if (mkEc && !fs::is_directory(unitDir)) {
+        static_cast<void>(core::createDirectories(unitDir, mkEc));   // at any length
+        if (std::error_code dirEc;
+            mkEc && core::reachedKind(unitDir, core::Use::Container, dirEc) != core::EntryKind::Directory) {
             emitDriver(rep, DiagnosticCode::D_OutputDirCreateFailed,
                        "shipped-source realization: could not create the "
                        "staging directory '" + core::genericSpelling(unitDir)
                        + "' for shipped runtime unit '" + claim.source
-                       + "': " + mkEc.message());
+                       + "': " + core::reasonText(mkEc));
             continue;
         }
 
@@ -4116,6 +4592,20 @@ buildDependencyArtifactKey(
             Program                        runtimeProgram;
             runtimeProgram.setOutputDir(unitDir);
             runtimeProgram.setCompileConfig(config);
+            // ★★ D-LK-PE-DLL-EXPORTS-THE-SHIPPED-RUNTIME-IT-LINKS — ONE
+            // DECLARATION FOR THE WHOLE RUNTIME: every definition a shipped
+            // runtime unit contributes is the IMPLEMENTATION of the image that
+            // links it, never that image's API, so the archive is built HIDDEN,
+            // exactly as libgcc.a's members are. ✔MEASURED before it: a DSS
+            // shared library calling memalignment re-exported the runtime's
+            // memalignment, free_sized and free_aligned_sized (`.so`), and the
+            // C23 entry points and `__dss_platform_*` bodies too (`.dll`,
+            // `.dylib`), where gcc and clang `-shared` and Apple clang
+            // `-dynamiclib` export the library's own function alone. Set here
+            // and nowhere else, beside the other hermetic properties of this
+            // build; the cache key needs no term for it, because it is a
+            // constant of this code and the compiler stamp covers the code.
+            runtimeProgram.setArchiveDefinitionVisibility(SymbolVisibility::Hidden);
             // ★★ THE POLICY IS DSS's OWN — DEFAULT-CONSTRUCTED, NEVER THE
             // USER's (`--suppress` / overrides / `--warnings-as-errors`). The
             // runtime is hermetic by design (above), and the cache key carries
@@ -4198,7 +4688,7 @@ buildDependencyArtifactKey(
             reportDriverNote(
                 "the shipped runtime archive '"
                 + core::genericSpelling(archives.back())
-                + "' could not be read back, so it was not added to the runtime "
+                + "' could not be read back (" + bytes.error() + "), so it was not added to the runtime "
                   "object cache; this build links it from the staging area and "
                   "the next build will compile it again.");
             continue;
@@ -4298,6 +4788,11 @@ int runCusToTargets(
     // gates them. Passed PER TARGET, not resolved once: two targets of one
     // build can differ in whether their format can carry the request.
     ImageRequest const&                         imageRequest,
+    // D-LK-PE-DLL-EXPORTS-THE-SHIPPED-RUNTIME-IT-LINKS: the visibility a
+    // static-archive build gives the definitions it compiles (nullopt on
+    // every build but the shipped runtime's), relayed into every target's
+    // `CompileOptions` — see `CompileOptions::archiveDefinitionVisibility`.
+    std::optional<SymbolVisibility>             archiveDefinitionVisibility,
     // D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION (C): the
     // ROOT manifest's cross-build artifact cache policy, threaded verbatim from
     // the `Program` knob. nullopt (every CLI build, every root project build,
@@ -4528,17 +5023,31 @@ int runCusToTargets(
     // reaches the front end exactly as before, so a build that names no object
     // is byte-identical: `objectInputsFromSources` is empty and
     // `sourcesToBuild` is `sourceFiles` itself.
-    std::vector<std::string>           sourcesToBuild;
-    std::vector<std::filesystem::path> objectInputsFromSources;
+    //
+    // ★ AND EACH INPUT'S PLACE (P69 fold 3d,
+    // D-LK-THE-LINK-ORDER-IS-NOT-THE-COMMAND-LINE-ORDER): its index in the
+    // gathered list, which is the order every reference driver hands its linker
+    // — a source stands where the object it compiles to would. Recorded by the
+    // same loop that partitions, so the two lists cannot fall out of step.
+    std::vector<std::string>                  sourcesToBuild;
+    std::vector<std::uint32_t>                placeOfSource;   // parallel to `sourcesToBuild`
+    std::vector<std::filesystem::path>        objectInputsFromSources;
+    std::vector<std::optional<std::uint32_t>> placeOfObjectInput;   // parallel to it
     {
-        for (auto const& file : sourceFiles) {
+        for (std::size_t place = 0; place < sourceFiles.size(); ++place) {
+            std::string const& file = sourceFiles[place];
             fs::path const path{file};
             bool isObject = false;
             for (auto const& [_, format] : formatByName) {
                 if (isRelocatableObjectFile(path, *format)) { isObject = true; break; }
             }
-            if (isObject) objectInputsFromSources.push_back(path);
-            else          sourcesToBuild.push_back(file);
+            if (isObject) {
+                objectInputsFromSources.push_back(path);
+                placeOfObjectInput.push_back(static_cast<std::uint32_t>(place));
+            } else {
+                sourcesToBuild.push_back(file);
+                placeOfSource.push_back(static_cast<std::uint32_t>(place));
+            }
         }
     }
 
@@ -4809,7 +5318,10 @@ int runCusToTargets(
     for (auto& kv : cuByKey) {
         std::vector<CompilationUnit>& keyCus = kv.second;
         std::vector<char>             cuFailed(keyCus.size(), 0);
-        for (std::size_t ci = 0; ci < keyCus.size(); ++ci) {
+        // EVERY CU of the key is drained, and its verdict read, before the run decides (`runEveryUnit`, the one
+        // home every several-unit step takes; P69 H6c2, site (k)). NOT netted: a unit's failure is read from its
+        // OWN streams below, and the run's dedup window can hold the run's count still for a unit that did report.
+        static_cast<void>(substrate::runEveryUnit(keyCus.size(), [&](std::size_t ci) {
             CompilationUnit const& cu = keyCus[ci];
             // ★ THE DELTA *AND* THE UNIT'S OWN VERDICT, BOTH, BECAUSE EACH SEES
             // WHAT THE OTHER CANNOT. `rep.errorCount()` moves when a WARNING is
@@ -4820,11 +5332,10 @@ int runCusToTargets(
             // one. The UNION is conservative in the safe direction: a unit that
             // errored is excluded.
             auto const errorsBefore = rep.errorCount();
-            bool       failed       = cu.driverDiagnostics().hasErrors();
-            copyDiagnostics(cu.driverDiagnostics(), rep);
+            // The unit's own streams, and its own verdict, through their one home.
+            bool failed = cu.forEachOwnDiagnosticStream(
+                [&rep](DiagnosticReporter const& stream) { rep.relayFrom(stream); });
             for (auto const& tree : cu.trees()) {
-                if (tree.diagnostics().hasErrors()) failed = true;
-                copyDiagnostics(tree.diagnostics(), rep);
                 // Defense-in-depth: a driver-produced tree always has a non-null
                 // source, but `BufferRegistry::add` THROWS on null — guard so a
                 // future tree-producer (or a hand-built test tree) can't abort the
@@ -4844,7 +5355,8 @@ int runCusToTargets(
             cuFailed[ci] = failed ? 1 : 0;
             ++totalCus;
             if (failed) ++failedCus;
-        }
+            return !failed;
+        }));
         // Compact the survivors to the FRONT, order preserved, so a target can
         // be handed `span{data(), live}` without a second container. Safe only
         // BECAUSE the loop above already copied every unit's diagnostics into
@@ -4966,6 +5478,7 @@ int runCusToTargets(
             }
         }
         compileOpts.pipelineOverride = pipelineOverride;
+        compileOpts.archiveDefinitionVisibility = archiveDefinitionVisibility;
         compileOpts.ltoMode = ltoMode == LtoModeArg::Thin
                                   ? CompileOptions::LtoMode::Thin
                                   : CompileOptions::LtoMode::Full;
@@ -4983,6 +5496,18 @@ int runCusToTargets(
         // INPUTS and the first of them is what an all-object link elects as its
         // client module.
         compileOpts.objectInputs     = objectInputsFromSources;
+        compileOpts.objectInputPlaces = placeOfObjectInput;
+        // Each unit's place: a unit per source (`compileUnits`) stands where
+        // its source does; ONE unit of several sources (an API unity build,
+        // `compileFiles`) where its first does. Where a unit failed to parse
+        // the units were compacted and nothing links (`analysisOnly`), so no
+        // place is stated.
+        compileOpts.unitPlaces.clear();
+        if (liveCus == cus.size() && cus.size() == placeOfSource.size()) {
+            compileOpts.unitPlaces = placeOfSource;
+        } else if (liveCus == cus.size() && cus.size() == 1 && !placeOfSource.empty()) {
+            compileOpts.unitPlaces.push_back(placeOfSource.front());
+        }
 
         // ── D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: THIS TARGET'S SHIPPED
         //    RUNTIME, AS CACHED STATIC ARCHIVES ────────────────────────────
@@ -5010,11 +5535,19 @@ int runCusToTargets(
                 // `scratch` before and after is what turns those per-unit
                 // reports into one per-target verdict.
                 std::size_t const errorsBefore = scratch.errorCount();
-                // A language with no preprocess pass has no active format on
-                // its CU key; the realization map is FORMAT-keyed, so such a
-                // build realizes nothing — exactly as it did before the cache.
-                if (parsedForRuntime.has_value()
-                    && keyPerTarget[i].format.has_value()) {
+                // ★ EVERY BUILD OF THE SPEC, WHATEVER ITS LANGUAGE (P69 fold
+                // 3e, the review of fold 3d's class C, neighbour N2). This was
+                // keyed on the CU key's format, which only a language with a
+                // preprocess pass carries -- so a link of objects with no
+                // `--language` (the target's assembly dialect) and every `.s`
+                // program took no platform runtime. ✔MEASURED (lane `xa`,
+                // fold 3d's bytes): MinGW-w64 gcc's objects linked so were
+                // refused `__main` undefined, a routine the PE runtime defines
+                // and every reference's own runtime supplies. The runtime is a
+                // fact of the (target, format) the image is built for, which
+                // the spec names; which members a link takes stays the lazy
+                // search's answer.
+                if (parsedForRuntime.has_value()) {
                     resolvedArchives = resolveShippedRuntimeArchives(
                         spec, *targetByName.at(parsedForRuntime->targetName),
                         *formatByName.at(parsedForRuntime->formatName),
@@ -5053,7 +5586,8 @@ int runCusToTargets(
         // units — that is the ruling, and it is what keeps a broken runtime unit
         // caught by every build of its target rather than by the one program
         // that still uses it. What reaches an ARTIFACT is a separate question,
-        // and a STATIC ARCHIVE answers it differently from an image:
+        // and ONLY AN IMAGE takes the runtime: a static archive and a
+        // relocatable object both answer it differently from an image.
         //
         // ⚠ A LIBRARY BUILD CARRIES EVERY MEMBER OF EVERY INPUT ARCHIVE, never
         // the referenced subset — `extractStaticArchiveMembers`, deliberately,
@@ -5065,9 +5599,13 @@ int runCusToTargets(
         // that it DEFERS "who owns this name" to a later link
         // (`allowsUndefinedImports()`), and that later link is an IMAGE build —
         // which supplies the runtime right here.
-        // ⚠ READ OFF THE FORMAT'S DECLARED `container`, never off its name or
-        // kind: the same predicate the driver's own static-archive arm is
-        // dispatched on.
+        // ⚠ A RELOCATABLE OBJECT IS THE SAME CONTRACT, and it was not withheld
+        // (P69 H5): the lazy member pull put the body of every runtime routine
+        // its unit calls INTO the object, as a reference compiler's `-c` never
+        // does -- every other object calling it, and the image's own pull,
+        // then defined it again (K_SymbolRedefinedAcrossUnits).
+        // ⚠ READ OFF THE FORMAT'S DECLARED FLAVOR (`isImageFlavor`), never off
+        // its name or kind: the predicate the linker writes an image by.
         //
         // ★★ APPENDED AFTER THE OPERATOR'S OWN `--resolve-library` ARCHIVES,
         // BECAUSE THE OPERATOR OUTRANKS THE PLATFORM DEFAULT. That is the same
@@ -5080,11 +5618,17 @@ int runCusToTargets(
         // dispatched by MAGIC BYTES like every other input: the archive goes to
         // the static merge, and the demand-driven member pull is what keeps a
         // `hello.c` free of directory-walking code it never calls.
-        if (!formatByName.at(TargetSpec::parse(spec)->formatName)
-                 ->isStaticArchive()) {
-            for (auto const& archive : *runtimeArchivesBySpec.at(spec))
+        if (formatByName.at(TargetSpec::parse(spec)->formatName)
+                ->isImageFlavor()) {
+            // D-OPT-DCE-DELETES-A-RELOCATABLE-MEMBERS-HIDDEN-DEFINITIONS: each
+            // one is recorded as the shipped runtime's in the SAME statement
+            // that adds it, so `compileOneTarget` can tell it from an
+            // operator's archive (`CompileOptions::shippedRuntimeArchives`).
+            for (auto const& archive : *runtimeArchivesBySpec.at(spec)) {
                 compileOpts.resolveLibraries.push_back(
                     ResolveLibrarySpec{archive});
+                compileOpts.shippedRuntimeArchives.push_back(archive);
+            }
         }
         // ── D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION (C):
         //    THE `buildCus` BOUNDARY, WHICH IS WHERE THE KEY IS COMPUTABLE ───
@@ -5359,8 +5903,10 @@ int Program::run(int argc, char* argv[]) {
     // LK10 cycle 3: rich CLI argument dispatch.
     auto parsed = parseCliArgs(argc, argv);
     if (!parsed) {
-        std::cerr << "error: " << parsed.error().detail << "\n\n"
-                  << cliHelpText();
+        // Every unit the walk refused, one line each, in argv order (one refusal prints what it always printed).
+        std::cerr << "error: " << parsed.error().detail << "\n";
+        for (CliArgsErrorInfo const& more : parsed.error().also) std::cerr << "error: " << more.detail << "\n";
+        std::cerr << "\n" << cliHelpText();
         return 2;
     }
     CliArgs const& args = *parsed;
@@ -5684,34 +6230,52 @@ int Program::compileProject(
     // no duplication); such a target still fails the whole build downstream,
     // so nothing slips past silently. The format is re-loaded by the build
     // (the same benign redundancy as the grammar above).
-    for (auto const& spec : pc.targets) {
+    // ★ EVERY TARGET IS ASKED BEFORE THE BUILD FAILS (`substrate::runEveryUnit`;
+    // site (j) of the orchestrator's ledger 568, P69 fold 3e): a target whose
+    // format does not serve the profile is named, and the targets after it are
+    // still asked -- as the driver's target pre-flight and the per-target compile
+    // already do. The inventory of the formats that serve the profile is read
+    // once, by the first rejected target; when it cannot be read, that target
+    // says so and fails, and every later rejected target meets the SAME failure
+    // and answers true -- the first one's false already fails the gate (the
+    // net's contract, H6c2: a step fails only for a failure it reported itself,
+    // so the net names no reporting target silent).
+    std::optional<std::expected<std::vector<std::string>, std::string>> serving;
+    bool const everyTargetServed = substrate::runEveryUnit(
+        pc.targets.size(),
+        substrate::namingSilentUnits(rep, "the artifact-profile gate",
+                                     [&](std::size_t t) { return "target '" + pc.targets[t] + "'"; },
+                                     [&](std::size_t t) {
+        std::string const& spec = pc.targets[t];
         auto parsed = TargetSpec::parse(spec);
-        if (!parsed.has_value()) continue;           // delegate → D_InvalidTargetSpec
+        if (!parsed.has_value()) return true;        // delegate → D_InvalidTargetSpec
         auto fmtR = ObjectFormatSchema::loadShipped(parsed->formatName);
-        if (!fmtR.has_value()) continue;             // delegate → D_SchemaLoadFailed
+        if (!fmtR.has_value()) return true;          // delegate → D_SchemaLoadFailed
         // THE TWO REJECT ARMS. The membership question is asked FIRST and
         // separately so the inventory scan is paid only by a build that is
         // already being rejected — every accepted target reads exactly the one
         // format it named, as before.
         if (artifactProfileSupported((*fmtR)->artifactProfiles(),
                                      pc.artifactProfile)) {
-            continue;
+            return true;
         }
-        auto serving = shippedFormatsServingProfile(pc.artifactProfile);
         if (!serving.has_value()) {
-            // The inventory could not be read, so WHICH reject is true is
-            // unknown — and an empty list would silently assert the stronger,
-            // possibly false one. Report what actually went wrong instead.
-            emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
-                       serving.error() + ", so the artifact profile '"
-                       + pc.artifactProfile
-                       + "' could not be checked against the formats that serve "
-                         "it. Set DSS_CONFIG_ROOT to the directory that contains "
-                         "'src/dss-config', or run from inside the compiler's "
-                         "source tree.");
-            drainDiagnosticsToStderr(rep);
-            return 1;
+            serving.emplace(shippedFormatsServingProfile(pc.artifactProfile));
+            if (!serving->has_value()) {
+                // The inventory could not be read, so WHICH reject is true is
+                // unknown — and an empty list would silently assert the stronger,
+                // possibly false one. Report what actually went wrong instead.
+                emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
+                           serving->error() + ", so the artifact profile '"
+                           + pc.artifactProfile
+                           + "' could not be checked against the formats that serve "
+                             "it. Set DSS_CONFIG_ROOT to the directory that contains "
+                             "'src/dss-config', or run from inside the compiler's "
+                             "source tree.");
+                return false;   // this target said it
+            }
         }
+        if (!serving->has_value()) return true;   // an earlier target said it, and failed the gate
         // The verdict is already known (the predicate above is the SAME one
         // this call re-asks), so the return value carries no new information
         // and is deliberately discarded — the call's remaining job is to write
@@ -5719,7 +6283,10 @@ int Program::compileProject(
         // `if` would imply a path that cannot exist.
         (void) enforceArtifactProfileFormat((*fmtR)->artifactProfiles(),
                                             pc.artifactProfile,
-                                            parsed->formatName, *serving, rep);
+                                            parsed->formatName, **serving, rep);
+        return false;
+    }));
+    if (!everyTargetServed) {
         drainDiagnosticsToStderr(rep);
         return 1;
     }
@@ -5853,13 +6420,10 @@ int Program::compileProject(
         if (!outputDir().has_value()) {
             setOutputDir(manifestBase);
         } else if (!sameOutputBase(*outputDir(), manifestBase)) {
-            // `artifactPathForReport`, NOT bare `core::genericSpelling`:
-            // the latter THROWS for a path the current locale cannot
-            // encode, and this note sits on a SUCCESS path -- a throw here
-            // would abort a build that was about to work. The other
-            // `genericSpelling` call sites in this file are on paths that
-            // are ALREADY failing. This wrapper is what every
-            // operator-facing report line already uses, u8 fallback and all.
+            // `artifactPathForReport`: the rendering every operator-facing
+            // report line uses (total since P69 H6c2: `core::genericSpelling`
+            // no longer throws for a path the current locale cannot encode,
+            // and this note sits on a SUCCESS path).
             reportDriverNote(
                 "the command-line output directory '"
                 + artifactPathForReport(*outputDir())
@@ -6070,7 +6634,7 @@ int Program::compileProject(
     if (!resolved->mergedSources.empty()) {
         std::set<core::PathIdentity> seen;
         auto const key = [](std::string const& s) {
-            return core::PathIdentity::of(fs::path{s});
+            return core::PathIdentity::of(fs::path{s}, core::Use::Leaf);   // a source: a FILE
         };
         for (auto const& s : expandedSources) seen.insert(key(s));
         expandedSources.reserve(expandedSources.size()
@@ -6195,9 +6759,11 @@ int Program::transpile(
 //   * the WALK          -> `dss::resolveSystemDirs(GrammarSchema const&)`,
 //                          `core/types/config_path_walk.hpp`, beside the
 //                          `findShippedConfigDir` it wraps;
-//   * the BUILDER BIND  -> `dss::applySystemDirs(UnitBuilder&, GrammarSchema const&)`,
-//                          `analysis/compilation_unit/compilation_unit.hpp`,
-//                          beside `UnitBuilder::addSystemDir`.
+//   * the BUILDER BIND  -> the `UnitBuilder` constructor itself (P69 L2b2, ruling
+//                          570: a unit has its language's system dirs BY
+//                          CONSTRUCTION; `LanguageSystemDirs` for a caller that
+//                          resolves them ahead, as this file's batch build does),
+//                          `analysis/compilation_unit/compilation_unit.hpp`.
 //
 // Both are already reachable from here: this file includes both headers. Do NOT
 // re-open a local copy -- the whole history of this seam is copies drifting
@@ -6212,8 +6778,8 @@ int Program::transpile(
 // regardless of any later cwd change; the resolver searches these AFTER the
 // including file's own directory (C 6.10.2, the quote form). A nonexistent dir
 // is added anyway (gcc parity — it simply yields no hits, and a genuinely-
-// missing header still fails loud P0016 downstream). Distinct from
-// `applySystemDirs` (the angle-form `/usr/include` analogue via `addSystemDir`).
+// missing header still fails loud P0016 downstream). Distinct from the unit's
+// SYSTEM dirs (the angle-form `/usr/include` analogue `UnitBuilder` takes itself).
 // AGNOSTIC: pure path plumbing — no language/target/format branch.
 void applyIncludeDirs(UnitBuilder& builder,
                       std::vector<std::string> const& dirs) {
@@ -6224,7 +6790,7 @@ void applyIncludeDirs(UnitBuilder& builder,
         // local drive with no error, so the search dir named a directory that
         // cannot exist and the header missed 0/30 for BOTH slash spellings while
         // the acceptance check, which saw the ORIGINAL string, stayed silent.
-        fs::path const abs = core::absoluteKeepingRoot(fs::path{d}, ec);
+        fs::path const abs = core::storeRouteAbsolute(fs::path{d}, ec);   // the header lists' text (H6d)
         builder.addIncludeDir(ec ? fs::path{d} : abs);
         ec.clear();
     }
@@ -6328,8 +6894,8 @@ int Program::compileFiles(
     // (cross-file references resolved WITHIN the CU; each file routes to the language's
     // schema by extension). For one CU per file (a multi-CU image the linker MERGES, LK11)
     // use `compileUnits` — this entry's single-CU semantics are unchanged.
-    // D-PARSE-DEEP-FRONTEND-STACK: the CU build (preprocess + parse + the
-    // type-name oracle reparse) recurses over the expression tree on the
+    // D-PARSE-DEEP-FRONTEND-STACK: the CU build (preprocess + parse)
+    // recurses over the expression tree on the
     // thread stack (the parser's residual paren/postfix arm), so a deeply-
     // nested-but-legal expression that the config-driven parser cap
     // (`parser.maxExpressionDepth`, c = 1024) admits would overflow the
@@ -6373,7 +6939,6 @@ int Program::compileFiles(
                 // the merge, so a budget derived from one would hand the front
                 // end no bound at all.
                 UnitBuilder builder{keyGrammar, DiagnosticBudget{rep.config()}};
-                applySystemDirs(builder, *keyGrammar);
                 // D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE: everything the
                 // pair decides about the build — the format kind, its header-
                 // name case rule, the target's plain-`char` sign, the target's
@@ -6420,6 +6985,7 @@ int Program::compileFiles(
         // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the CLI/manifest runpaths.
         ImageRequest{.stackReserveBytes = stackReserveBytes_,
                      .runpaths          = runpaths_},
+        archiveDefinitionVisibility_,
         // D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION (C):
         // the cross-build artifact cache policy. nullopt on every CLI build and
         // on every ROOT project build; engaged only on a DEPENDENCY sub-build,
@@ -6470,6 +7036,7 @@ std::string hirArtifactRoundTripFailure(std::string_view artifact) {
     back.shaderMap     = &parsed->shaderMap;
     back.transpileMap  = &parsed->transpileMap;
     back.diagnosticMap = &parsed->diagnosticMap;
+    back.symbolAliases = &parsed->symbolAliases;
     std::string const again = emitHir(parsed->hir, back, rep);
     if (again == text) return {};
 
@@ -6612,12 +7179,13 @@ int Program::emitHirText(
     // compared byte-for-byte by its consumers (and by this repo's goldens), so a
     // host-dependent line ending would make the same compiler produce two
     // different files for one input.
-    std::ofstream o{fs::path{path}, std::ios::binary | std::ios::trunc};
-    if (!o) {
+    auto opened = core::openOutputStream(fs::path{path}, std::ios::binary | std::ios::trunc);
+    if (!opened) {
         err << "error: --emit-hir: could not open '" << path
-            << "' for writing.\n";
+            << "' for writing: " << core::reasonText(opened.error()) << ".\n";
         return 1;
     }
+    std::ofstream& o = *opened;
     o.write(text.data(), static_cast<std::streamsize>(text.size()));
     o.close();
     if (!o) {
@@ -6744,8 +7312,8 @@ int Program::compileUnits(
         std::size_t const n = sources.size();
         // Resolved ONCE for the whole batch rather than once per file: the
         // answer is fixed for this key, and it is a filesystem walk (see
-        // `resolveSystemDirs`).
-        std::vector<fs::path> const systemDirs = resolveSystemDirs(*keyGrammar);
+        // `resolveSystemDirs`). Each unit takes it at construction.
+        LanguageSystemDirs const systemDirs{*keyGrammar};
 
         std::vector<std::optional<CompilationUnit>> slots(n);
         auto buildOne = [&](std::size_t i) {
@@ -6763,8 +7331,7 @@ int Program::compileUnits(
                     // note above; writing it from a job would reintroduce
                     // exactly the completion-order dependence this shape
                     // exists to prevent.
-                    UnitBuilder builder{keyGrammar, DiagnosticBudget{rep.config()}};
-                    for (auto const& d : systemDirs) builder.addSystemDir(d);
+                    UnitBuilder builder{keyGrammar, DiagnosticBudget{rep.config()}, systemDirs};
                     // D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE: the pair's
                     // consequences in ONE call (see the `compileFiles` twin).
                     if (pairTarget != nullptr && pairFormat != nullptr) {
@@ -6861,6 +7428,7 @@ int Program::compileUnits(
         // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the CLI/manifest runpaths.
         ImageRequest{.stackReserveBytes = stackReserveBytes_,
                      .runpaths          = runpaths_},
+        archiveDefinitionVisibility_,
         // D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION (C):
         // the cross-build artifact cache policy — see the `compileFiles` twin.
         dependencyArtifactCache_);

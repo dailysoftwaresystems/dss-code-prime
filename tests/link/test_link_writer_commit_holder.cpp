@@ -52,7 +52,7 @@
 //
 // ★ RED ON DISABLE, per mechanism — the fix has two, and one mutant cannot cover
 // both (✔ the transcript is in the lane's findings):
-//   * drop `kRenameFlagPosixSemantics` from the replace in `writer.cpp`
+//   * drop `FILE_RENAME_FLAG_POSIX_SEMANTICS` from the replace in `writer.cpp`
 //     (`renameByHandle`)       -> (A) goes red; (B)–(G) stay green.
 //   * make the commit loop stop consulting its patience after a holder's
 //     refusal                  -> (B), (D), (E) go red; (A), (C), (F), (G) stay green.
@@ -70,6 +70,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "link/writer.hpp"
 #include "scratch_dir.hpp"
+#include "text_scan.hpp"
 
 #include <gtest/gtest.h>
 
@@ -78,7 +79,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
-#include <regex>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -285,10 +286,8 @@ private:
 // The refusal count the writer's diagnostic reports ("… refused it N time(s)
 // across …"), or 0 when absent.
 [[nodiscard]] unsigned long reportedRefusals(std::string const& text) {
-    std::smatch     m;
-    std::regex const rx{R"(refused it (\d+) time\(s\))"};
-    if (!std::regex_search(text, m, rx)) return 0;
-    return std::stoul(m[1].str());
+    std::optional<std::string> const count = dss::test::digitsBetween(text, "refused it ", " time(s)");
+    return count ? std::stoul(*count) : 0;
 }
 
 }  // namespace
@@ -383,7 +382,8 @@ TEST(LinkWriterCommitHolder, AHolderThatNeverLetsGoIsRefusedLoudlyAndByName) {
     EXPECT_TRUE(sawCode(rep, DiagnosticCode::K_ImageWriteOpenFailed)) << text;
     EXPECT_NE(text.find("repeat0.o"), std::string::npos) << "the refusal must name the target:\n"
                                                         << text;
-    EXPECT_NE(text.find("Windows error "), std::string::npos)
+    // The home's ONE rendering of the OS's reason (`core::reasonText`, H6c2): the number first, then the system's text.
+    EXPECT_NE(text.find("GetLastError="), std::string::npos)
         << "the refusal must carry the holder's error BY NUMBER — the text is "
            "localized, the number is what can be searched on:\n"
         << text;

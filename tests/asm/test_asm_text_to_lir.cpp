@@ -905,14 +905,16 @@ TEST(AsmTextToLir, InstructionAfterTerminatorBeginsABlockOfItsOwn) {
 
 // ★ THE HEADER SAID `.globl`-EXPORTED AND THE CODE ELECTED ON NAME ALONE.
 // Reconciled toward the header: an entry-named label that is not exported is a
-// diagnostic, because leaving `userEntrySymbol` unset instead would send the
-// trampoline to functions[0].
+// diagnostic, because the election reads only EXPORTED functions (P69 fold 3e:
+// the lowering elects nothing; `collectObjectEntryCandidates` reads the unit).
 TEST(AsmTextToLir, EntryNamedLabelMustBeExported) {
     auto const exported = lowerAsmText(baseDialectDoc(), src(
         ".globl main\n.func main\nmain:\n  ret\n"));
     ASSERT_TRUE(parsedCleanly(*exported)) << parseMessages(*exported);
     ASSERT_TRUE(exported->module.has_value()) << messages(*exported);
-    EXPECT_TRUE(exported->module->userEntrySymbol.has_value());
+    ASSERT_EQ(exported->module->symbols.size(), 1u);
+    EXPECT_EQ(exported->module->symbols[0].name, "main");
+    EXPECT_EQ(exported->module->symbols[0].binding, SymbolBinding::Global);
 
     // The same file WITHOUT the export. Deliberately no `.globl`.
     auto const local = lowerAsmText(baseDialectDoc(), src(
@@ -1963,7 +1965,6 @@ TEST(AsmTextToLir, DirectiveOnALabelLineIsApplied) {
     ASSERT_EQ(run->module->symbols.size(), 1u);
     EXPECT_EQ(run->module->symbols[0].binding, SymbolBinding::Global)
         << "the `.globl` on the label's own line was dropped";
-    EXPECT_TRUE(run->module->userEntrySymbol.has_value());
 }
 
 // ══ D-ASM-NO-DATA-DEFINING-DIRECTIVE ═══════════════════════════════════════
@@ -3154,12 +3155,43 @@ TEST(AsmTextToLir, DataSlotRelocationWidthFollowsTheDirectiveNotThePointer) {
     auto const& item = run->module->dataItems[0];
     EXPECT_EQ(item.bytes.size(), 4u) << "the ROW's unitBytes, not a pointer";
     ASSERT_EQ(item.relocations.size(), 1u);
-    std::optional<RelocationKind> expected;
-    for (auto const& r : run->target->relocations()) {
-        if (r.widthBytes == 4 && !r.pcRelative) { expected = r.kind; break; }
-    }
-    ASSERT_TRUE(expected.has_value());
-    EXPECT_EQ(item.relocations[0].kind, *expected);
+    // The row NAMED, never re-derived: x86_64's 4-byte address slot is `abs32` (R_X86_64_32, what GNU as writes for
+    // `.long sym`). P69 fold 3c: this expectation used to be "the first 4-byte non-pc-relative row" — the very scan the
+    // assembler ran, which gave an arm64 `.long main` the `call26` kind; here it passed only because x86_64 happened to
+    // declare `abs32` before `abs32s` and `addr32`.
+    auto const* abs32 = run->target->relocationByName("abs32");
+    ASSERT_NE(abs32, nullptr);
+    EXPECT_EQ(item.relocations[0].kind, abs32->kind);
+}
+
+// P69 fold 3c: a `.long` naming a symbol on a target with no 4-byte address-slot row is REFUSED by name, the target
+// and the width named. The synthetic target is the shipped x86_64 one without `abs32` and `addr32`: what remains of
+// width 4 is `abs32s` (signed — never a slot, half the addresses are out of its range) and rows that are pc-relative,
+// thread-local or image-relative.
+TEST(AsmTextToLir, ADataSlotOnATargetWithNoAddressSlotOfItsWidthIsRefusedByName) {
+    auto target = test_support::mutateShippedTargetSchemaDoc("x86_64", [](nlohmann::json& doc) {
+        auto& rows = doc.at("relocations");
+        for (auto it = rows.begin(); it != rows.end();) {
+            std::string const n = it->is_object() ? it->value("name", "") : "";
+            it = (n == "abs32" || n == "addr32") ? rows.erase(it) : it + 1;
+        }
+    });
+    ASSERT_TRUE(target.has_value()) << "the x86_64 target without abs32 and addr32 loads";
+    auto const run = lowerAsmTextWithTarget(jumpTableDoc(), src(
+        ".data\n"
+        "tbl:\n"
+        "  .long La\n"
+        ".text\n"
+        ".globl main\n.func main\nmain:\n"
+        "  movq $0, %rax\n"
+        "  jmp *%rax\n"
+        "La:\n"
+        "  ret\n"), *target);
+    ASSERT_TRUE(parsedCleanly(*run)) << parseMessages(*run);
+    EXPECT_FALSE(run->module.has_value());
+    EXPECT_EQ(countDiagnostics(run->reporter, kAsmCode), 1u) << messages(*run);
+    EXPECT_NE(messages(*run).find("needs an ABSOLUTE 4-byte relocation"), std::string::npos) << messages(*run);
+    EXPECT_NE(messages(*run).find("target 'x86_64' declares none"), std::string::npos) << messages(*run);
 }
 
 // ★★★ TAKING ONE LABEL'S ADDRESS TWICE IS ONE SYMBOL, BOUND ONCE.

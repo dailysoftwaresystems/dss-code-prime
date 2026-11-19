@@ -1,0 +1,1 @@
+        for made in (maker["inputs"] if maker["rule"] == "phony" else maker["outputs"]):

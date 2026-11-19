@@ -1,0 +1,2 @@
+                out.securityCookieInitializerMangledName =
+                    cs.contains(kInitKey) ? cs.at(kInitKey).get<std::string>() : std::string{};

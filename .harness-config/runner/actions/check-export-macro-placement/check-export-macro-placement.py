@@ -80,7 +80,9 @@ import importlib.util
 import io
 import os
 import re
+import shutil
 import sys
+import tempfile
 sys.dont_write_bytecode = True  # a by-path load must not write __pycache__ beside another action (the rule: check-scripts-index)
 
 # ★ AT IMPORT, NOT IN `main()`, AND BOTH STREAMS. On Windows a Python child whose
@@ -112,13 +114,13 @@ def _own_tree():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     try:
-        return mod.resolve(__file__)
+        return mod, mod.resolve(__file__)
     except mod.Refusal as exc:
         print("check-export-macro-placement: %s" % exc, file=sys.stderr)
         sys.exit(2)
 
 
-REPO = _own_tree()
+OT, REPO = _own_tree()
 
 # Every root that compiles against `core/export.hpp`. `tests/` is included
 # deliberately: a test target sees `DSS_SHARED_BUILD` without
@@ -243,31 +245,42 @@ def sites_with_lines(raw):
     return out, count
 
 
-def scan_tree(roots):
+def scan_tree(roots, repo=None):
+    """Every C++ source under `roots` of the tree `repo` (default: this guard's own), less what
+    the tree leaves out -- what git ignores there, read from the tree's own `.gitignore`, and
+    `.git` (`owning-tree`'s `TreeIgnores`, the one statement every walker asks): a build and the
+    sources it fetched into `_deps/`, another checkout. This guard skips nothing git does not
+    ignore. A directory the walk cannot list, or a path the reader cannot answer as git does,
+    exits 2."""
+    repo = REPO if repo is None else repo
     per_file = {}
     scanned = 0
     exported_classes = 0
     missing = []
-    for root in roots:
-        abs_root = os.path.join(REPO, root)
-        if not os.path.isdir(abs_root):
-            missing.append(root)
-            continue
-        for dirpath, dirnames, filenames in os.walk(abs_root):
-            dirnames[:] = [d for d in dirnames
-                           if d not in ('.git', 'build', '_deps', '.worktrees')]
-            for name in sorted(filenames):
-                if not name.endswith(SUFFIXES):
-                    continue
-                path = os.path.join(dirpath, name)
-                scanned += 1
-                with io.open(path, 'r', encoding='utf-8', errors='replace') as fh:
-                    raw = fh.read()
-                sites, count = sites_with_lines(raw)
-                exported_classes += count
-                if sites:
-                    rel = os.path.relpath(path, REPO).replace(os.sep, '/')
-                    per_file[rel] = sites
+    try:
+        ignores = OT.TreeIgnores(repo)
+        for root in roots:
+            abs_root = os.path.join(repo, root)
+            if not os.path.isdir(abs_root):
+                missing.append(root)
+                continue
+            for dirpath, dirnames, filenames in ignores.walk(abs_root):
+                dirnames.sort()
+                for name in sorted(filenames):
+                    if not name.endswith(SUFFIXES):
+                        continue
+                    path = os.path.join(dirpath, name)
+                    scanned += 1
+                    with io.open(path, 'r', encoding='utf-8', errors='replace') as fh:
+                        raw = fh.read()
+                    sites, count = sites_with_lines(raw)
+                    exported_classes += count
+                    if sites:
+                        rel = os.path.relpath(path, repo).replace(os.sep, '/')
+                        per_file[rel] = sites
+    except OT.Refusal as exc:
+        print("check-export-macro-placement: the walk of the tree is refused: %s" % exc, file=sys.stderr)
+        sys.exit(2)
     return per_file, scanned, exported_classes, missing
 
 
@@ -428,6 +441,28 @@ def _selftest():
         bad += 1
     else:
         print('  [ok  ] an empty translation unit reports nothing (floors do the work)')
+
+    # The walk leaves out what the tree leaves out and nothing more: a build below a root (its
+    # fetched `_deps/` with it) and `.git` are not read; a source beside them, and one in a
+    # directory whose name merely begins like a left-out one, are.
+    box = tempfile.mkdtemp(prefix='export-macro-walk-')
+    try:
+        for rel, text in (('.gitignore', 'build/\n'), ('src/a.hpp', 'int a;\n'),
+                          ('src/builder/b.hpp', 'int b;\n'), ('src/build/_deps/x/c.hpp', 'int c;\n'),
+                          ('src/.git/d.hpp', 'int d;\n')):
+            full = os.path.join(box, *rel.split('/'))
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with io.open(full, 'w', encoding='utf-8', newline='\n') as fh:
+                fh.write(text)
+        _per_file, walked, _classes, _missing = scan_tree(('src',), repo=box)
+    finally:
+        shutil.rmtree(box, ignore_errors=True)
+    if walked != 2:
+        print('  [FAIL] the walk read %d source(s) of a tree whose .gitignore leaves out its build; 2 expected'
+              % walked)
+        bad += 1
+    else:
+        print('  [ok  ] the walk asks the tree: a build, its _deps and .git are not read, a near name is')
 
     # The imported stripper must really be the sibling's, not a silent fallback.
     if strip_comments_and_strings.__module__ != '_no_abort_in_tests':

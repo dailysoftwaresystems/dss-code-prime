@@ -351,6 +351,7 @@ TEST(MachOArm64Exit, TrampolineEmitsDirectBlForExitImport) {
     user.symbol = SymbolId{1};
     user.bytes  = {0x40, 0x05, 0x80, 0xD2, 0xC0, 0x03, 0x5F, 0xD6};
     mod.functions.push_back(std::move(user));
+    mod.userEntrySymbol = SymbolId{1};   // a program's module states its entry (the build's election)
 
     DiagnosticReporter rep;
     bool const ok = linker::injectEntryTrampoline(mod, *target, *fmt, rep);
@@ -434,6 +435,7 @@ TEST(MachOArm64Exit, IndirectSlotDispatchOnMachOFailsLoud) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "sysv_amd64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -771,6 +773,7 @@ TEST(MachOArm64Exit, SegmentPageSizeNonPowerOfTwoFailsLoud) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "apple_arm64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777228, "cpusubtype": 0, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,
@@ -844,6 +847,7 @@ TEST(MachOArm64Exit, TextVaNotCongruentTo16KPageFailsLoud) {
       "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
         "importMangledName": "_exit" },
       "entryCallingConvention": "apple_arm64",
+      "entryTransition": "called",
       "macho": { "cputype": 16777228, "cpusubtype": 0, "filetype": "execute", "flags": 2097285 },
       "image": {
         "pageZeroSize": 4294967296,

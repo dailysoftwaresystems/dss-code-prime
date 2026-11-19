@@ -1,0 +1,2 @@
+                        if (false) {
+                            probe = selectionResultOf(s, cfg, tree, probe, scope);

@@ -91,7 +91,7 @@
 //
 // The environment vector follows argv's terminator on the entry stack, so its
 // address depends on the RUNTIME argc; the format declares the layout
-// (`envpFollowsArgvTerminator`, `vectorSlotBytes`) and this computes it — no
+// (`envpFollowsArgvTerminator`; each slot a pointer of the module's data model) and this computes it — no
 // per-architecture trampoline code, and the trampoline still hands over exactly
 // (argc, argv).
 //
@@ -126,6 +126,7 @@
 #include "core/types/entry_shape.hpp"         // EntryMaterialization (the verb)
 #include "core/types/target_schema.hpp"       // ProcessArgs
 
+#include <cstdint>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -161,6 +162,12 @@ class DiagnosticReporter;
 // mechanism this pass has no arm for, or when the declared mechanism's own
 // fields are unusable. NO resolved entry (a library TU with no `main`) is a clean
 // no-op: there is nothing to materialize into.
+//
+// The init's symbol and its imports' are minted by the MODULE (`Mir::symbolIdEnd`,
+// `MirBuilder::mintSymbolOrAbort` — see mir/merge/synth_symbol_floor.hpp): past every id
+// the module holds and every id the name table it was made from holds, so the init — a
+// GLOBAL definition — is never published under a name the table gives to something else.
+// No caller hands this pass an end; tests/mir/test_synth_symbol_floor.cpp pins the ids.
 [[nodiscard]] DSS_EXPORT bool
 realizeEntryShape(Mir&                              mir,
                   TypeInterner&                     interner,
@@ -171,5 +178,64 @@ realizeEntryShape(Mir&                              mir,
                   CSymbolDecorationScheme           scheme,
                   std::string_view                  formatName,
                   DiagnosticReporter&               reporter);
+
+// ── THE SAME, FOR AN ENTRY WHOSE SIGNATURE IS NONE OF ITS NAME'S ROWS (P69 fold
+//    3e, lane `xa`, class C's N3) ─────────────────────────────────────────────
+//
+// The entry is `userEntrySymbol`, a function of `mir` the semantic tier stamped
+// with the RICHEST row of its name the format realizes because its own signature is
+// none of them (`SymbolRecord::entryCalledWithTheVerbsSignature`; warned there,
+// S_EntryShapeNotDeclared). The init, where the verb × the mechanism needs one, calls
+// it with the VERB's signature -- the row's parameter shapes and `int` -- never its
+// own, as every reference's startup calls any `main` and as an object's entry, which
+// carries no prototype, is called (`realizeForeignEntryShape`). ✔MEASURED before
+// (lane `xa`): `int main(int, double)` and `int main(int, char **, int)` are linked
+// and run by gcc 13.3 (-Wmain) and cl 19.44; DSS refused both.
+[[nodiscard]] DSS_EXPORT bool
+realizeEntryShapeWithTheVerbsSignature(Mir&                              mir,
+                                       TypeInterner&                     interner,
+                                       std::optional<SymbolId>&          userEntrySymbol,
+                                       std::vector<ExternImport>&        externImports,
+                                       EntryMaterialization              verb,
+                                       std::optional<ProcessArgs> const& processArgs,
+                                       CSymbolDecorationScheme           scheme,
+                                       std::string_view                  formatName,
+                                       DiagnosticReporter&               reporter);
+
+// ── THE SAME MATERIALIZATION FOR AN ENTRY ANOTHER INPUT DEFINES (P69 fold 3d,
+//    D-PROGRAM-AN-OBJECTS-ENTRY-IS-CALLED-WITHOUT-ITS-ARGUMENTS) ─────────────
+//
+// The program's entry is a function a pre-assembled OBJECT input defines, under
+// `entryLinkName` (the format's spelling), elected with `verb` — the richest
+// row of its name the format realizes (`collectObjectEntryCandidates`, program
+// tier). Where the verb × the mechanism needs a pre-main init, the init is
+// synthesized into `mir` exactly as `realizeEntryShape` synthesizes it, and it
+// calls the entry through an import row it appends to `externImports`, by name —
+// the link's merge binds that row to the object's definition. The entry's
+// signature is the verb's own (its row's parameter shapes, an `int` result).
+// `init` is set to the init when one was synthesized, and left unset where none
+// is needed (a no-argument verb; a loader that hands the arguments itself, Mach-O;
+// an entry-stack vector with no environment, which the trampoline materializes):
+// the caller then states the entry on the object that defines it.
+//
+// ✔MEASURED before (lane `xa`, `argc_pe.py`): an object's `main` linked for
+// `pe64-x86_64-windows-exec` was called on whatever the argument registers held
+// (cl 19.44's `return argc * 10 + (argv[1][0] - '0')`, run as `prog 7 x y`,
+// exited 1091911680 where link.exe's image exits 47), because the init was made
+// only for an entry `mir` defines.
+//
+// `mir` may hold nothing else: the all-object link's STARTUP module is made for
+// this alone (an empty module, its symbol-id end stated by its maker).
+[[nodiscard]] DSS_EXPORT bool
+realizeForeignEntryShape(Mir&                              mir,
+                         TypeInterner&                     interner,
+                         std::string_view                  entryLinkName,
+                         std::optional<SymbolId>&          init,
+                         std::vector<ExternImport>&        externImports,
+                         EntryMaterialization              verb,
+                         std::optional<ProcessArgs> const& processArgs,
+                         CSymbolDecorationScheme           scheme,
+                         std::string_view                  formatName,
+                         DiagnosticReporter&               reporter);
 
 } // namespace dss

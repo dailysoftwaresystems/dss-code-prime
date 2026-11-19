@@ -532,7 +532,7 @@ struct DSS_EXPORT GrammarSchemaData {
 
     // Pool indexed by `LexemeMeaning::stringStyleId`. Slot 0 is the
     // InvalidStringStyle sentinel; real ids 1..N. Each StringStyle
-    // owns its `endsAt`/`tagPattern` strings; the vector may reallocate
+    // owns its `endsAt` string and tag; the vector may reallocate
     // (LexemeMeaning carries the id, not a pointer).
     std::vector<StringStyle>                          stringStyles;
 
@@ -1130,6 +1130,17 @@ public:
     [[nodiscard]] std::span<RuleId const>
     altRuleBranches(SchemaCursor cur) const noexcept;
 
+    // ★ P69 (lane `cs`, fold f26e): THE POSITION THAT DECIDES `tok` WHEN IT IS A NESTED
+    // SPECULATIVE CHOICE. At a NON-speculative AltChoice cursor, follow the branch whose
+    // expected set holds `tok` (first match, the routing `advance` does) through
+    // NON-speculative AltChoice positions of the same rule, and answer the first
+    // SPECULATIVE AltChoice reached (`detail::enumerationEnters`): the parser moves its
+    // cursor there and dispatches the choice in place, with its own lookahead, probes and
+    // skip. Invalid when the route reaches a token or rule slot (the caller's own routes take
+    // those), at a speculative or non-AltChoice cursor, and for an invalid cursor.
+    [[nodiscard]] SchemaCursor nestedSpeculativeChoice(SchemaCursor cur,
+                                                       SchemaTokenId tok) const noexcept;
+
     [[nodiscard]] std::span<SchemaTokenId const> expectedSet(SchemaCursor cur) const noexcept;
 
     // c97 O(1) membership queries (bitset-backed; built once at schema
@@ -1291,6 +1302,16 @@ public:
     // `typeNameCommitRule(rule).valid()`; returns the default otherwise.
     [[nodiscard]] TypeNameCommitPolarity
         typeNameCommitPolarity(RuleId rule) const noexcept;
+    // P69 L2b2 (lane `lm`): the triage's STATIC half (see `CompiledRule::typeBaseAskable`),
+    // one load-time computation both base askers read. `typeBaseAskable`: may the type
+    // child's base be read as the first grammar token when its frame opens?
+    // `typeChildLeadRunLength`: the number of single-token elements before the type child
+    // when the entry is such a run and then the type rule (nullopt otherwise);
+    // `typeChildLeadRunAdmits`: does the run's `i`-th element admit `tok`?
+    [[nodiscard]] bool typeBaseAskable(RuleId rule) const noexcept;
+    [[nodiscard]] std::optional<std::size_t> typeChildLeadRunLength(RuleId rule) const noexcept;
+    [[nodiscard]] bool typeChildLeadRunAdmits(RuleId rule, std::size_t i,
+                                              SchemaTokenId tok) const noexcept;
 
     // commitAfterPrefix CUT (`commitAfterPrefix` on the shape body; PEG
     // "cut"; D-CSUBSET-LABEL-BUDGET-CLIFF, p19 Cluster G c31). True iff a
@@ -1303,6 +1324,25 @@ public:
     // `Parser::Impl::trySpeculativeBranch`. Names no token, rule, or
     // language.
     [[nodiscard]] bool commitAfterPrefix(RuleId rule) const noexcept;
+
+    // P69 L2b2 (lane `lm`): `rule` is a VALUE reading of its position (`valueReading` on the
+    // shape body). After a candidate of a speculative site COMMITTED to its type reading and
+    // failed, the parser tries none of the site's value readings. False for every rule that
+    // omits the flag. Names no token, rule, or language.
+    [[nodiscard]] bool isValueReading(RuleId rule) const noexcept;
+
+    // P69 (lane `cs`): the token kinds that must NOT follow a cleanly-closed speculative
+    // probe of `rule` (`notFollowedBy` on the shape body — a PEG not-predicate); when the
+    // next token is one, the probe is abandoned and the alt tries its next candidate.
+    // Sorted by `.v`; empty for every rule that declares none.
+    [[nodiscard]] std::span<SchemaTokenId const> notFollowedBy(RuleId rule) const noexcept;
+
+    // P69 round 4 (lane `cs`): the positive twin — the token kinds ONE of which MUST follow a
+    // cleanly-closed speculative probe of `rule` (`followedByFirstOf` on the shape body: the
+    // FIRST set of the shape it names — a PEG and-predicate); when the next token is none of
+    // them, the probe is abandoned and the alt tries its next candidate (or its skip). Sorted
+    // by `.v`; empty for every rule that declares none.
+    [[nodiscard]] std::span<SchemaTokenId const> followedBy(RuleId rule) const noexcept;
 
     // Pratt-walker wrapper rule ids declared by `expr.wrapperRules`
     // for `rule`. The loader auto-interned the declared names and
@@ -1385,8 +1425,16 @@ public:
     [[nodiscard]] std::span<ConfigDiagnostic const> loadDiagnostics() const noexcept;
 
     // ── Scope rules ──
-    [[nodiscard]] bool isTokenValidInScope(SchemaTokenId tok,
-                                           std::span<ScopeKind const> stack) const noexcept;
+    // Is `tok` valid where the scopes `open(ctx, kind)` says are open — false iff a scope of a
+    // kind whose `scopes.validity` row forbids `tok` is open. Asked of a PRESENCE oracle, one
+    // question per scope kind that forbids anything, in ascending kind order, never the stack's
+    // depth, and none for a grammar that declares no scope rules (P69 L2a2: a walk of the stack,
+    // once per token, made a parse cost Θ(tokens × nesting)). ★ P69 L2b1 (lane `lm`, the L2a2
+    // review's A4): there is no stack form of this question any more — the walk overload is
+    // deleted, so a resolution cannot call it, and its tests ask this one through a stack oracle.
+    using ScopeOpenFn = bool (*)(void const* ctx, ScopeKind kind) noexcept;
+    [[nodiscard]] bool isTokenValidInScope(SchemaTokenId tok, ScopeOpenFn open,
+                                           void const* ctx) const noexcept;
 
     // ── Termination ──
     [[nodiscard]] bool canEndSource(SchemaCursor cur) const noexcept;
@@ -1435,6 +1483,10 @@ private:
     // Written ONLY by `loadFromText` (a static member, so no friend is
     // needed); every other construction path leaves it empty on purpose.
     std::string contentDigest_;
+
+    // The scope kinds a `scopes.validity` row forbids a token in, ascending (the ctor's sealing
+    // pass; see `isTokenValidInScope`).
+    std::vector<std::uint16_t> scopeForbidOrder_;
 
     detail::GrammarSchemaData d_;
 };

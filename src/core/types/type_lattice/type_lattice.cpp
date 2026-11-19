@@ -1,5 +1,6 @@
 #include "core/types/type_lattice/type_lattice.hpp"
 
+#include "core/substrate/walk_steps.hpp"           // P69 L2b1: isVariablyModified's bound
 #include "core/types/alignment.hpp"              // the ONE owner of the representable-alignment domain
 #include "core/types/config_key_vocabulary.hpp"  // renderAllowedList — the ONE "expected one of …" renderer
 #include "core/types/grammar_schema.hpp"
@@ -524,6 +525,21 @@ bool TypeInterner::typeContainsVla(TypeId id) const {
         auto const ops = operands(id);
         if (ops.empty()) return false;
         id = ops[0];
+    }
+    return false;
+}
+
+bool TypeInterner::isVariablyModified(TypeId id) const {
+    // P69 L2b1 (lane `lm`): see the declaration. Each step moves to an operand interned before
+    // its owner, so the chain is finite; the bound is the interner's own size.
+    for (substrate::WalkSteps steps{size(), "isVariablyModified's derivation chain"}; id.valid();
+         steps.step()) {
+        if (isVlaArray(id)) return true;
+        TypeKind const k = kind(id);
+        if (k != TypeKind::Ptr && k != TypeKind::Array && k != TypeKind::FnSig) return false;
+        auto const ops = operands(id);
+        if (ops.empty()) return false;
+        id = ops[0];   // the pointee, the element, or a signature's result
     }
     return false;
 }

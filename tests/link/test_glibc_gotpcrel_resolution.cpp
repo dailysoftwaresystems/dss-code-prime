@@ -259,7 +259,13 @@ struct Schemas {
         // here as FUNCTIONS, which is what they are in glibc. Defining them as
         // data would make this test's link a different program from the one the
         // member describes.
-        if (ext.isData) {
+        // ★ A name the member reaches WITHOUT a call states no kind at all — an
+        // STT_NOTYPE symbol, read `Pending` since P69
+        // (D-LK-MEMBER-UNTYPED-EXTERN-TAKEN-AS-DATA) — and the link takes the
+        // kind from the definition. This file's definitions are its own, so it
+        // gives such a name the 8-byte datum it gave every untyped name before
+        // P69: the image linked here is the one it always linked.
+        if (ext.isData || ext.kindOrigin == ExternKindOrigin::Pending) {
             AssembledData d;
             d.symbol    = ext.symbol;
             d.section   = DataSectionKind::Data;
@@ -442,8 +448,8 @@ TEST(GlibcGotPcRelResolution, AModuleWithNoGotSlotRelocationGetsNoSlot) {
     (void)defineRemainingExterns(*module);
     DiagnosticReporter lowerReporter;
     AssembledModule lowered;
-    EXPECT_TRUE(linker::lowerGotSlotReferences(*module, lowered, *S.target,
-                                               *S.writer, lowerReporter))
+    EXPECT_EQ(linker::lowerGotSlotReferences(*module, lowered, *S.target,
+                                               *S.writer, lowerReporter), linker::LinkPassOutcome::Unchanged)
         << "a module naming no GOT slot must leave the lowering nothing to do — "
            "otherwise test 1's slots say nothing about the relocation, only "
            "about the link";
@@ -465,7 +471,7 @@ TEST(GlibcGotPcRelResolution, AStillUndeclaredWireTypeIsStillRefused) {
 
     bool declaresGotTpOff = false;
     for (auto const& r : S.reader->relocations()) {
-        if (r.nativeId == kRX8664GotTpOff || r.pltNativeId == kRX8664GotTpOff) {
+        if (r.nativeId == kRX8664GotTpOff) {   // (`pltNativeId`, its second id, is retired)
             declaresGotTpOff = true;
         }
     }

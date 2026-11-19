@@ -1,0 +1,1 @@
+            && linker::externSurvivesReferenceGate(ext, usedBy[mi]) && !ext.addressSlotSymbol.valid();

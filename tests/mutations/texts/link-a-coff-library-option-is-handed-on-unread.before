@@ -1,0 +1,1 @@
+                out.dependentLibraries.emplace_back(value);

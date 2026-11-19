@@ -34,14 +34,13 @@ enum class SlotKind : std::uint8_t {
 //   PreferType       — the FC2 default: commit iff the follower token could
 //                      not continue a value reading (not an infix/postfix/
 //                      ternary operator per the operator table); an
-//                      operator follower rolls back + records the
-//                      AmbiguousTypeNameCandidate for the CU oracle.
+//                      operator follower rolls back + records an
+//                      UnknownNameRefusal.
 //   RequireKnownType — commit ONLY on a sketch-KNOWN type. Unknown always
 //                      rolls back to the competing reading AND records the
-//                      candidate (so a cross-file typedef still resolves on
-//                      the oracle's seeded reparse). The C 6.7.6.3p11
-//                      parameter-position rule: `T (name)` is a parenthesized
-//                      declarator unless `name` is a visible typedef.
+//                      refusal. The C 6.7.6.3p11 parameter-position rule:
+//                      `T (name)` is a parenthesized declarator unless
+//                      `name` is a visible typedef.
 enum class TypeNameCommitPolarity : std::uint8_t {
     PreferType,
     RequireKnownType,
@@ -290,6 +289,22 @@ private:
     std::uint16_t   lookahead_    = 0;
 };
 
+// ★★ P69 (lane `cs`, fold f26e): A SPECULATIVE CHOICE IS DECIDED WHERE IT STANDS. Whether a
+// walk enumerating the candidates of the AltChoice `root` descends into the AltChoice `nested`
+// that one of its branches reaches inside the same rule. It does, except where `nested` is
+// SPECULATIVE and `root` is not: such a choice is decided at its own position — the cursor is
+// routed to it (`GrammarSchema::nestedSpeculativeChoice`) and dispatched there, with its own
+// lookahead prune, its probes and its skip. Entered rule-first by the enclosing choice, none of
+// them ran: C's `declAttrRun` (a GNU run, then a speculative C23 sequence) read the `[` of
+// `void f(int[3]);` as a sequence's and refused the program. Under a speculative root every
+// nested choice is part of the root's own candidate set — each candidate is probed and rolled
+// back, so nothing is entered unweighed. The ONE rule both readers ask: the schema's
+// precomputed enumeration (`collectAltBranchRules`) and the loader's mirror of where the
+// parser's cursor stands (`validateNotFollowedBy`).
+[[nodiscard]] inline bool enumerationEnters(Position const& root, Position const& nested) noexcept {
+    return !(nested.slotKind() == SlotKind::AltChoice && nested.speculative() && !root.speculative());
+}
+
 struct CompiledRule {
     // Index into `positions` for the rule's entry point. `positions[0]`
     // is reserved as a sentinel so cursor `posId == 0` means "invalid",
@@ -373,6 +388,23 @@ struct CompiledRule {
     TypeNameCommitPolarity     typeNameCommitPolarity =
         TypeNameCommitPolarity::PreferType;
 
+    // P69 L2b2 (lane `lm`): THE TYPE-NAME TRIAGE'S STATIC HALF, computed ONCE by the
+    // GrammarSchema sealing pass and read by both of the triage's base askers — the early
+    // base ask when the type child's frame opens (`Parser::Impl::askTriageBaseEarly_`) and
+    // the same ask hoisted before the probe opens (`Parser::Impl::hoistRefutesTheCandidate_`)
+    // — so the two cannot disagree about when the base may be asked.
+    //   * `typeBaseAskable`: the rule has a type guard, its type rule cannot derive nothing
+    //     (else the next grammar token would be the NEXT element's), and no attribute
+    //     specifier of the language can start with an identifier (else the base is the first
+    //     leaf outside one, which a token peek cannot tell).
+    //   * `typeChildLeads` / `typeChildLeadRun`: the rule's entry is a run of single-token
+    //     elements (the run's positions, possibly none) and then a RuleLeaf of its type rule,
+    //     so the type child opens at a FIXED grammar-token offset: the run's length.
+    // Config-derived (the position table, the guard, the language's attribute rules).
+    bool                       typeBaseAskable = false;
+    bool                       typeChildLeads  = false;
+    std::vector<std::uint32_t> typeChildLeadRun;
+
     // commitAfterPrefix CUT (PEG "cut"; D-CSUBSET-LABEL-BUDGET-CLIFF, p19
     // Cluster G c31). When true, a speculative probe of this rule COMMITS
     // as soon as the rule's FIXED leading token-prefix (predictivePrefix,
@@ -387,6 +419,33 @@ struct CompiledRule {
     // rule, or language. Default false ⇒ standard rollback-on-failure
     // speculation.
     bool                       commitAfterPrefix = false;
+
+    // P69 L2b2 (lane `lm`): the rule is a VALUE READING of its position (`valueReading` on the
+    // shape body) — the reading a speculative site's rollback hands the parse to when a type
+    // reading does not hold (c `exprStmt` against the declarations, `parenExpr` against the
+    // cast). When a candidate of the same site has COMMITTED to its type reading (its type
+    // child closed as a certain type name) and then failed, the site tries no value reading
+    // after it: C reads a certain type name in that position as a type, never as a value.
+    // Config-sourced; the engine names no rule. Default false.
+    bool                       valueReading = false;
+
+    // P69 (lane `cs`, D-C-SIZEOF-OF-A-COMPOUND-LITERAL-IS-A-PARSE-ERROR): a PEG NOT-PREDICATE
+    // on the rule's FOLLOWER (`notFollowedBy` on the shape body): a speculative probe of this
+    // rule that CLOSES cleanly is abandoned — the enclosing alt tries its next candidate —
+    // when the next token is one of these kinds. Sorted by `SchemaTokenId.v`. Config-sourced;
+    // the engine names no token. Empty (the default) ⇒ no predicate.
+    std::vector<SchemaTokenId> notFollowedBy;
+
+    // P69 round 4 (lane `cs`): the POSITIVE twin — a PEG AND-PREDICATE on the rule's FOLLOWER
+    // (`followedByFirstOf` on the shape body, naming a declared shape): a speculative probe of
+    // this rule that CLOSES cleanly is abandoned UNLESS the next token can START the named shape
+    // (is in its FIRST set). `followedByFirstOf` is the shape named; `followedBy` is its FIRST
+    // set, resolved once FIRST sets exist and sorted by `SchemaTokenId.v`. Naming a SHAPE rather
+    // than listing tokens is the point: the set is the grammar's own, so a keyword added to that
+    // shape is admitted here by construction instead of by a second list kept in step by hand.
+    // Config-sourced; the engine names no token and no rule. Invalid / empty ⇒ no predicate.
+    RuleId                     followedByFirstOf{};
+    std::vector<SchemaTokenId> followedBy;
 };
 
 } // namespace dss::detail

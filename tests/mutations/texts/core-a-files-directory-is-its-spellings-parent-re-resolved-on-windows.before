@@ -1,0 +1,1 @@
+    return HostPathAccess::made(fs::path{dosSpellingOf(above)}, above, above, HostPath::Origin::Composed);
