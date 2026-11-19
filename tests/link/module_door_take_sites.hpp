@@ -8,7 +8,7 @@
 //   * tests/link/test_module_door_take_sites.cpp drives every row with its door at the edge of its space and holds it
 //     to the rule: refused BY NAME, once, and what its caller holds or receives exactly as it was.
 // A row is a take on the module door (`ModuleSymbolIds::take`, the label its last argument) or the construction of
-// the door of a new space (`NewSpaceSymbolIds{start, reporter, label}`, whose every take answers to that label).
+// the door of a new space (`ReportedSymbolIds{start, sink, label}`, whose every take answers to that label).
 
 #include <string_view>
 

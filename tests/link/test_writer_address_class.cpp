@@ -57,7 +57,7 @@ std::vector<std::uint8_t> encodeMachO(AssembledModule const& m, TargetSchema con
 }
 std::vector<std::uint8_t> encodePe(AssembledModule const& m, TargetSchema const& t, ObjectFormatSchema const& f,
                                    DiagnosticReporter& r, ImageRequest const& q) {
-    return pe::encode(m, t, f, r, q);
+    return pe::encode(m, t, f, r, q).value_or(std::vector<std::uint8_t>{});
 }
 
 Writer const kWriters[] = {

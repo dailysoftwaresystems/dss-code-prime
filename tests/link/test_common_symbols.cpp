@@ -981,7 +981,7 @@ TEST(CommonSymbols, ACoffObjectsCommonReadsBackAsTheSameCommon) {
     m.externImports.push_back(commonRow(4, "chidden", 8, 8, SymbolVisibility::Hidden));   // 8 above 4: said
     m.externImports.push_back(commonRow(5, "cfour", 4, 4));                          // what every linker gives: unsaid
     DiagnosticReporter rep;
-    auto const obj = pe::encode(m, *L.target, *L.format, rep);
+    auto const obj = pe::encode(m, *L.target, *L.format, rep).value();
     ASSERT_FALSE(obj.empty()) << diagnosticsOf(rep);
     // The directive section, read off the file: the last section, by the writer's ordinals.
     std::uint16_t const nSec = static_cast<std::uint16_t>(rdLE(obj, 2, 2));
@@ -1052,8 +1052,8 @@ TEST(CommonSymbols, TheCoffWriterAndReaderReadTheDocumentsCommonAlignment) {
         return directive;
     };
     DiagnosticReporter rep;
-    auto const shippedObj = pe::encode(m, *L.target, *L.format, rep);
-    auto const unsaidObj  = pe::encode(m, *L.target, **everyLinker32, rep);
+    auto const shippedObj = pe::encode(m, *L.target, *L.format, rep).value();
+    auto const unsaidObj  = pe::encode(m, *L.target, **everyLinker32, rep).value();
     ASSERT_FALSE(shippedObj.empty() || unsaidObj.empty()) << diagnosticsOf(rep);
     EXPECT_NE(directiveOf(shippedObj).find("-aligncomm:shared,5"), std::string::npos)
         << "the shipped document's every-linker 4 is below the common's 32, so it is said: "
@@ -1618,10 +1618,10 @@ TEST(CommonSymbolsArchive, APeLinkKeepsTheCommonAndFetchesNothing) {
     test_support::ScratchDir scratch{test_support::Location::InsideRepo, "common-archive-pe"};
     auto const dir = scratch.path();
     DiagnosticReporter rep;
-    auto const commonObj = pe::encode(unitWithCommon(1, "main", 4, 4, /*entry=*/false), *L.target, *L.format, rep);
+    auto const commonObj = pe::encode(unitWithCommon(1, "main", 4, 4, /*entry=*/false), *L.target, *L.format, rep).value();
     ASSERT_FALSE(commonObj.empty()) << diagnosticsOf(rep);
     auto const referenceObj =
-        pe::encode(unitWithCommon(1, "main", /*size=*/0, 0, /*entry=*/false), *L.target, *L.format, rep);
+        pe::encode(unitWithCommon(1, "main", /*size=*/0, 0, /*entry=*/false), *L.target, *L.format, rep).value();
     ASSERT_FALSE(referenceObj.empty()) << diagnosticsOf(rep);
     auto const lib = dssArchiveOf(dir, "shareddef", "int shared = 7;\n", "x86_64:pe64-x86_64-windows-staticlib", rep);
     ASSERT_FALSE(lib.empty()) << diagnosticsOf(rep);
@@ -1996,7 +1996,7 @@ struct SearchFamily {
         {"Mach-O", "macho64-x86_64-darwin", "macho64-x86_64-darwin-exec", "_", false, true,
          [](auto const& m, auto const& t, auto const& f, auto& r) { return macho::encode(m, t, f, r); }},
         {"PE", "pe64-x86_64-windows", "pe64-x86_64-windows-exec", "", false, false,
-         [](auto const& m, auto const& t, auto const& f, auto& r) { return pe::encode(m, t, f, r); }}};
+         [](auto const& m, auto const& t, auto const& f, auto& r) { return pe::encode(m, t, f, r).value_or(std::vector<std::uint8_t>{}); }}};
     return families;
 }
 
@@ -4787,7 +4787,7 @@ struct RecordFamily {
           [](auto const& m, auto const& t, auto const& f, auto& r) { return macho::encode(m, t, f, r); }},
          "arm64", true, {0xC0, 0x03, 0x5F, 0xD6}},
         {{"PE x86_64", "pe64-x86_64-windows", "pe64-x86_64-windows-exec", "", false, false,
-          [](auto const& m, auto const& t, auto const& f, auto& r) { return pe::encode(m, t, f, r); }},
+          [](auto const& m, auto const& t, auto const& f, auto& r) { return pe::encode(m, t, f, r).value_or(std::vector<std::uint8_t>{}); }},
          "x86_64", true, {0xC3}}};
     return families;
 }
@@ -6505,7 +6505,7 @@ void writePe(AssembledModule const& hand, PeObject& out, std::shared_ptr<ObjectF
     out.L = load("x86_64", "pe64-x86_64-windows");
     ASSERT_TRUE(out.L.target && out.L.format);
     if (format) out.L.format = std::move(format);
-    out.bytes = pe::encode(hand, *out.L.target, *out.L.format, out.rep);
+    out.bytes = pe::encode(hand, *out.L.target, *out.L.format, out.rep).value_or(std::vector<std::uint8_t>{});
     if (out.bytes.empty()) return;
     out.records = coffRecords(out.bytes);
     out.back    = pe::readRelocatableObject(out.bytes, *out.L.target, *out.L.format, out.rep, CompilationUnitId{1});

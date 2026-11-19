@@ -150,6 +150,12 @@ public:
     // a nullable AltChoice (the parser should emit
     // `P_NoAlternativeMatched` and consume in that case).
     bool takeNullableBranch() noexcept;
+
+    // ★ P69 (lane `cs`, fold f26e): move the cursor, without consuming a token, to the nested
+    // SPECULATIVE choice the non-speculative AltChoice it stands at routes `tok` to
+    // (`GrammarSchema::nestedSpeculativeChoice`), so the parser dispatches that choice where it
+    // stands. False, and nothing moves, when there is none.
+    bool routeToNestedSpeculativeChoice(SchemaTokenId tok) noexcept;
     [[nodiscard]] std::size_t                   depth()          const noexcept { return frames_.size(); }
     [[nodiscard]] bool                          isDesynced()     const noexcept { return cursorDesynced_; }
 

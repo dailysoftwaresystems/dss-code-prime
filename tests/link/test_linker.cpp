@@ -1828,7 +1828,7 @@ TEST(LinkerStackReserve, DllWalkerItselfRefusesWhenReachedDirectly) {
     ImageRequest req;
     req.stackReserveBytes = 4194304u;
     auto const bytes = pe::encode(mod, **target, **dll, rep, req);
-    EXPECT_TRUE(bytes.empty())
+    EXPECT_FALSE(bytes.has_value())
         << "the walker must emit NOTHING rather than an image carrying an "
            "inert reserve";
     EXPECT_EQ(countCode(rep, DiagnosticCode::K_FormatLacksStackReserveControl),
@@ -1970,7 +1970,7 @@ TEST(LinkerStackReserve, WalkerEnforcesTheDeclaredBoundsNotJustTheCapability) {
         ImageRequest req;
         req.stackReserveBytes = c.value;
         auto const bytes = pe::encode(mod, **target, **fmt, rep, req);
-        EXPECT_TRUE(bytes.empty())
+        EXPECT_FALSE(bytes.has_value())
             << c.why << " (" << c.value
             << "): the walker must emit NOTHING rather than an image whose "
                "header carries an out-of-range reserve";
@@ -1985,7 +1985,7 @@ TEST(LinkerStackReserve, WalkerEnforcesTheDeclaredBoundsNotJustTheCapability) {
     DiagnosticReporter okRep;
     ImageRequest okReq;
     okReq.stackReserveBytes = 4194304u;
-    auto const okBytes = pe::encode(mod, **target, **fmt, okRep, okReq);
+    auto const okBytes = pe::encode(mod, **target, **fmt, okRep, okReq).value();
     EXPECT_EQ(okRep.errorCount(), 0u);
     ASSERT_GT(okBytes.size(), 0xE8u);
     std::uint64_t landed = 0;

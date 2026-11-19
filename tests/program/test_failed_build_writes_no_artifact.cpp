@@ -54,9 +54,11 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -206,6 +208,111 @@ TEST(FailedBuildWritesNoArtifact, NoArtifactIsWrittenForACrossUnitRedefinition) 
            "withheld (the writer's net held), but the work was wasted and "
            "every diagnostic those tiers produced describes a program the "
            "source does not name.";
+}
+
+// ── AN ERROR THE VOLUME GATES ELIDE STILL FAILS THE BUILD, UNDER ITS OWN NAME ──
+//
+// (P69 fold f26e, lane `cs`, D9(c).) Every tier decides "did this stage fail" from
+// `DiagnosticReporter::errorCount()`, and the artifact writer refuses on the same count. The volume gates (the
+// per-code cap, the dedup window, the global cap) elide a diagnostic into a marker, and `--max-per-code 0` is legal
+// ("show none, count them"), so under it the FIRST Error of every code outside the unsuppressable table is elided.
+// ✔MEASURED before the fix (six one-Error sources, the five below and `int *p = 5;`, at the defaults and under
+// `maxPerCode = 0`, x86_64:elf64-x86_64-linux-exec, MinGW gcc 13.2 build): the assignment to a `const` object BUILT
+// GREEN -- rc 0, errorCount() 0, an artifact on disk -- and the other four failed only because a LATER tier reported
+// its own Error over the model the elided one had left broken: the undeclared identifier as H_TypeUnresolved, the
+// argument count as H_VerifierFailure, the missing member and the syntax error as H_UnsupportedLoweringForKind. The
+// reporter now counts what its gates drop and every relay carries the count, so the tier whose Error was elided
+// stops the build itself.
+// Each source runs TWICE: at the defaults (the control: its own codes are STORED, so the input reaches the tier this
+// case is about) and under `maxPerCode = 0` (its own codes are stored nowhere and still COUNTED). In both: rc 1, no
+// artifact, and no code from any tier after the source's own.
+namespace {
+
+struct OneErrorSource {
+    char const*                 tag;
+    char const*                 text;
+    std::vector<DiagnosticCode> own;   // what the defaults report for it, every one an Error
+};
+
+[[nodiscard]] std::vector<OneErrorSource> const& oneErrorSources() {
+    static std::vector<OneErrorSource> const sources = {
+        {"undeclared", "int main(void) { return undeclared; }\n", {DiagnosticCode::S_UndeclaredIdentifier}},
+        {"argcount", "int f(int a) { return a; }\nint main(void) { return f(1, 2); }\n",
+         {DiagnosticCode::S_ArgCountMismatch}},
+        {"constassign", "int main(void) { const int c = 1; c = 2; return c; }\n", {DiagnosticCode::S_ConstViolation}},
+        {"nomember", "struct S { int a; };\nint main(void) { struct S s = {1}; return s.b; }\n",
+         {DiagnosticCode::S_UndeclaredIdentifier}},
+        {"syntax", "int main(void) { return 1 }\n",
+         {DiagnosticCode::P_UnexpectedToken, DiagnosticCode::P_MissingRequiredChild}},
+    };
+    return sources;
+}
+
+// Every code the run met -- stored, or counted by a gate that dropped it.
+[[nodiscard]] std::set<DiagnosticCode> codesOf(DiagnosticReporter const& rep) {
+    std::set<DiagnosticCode> out;
+    for (auto const& d : rep.all()) out.insert(d.code);
+    for (DiagnosticCode const c : rep.droppedCodes()) out.insert(c);
+    return out;
+}
+
+[[nodiscard]] std::string namesOf(std::set<DiagnosticCode> const& codes) {
+    std::string s;
+    for (DiagnosticCode const c : codes) {
+        if (!s.empty()) s += ", ";
+        s += diagnosticCodeName(c);
+    }
+    return s.empty() ? std::string{"<none>"} : s;
+}
+
+}  // namespace
+
+TEST(FailedBuildWritesNoArtifact, AnErrorTheVolumeGatesElideStillFailsTheBuild) {
+    for (OneErrorSource const& src : oneErrorSources()) {
+        for (bool const elideEvery : {false, true}) {
+            SCOPED_TRACE(std::string{src.tag} + (elideEvery ? " under maxPerCode = 0" : " at the defaults"));
+            ScratchDir scratch{Location::InsideRepo,
+                               std::string{"noartifact-elided-"} + src.tag + (elideEvery ? "-0" : "-d")};
+            fs::path const a   = scratch.path() / "a.c";
+            fs::path const out = scratch.path() / "out";
+            writeFile(a, src.text);
+            scratch.useAsCwd();
+
+            DiagnosticReporter::Config cfg{};      // the shipped defaults…
+            if (elideEvery) cfg.maxPerCode = 0;    // …or `--max-per-code 0`
+            DiagnosticReporter rep{cfg};
+            Program            prog;
+            prog.setOutputDir(out);
+            int const rc = prog.compileUnits({a.generic_string()}, "c", {"x86_64:elf64-x86_64-linux-exec"}, rep);
+            std::set<DiagnosticCode> const codes = codesOf(rep);
+
+            EXPECT_EQ(rc, 1) << "codes met: " << namesOf(codes);
+            auto const files = filesUnder(out);
+            EXPECT_TRUE(files.empty()) << "a build of a source with an Error wrote " << join(files);
+            for (DiagnosticCode const own : src.own) {
+                if (!elideEvery) {
+                    EXPECT_GE(countCode(rep, own), 1u)
+                        << "the defaults no longer report " << diagnosticCodeName(own)
+                        << ", so the elided half below measures nothing; codes met: " << namesOf(codes);
+                } else {
+                    EXPECT_EQ(countCode(rep, own), 0u)
+                        << diagnosticCodeName(own) << " was STORED under maxPerCode = 0: the input no longer "
+                        << "reaches the per-code gate";
+                    EXPECT_GE(rep.droppedFor(own).errors, 1u)
+                        << "the source's own Error " << diagnosticCodeName(own)
+                        << " was elided and not counted; codes met: " << namesOf(codes);
+                }
+            }
+            for (DiagnosticCode const c : codes) {
+                bool const said = std::ranges::find(src.own, c) != src.own.end()
+                               || c == DiagnosticCode::P_DiagnosticsElided
+                               || diagnosticCodeName(c).starts_with("D_");
+                EXPECT_TRUE(said) << diagnosticCodeName(c) << " is from a tier after the source's own: the run "
+                                  << "went on past the Error that should have stopped it; codes met: "
+                                  << namesOf(codes);
+            }
+        }
+    }
 }
 
 // ── THE NON-DESTRUCTIVE CLAUSE ──────────────────────────────────────────────

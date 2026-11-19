@@ -1591,3 +1591,93 @@ TEST(ParserSpeculation, FollowedByFirstOfKeepsACleanCloseOnlyBeforeTheNamedShape
     EXPECT_EQ(countNodesByRule(plain, "run"), 0u);
     EXPECT_EQ(countNodesByRule(plain, "tail"), 0u);
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// ★★ P69 (lane `cs`, fold f26e): A SPECULATIVE CHOICE IS DECIDED WHERE IT STANDS. A speculative
+// choice — an optional, a repeat of an alt, an alt — that an enclosing NON-speculative choice of the
+// same rule reaches (an optional's or a repeat's continuation, an alt's branch) is dispatched at its
+// own position: the enclosing choice routes the cursor TO it (`GrammarSchema::nestedSpeculativeChoice`)
+// and stops its own enumeration there (`detail::enumerationEnters`). Entered rule-first by the
+// enclosing choice, the nested one's lookahead prune, probes and skip never ran: the enclosing loop
+// descended `pair` on its first token alone — C's `void f(int[3]);` read the `[` as a C23 attribute
+// sequence's. Every grammar here has `pair` = `[ [ N ] ]` (FIRST_2 = `[ [`) and `tail` = `[ N ]`,
+// which share their first token; `lead` = `A` is the enclosing choice's own element. The nested choice
+// ENDS its rule (`head`), and `tail` follows in the enclosing one, as in every shipped instance (c's
+// `declAttrRun`, `enumSpec`): a nested optional or repeat followed IN ITS OWN RULE by a required element
+// sharing its first token takes no skip, a property of the speculative-optional engine apart from this
+// class (its loop-exit boundary, `SpeculativeInlineRepeatAltBacktracksToSiblingBranch`).
+// RED-ON-DISABLE: let the enumeration enter a nested speculative choice from a non-speculative root
+// (`enumerationEnters` answers true) → every `[ N ]` cell is refused; take the route away → every
+// cell that does not start with `A` is refused.
+namespace {
+
+[[nodiscard]] std::string nestedSpeculativeSchema(std::string_view rootBody, std::string_view headBody) {
+    return std::string{R"JSON({
+  "dssSchemaVersion": 2,
+  "language": { "name": "NestedSpeculative", "version": "0.1.0" },
+  "tokens": {
+    " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\n": [{ "kind": "Newline",    "flags": ["EmptySpace"] }],
+    "[":  [{ "kind": "BracketOpen" }],
+    "]":  [{ "kind": "BracketClose" }],
+    "N":  [{ "kind": "Num" }],
+    "A":  [{ "kind": "AKind" }]
+  },
+  "shapes": {
+    "root": )JSON"} + std::string{rootBody} + R"JSON(,
+    "head": )JSON" + std::string{headBody} + R"JSON(,
+    "pair": { "sequence": ["BracketOpen", "BracketOpen", "Num", "BracketClose", "BracketClose"] },
+    "tail": { "sequence": ["BracketOpen", "Num", "BracketClose"] },
+    "lead": { "sequence": ["AKind"] }
+  }
+})JSON";
+}
+
+} // namespace
+
+TEST(ParserSpeculation, ANestedSpeculativeChoiceIsDecidedWhereItStands) {
+    std::string const specOpt = R"({ "optional": "pair", "speculative": true, "lookahead": 2 })";
+    std::string const specRep = R"({ "repeat": { "alt": ["pair"], "speculative": true, "lookahead": 2 } })";
+    std::string const specAlt = R"({ "alt": ["pair", "tail"], "speculative": true, "lookahead": 2 })";
+    struct Input { char const* src; std::size_t pair; std::size_t tail; std::size_t lead; };
+    // A nested optional / repeat is followed by `tail`; a nested alt holds `tail` as its own branch.
+    std::vector<Input> const followed = {
+        {"[ N ]", 0, 1, 0}, {"[ [ N ] ] [ N ]", 1, 1, 0}, {"A [ N ]", 0, 1, 1}};
+    std::vector<Input> const asBranch = {{"[ N ]", 0, 1, 0}, {"[ [ N ] ]", 1, 0, 0}, {"A [ N ]", 0, 1, 1}};
+    // `head` holds the enclosing choice and, ENDING it, the nested one; `root` is `head` then `tail`, or `head`
+    // alone where the nested alt holds `tail` as its own branch.
+    std::string const thenTail = R"({ "sequence": ["head", "tail"] })";
+    std::string const alone = R"({ "sequence": ["head"] })";
+    struct Cell { char const* name; std::string root; std::string head; std::vector<Input> inputs; };
+    std::vector<Cell> const cells = {
+        {"optional · speculative optional", thenTail,
+         R"({ "sequence": [{ "optional": "lead" }, )" + specOpt + R"(] })", followed},
+        {"optional · speculative repeat", thenTail,
+         R"({ "sequence": [{ "optional": "lead" }, )" + specRep + R"(] })", followed},
+        {"optional · speculative alt", alone,
+         R"({ "sequence": [{ "optional": "lead" }, )" + specAlt + R"(] })", asBranch},
+        {"repeat · speculative optional", thenTail,
+         R"({ "sequence": [{ "repeat": "lead" }, )" + specOpt + R"(] })", followed},
+        {"repeat · speculative repeat", thenTail,
+         R"({ "sequence": [{ "repeat": "lead" }, )" + specRep + R"(] })", followed},
+        {"repeat · speculative alt", alone,
+         R"({ "sequence": [{ "repeat": "lead" }, )" + specAlt + R"(] })", asBranch},
+        {"alt branch · speculative optional", thenTail, R"({ "alt": ["lead", )" + specOpt + R"(] })", followed},
+        {"alt branch · speculative repeat", thenTail, R"({ "alt": ["lead", )" + specRep + R"(] })", followed},
+        {"alt branch · speculative alt", alone, R"({ "alt": ["lead", )" + specAlt + R"(] })",
+         {{"[ N ]", 0, 1, 0}, {"[ [ N ] ]", 1, 0, 0}, {"A", 0, 0, 1}}},
+    };
+    for (Cell const& c : cells) {
+        std::string const schema = nestedSpeculativeSchema(c.root, c.head);
+        for (Input const& in : c.inputs) {
+            Tree t = parseWithSchema(schema, in.src);
+            ASSERT_NE(t.root(), InvalidNode) << c.name << " `" << in.src << "`";
+            EXPECT_FALSE(t.diagnostics().hasErrors())
+                << c.name << " `" << in.src << "`: a speculative choice nested in a non-speculative "
+                   "one must be decided where it stands";
+            EXPECT_EQ(countNodesByRule(t, "pair"), in.pair) << c.name << " `" << in.src << "`";
+            EXPECT_EQ(countNodesByRule(t, "tail"), in.tail) << c.name << " `" << in.src << "`";
+            EXPECT_EQ(countNodesByRule(t, "lead"), in.lead) << c.name << " `" << in.src << "`";
+        }
+    }
+}

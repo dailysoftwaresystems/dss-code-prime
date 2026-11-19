@@ -1064,6 +1064,19 @@ struct DSS_EXPORT DeclaratorConfig {
     // and as a for-init. Off (the default) ⇒ an error. An ABSTRACT declarator (`int *;`) is no
     // empty declaration: every reference refuses it, and `requireNamedDeclarators` keeps it one.
     bool          emptyDeclarationWarns = false;
+    // ★ P69 (lane `cs`, fold f26e) [[D-C-A-C23-SEQUENCE-AFTER-A-WIDTH-OR-AFTER-A-GNU-RUN-IS-ACCEPTED-OTHERWISE-THAN-THE-REFERENCES]]:
+    // WHERE AN ASM LABEL MAY STAND, read by its one reader (`readAsmLabel`), which refuses
+    // anything else with S_AsmLabelMisplaced. `asmLabelLeadingFunctionOnlyRules`: the runs
+    // that, written BETWEEN a declarator and its label, are taken only on the FIRST declarator
+    // of a declaration that declares a FUNCTION (✔MEASURED, probes n5o and n5t: clang and Apple
+    // clang take `int f(void) __attribute__((unused)) __asm__("g");`, gcc and MinGW-w64 gcc
+    // refuse it, and all four refuse such a run on an object, an array, a pointer to a function
+    // and a later declarator). `asmLabelRefusedOnDefinition`: no label on a function DEFINITION
+    // (all four refuse it; GCC's manual forbids it). Empty / false: nothing is judged. Both keys
+    // need `asmLabelRule` -- the loader refuses either one without it.
+    std::vector<RuleId>      asmLabelLeadingFunctionOnlyRules;
+    std::vector<std::string> asmLabelLeadingFunctionOnlyRuleNames;
+    bool          asmLabelRefusedOnDefinition = false;
 };
 
 // VLA C4c (D-CSUBSET-VLA-PARAM-STAR): is rule `r` a FUNCTION suffix — either the
@@ -3455,8 +3468,12 @@ struct DSS_EXPORT AttributeSemanticsRow {
 //     `[[__gnu__::weak]]`, `[[gnu::visibility("hidden")]]`, `[[gnu::dllimport]]` and
 //     `[[gnu::selectany]]` confer exactly what their GNU spelling confers at the
 //     declaration's leading sequence and after an identifier declarator; `[[weak]]`
-//     and `[[clang::weak]]` confer nothing anywhere and are warned ignored.
-// The introducer of every declared spelling is never read as a clause name.
+//     and `[[clang::weak]]` confer nothing anywhere and are warned ignored;
+//   * `impliedClause` — ★ P69 (lane `cs`, fold f26e): non-empty ⇒ the introducer ALONE is
+//     one clause, named this (c's calling-convention keywords: `__vectorcall` is the
+//     clause `vectorcall`), so the keyword is judged exactly as its row is. The loader
+//     refuses one beside a qualifier or claimed namespaces, and one naming no effects row.
+// The introducer of every other declared spelling is never read as a clause name.
 struct DSS_EXPORT AttributeSpelling {
     SchemaTokenId               introducer{};
     std::string                 introducerName;   // loader diagnostics
@@ -3464,6 +3481,7 @@ struct DSS_EXPORT AttributeSpelling {
     std::vector<ObjectFormatKind> availableObjectFormats;   // sorted, unique
     bool                        afterCompositeBodyIsTheDeclarations = false;
     std::vector<std::string>    standardNamespaces;   // dunder-normalized, unique across rows
+    std::string                 impliedClause;        // non-empty: the introducer is this clause
 
     // Whether the spelling exists for `format`. No format in scope ⇒ false for a
     // spelling that names its formats: the answer is unknown, and "unknown" must

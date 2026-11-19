@@ -4,6 +4,7 @@
 #include "core/export.hpp"                     // DSS_EXPORT
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/target_schema.hpp"
+#include "link/link_pass_outcome.hpp"          // LinkPassOutcome
 #include "link/object_format_schema.hpp"       // pcRelativeImportAddress
 
 #include <span>
@@ -36,13 +37,12 @@
 // is not an import here. Runs on the link's INPUT units, before the merge,
 // because a unit is the scope of the rule.
 //
-// Returns TRUE when nothing needs a change (`out` untouched); FALSE when `out`
-// holds the adjusted units OR an error was reported — the caller tells the two
-// apart by the reporter's error count (the `lowerGotSlotReferences`
-// convention).
+// Answers (`link/link_pass_outcome.hpp`) Unchanged when nothing needs a change
+// (`out` untouched), Rewritten when `out` holds the adjusted units, and Refused
+// when a unit's reference was refused by name.
 namespace dss::linker {
 
-[[nodiscard]] DSS_EXPORT bool
+DSS_EXPORT LinkPassOutcome
 bindPcRelativeImportAddressUnits(std::span<AssembledModule const> units,
                                  std::vector<AssembledModule>&    out,
                                  TargetSchema const&              target,

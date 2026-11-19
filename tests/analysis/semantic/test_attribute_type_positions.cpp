@@ -58,11 +58,13 @@
 #include "core/types/aggregate_layout.hpp"
 #include "core/types/data_model.hpp"
 #include "core/types/diagnostic_budget.hpp"
+#include "core/types/diagnostic_reporter.hpp"   // the linkage tier's reporter (f26e's keyword matrix)
 #include "core/types/object_format_kind.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"   // the four pairs of the convention matrix
 #include "core/types/type_lattice/type_interner.hpp"
 #include "core/types/type_lattice/type_layout.hpp"
+#include "hir/lowering/cst_to_hir.hpp"   // lowerToHir: the linkage tier judges a declaration's GNU clause names
 
 #include "semantic_test_fixture.hpp"
 
@@ -733,9 +735,12 @@ TEST(AttributeTypePositions, AConventionNameIsActiveForeignOrUnknownByThePairsOw
                             && d.actual.find(std::string{"'"} + n.name + "'")
                                    != std::string::npos)
                             namesActive = true;
+                    std::string said;
+                    for (auto const& d : m.diagnostics().all())
+                        if (d.code == DiagnosticCode::S_AttributeNotHonoured) said += "\n  " + d.actual;
                     EXPECT_TRUE(namesActive)
                         << where << " — the refusal names the attribute and the "
-                                    "convention the unit is compiled for";
+                                    "convention the unit is compiled for; it said:" << said;
                     break;
                 }
                 case Answer::Unknown:
@@ -750,6 +755,97 @@ TEST(AttributeTypePositions, AConventionNameIsActiveForeignOrUnknownByThePairsOw
     EXPECT_EQ(seen[static_cast<std::size_t>(A)], 3u);
     EXPECT_EQ(seen[static_cast<std::size_t>(F)], 46u);
     EXPECT_EQ(seen[static_cast<std::size_t>(U)], 16u);
+}
+
+// ★ P69 (lane `cs`, fold f26e; ruling 620 (b)): A CALLING-CONVENTION KEYWORD ANSWERS AS ITS ROW ON EVERY PAIR.
+// `__vectorcall` and `__regcall` are keywords of clang (x86-64 ELF and Mach-O: DISTINCT conventions; arm64:
+// recognized and warned) and `__vectorcall` of cl (pe: DISTINCT) -- fold f26d's census, MEASURED by probe f8. Each
+// is a spelling whose introducer alone is the clause its row names (`impliedClause`), so on every shipped pair it
+// draws exactly what the attribute form draws: refused by name where the convention is known and not emitted, the
+// census's unknown word where the target knows no such convention. And the keyword is no GNU clause NAME:
+// `__attribute__((__vectorcall))` is an unknown attribute (clang: "unknown attribute ignored"). A declaration's GNU
+// clause names are the LINKAGE tier's to judge (H_UnknownLinkageSpecifier), so that is the tier asked: the keyword
+// form is the clause `vectorcall` there too (ignored by name, as the attribute form is), and the keyword written as a
+// GNU clause name is a keyword-spelled unknown name.
+//
+// RED-ON-DISABLE: drop the implied clause from the spellings rows (or read the keyword's written text as its name)
+// and every keyword cell is an unknown attribute where its row is refused; let the linkage tier skip the keyword's
+// token KIND (`linkageSpecifierIgnoredKinds`) and the GNU-wrapped keyword is accepted in silence.
+TEST(AttributeTypePositions, AConventionKeywordAnswersAsItsRowOnEveryPair) {
+    struct Pair {
+        char const*      target;
+        char const*      convention;
+        ObjectFormatKind format;
+    };
+    constexpr Pair kPairs[5] = {
+        {"x86_64", "sysv_amd64", ObjectFormatKind::Elf},
+        {"x86_64", "sysv_amd64_darwin", ObjectFormatKind::MachO},
+        {"x86_64", "ms_x64", ObjectFormatKind::Pe},
+        {"arm64", "aapcs64", ObjectFormatKind::Elf},
+        {"arm64", "apple_arm64", ObjectFormatKind::MachO}};
+    struct Keyword {
+        char const* keyword;
+        char const* row;
+    };
+    constexpr Keyword kKeywords[2] = {{"__vectorcall", "vectorcall"}, {"__regcall", "regcall"}};
+    struct Verdict {
+        bool        errors;
+        std::size_t refused;
+        std::size_t unknown;
+        std::size_t linkageUnknown;   // the linkage tier's (HIR): H_UnknownLinkageSpecifier
+        std::string linkageSaid;
+    };
+    std::size_t refusedCells = 0;
+    std::size_t unknownCells = 0;
+    for (Pair const& pair : kPairs) {
+        auto const target = TargetSchema::loadShipped(pair.target);
+        ASSERT_TRUE(target.has_value()) << pair.target;
+        auto const verdictOf = [&](std::string const& src) {
+            auto cu = buildShippedUnit("c", {src});
+            assertNoBuilderErrors(*cu);
+            auto m = analyze(
+                cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kLayout, std::nullopt,
+                SelectableObjectFormatKind::of(pair.format), std::nullopt, LongDoubleFormat::None,
+                target->get(), /*deepRecursionReserveBytes=*/0, /*roleResolver=*/nullptr,
+                EnumCompatibleTypeRule::Gnu, pair.convention);
+            Verdict v{m.hasErrors(), countCode(m.diagnostics(), DiagnosticCode::S_AttributeNotHonoured),
+                      countCode(m.diagnostics(), DiagnosticCode::S_UnknownAttribute), 0, {}};
+            DiagnosticReporter lowering{};
+            auto const lowered = lowerToHir(m, lowering);
+            if (lowered == nullptr) {   // no linkage verdict at all: every assertion on it fails, and says why
+                v.linkageUnknown = 99;
+                v.linkageSaid    = "\n  <lowerToHir returned no HIR>";
+                return v;
+            }
+            v.linkageUnknown = countCode(lowering, DiagnosticCode::H_UnknownLinkageSpecifier);
+            for (auto const& d : lowering.all())
+                if (d.code == DiagnosticCode::H_UnknownLinkageSpecifier) v.linkageSaid += "\n  " + d.actual;
+            return v;
+        };
+        for (Keyword const& k : kKeywords) {
+            std::string const where = std::string{k.keyword} + " on " + pair.target + "/" + pair.convention;
+            Verdict const row = verdictOf(std::string{"void __attribute__(("} + k.row + ")) f(void);\n");
+            Verdict const kw  = verdictOf(std::string{"void "} + k.keyword + " f(void);\n");
+            EXPECT_EQ(kw.errors, row.errors) << where;
+            EXPECT_EQ(kw.refused, row.refused) << where;
+            EXPECT_EQ(kw.unknown, row.unknown) << where;
+            EXPECT_EQ(kw.linkageUnknown, 0u) << where << " -- the keyword is the clause `" << k.row
+                                             << "` to the linkage tier too:" << kw.linkageSaid;
+            EXPECT_EQ(row.linkageUnknown, 0u) << where << " -- control: the attribute form" << row.linkageSaid;
+            bool const x86 = std::string_view{pair.target} == "x86_64";
+            EXPECT_EQ(kw.refused, x86 ? 1u : 0u) << where << " -- refused by name on every x86-64 pair";
+            EXPECT_EQ(kw.unknown, x86 ? 0u : 1u) << where << " -- the census's unknown word on arm64";
+            refusedCells += kw.refused;
+            unknownCells += kw.unknown;
+            Verdict const gnu = verdictOf(std::string{"void __attribute__(("} + k.keyword + ")) f(void);\n");
+            EXPECT_FALSE(gnu.errors) << where;
+            EXPECT_EQ(gnu.refused, 0u) << where << " -- the keyword is no GNU clause name";
+            EXPECT_EQ(gnu.unknown, 0u) << where << " -- a declaration's GNU clause name is the linkage tier's to judge";
+            EXPECT_EQ(gnu.linkageUnknown, 1u) << where << " -- the keyword is no GNU clause name:" << gnu.linkageSaid;
+        }
+    }
+    EXPECT_EQ(refusedCells, 6u);
+    EXPECT_EQ(unknownCells, 4u);
 }
 
 // A CONVENTION ID OF THE LANGUAGE'S TABLE THAT NO SHIPPED TARGET KNOWS would select

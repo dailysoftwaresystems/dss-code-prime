@@ -1289,27 +1289,37 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
             // P69: an unnamed object's OWN object — a static one's symbol (the producer
             // mints one per node), never its initializer's storage; an automatic one has no
             // link-time address (the semantic tier refuses taking it first).
-            std::optional<SymbolId> const s =
-                env.resolveUnnamedObject ? env.resolveUnnamedObject(n) : std::nullopt;
-            if (!s.has_value() || !s->valid()) {
+            auto const s = env.resolveUnnamedObject
+                               ? env.resolveUnnamedObject(n)
+                               : std::expected<std::optional<SymbolId>, SymbolIdsRefused>{std::nullopt};
+            if (!s.has_value()) {   // refused by name at the door (P69 f26e, B1): no fold, no other answer
+                result = fail(ConstEvalFailure::SymbolIdsRefused, n);
+                return;
+            }
+            if (!s->has_value() || !(*s)->valid()) {
                 result = fail(ConstEvalFailure::NotAConstantExpression, n);
                 return;
             }
-            result = ok(addressLiteral(HirAddressValue{s->v, 0, hir.typeId(n), false},
+            result = ok(addressLiteral(HirAddressValue{(*s)->v, 0, hir.typeId(n), false},
                                        TypeKind::Ptr));
             return;
         }
         if (nk == HirKind::Literal) {
             std::uint32_t const idx = hir.payload(n);
-            std::optional<SymbolId> const s =
+            auto const s =
                 (std::holds_alternative<std::string>(literals.at(idx).value)
                  && env.resolveStringLiteralSymbol)
-                    ? env.resolveStringLiteralSymbol(n) : std::nullopt;
-            if (!s.has_value() || !s->valid()) {
+                    ? env.resolveStringLiteralSymbol(n)
+                    : std::expected<std::optional<SymbolId>, SymbolIdsRefused>{std::nullopt};
+            if (!s.has_value()) {   // refused by name at the door (P69 f26e, B1): no fold, no other answer
+                result = fail(ConstEvalFailure::SymbolIdsRefused, n);
+                return;
+            }
+            if (!s->has_value() || !(*s)->valid()) {
                 result = fail(ConstEvalFailure::NotAConstantExpression, n);
                 return;
             }
-            result = ok(addressLiteral(HirAddressValue{s->v, 0, hir.typeId(n), false},
+            result = ok(addressLiteral(HirAddressValue{(*s)->v, 0, hir.typeId(n), false},
                                        TypeKind::Ptr));
             return;
         }

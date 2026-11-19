@@ -164,10 +164,13 @@ TEST(Reporter, PerCodeCapCoalescesAndSaysSo) {
     }
     // 3 admitted + 1 elision marker.
     EXPECT_EQ(r.all().size(), 4u);
-    // ★ THE MARKER IS `Info`, SO IT MUST NOT INFLATE THE ERROR COUNT. This is
-    // the assertion that would catch a severity regression from the outside:
-    // errorCount stays 3 even though all() grew to 4.
-    EXPECT_EQ(r.errorCount(), 3u);
+    // ★ THE MARKER IS `Info`, SO IT MUST NOT INFLATE THE ERROR COUNT -- and the
+    // 7 coalesced Errors are still Errors (D9(c)): 3 landed + 7 dropped = 10,
+    // never the 4 entries of all(). This read 3 while the count ignored the
+    // dropped half, which is how a build whose every Error was coalesced read
+    // as clean.
+    EXPECT_EQ(r.errorCount(), 10u);
+    EXPECT_EQ(r.droppedFor(DiagnosticCode::P_UnknownToken).errors, 7u);
     EXPECT_TRUE(r.anyCountIsAFloor());
     EXPECT_EQ(r.elisionFor(DiagnosticCode::P_UnknownToken).coalesced, 7u);
 }
@@ -496,10 +499,12 @@ TEST(Reporter, ErrorPastTheCapStillProducesNonEmptyExplanatoryOutput) {
         EXPECT_NE(d.code, DiagnosticCode::D_FileNotFound);
     }
 
-    // ★ But the build still FAILS — the marker is Error-severity, so the
-    // exit-code gate cannot read green on a run that threw an error away.
+    // ★ But the build still FAILS — the marker is Error-severity, and the Error
+    // the cap ate is still counted (D9(c)): 2 = the marker + the eaten
+    // D_FileNotFound, whose text is gone and whose count is not.
     EXPECT_TRUE(r.hasErrors());
-    EXPECT_EQ(r.errorCount(), 1u);
+    EXPECT_EQ(r.errorCount(), 2u);
+    EXPECT_EQ(r.droppedFor(DiagnosticCode::D_FileNotFound).errors, 1u);
 
     // ★ And stderr is not empty, and not uninformative. Route 1: the
     // positioned renderer.
@@ -1534,6 +1539,197 @@ TEST(ReporterElision, RollbackRestoresTheElisionLedger) {
     auto const* marker = findElisionMarker(r);
     ASSERT_NE(marker, nullptr);
     EXPECT_EQ(r.elisionFor(dss::DiagnosticCode::P_UnknownToken).coalesced, 3u);
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// D9(c): WHAT THE VOLUME GATES DROP IS STILL COUNTED, BY SEVERITY, AND EVERY
+// RELAY CARRIES THE COUNT.
+//
+// ✔MEASURED through `Program::compileUnits` before the fix: under
+// `maxPerCode = 0` a source whose one Error was elided built GREEN, because
+// `errorCount()` counted only `all()`. Each pin drops through ONE route -- the
+// per-code cap, the dedup window, the global cap, a relay -- and asks the
+// count. RED-ON-DISABLE: take `noteDropped_` off a route, or the dropped half
+// off `errorCount()`, or `takeDroppedFrom_` off `relayFrom`, and that route's
+// pin reds on its own assertion.
+// ═════════════════════════════════════════════════════════════════════════
+namespace {
+
+dss::ParseDiagnostic diagAt(dss::DiagnosticCode code, dss::DiagnosticSeverity severity,
+                            std::size_t nth, std::string actual = "d9") {
+    dss::ParseDiagnostic d;
+    d.code     = code;
+    d.severity = severity;
+    d.buffer   = dss::BufferId{1};
+    d.span     = dss::SourceSpan::of(static_cast<dss::ByteOffset>(nth),
+                                     static_cast<dss::ByteOffset>(nth + 1));
+    d.actual   = std::move(actual);
+    return d;
+}
+
+} // namespace
+
+TEST(ReporterDropped, AnErrorThePerCodeCapElidesIsStillAnError) {
+    dss::DiagnosticReporter::Config cfg;
+    cfg.maxPerCode  = 0;   // `--max-per-code 0`: store none, count them
+    cfg.dedupWindow = 0;
+    dss::DiagnosticReporter r{cfg};
+    r.report(diagAt(DiagnosticCode::S_ConstViolation, DiagnosticSeverity::Error, 0));
+
+    ASSERT_EQ(r.all().size(), 1u) << "only the elision marker is stored";
+    ASSERT_NE(findElisionMarker(r), nullptr);
+    EXPECT_TRUE(r.hasErrors())
+        << "an Error the per-code cap elided left the reporter error-free";
+    EXPECT_EQ(r.errorCount(), 1u);
+    EXPECT_EQ(r.droppedFor(DiagnosticCode::S_ConstViolation).errors, 1u);
+    EXPECT_EQ(r.droppedFor(DiagnosticCode::S_ConstViolation).total(), 1u);
+    EXPECT_EQ(r.droppedCodes(), std::vector<DiagnosticCode>{DiagnosticCode::S_ConstViolation});
+    EXPECT_TRUE(r.anyCountIsAFloor());
+    EXPECT_EQ(r.reportsReceived(), 1u);
+}
+
+TEST(ReporterDropped, ADedupedDiagnosticIsCountedAtItsOwnSeverity) {
+    dss::DiagnosticReporter r;   // the default window of 4
+    for (int i = 0; i < 3; ++i) {
+        r.report(diagAt(DiagnosticCode::P_UnknownToken, DiagnosticSeverity::Warning, 5));
+    }
+    EXPECT_EQ(r.warningCount(), 3u) << "1 landed + 2 deduped";
+    EXPECT_EQ(r.errorCount(), 0u);
+    EXPECT_EQ(r.droppedFor(DiagnosticCode::P_UnknownToken).warnings, 2u);
+}
+
+// The dedup key holds no severity, so an Error identical to a stored Warning of
+// the same code is dropped as its "duplicate" -- and it was the one Error of the
+// run. Counted at ITS severity, it still fails the run.
+TEST(ReporterDropped, AnErrorDedupedBehindAWarningIsStillAnError) {
+    dss::DiagnosticReporter r;
+    r.report(diagAt(DiagnosticCode::P_AmbiguousToken, DiagnosticSeverity::Warning, 7));
+    r.report(diagAt(DiagnosticCode::P_AmbiguousToken, DiagnosticSeverity::Error, 7));
+    ASSERT_EQ(r.elisionFor(DiagnosticCode::P_AmbiguousToken).deduped, 1u)
+        << "the Error was not deduped: the input no longer reaches the window";
+    EXPECT_TRUE(r.hasErrors());
+    EXPECT_EQ(r.errorCount(), 1u);
+    EXPECT_EQ(r.warningCount(), 1u);
+}
+
+TEST(ReporterDropped, TheGlobalCapCountsWhatItAteBySeverity) {
+    dss::DiagnosticReporter::Config cfg;
+    cfg.maxDiagnostics = 1;
+    cfg.maxPerCode     = 100;
+    cfg.dedupWindow    = 0;
+    dss::DiagnosticReporter r{cfg};
+    r.report(diagAt(DiagnosticCode::P_DeprecatedSyntax, DiagnosticSeverity::Warning, 0));  // lands
+    r.report(diagAt(DiagnosticCode::D_FileNotFound, DiagnosticSeverity::Error, 1));        // trips: eaten
+    r.report(diagAt(DiagnosticCode::P_DeprecatedSyntax, DiagnosticSeverity::Warning, 2));  // eaten
+
+    ASSERT_TRUE(r.hitCap());
+    EXPECT_EQ(r.droppedByCap(), 2u);
+    EXPECT_EQ(r.droppedFor(DiagnosticCode::D_FileNotFound).errors, 1u);
+    EXPECT_EQ(r.droppedFor(DiagnosticCode::P_DeprecatedSyntax).warnings, 1u);
+    EXPECT_EQ(r.errorCount(), 2u) << "the cap marker + the eaten Error";
+    EXPECT_EQ(r.warningCount(), 2u) << "the landed Warning + the eaten one";
+    EXPECT_TRUE(r.anyCountIsAFloor()) << "a count the global cap cut is a floor too";
+}
+
+TEST(ReporterDropped, ARelayCarriesWhatTheSourceDropped) {
+    dss::DiagnosticReporter::Config tier;
+    tier.maxPerCode = 0;
+    dss::DiagnosticReporter src{tier};
+    src.report(diagAt(DiagnosticCode::S_ConstViolation, DiagnosticSeverity::Error, 0));
+    ASSERT_TRUE(src.hasErrors());
+
+    dss::DiagnosticReporter dst;
+    dst.relayFrom(src);
+    EXPECT_TRUE(dst.hasErrors())
+        << "the source's elided Error was lost at the relay: a copy of all() carries only the marker";
+    EXPECT_EQ(dst.errorCount(), 1u);
+    EXPECT_EQ(dst.droppedFor(DiagnosticCode::S_ConstViolation).errors, 1u);
+    EXPECT_TRUE(dst.anyCountIsAFloor());
+    EXPECT_NE(findElisionMarker(dst), nullptr) << "the source's marker crosses as a stored diagnostic";
+    EXPECT_EQ(dst.reportsReceived(), 2u) << "the relayed marker + the relayed drop";
+}
+
+TEST(ReporterDropped, ARelayedDropTakesTheDestinationsPolicy) {
+    dss::DiagnosticReporter::Config tier;
+    tier.maxPerCode = 0;
+    dss::DiagnosticReporter src{tier};
+    src.report(diagAt(DiagnosticCode::P_DeprecatedSyntax, DiagnosticSeverity::Warning, 0));
+    src.report(diagAt(DiagnosticCode::P_UnknownToken, DiagnosticSeverity::Warning, 1));
+    src.report(diagAt(DiagnosticCode::S_ArgCountMismatch, DiagnosticSeverity::Error, 2));
+    ASSERT_FALSE(isUnsuppressable(DiagnosticCode::S_ArgCountMismatch));
+
+    dss::DiagnosticReporter::Config run;
+    run.policy.warningsAsErrors = true;
+    run.policy.suppress.insert(DiagnosticCode::P_UnknownToken);
+    run.policy.suppress.insert(DiagnosticCode::S_ArgCountMismatch);
+    dss::DiagnosticReporter dst{run};
+    dst.relayFrom(src);
+
+    EXPECT_EQ(dst.droppedFor(DiagnosticCode::P_DeprecatedSyntax).errors, 1u)
+        << "--warnings-as-errors promotes a relayed drop exactly as it promotes a report";
+    EXPECT_EQ(dst.droppedFor(DiagnosticCode::P_DeprecatedSyntax).warnings, 0u);
+    EXPECT_EQ(dst.droppedFor(DiagnosticCode::P_UnknownToken).total(), 0u)
+        << "--suppress silences a relayed Warning exactly as it silences a report";
+    EXPECT_EQ(dst.droppedFor(DiagnosticCode::S_ArgCountMismatch).errors, 1u)
+        << "--suppress never silences an Error, relayed or reported";
+    EXPECT_EQ(countCodeIn(dst.all(), DiagnosticCode::D_SuppressRequestIgnored), 1u)
+        << "and the refused request is said, once";
+}
+
+TEST(ReporterDropped, RollbackForgetsASpeculativeDrop) {
+    dss::DiagnosticReporter::Config cfg;
+    cfg.maxPerCode = 0;
+    dss::DiagnosticReporter r{cfg};
+    auto const snap = r.snapshotForRollback();
+    r.report(diagAt(DiagnosticCode::P_UnexpectedToken, DiagnosticSeverity::Error, 0));
+    ASSERT_TRUE(r.hasErrors());
+
+    r.truncateTo(snap);
+    EXPECT_FALSE(r.hasErrors()) << "a rewound branch left its dropped Error counted";
+    EXPECT_EQ(r.droppedFor(DiagnosticCode::P_UnexpectedToken).total(), 0u);
+    EXPECT_TRUE(r.droppedCodes().empty());
+    EXPECT_FALSE(r.anyCountIsAFloor());
+    EXPECT_EQ(r.reportsReceived(), 0u);
+}
+
+// A filtering relay can judge only what its source kept, so its source keeps
+// everything (`Config::unbounded()`) and the budget applies after the filter.
+TEST(ReporterDropped, ASelectedRelayAppliesTheBudgetAfterTheFilter) {
+    dss::DiagnosticReporter staging{dss::DiagnosticReporter::Config::unbounded()};
+    for (std::size_t i = 0; i < 60; ++i) {
+        staging.report(diagAt(DiagnosticCode::P_UnknownToken, DiagnosticSeverity::Error, i,
+                              i % 2 == 0 ? "keep" : "skip"));
+    }
+    ASSERT_EQ(staging.all().size(), 60u) << "a staging reporter stores everything";
+
+    dss::DiagnosticReporter::Config cfg;
+    cfg.maxPerCode  = 10;
+    cfg.dedupWindow = 0;
+    dss::DiagnosticReporter dst{cfg};
+    dst.relaySelectedFrom(staging, [](dss::ParseDiagnostic const& d) { return d.actual == "keep"; });
+    EXPECT_EQ(dst.errorCount(), 30u) << "every admitted Error counted: 10 landed + 20 coalesced";
+    EXPECT_EQ(dst.droppedFor(DiagnosticCode::P_UnknownToken).errors, 20u);
+}
+
+TEST(ReporterDroppedDeathTest, ASelectedRelayFromAGatedSourceIsFatal) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_DEATH(
+        {
+            dss::DiagnosticReporter gated;   // the default gates
+            dss::DiagnosticReporter dst;
+            dst.relaySelectedFrom(gated, [](dss::ParseDiagnostic const&) { return true; });
+        },
+        "relaySelectedFrom's source has a volume gate");
+}
+
+TEST(ReporterDroppedDeathTest, ARelayIntoItselfIsFatal) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_DEATH(
+        {
+            dss::DiagnosticReporter r;
+            r.relayFrom(r);
+        },
+        "relayed into itself");
 }
 
 // ── THE RENDER ORDER IS TOTAL (P69 fold 3f, lane xa) ───────────────────────────

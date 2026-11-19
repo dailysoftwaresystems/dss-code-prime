@@ -347,8 +347,7 @@ readCHeaderFromText(std::string_view      text,
     // The streams and the verdict come from their one home.
     bool const unitFailed =
         cu->forEachOwnDiagnosticStream([&reporter](DiagnosticReporter const& stream) {
-            reporter.sourceBuffers().addAll(stream.sourceBuffers());
-            for (auto const& d : stream.all()) reporter.report(d);
+            reporter.relayFrom(stream);
         });
     if (unitFailed) {
         return std::unexpected(emitWithFirstReportedCause(
@@ -363,9 +362,7 @@ readCHeaderFromText(std::string_view      text,
         analyzeForTargetFormat(cu, DiagnosticBudget::libraryDefault(), pair.target,
                                pair.format, pair.callingConvention)
             .model;
-    for (auto const& d : model.diagnostics().all()) {
-        reporter.report(d);
-    }
+    reporter.relayFrom(model.diagnostics());
     if (model.hasErrors()) {
         return std::unexpected(emitWithFirstReportedCause(
             HeaderReadErrorKind::HeaderParseFailed,

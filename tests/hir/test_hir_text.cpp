@@ -919,17 +919,30 @@ TEST(HirTextSignatureRead, ASignatureWithSeveralHolesIsOneDiagnosticNamingEachHo
 // ★ "DID THE READER REFUSE" IS THE READER'S OWN COUNT, NOT THE REPORTER'S DELTA.
 // The reporter's dedup window drops a diagnostic identical to a recent one, so
 // reading ONE malformed text twice into ONE reporter leaves the second read with
-// no new stored error — and the delta called that text accepted.
+// no new STORED error — and the delta called that text accepted. Since D9(c)
+// (P69 fold f26e) the reporter COUNTS the dropped repeat, so its delta refuses
+// the text too; the reader's own count is still the verdict this case pins.
+namespace {
+[[nodiscard]] std::size_t storedErrors(DiagnosticReporter const& r) {
+    std::size_t n = 0;
+    for (auto const& d : r.all()) if (d.severity == DiagnosticSeverity::Error) ++n;
+    return n;
+}
+} // namespace
+
 TEST(HirTextSignatureRead, ARefusalIsCountedByTheReaderNotByTheReportersDelta) {
     std::string const text = moduleWithFunctionTyped("fn(ptr<garbage>) -> void");
     DiagnosticReporter shared;
     ASSERT_FALSE(parseHir(text, CompilationUnitId{94}, shared)->ok);
-    std::size_t const afterFirst = shared.errorCount();
+    std::size_t const afterFirst       = shared.errorCount();
+    std::size_t const storedAfterFirst = storedErrors(shared);
     auto const second = parseHir(text, CompilationUnitId{95}, shared);
-    // THE PREMISE, MEASURED: the reporter really stored nothing new. If the dedup
+    // THE PREMISE, MEASURED: the reporter really STORED nothing new. If the dedup
     // window ever stops dropping the repeat, this arm stops testing the delta and
     // must say so rather than pass on a question it no longer asks.
-    EXPECT_EQ(shared.errorCount(), afterFirst) << "premise gone: the repeat was stored";
+    EXPECT_EQ(storedErrors(shared), storedAfterFirst) << "premise gone: the repeat was stored";
+    EXPECT_EQ(shared.errorCount(), afterFirst + 1u)
+        << "the repeat the dedup window dropped is still an Error of the reporter (D9(c))";
     EXPECT_FALSE(second->ok)
         << "a text the reader REFUSED read as accepted, because the reporter stored "
            "no new error for it";
@@ -940,10 +953,13 @@ TEST(HirTextSignatureRead, ARefusalIsCountedByTheReaderNotByTheReportersDelta) {
     TypeRegistry reg;
     DiagnosticReporter tr;
     ASSERT_FALSE(parseTypeFromText("i32 i32", in, reg, tr).valid());
-    std::size_t const typeErrors = tr.errorCount();
+    std::size_t const typeErrors       = tr.errorCount();
+    std::size_t const storedTypeErrors = storedErrors(tr);
     EXPECT_FALSE(parseTypeFromText("i32 i32", in, reg, tr).valid())
         << "the second read of the same malformed type text escaped as a valid type";
-    EXPECT_EQ(tr.errorCount(), typeErrors) << "premise gone: the repeat was stored";
+    EXPECT_EQ(storedErrors(tr), storedTypeErrors) << "premise gone: the repeat was stored";
+    EXPECT_EQ(tr.errorCount(), typeErrors + 1u)
+        << "the repeat the dedup window dropped is still an Error of the reporter (D9(c))";
 }
 
 // ── THE VERIFIER'S VERDICT IS ITS OWN COUNT, JUDGED BY THE POLICY ────────────
@@ -962,15 +978,21 @@ struct TwoReads {
     bool second = true;
     std::size_t errorsAfterFirst  = 0;
     std::size_t errorsAfterSecond = 0;
+    // The Errors the reporter STORED (`all()`), which the dedup window keeps from
+    // moving; `errorsAfter…` counts the dropped ones too (D9(c)).
+    std::size_t storedErrorsAfterFirst  = 0;
+    std::size_t storedErrorsAfterSecond = 0;
 };
 
 [[nodiscard]] TwoReads readTwiceIntoOneReporter(std::string const& text,
                                                 DiagnosticReporter& shared) {
     TwoReads t;
-    t.first            = parseHir(text, CompilationUnitId{101}, shared)->ok;
-    t.errorsAfterFirst = shared.errorCount();
-    t.second            = parseHir(text, CompilationUnitId{102}, shared)->ok;
-    t.errorsAfterSecond = shared.errorCount();
+    t.first                   = parseHir(text, CompilationUnitId{101}, shared)->ok;
+    t.errorsAfterFirst        = shared.errorCount();
+    t.storedErrorsAfterFirst  = storedErrors(shared);
+    t.second                  = parseHir(text, CompilationUnitId{102}, shared)->ok;
+    t.errorsAfterSecond       = shared.errorCount();
+    t.storedErrorsAfterSecond = storedErrors(shared);
     return t;
 }
 
@@ -1025,9 +1047,12 @@ TEST(HirTextVerdict, APromotedWarningFailsEveryReadIntoOneReporter) {
     DiagnosticReporter shared{cfg};
     TwoReads const t = readTwiceIntoOneReporter(deadCodeModule(), shared);
     EXPECT_FALSE(t.first) << "under --warnings-as-errors the dead-code warning is an error";
-    // THE PREMISE, MEASURED: the reporter really stored nothing new the second time.
-    EXPECT_EQ(t.errorsAfterSecond, t.errorsAfterFirst)
+    // THE PREMISE, MEASURED: the reporter really stored nothing new the second time
+    // -- and, since D9(c), it still COUNTS the promoted repeat it dropped.
+    EXPECT_EQ(t.storedErrorsAfterSecond, t.storedErrorsAfterFirst)
         << "premise gone: the promoted repeat was stored";
+    EXPECT_EQ(t.errorsAfterSecond, t.errorsAfterFirst + 1u)
+        << "the promoted repeat the dedup window dropped is still an Error of the reporter (D9(c))";
     EXPECT_FALSE(t.second)
         << "the promoted warning failed the first read and passed the second: the "
            "verdict read the reporter's delta, which the dedup window had emptied";
@@ -1464,6 +1489,61 @@ TEST(ParseTypeFromText, PackedParseAndForkIdentity) {
     ASSERT_TRUE(packedUnion.valid());
     EXPECT_EQ(interner.kind(packedUnion), TypeKind::Union);
     EXPECT_TRUE(interner.isPacked(packedUnion));
+}
+
+// P69 (lane `cs`, fold f26e): a STANDALONE type text spells a composite's own
+// alignment — `struct "N" packed? (aligned INT)? { … }`, the module `types` grammar's
+// marker in its place — and it is the composite the shipped-lib `structs` decoder
+// interns for the same header type (one `structType`), so a descriptor typedef
+// spelling it inline and the `structs` entry naming its members are ONE TypeId
+// (Windows `M128A` / `CONTEXT`, DECLSPEC_ALIGN(16)). Every shape the inline form
+// takes: plain fields, explicit offsets, member aligns, packed, a union; a value
+// that is no alignment is refused.
+TEST(ParseTypeFromText, AWholeCompositeAlignmentIsTheComposites) {
+    TypeInterner interner{CompilationUnitId{15}};
+    TypeRegistry reg;
+    DiagnosticReporter rep;
+    TypeId const u64 = interner.primitive(TypeKind::U64);
+    TypeId const i64 = interner.primitive(TypeKind::I64);
+    TypeId const i32 = interner.primitive(TypeKind::I32);
+    std::span<std::int64_t const> const noWidths{};
+    std::span<std::uint64_t const> const noOffsets{};
+    std::span<std::uint32_t const> const noAligns{};
+
+    struct Cell {
+        char const*   text;
+        std::uint32_t align;
+    };
+    for (Cell const& c : {Cell{"struct \"A\" aligned 16 { u64, i64 }", 16u},
+                          Cell{"struct \"O\" aligned 16 { i32 @0, i32 @4 }", 16u},
+                          Cell{"struct \"M\" aligned 32 { i32 ~4, i32 ~8 }", 32u},
+                          Cell{"struct \"P\" packed aligned 8 { i8, i32 }", 8u},
+                          Cell{"union \"U\" aligned 8 { i8, i32 }", 8u}}) {
+        SCOPED_TRACE(c.text);
+        TypeId const t = parseTypeFromText(c.text, interner, reg, rep);
+        ASSERT_TRUE(t.valid());
+        EXPECT_EQ(rep.errorCount(), 0u);
+        EXPECT_EQ(interner.explicitCompositeAlign(t), c.align)
+            << "the inline composite lost the alignment it states";
+    }
+    std::array<TypeId, 2> const a{u64, i64};
+    EXPECT_EQ(parseTypeFromText("struct \"A\" aligned 16 { u64, i64 }", interner, reg, rep),
+              interner.structType("A", a, noWidths, noOffsets, noAligns, 16u))
+        << "the inline spelling and the `structs` decoder's composite must be one TypeId";
+    std::array<TypeId, 2> const o{i32, i32};
+    std::array<std::uint64_t, 2> const offs{0u, 4u};
+    EXPECT_EQ(parseTypeFromText("struct \"O\" aligned 16 { i32 @0, i32 @4 }", interner, reg, rep),
+              interner.structType("O", o, noWidths, offs, noAligns, 16u));
+    EXPECT_NE(parseTypeFromText("struct \"A\" aligned 16 { u64, i64 }", interner, reg, rep),
+              parseTypeFromText("struct \"A\" { u64, i64 }", interner, reg, rep))
+        << "an aligned composite must not alias its unaligned twin";
+    EXPECT_TRUE(interner.isPacked(
+        parseTypeFromText("struct \"P\" packed aligned 8 { i8, i32 }", interner, reg, rep)));
+    EXPECT_EQ(rep.errorCount(), 0u);
+
+    DiagnosticReporter bad;
+    (void)parseTypeFromText("struct \"B\" aligned 3 { i32 }", interner, reg, bad);
+    EXPECT_GE(bad.errorCount(), 1u) << "`aligned 3` is no alignment and must be refused";
 }
 
 // D-CSUBSET-PACKED: the `packed` marker ROUND-TRIPS through emit — a packed struct

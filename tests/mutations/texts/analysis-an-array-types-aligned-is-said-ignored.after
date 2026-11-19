@@ -1,0 +1,2 @@
+        case TypeGrainApplies::Alignment:
+            return false;

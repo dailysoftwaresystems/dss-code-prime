@@ -1449,7 +1449,7 @@ public:
         std::vector<SymbolId> out;
         for (std::size_t i = 1; i < symbols_.size(); ++i)
             if (symbols_[i].isImplicitDeclaration && symbols_[i].type.valid())
-                out.push_back(symbolIdOfIndex(i));   // the table's index rule (P69 f26d, N9)
+                out.push_back(IndexSymbolIds{symbols_.size()}.idAt(i, "the unit's table"));   // a READ
         return out;
     }
 

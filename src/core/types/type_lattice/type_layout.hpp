@@ -407,4 +407,18 @@ operandLayout(TypeId id, TypeInterner const& interner,
               AggregateLayoutParams params, DataModel dm,
               NonObjectTypeSizes const& sizes);
 
+// ★ P69 (lane `cs`, fold f26e) — THE ALIGNMENT A TYPE HAS, A VARIABLY MODIFIED ONE INCLUDED
+// (D-CSUBSET-ALIGNOF-VALUE-OVERALIGNED-OBJECT). `computeLayout`'s alignment wherever a layout
+// exists; for an array with a run-time length, which has none, the alignment it still has: C23
+// 6.5.4.4p3 gives an array its element's, and the length never enters. Walked from the outside
+// in, a level whose OWN record carries a type-level alignment answers it -- the skin replaces,
+// as `layoutOne` makes it replace -- and otherwise its element answers. nullopt where no
+// alignment exists: an incomplete type, a function, an array of unknown size. The ONE answer
+// every reader of a variably modified type's alignment asks: the constant fold, the type
+// positions that decide whether a request mints a skin, the HIR lowering of `_Alignof`, and the
+// alignment a frame slot -- a VLA's alloca included -- is placed at.
+[[nodiscard]] DSS_EXPORT std::optional<Alignment>
+typeAlignment(TypeId id, TypeInterner const& interner,
+              AggregateLayoutParams params, DataModel dm);
+
 } // namespace dss

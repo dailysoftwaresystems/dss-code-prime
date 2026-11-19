@@ -4,7 +4,7 @@
 #include "core/types/arg_payload.hpp"
 #include "core/types/object_format_kind.hpp"   // isWriterReservedSymbolIdValue (a value no module may mint)
 #include "core/types/target_schema.hpp"   // TargetRegClass (the piece's result-register pool)
-#include "core/types/symbol_id_cursor.hpp"   // the one rule of a fresh SymbolId (P69 f26d, N9)
+#include "core/types/symbol_id_cursor.hpp"   // the one home of a fresh SymbolId (P69 f26d N9; f26e B1)
 
 #include <algorithm>
 #include <cstdio>
@@ -553,31 +553,6 @@ MirBuilder::MirBuilder(MirModuleId tag)
 
 namespace {
 
-// THE ONE PLACE a fresh SymbolId of a module's id space is made: the id at `end`,
-// and the end moves past it. A value a format WRITER defines for itself is never a
-// module's and is stepped over (`isWriterReservedSymbolIdValue`, the owner's own
-// predicate — today the PE `_tls_index` singleton; a module that minted it would
-// alias a constant or a block onto the writer's slot). The invalid `SymbolId{}`
-// when the space is exhausted — minting the last value would leave the end nowhere
-// to go, and a wrapped id would be 0, the invalid sentinel.
-[[nodiscard]] SymbolId takeSymbolIdAt(std::uint32_t& end) noexcept {
-    // The rule is the core's (P69 f26d, N9: core/types/symbol_id_cursor.hpp), asked over the end this
-    // module carries as a plain value.
-    SymbolIdEnd cursor = SymbolIdEnd::startingAt(end);
-    SymbolId const id  = cursor.take();
-    end                = cursor.value();
-    return id;
-}
-
-[[noreturn]] void symbolIdSpaceExhausted(char const* who, std::uint32_t end) {
-    // Nothing downstream could tell a wrapped id from a real symbol.
-    std::fprintf(stderr,
-                 "dss::%s fatal: the module's SymbolId space is exhausted (its end is %u) — "
-                 "no fresh symbol can be minted.\n",
-                 who, end);
-    std::abort();
-}
-
 // THE REFUSAL OF A COUNTED END. A module's end is STATED when whoever made the
 // module said where its id space ends — a name table's end, "this module is its own
 // table", or the statement of the module it replaces, copied. An end nobody stated
@@ -624,15 +599,20 @@ void MirBuilder::keepSymbolIdsClearOf(SymbolId taken) noexcept {
     raiseSymbolIdEndTo_(onePastSymbolId(taken));
 }
 
-SymbolId MirBuilder::mintSymbol() {
+// THE MODULE'S DOORS (P69 f26e, B1): the home's forms over the module's end. A value a format WRITER defines for
+// itself is stepped over and the last value is never handed out (core/types/symbol_id_cursor.hpp); the OPTIONAL door
+// reports under the caller's tier code and writes nothing, the ABORT door is fatal by name.
+SymbolIdEnd& MirBuilder::statedEnd_() {
     if (!symbolIdEndStated_) symbolIdEndNeverStated("MirBuilder::mintSymbol");
-    return takeSymbolIdAt(symbolIdEnd_);
+    return symbolIdEnd_;
 }
 
-SymbolId MirBuilder::mintSymbolOrAbort(char const* who) {
-    SymbolId const minted = mintSymbol();
-    if (!minted.valid()) symbolIdSpaceExhausted(who, symbolIdEnd_);
-    return minted;
+std::optional<SymbolId> MirBuilder::mintSymbol(SymbolIdRefusalSink sink, std::string_view who) {
+    return OptionalSymbolIds{statedEnd_(), sink}.take(who);
+}
+
+SymbolId MirBuilder::mintSymbolOrAbort(std::string_view who) {
+    return AbortingSymbolIds{statedEnd_(), "the module"}.take(who);
 }
 
 void MirBuilder::carryModuleFactsOf(Mir const& rebuilt) {
@@ -672,21 +652,18 @@ void MirBuilder::addAlias(SymbolId alias, SymbolId target, MirLinkage linkage) {
 // The module's own end and the module's own word on it — never a count of the
 // symbols it holds (that count is exactly what a name table outgrows).
 MirSymbolIdContinuation::MirSymbolIdContinuation(Mir const& mir) noexcept
-    : end_{mir.symbolIdEnd()}, stated_{mir.symbolIdEndIsStated()} {}
+    : end_{SymbolIdEnd::startingAt(mir.symbolIdEnd())}, stated_{mir.symbolIdEndIsStated()} {}
 
 void MirSymbolIdContinuation::keepClearOf(SymbolId taken) noexcept {
-    if (onePastSymbolId(taken) > end_) end_ = onePastSymbolId(taken);
+    end_.keepClearOf(taken);
 }
 
-SymbolId MirSymbolIdContinuation::mint() noexcept {
+std::optional<SymbolId> MirSymbolIdContinuation::mint(SymbolIdRefusalSink sink, std::string_view who) {
     if (!stated_) symbolIdEndNeverStated("MirSymbolIdContinuation::mint");
-    return takeSymbolIdAt(end_);
-}
-
-SymbolId MirSymbolIdContinuation::mintOrAbort(char const* who) {
-    SymbolId const minted = mint();
-    if (!minted.valid()) symbolIdSpaceExhausted(who, end_);
-    return minted;
+    if (refused_) return std::nullopt;   // refused ONCE, by name: the lowering's gate withholds the module
+    std::optional<SymbolId> const id = OptionalSymbolIds{end_, sink}.take(who);
+    if (!id) refused_ = true;
+    return id;
 }
 
 void MirBuilder::checkSameModule_(std::uint32_t arenaTag, char const* what) const {
@@ -1892,7 +1869,7 @@ Mir MirBuilder::finish() && {
     // every id minted since (the constructor counted the defined symbols alone) —
     // and with the end, whether anyone ever STATED it. The frozen module once
     // dropped that fact, so the first rebuild made a counted end a stated one.
-    if (symbolIdEnd_ > built.symbolIdEnd_) built.symbolIdEnd_ = symbolIdEnd_;
+    if (symbolIdEnd_.value() > built.symbolIdEnd_) built.symbolIdEnd_ = symbolIdEnd_.value();
     built.symbolIdEndStated_ = symbolIdEndStated_;
     built.aliases_ = std::move(aliases_);   // P69 (lane `cs`): no arena holds them
     built.facts_ = facts_;   // the list whole: the constructor took two of its facts (P69 f26d)

@@ -56,6 +56,16 @@
 
 namespace dss {
 
+// THE ONE MAKER of a frozen module's continuation (P69 f26e, main's M1): the
+// continuation's constructor is private to this friend, so a module's ids past
+// its end are handed out by ONE sequence per lowering -- this file's -- and no
+// other source can open a second one over the same ids.
+struct MirToLirLoweringAccess {
+    [[nodiscard]] static MirSymbolIdContinuation continuationOf(Mir const& mir) noexcept {
+        return MirSymbolIdContinuation{mir};
+    }
+};
+
 namespace {
 
 // Symbolic name of a MIR opcode, for diagnostic messages. Centralised so a
@@ -1398,9 +1408,7 @@ struct Lowerer {
     // blocks 3..9 — ids of the table, each some other name's, and no diagnostic.
     // A scan sees what a module HOLDS; a table owns far more (a declaration
     // defined elsewhere, an import nobody handed in, a local, a tag).
-    MirSymbolIdContinuation symbolIds_{mir};
-    // The refusal of an exhausted id space is made ONCE per lowering, not per mint.
-    bool          symbolSpaceExhaustedReported_  = false;
+    MirSymbolIdContinuation symbolIds_ = MirToLirLoweringAccess::continuationOf(mir);
 
     // ★ THE ONE MINTER OF LOWERING-SYNTHESIZED SYMBOLS (P68 round 8, lane `ht`,
     // part 1c; its seed replaced in P69). Block, jump-table and sign-mask
@@ -1412,36 +1420,21 @@ struct Lowerer {
     // last value of the space is never handed out, and nothing wraps (a module
     // holding the top id used to mint 0, the invalid sentinel, then walk up
     // through ids it owns). Exhaustion is refused ONCE, by name
-    // (`L_SymbolIdSpaceExhausted`, unsuppressable): the lowering's error gate
-    // then withholds the module, so the invalid `SymbolId{}` returned meanwhile
-    // is never emitted — the discipline `hir_to_mir`'s synthetic minters keep.
-    [[nodiscard]] SymbolId mintPastTheModulesIds(std::string_view what) {
-        SymbolId const minted = symbolIds_.mint();
-        if (minted.valid()) return minted;
-        if (!symbolSpaceExhaustedReported_) {
-            symbolSpaceExhaustedReported_ = true;
-            ParseDiagnostic d;
-            d.code     = DiagnosticCode::L_SymbolIdSpaceExhausted;
-            d.severity = DiagnosticSeverity::Error;
-            d.actual   = std::format(
-                "cannot mint a {}: the SymbolId space is exhausted — this module's "
-                "ids end at {} (its name table, every symbol it defines and every "
-                "id already minted for it), and the lowering's own symbols continue "
-                "from there; wrapping would land on the invalid sentinel and on ids "
-                "the module already owns",
-                what, symbolIds_.end());
-            reporter.report(std::move(d));
-        }
-        return SymbolId{};
+    // (`L_SymbolIdSpaceExhausted`, unsuppressable) at the continuation's door
+    // (P69 f26e, B1), and every take tests the value: no invalid id is handed
+    // out, and the lowering's error gate withholds the module.
+    [[nodiscard]] std::optional<SymbolId> mintPastTheModulesIds(std::string_view what) {
+        return symbolIds_.mint(SymbolIdRefusalSink{&reporter, DiagnosticCode::L_SymbolIdSpaceExhausted},
+                               std::format("cannot mint a {}", what));
     }
 
-    [[nodiscard]] SymbolId mintBlockSymbol(MirBlockId block) {
+    [[nodiscard]] std::optional<SymbolId> mintBlockSymbol(MirBlockId block) {
         if (auto it = blockToSym_.find(block.v); it != blockToSym_.end()) {
             return it->second;
         }
-        SymbolId const sym = mintPastTheModulesIds("block symbol");
-        if (!sym.valid()) return sym;   // refused by name above; nothing is recorded
-        blockToSym_.emplace(block.v, sym);
+        std::optional<SymbolId> const sym = mintPastTheModulesIds("block symbol");
+        if (!sym) return std::nullopt;   // refused by name at the door; nothing is recorded
+        blockToSym_.emplace(block.v, *sym);
         return sym;
     }
 
@@ -1558,7 +1551,7 @@ struct Lowerer {
     // symbol can never collide with a block symbol, nor with any id of the
     // module's own space or beside it. Not deduped (each dense switch gets its
     // own table).
-    [[nodiscard]] SymbolId mintJumpTableSymbol() {
+    [[nodiscard]] std::optional<SymbolId> mintJumpTableSymbol() {
         // The SAME sequence as `mintBlockSymbol` — through the one minter, so the
         // two cannot disagree about where the ids start or about exhaustion.
         return mintPastTheModulesIds("jump-table or sign-mask symbol");
@@ -1568,7 +1561,7 @@ struct Lowerer {
     // negate sign-mask `.rodata` item. Draws from the SAME sequence (via
     // `mintJumpTableSymbol`), so a mask symbol
     // can never collide with a block/table/user/extern symbol. Per-occurrence.
-    [[nodiscard]] SymbolId mintSignMaskSymbol() { return mintJumpTableSymbol(); }
+    [[nodiscard]] std::optional<SymbolId> mintSignMaskSymbol() { return mintJumpTableSymbol(); }
 
     // Whether the running lowering pass added any error-severity
     // diagnostics. Mirrors ML2's delta-on-errorCount; reset by the ctor.
@@ -9351,7 +9344,9 @@ struct Lowerer {
         //    (`symbolIds_`: past the module's whole id space and every id beside
         //    it) and record it in `externSymbols` so any downstream extern-aware
         //    site treats it correctly.
-        SymbolId const sym = mintJumpTableSymbol();
+        std::optional<SymbolId> const minted = mintJumpTableSymbol();
+        if (!minted) return std::nullopt;   // refused by name at the door
+        SymbolId const sym = *minted;
         ExternImport imp;
         imp.symbol      = sym;
         imp.mangledName = helperSymbol;
@@ -9487,7 +9482,9 @@ struct Lowerer {
                                 "MIR Call (preemptible definition)");
             return std::nullopt;
         }
-        SymbolId const sym = mintJumpTableSymbol();
+        std::optional<SymbolId> const minted = mintJumpTableSymbol();
+        if (!minted) return std::nullopt;   // refused by name at the door
+        SymbolId const sym = *minted;
         imp.symbol = sym;
         externSymbols.insert(sym.v);
         if (externCallDispatch_ == ExternCallDispatch::IndirectSlot
@@ -9540,7 +9537,9 @@ struct Lowerer {
         // by `resolvePreemptionImport` above and is the LAST one it pushed, but
         // it is found by symbol rather than by position so a future producer
         // between the two calls cannot silently retarget the stamp.
-        SymbolId const slot = mintJumpTableSymbol();
+        std::optional<SymbolId> const mintedSlot = mintJumpTableSymbol();
+        if (!mintedSlot) return std::nullopt;   // refused by name at the door
+        SymbolId const slot = *mintedSlot;
         bool stamped = false;
         for (auto& e : newWideFloatExterns_) {
             if (e.symbol != *ref) continue;
@@ -10919,7 +10918,9 @@ struct Lowerer {
             return;
         }
         LirBlockId const lirTarget = mirBlockToLirBlock.get(mirTarget);
-        SymbolId const sym = mintBlockSymbol(mirTarget);
+        std::optional<SymbolId> const minted = mintBlockSymbol(mirTarget);
+        if (!minted) return;   // refused by name at the door; the gate withholds the module
+        SymbolId const sym = *minted;
         // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: an address that only
         // ever reaches STATIC DATA needs the block's SYMBOL, not a register holding
         // it. Emit no `lea` (gcc emits none for `static void *tbl[]={&&L0,&&L1};`
@@ -12198,7 +12199,9 @@ struct Lowerer {
 
         // Mint the sign-mask rodata symbol + record its descriptor (the
         // pipeline materializes the 16-byte, 16-byte-aligned `.rodata` item).
-        SymbolId const maskSym = mintSignMaskSymbol();
+        std::optional<SymbolId> const mintedMask = mintSignMaskSymbol();
+        if (!mintedMask) return;   // refused by name at the door; the gate withholds the module
+        SymbolId const maskSym = *mintedMask;
         signMaskConstants_.push_back(SignMaskConstant{maskSym, isF64});
 
         // Emit `fneg_mask xmm, [rip+mask]`. op[0] = the value (the 2-address
@@ -13903,7 +13906,9 @@ struct Lowerer {
                                           "(atomics-runtime call)");
             return std::nullopt;
         }
-        SymbolId const sym = mintJumpTableSymbol();
+        std::optional<SymbolId> const minted = mintJumpTableSymbol();
+        if (!minted) return std::nullopt;   // refused by name at the door
+        SymbolId const sym = *minted;
         ExternImport imp;
         imp.symbol      = sym;
         imp.mangledName = mangledName;
@@ -15947,7 +15952,9 @@ struct Lowerer {
         }
 
         // base = lea [jumpTableSymbol]  — 1-op SymbolRef form (like lowerGlobalAddr).
-        SymbolId const tableSym = mintJumpTableSymbol();
+        std::optional<SymbolId> const mintedTable = mintJumpTableSymbol();
+        if (!mintedTable) return false;   // refused by name at the door; the gate withholds the module
+        SymbolId const tableSym = *mintedTable;
         LirReg const baseReg = lir.newVReg(LirRegClass::GPR);
         {
             std::array<LirOperand, 1> baseOps{LirOperand::makeSymbolRef(tableSym.v)};
@@ -16037,8 +16044,11 @@ struct Lowerer {
                 it != desc.blockSymbols.end()) {
                 blkSym = it->second;
             } else {
-                blkSym = edgeWasSplit(targetMir) ? mintJumpTableSymbol()
-                                                 : mintBlockSymbol(targetMir);
+                std::optional<SymbolId> const mintedBlk = edgeWasSplit(targetMir)
+                                                              ? mintJumpTableSymbol()
+                                                              : mintBlockSymbol(targetMir);
+                if (!mintedBlk) return false;   // refused by name at the door; the gate withholds the module
+                blkSym = *mintedBlk;
                 desc.blockSymbols[lirBlock.v] = blkSym;
             }
             desc.slotBindings.emplace_back(lirBlock.v, j);
@@ -17048,6 +17058,8 @@ struct Lowerer {
                 return v;
             }(),
             .funcLocalAlignments  = std::move(funcLocalAlignments),
+            // A7: the continuation's end -- past the module's whole space and every id minted here.
+            .symbolIdEnd          = SymbolIdEnd::startingAt(symbolIds_.end()),
             .ok                   = !hadError()
         };
     }

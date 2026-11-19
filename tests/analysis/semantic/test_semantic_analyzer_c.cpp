@@ -13074,6 +13074,42 @@ TEST(SemanticAnalyzerC, DeprecatedWarnsAtEachCallSite) {
 
 // `[[deprecated("use h instead")]]` — the decoded string argument rides the
 // warning as `name: msg` (the shared decodeAdjacentStringBodies chokepoint).
+// ★ P69 (lane `cs`, fold f26e -- the review of f26d A3): A `deprecated` ENUMERATOR IS WARNED AT ITS USE, in each
+// spelling and position the language gives it -- the C23 sequence and the GNU run after the enumeration constant, with
+// and without a value, with and without a message -- once, naming it and its message; the enumerator beside it is no
+// deprecated one (the CONTROL). ✔MEASURED (probe a3e): gcc 13.3.0, clang 18.1.3, Apple clang 21 and MinGW-w64 gcc 13.2.0
+// warn "'A' is deprecated[: gone]" at every one of the five cells and at none of the control's; cl 19.52 ignores the
+// sequence on an enumerator (C5030) and has no GNU spelling. RED-ON-DISABLE: the enumerator's facts kept from its
+// record -> every cell reads no warning.
+TEST(SemanticAnalyzerC, ADeprecatedEnumeratorIsWarnedAtItsUse) {
+    auto const warnings = [](SemanticModel const& m) {
+        std::vector<std::string> out;
+        for (auto const& d : m.diagnostics().all())
+            if (d.code == DiagnosticCode::S_DeprecatedSymbolUsed) out.push_back(d.actual);
+        return out;
+    };
+    struct Cell { char const* what; char const* decl; char const* said; };
+    Cell const cells[] = {
+        {"the C23 sequence before the value", "enum E { A [[deprecated]] = 1, B };\n", "A"},
+        {"the C23 sequence with a message", "enum E { A [[deprecated(\"gone\")]] = 1, B };\n", "A: gone"},
+        {"the GNU run before the value", "enum E { A __attribute__((deprecated)) = 1, B };\n", "A"},
+        {"the C23 sequence, no value", "enum E { A [[deprecated]], B };\n", "A"},
+        {"the GNU run with a message, no value", "enum E { A __attribute__((deprecated(\"gone\"))), B };\n",
+         "A: gone"},
+    };
+    for (Cell const& c : cells) {
+        std::string const src = std::string{c.decl} + "int use(void) { return A; }\n";
+        SCOPED_TRACE(std::string{c.what} + "\n" + src);
+        auto const model = analyzeShipped("c", {src});
+        EXPECT_FALSE(model.hasErrors());
+        EXPECT_EQ(warnings(model), std::vector<std::string>{c.said})
+            << "a deprecated enumerator is warned at its use, once, with its message";
+    }
+    auto const control = analyzeShipped("c", {"enum E { A [[deprecated]] = 1, B };\nint use(void) { return B; }\n"});
+    EXPECT_FALSE(control.hasErrors());
+    EXPECT_TRUE(warnings(control).empty()) << "CONTROL: a use of the other enumerator warns nothing";
+}
+
 TEST(SemanticAnalyzerC, DeprecatedMessageIncluded) {
     auto model = analyzeShipped("c", {
         "[[deprecated(\"use h instead\")]] int g(void) { return 1; }\n"
@@ -17904,13 +17940,18 @@ TEST(SemanticAnalyzerC, AsmLabelOnFileScopeObjectIsRecordedVerbatim) {
 // source does not contain — because the definition gate counted every Internal
 // child past the declarator and had never received TF-C62's decoration skip. It
 // was the sixth init-detection site and the one left behind.
-TEST(SemanticAnalyzerC, AsmLabelOnFunctionDefinitionIsRecorded) {
+// ★ P69 (lane `cs`, fold f26e): THE LABEL ON A DEFINITION IS REFUSED, AS EVERY REFERENCE REFUSES IT. The
+// over-acceptance described above is withdrawn: ✔MEASURED (lane `cs` probe n5t; gcc 15.2.0, clang 21.1.8, Apple
+// clang 21, MinGW-w64 gcc 13.2.0) every reference refuses an asm label between a function's declarator and its
+// body, and the n5r class rules it refused (`asmLabelRefusedOnDefinition`, S_AsmLabelMisplaced, saying where the
+// label goes). The noinline shape below still compiles.
+TEST(SemanticAnalyzerC, AsmLabelOnFunctionDefinitionIsRefusedAsEveryReferenceRefusesIt) {
     auto m = analyzeShipped("c", {
         "int fn(int x) __asm(\"myfn\") { return x; }\n"
         "int main(void) { return fn(42); }\n",
     });
-    EXPECT_FALSE(m.diagnostics().hasErrors());
-    EXPECT_EQ(asmNameOf(m, "fn"), "myfn");
+    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_AsmLabelMisplaced), 1u)
+        << "a label on a definition is refused, once, by its own code";
 
 }
 
@@ -18055,10 +18096,15 @@ TEST(SemanticAnalyzerC, AsmLabelsAreRecordedPerDeclarator) {
         << "an undecorated declarator in the same declaration must stay unlabelled";
 }
 
-// FORM 7 — a label INTERLEAVED with an attribute, both orders. The run is a
-// `{repeat alt}` precisely so neither order needs a rule, and both must keep the
-// initializer detection correct (the label is not the init value).
-TEST(SemanticAnalyzerC, AsmLabelInterleavesWithAttributesEitherOrder) {
+// FORM 7 — a label beside an attribute run. ~~ It read: 'both orders. The run is a
+// `{repeat alt}` precisely so neither order needs a rule'. ~~ P69 (lane `cs`, fold f26e)
+// MEASURED the order (probes n5o, n5t: gcc 15.2.0, clang 21.1.8, Apple clang, MinGW-w64 gcc
+// 13.2.0): the label then the run is everyone's; the run then the label is refused by all four
+// on an OBJECT (S_AsmLabelMisplaced here) and taken by clang and Apple clang on the FIRST
+// declarator of a declaration that declares a FUNCTION. Both accepted forms must keep the
+// initializer detection correct (the label is not the init value). The whole universe is
+// `test_declarator_run_order.cpp`'s.
+TEST(SemanticAnalyzerC, AsmLabelTakesAGnuRunBeforeItOnlyOnALeadingFunctionDeclarator) {
     auto first = analyzeShipped("c", {
         "int p __asm(\"pp\") __attribute__((aligned(8))) = 1;\n"
         "int main(void) { return p; }\n",
@@ -18069,8 +18115,16 @@ TEST(SemanticAnalyzerC, AsmLabelInterleavesWithAttributesEitherOrder) {
         "int q __attribute__((aligned(8))) __asm(\"qq\") = 1;\n"
         "int main(void) { return q; }\n",
     });
-    EXPECT_FALSE(second.diagnostics().hasErrors()) << "attribute before label";
-    EXPECT_EQ(asmNameOf(second, "q"), "qq");
+    EXPECT_EQ(countCode(second.diagnostics(), DiagnosticCode::S_AsmLabelMisplaced), 1u)
+        << "an object's attribute before its label: every reference refuses it";
+    EXPECT_EQ(asmNameOf(second, "q"), "") << "a refused label renames nothing";
+    auto third = analyzeShipped("c", {
+        "int f(void) __attribute__((unused)) __asm(\"ff\");\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_FALSE(third.diagnostics().hasErrors())
+        << "a leading function declarator's attribute before its label: clang takes it";
+    EXPECT_EQ(asmNameOf(third, "f"), "ff");
 }
 
 // FAIL-LOUD 1 — an EMPTY label. The most dangerous invalid form: an empty name

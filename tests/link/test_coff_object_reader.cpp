@@ -186,7 +186,7 @@ constexpr std::size_t kSymbolRecordSz = 18;
                                 SymbolVisibility::Default}};
     mod.externImports = {ExternImport{SymbolId{2}, "g", "msvcrt.dll", false}};
     DiagnosticReporter rep;
-    return pe::encode(mod, *loaded.target, *loaded.format, rep);
+    return pe::encode(mod, *loaded.target, *loaded.format, rep).value();
 }
 
 // File offset of the extern IMAGE_SYMBOL record whose inline name is `name`
@@ -285,7 +285,7 @@ TEST(CoffObjectReader, DssWriterRoundTripReconstructsEveryFieldClass) {
     };
 
     DiagnosticReporter wrep;
-    auto objBytes = pe::encode(mod, *loaded.target, *loaded.format, wrep);
+    auto objBytes = pe::encode(mod, *loaded.target, *loaded.format, wrep).value();
     ASSERT_EQ(wrep.errorCount(), 0u) << "writer must accept the module";
     ASSERT_FALSE(objBytes.empty());
 
@@ -441,7 +441,7 @@ TEST(CoffObjectReader, MultiItemSectionSlicesEachAtomValueCorrect) {
     };
 
     DiagnosticReporter wrep;
-    auto objBytes = pe::encode(mod, *loaded.target, *loaded.format, wrep);
+    auto objBytes = pe::encode(mod, *loaded.target, *loaded.format, wrep).value();
     ASSERT_EQ(wrep.errorCount(), 0u);
     ASSERT_FALSE(objBytes.empty());
 
@@ -518,7 +518,7 @@ TEST(CoffObjectReader, AtomsAreReadInTheOrderOfTheirSections) {
     };
 
     DiagnosticReporter wrep;
-    auto objBytes = pe::encode(mod, *loaded.target, *loaded.format, wrep);
+    auto objBytes = pe::encode(mod, *loaded.target, *loaded.format, wrep).value();
     ASSERT_EQ(wrep.errorCount(), 0u) << "writer must accept the module";
     ASSERT_FALSE(objBytes.empty());
     DiagnosticReporter rrep;
@@ -983,7 +983,7 @@ struct Rel32nSite {
     mod.symbols = {ModuleSymbol{SymbolId{1}, "f", SymbolBinding::Global, SymbolVisibility::Default},
                    ModuleSymbol{SymbolId{2}, "d", SymbolBinding::Global, SymbolVisibility::Default}};
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep).value();
     EXPECT_EQ(rep.errorCount(), 0u) << "DSS must write the five-site object";
     return bytes;
 }
@@ -4006,7 +4006,7 @@ TEST(CoffWeakExternalNative, ForeignLinkerConsumesADssReEmittedWeakAlias) {
     // 3. DSS re-emits it. This is the arm that used to FAIL LOUD: the alias
     //    binds Weak where its canonical binds Global.
     DiagnosticReporter wrep;
-    auto const reemitted = pe::encode(*mod, *loaded.target, *loaded.format, wrep);
+    auto const reemitted = pe::encode(*mod, *loaded.target, *loaded.format, wrep).value();
     ASSERT_FALSE(reemitted.empty())
         << "re-emitting a weak alias must now succeed; errs=" << wrep.errorCount();
     EXPECT_EQ(wrep.errorCount(), 0u);

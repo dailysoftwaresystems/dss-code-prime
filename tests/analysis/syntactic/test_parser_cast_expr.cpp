@@ -996,6 +996,9 @@ TEST(ParserCastExpr, AbstractFnPtrCastExactShape) {
               "            rule:declHeadForParam\n"
               "              rule:typeSpecifierSeq\n"
               "                tok:\"void\"\n"
+              // P69 (lane `cs`, fold f26e): a parameter's END-OF-SPECIFIERS position, the
+              // possibly-empty run a declaration's head carries too (c.lang.json `param`).
+              "            rule:declAttrRun\n"
               "        tok:\")\"\n"
               "  tok:\")\"\n"
               "  rule:castOperand\n"
@@ -1020,7 +1023,9 @@ TEST(ParserCastExpr, AbstractFnPtrCastWithIntParamParses) {
                           "    rule:abstractDirectDeclarator\n"
                           "      rule:parenDeclarator\n"),
               std::string::npos) << pretty;
+    // The parameter's `int`, then its (empty) end-of-specifiers run (P69 fold f26e), then `)`.
     EXPECT_NE(pretty.find("tok:\"int\"\n"
+                          "            rule:declAttrRun\n"
                           "        tok:\")\"\n"),
               std::string::npos) << pretty;
 }
@@ -1055,6 +1060,7 @@ TEST(ParserCastExpr, AbstractFnPtrSizeofExactShape) {
               "            rule:declHeadForParam\n"
               "              rule:typeSpecifierSeq\n"
               "                tok:\"void\"\n"
+              "            rule:declAttrRun\n"
               "        tok:\")\"\n"
               "  tok:\")\"\n");
 }

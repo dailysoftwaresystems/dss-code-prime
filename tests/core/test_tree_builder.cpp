@@ -1410,7 +1410,8 @@ TEST(TreeBuilderIngest, PreservesScopeStackVerbatim) {
     ext.code       = DiagnosticCode::P_DeprecatedSyntax;
     ext.severity   = DiagnosticSeverity::Warning;
     ext.scopeStack = {ScopeKind::Generic};   // its own, distinct scope
-    std::vector<ParseDiagnostic> diags{ext};
+    DiagnosticReporter diags{DiagnosticReporter::Config::unbounded()};
+    diags.report(ext);
 
     {
         auto root = b.open(h.schema->rules().find("root"));
@@ -1442,12 +1443,39 @@ TEST(TreeBuilderIngest, EmptySpanDiagnosticReachesTheTree) {
     ext.code     = DiagnosticCode::P_IllegalChar;
     ext.severity = DiagnosticSeverity::Error;
     ext.span     = SourceSpan::empty(0);
-    std::vector<ParseDiagnostic> diags{ext};
+    DiagnosticReporter diags{DiagnosticReporter::Config::unbounded()};
+    diags.report(ext);
     b.ingestDiagnostics(diags);
 
     Tree t = std::move(b).finish();
     EXPECT_EQ(countCode(t.diagnostics().all(), DiagnosticCode::P_IllegalChar), 1u)
         << "ingested diagnostic must reach the Tree's reporter";
+}
+
+// D9(c): the builder ingests the lexer's REPORTER, not its `all()` -- so an Error
+// the lexer's per-code cap elided is still an Error of the Tree's stream. With
+// `all()` alone it was lost at this hand-off, and a parse whose only fault was a
+// lexical one read as clean.
+TEST(TreeBuilderIngest, ALexerErrorItsGatesDroppedStillCountsInTheTree) {
+    auto h = Harness::make("var x = y;");
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
+
+    DiagnosticReporter::Config lexerCfg{};
+    lexerCfg.maxPerCode = 0;   // the lexer stores nothing it is told
+    DiagnosticReporter lexer{lexerCfg};
+    ParseDiagnostic ext;
+    ext.code     = DiagnosticCode::P_IllegalChar;
+    ext.severity = DiagnosticSeverity::Error;
+    ext.span     = SourceSpan::empty(0);
+    lexer.report(ext);
+    ASSERT_EQ(countCode(lexer.all(), DiagnosticCode::P_IllegalChar), 0u)
+        << "the Error was stored: the input no longer reaches the per-code gate";
+    b.ingestDiagnostics(lexer);
+
+    Tree t = std::move(b).finish();
+    EXPECT_TRUE(t.diagnostics().hasErrors())
+        << "the lexer's elided Error was lost at the ingest";
+    EXPECT_EQ(t.diagnostics().droppedFor(DiagnosticCode::P_IllegalChar).errors, 1u);
 }
 
 // ── P69 L2a2 (lane `lm`): A TOKEN'S SCOPE CHECK ASKS PRESENCE, NOT THE STACK ────────────────────

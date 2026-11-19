@@ -1834,6 +1834,97 @@ TEST(TargetSchema, ACallingConventionRowDerivesFromAnotherAndStatesOnlyWhatDiffe
     EXPECT_EQ(darwin->aggregate.x87UpWithoutX87, ::dss::X87UpWithoutX87::Sse);
 }
 
+// ★ P69 (lane `cs`, fold f26e — D-TARGET-WIN64-INT128-RESULT-GOES-THROUGH-A-HIDDEN-POINTER-NOT-XMM0): WHERE A
+// 128-BIT INTEGER RESULT COMES BACK IS A KEY OF THE CONVENTION ROW. `integer128Result` is read by name -- absent ⇒
+// the aggregate rule -- a derived row takes its base's and may state its own, and the shipped rows state it where
+// the references measured it: `ms_x64` `first_fpr` (XMM0), every other row nothing (SysV RAX:RDX, AAPCS64 x0:x1).
+namespace {
+[[nodiscard]] std::string integer128Document(std::string const& rows) {
+    return std::string(
+               R"({"dssTargetVersion":1,"target":{"name":"X"},
+                   "opcodes":[{"mnemonic":"invalid","result":"none"}],
+                   "registers":[{"name":"rax","class":"gpr","widthBytes":8},
+                                {"name":"rsp","class":"gpr","widthBytes":8},
+                                {"name":"xmm0","class":"fpr","widthBytes":16}],
+                   "callingConventions":[)")
+         + rows + "]}";
+}
+// A Win64-shaped row; `extra` is spliced before its closing brace.
+[[nodiscard]] std::string integer128Row(std::string const& name, std::string const& extra, bool fpReturn = true) {
+    return R"({"name":")" + name + R"(","argGprs":["rax"],"returnGprs":["rax"],)"
+         + (fpReturn ? std::string{R"("returnFprs":["xmm0"],)"} : std::string{})
+         + R"("stackPointer":"rsp","stackAlignment":16,"aggregateClassification":"win64_by_size",)"
+         + R"("aggregateMaxRegBytes":8)" + extra + "}";
+}
+}  // namespace
+
+TEST(TargetSchema, AnInteger128ResultRuleIsReadByNameAndTheShippedRowsStateIt) {
+    using ::dss::Integer128Result;
+    auto r = TargetSchema::loadFromText(integer128Document(
+        integer128Row("b", "") + R"(,{"name":"w","derivesFrom":"b","integer128Result":"first_fpr"},)"
+        + R"({"name":"v","derivesFrom":"w","stackAlignment":8},)"
+        + R"({"name":"a","derivesFrom":"w","integer128Result":"aggregate"})"));
+    std::string refused;
+    if (!r.has_value())
+        for (auto const& d : r.error()) refused += " | " + d.path + ": " + d.message;
+    ASSERT_TRUE(r.has_value()) << refused;
+    auto const* b = (*r)->callingConventionByName("b");
+    auto const* w = (*r)->callingConventionByName("w");
+    auto const* v = (*r)->callingConventionByName("v");
+    auto const* a = (*r)->callingConventionByName("a");
+    ASSERT_TRUE(b != nullptr && w != nullptr && v != nullptr && a != nullptr);
+    EXPECT_EQ(b->aggregate.integer128Result, Integer128Result::ByTheAggregateRule) << "absent ⇒ the aggregate rule";
+    EXPECT_EQ(w->aggregate.integer128Result, Integer128Result::InTheFirstFpr) << "a row stating first_fpr";
+    EXPECT_EQ(v->aggregate.integer128Result, Integer128Result::InTheFirstFpr) << "a row stating first_fpr, through "
+                                                                                 "the chain v → w → b";
+    EXPECT_EQ(a->aggregate.integer128Result, Integer128Result::ByTheAggregateRule) << "an own key overrides the "
+                                                                                      "base's";
+    EXPECT_EQ(::dss::integer128ResultName(Integer128Result::InTheFirstFpr), "first_fpr");
+    EXPECT_EQ(::dss::integer128ResultName(Integer128Result::ByTheAggregateRule), "aggregate");
+    struct Shipped { char const* target; char const* cc; Integer128Result want; };
+    for (Shipped const& s : {Shipped{"x86_64", "ms_x64", Integer128Result::InTheFirstFpr},
+                             Shipped{"x86_64", "sysv_amd64", Integer128Result::ByTheAggregateRule},
+                             Shipped{"x86_64", "sysv_amd64_darwin", Integer128Result::ByTheAggregateRule},
+                             Shipped{"arm64", "aapcs64", Integer128Result::ByTheAggregateRule},
+                             Shipped{"arm64", "apple_arm64", Integer128Result::ByTheAggregateRule}}) {
+        auto t = TargetSchema::loadShipped(s.target);
+        ASSERT_TRUE(t.has_value()) << s.target;
+        auto const* cc = (*t)->callingConventionByName(s.cc);
+        ASSERT_NE(cc, nullptr) << s.target << " " << s.cc;
+        EXPECT_EQ(cc->aggregate.integer128Result, s.want)
+            << "a row stating first_fpr: " << s.target << " " << s.cc << " states '"
+            << ::dss::integer128ResultName(cc->aggregate.integer128Result) << "'";
+    }
+}
+
+// ... and refused by name otherwise: another spelling, a number, and `first_fpr` on a row that returns in no FP
+// register (it would name a register the row has not got). CONTROL: that row with its FP return register loads.
+TEST(TargetSchema, AnInteger128ResultRuleIsRefusedByNameOtherwise) {
+    struct Bad { char const* what; std::string row; char const* says; };
+    for (Bad const& c : {Bad{"another spelling", integer128Row("w", R"(,"integer128Result":"FIRST_FPR")"),
+                             "accepted: 'aggregate' / 'first_fpr'"},
+                         Bad{"a number", integer128Row("w", R"(,"integer128Result":1)"),
+                             "accepted: 'aggregate' / 'first_fpr'"},
+                         Bad{"first_fpr on a row that returns in no FP register",
+                             integer128Row("w", R"(,"integer128Result":"first_fpr")", /*fpReturn=*/false),
+                             "declares no 'returnFprs' to return it in"}}) {
+        auto r = TargetSchema::loadFromText(integer128Document(c.row));
+        ASSERT_FALSE(r.has_value()) << c.what << " must be refused";
+        bool named = false;
+        std::string all;
+        for (auto const& d : r.error()) {
+            all += " | " + d.path + ": " + d.message;
+            if (d.code == DiagnosticCode::C_MalformedJson && d.message.find(c.says) != std::string::npos
+                && d.path.find("integer128Result") != std::string::npos)
+                named = true;
+        }
+        EXPECT_TRUE(named) << c.what << ": refused saying '" << c.says << "' at its key; said:" << all;
+    }
+    auto control = TargetSchema::loadFromText(
+        integer128Document(integer128Row("w", R"(,"integer128Result":"first_fpr")")));
+    EXPECT_TRUE(control.has_value()) << "CONTROL: first_fpr on a row with an FP return register loads";
+}
+
 // ★ P69 (lane `cs`, fold f26c — the SysV row, main's ledger 452): A STACKED-ARGUMENT ALIGNMENT CAP is a number of
 // bytes (0 or a power of two) OR the keyword `own` — the argument's own alignment, uncapped — and nothing else: a
 // misspelt keyword, another string, a negative or a non-power-of-two number is refused naming BOTH forms. SysV

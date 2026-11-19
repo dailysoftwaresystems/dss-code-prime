@@ -1,1 +1,3 @@
-        if (!id.valid()) return std::nullopt;
+        if (!id.valid()) {
+            return std::nullopt;
+        }

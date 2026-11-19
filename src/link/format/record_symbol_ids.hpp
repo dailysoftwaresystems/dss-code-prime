@@ -4,11 +4,12 @@
 #include "core/types/object_format_kind.hpp"    // kFirstWriterReservedSymbolIdValue
 #include "core/types/parse_diagnostic.hpp"      // K_SymbolIdSpaceExhausted
 #include "core/types/strong_ids.hpp"            // SymbolId
-#include "core/types/symbol_id_cursor.hpp"      // symbolIdOfIndex, SymbolIdEnd -- the one rule of a fresh id
+#include "core/types/symbol_id_cursor.hpp"      // IndexSymbolIds, OptionalSymbolIds -- the one home of a fresh id
 
 #include <cstddef>
 #include <cstdint>
 #include <format>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -66,59 +67,54 @@
 namespace dss::link::format {
 
 // ★ P69 (lane `cs`, fold f26d -- review-csf26c2 N9): TWO SPACES, EACH BY THE ONE RULE OF A FRESH ID
-// (core/types/symbol_id_cursor.hpp). A record's id is an INDEX id -- `symbolIdOfIndex` of its position, record 0's
-// of the record count -- so the table ENDS below the first value a format writer reserves: a table whose count
-// reaches it is refused at the read, by name. The ids no record holds are a COUNTING space past the table, taken
-// through the cursor, which steps over a reserved value and refuses the last. This table is their door: it reports
-// either refusal itself, once, and hands out the invalid id from then on; the reader that owns it refuses its whole
-// output (`refused()`), so no module carries such an id. The module the reader builds carries the table's end
+// (core/types/symbol_id_cursor.hpp). A record's id is an INDEX id -- read through the home's INDEX door, record 0's
+// the record count -- so the table ENDS below the first value a format writer reserves: a table whose count reaches
+// it is refused when it is OPENED (`open` -> nullopt, reported by name). The ids no record holds are a COUNTING space
+// past the table, taken through the home's OPTIONAL door, which steps over a reserved value and refuses the last:
+// each take answers nullopt once refused (reported by name), and the reader refuses its read AT the take (P69 f26e,
+// B1), so no module carries an invalid id. The module the reader builds carries the table's end
 // (`end()`, `AssembledModule::symbolIdEnd`): an id `fresh` handed out and the reader later dropped is never handed
 // out again by a pass that mints on the module.
 class RecordSymbolIds {
 public:
-    RecordSymbolIds(std::size_t recordCount, DiagnosticReporter& reporter, std::string_view reader)
-        : recordCount_{recordCount}, reporter_{&reporter}, reader_{reader} {
-        if (recordCount_ != 0u && !symbolIdOfIndex(recordCount_).valid()) {
-            refuse(std::format("its {} symbol records reach {}, the first SymbolId a format writer reserves -- a "
-                               "record's id is its index, and an index space ends there",
-                               recordCount_, kFirstWriterReservedSymbolIdValue));
-            return;
+    // The table of `recordCount` records, OPENED: or nullopt -- the refusal REPORTED here, by name -- when the
+    // records reach the first writer-reserved value (an index space ends there).
+    [[nodiscard]] static std::optional<RecordSymbolIds> open(std::size_t recordCount, DiagnosticReporter& reporter,
+                                                             std::string_view reader) {
+        if (recordCount != 0u && !IndexSymbolIds::fits(recordCount + 1u)) {
+            reportExhaustedSymbolIds(SymbolIdRefusalSink{&reporter, DiagnosticCode::K_SymbolIdSpaceExhausted},
+                                     std::format("{}: the object's symbol table", reader),
+                                     SymbolIdSpaceKind::IndexPosition, recordCount);
+            return std::nullopt;
         }
-        fresh_.keepClearOfHighest(static_cast<std::uint32_t>(recordCount_));
+        return RecordSymbolIds{recordCount, reporter, reader};
     }
 
-    // The id of record `index` of the table (`index` < the record count).
-    [[nodiscard]] constexpr SymbolId of(std::uint32_t index) const noexcept {
-        return symbolIdOfIndex(index == 0u ? recordCount_ : index);
+    // The id of record `index` of the table (`index` < the record count) -- a READ through the INDEX door.
+    [[nodiscard]] SymbolId of(std::uint32_t index) const {
+        return IndexSymbolIds{recordCount_ + 1u}.idAt(index == 0u ? recordCount_ : index, "an object's record table");
     }
 
-    // An id no record holds and no earlier call returned; the invalid id once the table is refused.
-    [[nodiscard]] SymbolId fresh() {
-        if (refused_) return SymbolId{};
-        SymbolId const id = fresh_.take();
-        if (!id.valid()) {
-            refuse(std::format("its ids past the table are exhausted (the end is {})", fresh_.value()));
-        }
-        return id;
+    // An id no record holds and no earlier call returned -- the OPTIONAL door: nullopt once the space past the
+    // table is exhausted, the refusal reported by name; the reader refuses its read at the take.
+    [[nodiscard]] std::optional<SymbolId> fresh() {
+        return OptionalSymbolIds{fresh_, SymbolIdRefusalSink{reporter_, DiagnosticCode::K_SymbolIdSpaceExhausted}}
+            .take(std::format("{}: an id past the object's table", reader_));
     }
 
-    // The table or its fresh ids were refused (reported here): the reader refuses its output.
-    [[nodiscard]] bool refused() const noexcept { return refused_; }
     // One past every id this table gave: the module the reader builds carries it.
     [[nodiscard]] SymbolIdEnd end() const noexcept { return fresh_; }
 
 private:
-    void refuse(std::string const& why) {
-        refused_ = true;
-        report(*reporter_, DiagnosticCode::K_SymbolIdSpaceExhausted, DiagnosticSeverity::Error,
-               std::format("{}: the object's SymbolId space is exhausted: {}", reader_, why));
+    RecordSymbolIds(std::size_t recordCount, DiagnosticReporter& reporter, std::string_view reader)
+        : recordCount_{recordCount}, reporter_{&reporter}, reader_{reader} {
+        fresh_.keepClearOfHighest(static_cast<std::uint32_t>(recordCount_));
     }
 
     std::size_t         recordCount_;
     DiagnosticReporter* reporter_;
     std::string_view    reader_;
     SymbolIdEnd         fresh_;
-    bool                refused_ = false;
 };
 
 }  // namespace dss::link::format

@@ -1,1 +1,1 @@
-            SymbolId const id = next_.take();
+            SymbolId const id = AbortingSymbolIds{next_, "the merged module"}.take("mergeCuMirs");

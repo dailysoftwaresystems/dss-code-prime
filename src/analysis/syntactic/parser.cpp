@@ -1516,6 +1516,19 @@ struct Parser::Impl {
     // Returning false lets the caller's SpeculationProbe restore all
     // five machines; the alt's next candidate branch then parses the
     // value reading.
+    // P69 (lane `cs`, fold f26e): an INTERNAL node that holds no token -- a possibly-empty
+    // run the grammar writes between a type and what follows it (`declAttrRun`, at the end of
+    // a declaration's specifiers) -- is not the type-name's operand: both asks of the triage
+    // (the operand's opening and the close) read the follower past it. Read as the operand,
+    // an empty run gave no follower token, and an unknown-led `u * v;` committed as a
+    // declaration where the follower test reads `*` and keeps the expression.
+    [[nodiscard]] bool isTokenlessNode_(NodeId n) const {
+        if (builder->nodeKind(n) != NodeKind::Internal) return false;
+        std::vector<NodeId> leaves;
+        collectLeavesBelow_(n, leaves, /*cap=*/0);
+        return leaves.empty();
+    }
+
     [[nodiscard]] bool typeNameCommitApproved_(
         RuleId branch, RuleId typeRule, TypeNameCommitPolarity polarity,
         std::optional<UnknownNameRefusal>& outRefusal) {
@@ -1542,7 +1555,7 @@ struct Parser::Impl {
                 }
                 continue;
             }
-            if (builder->nodeKind(c) == NodeKind::Internal) {
+            if (builder->nodeKind(c) == NodeKind::Internal && !isTokenlessNode_(c)) {
                 operandSibling = c;
                 break;
             }
@@ -1797,7 +1810,8 @@ struct Parser::Impl {
                 }
                 continue;
             }
-            if (builder->nodeKind(c) == NodeKind::Internal) return;   // not the operand
+            if (builder->nodeKind(c) == NodeKind::Internal && !isTokenlessNode_(c))
+                return;   // not the operand (an empty run is passed over, `isTokenlessNode_`)
         }
         if (!typeChild.valid()) return;
         // P69 L2b2: the operand opens HERE, at the type-name's follower — the end of the
@@ -3606,6 +3620,20 @@ struct Parser::Impl {
                 return StepOutcome::Continue;
             }
 
+            // ★★ P69 (lane `cs`, fold f26e): A SPECULATIVE CHOICE IS DECIDED WHERE IT
+            // STANDS. When the branch this alt takes for `tokKind` reaches a nested
+            // SPECULATIVE choice of the same rule — an optional's or a repeat's
+            // continuation, an alt's branch — the cursor moves to that choice and the next
+            // step dispatches it there, with its own lookahead prune, its probes and its
+            // skip. Entered rule-first by the loop below, it ran none of them: C's
+            // `void f(int[3]);` read the `[` as a C23 attribute sequence's (`declAttrRun`)
+            // and was refused. The loop cannot reach a rule behind such a choice
+            // (`detail::enumerationEnters`, the rule the enumeration and the loader's mirror
+            // both read).
+            if (walker.routeToNestedSpeculativeChoice(tokKind)) {
+                return StepOutcome::Continue;
+            }
+
             // AltChoice → RuleLeaf branch route, candidates sourced
             // from the alt's compiled branch table in DECLARED grammar
             // order (same contract as `candidateBranches`: speculative
@@ -3736,7 +3764,7 @@ ParseResult Parser::parse() && {
     // in one stream (08-compilation-unit-plan §2.6 C2-L1). No-op when the
     // caller didn't pass them.
     if (I.lexerDiagnostics) {
-        I.builder->ingestDiagnostics(I.lexerDiagnostics->all());
+        I.builder->ingestDiagnostics(*I.lexerDiagnostics);
     }
 
     // Default-construct the Pratt walker if the caller didn't inject

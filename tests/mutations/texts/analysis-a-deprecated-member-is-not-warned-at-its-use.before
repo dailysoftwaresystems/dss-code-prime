@@ -1,0 +1,2 @@
+                    if (SymbolRecord const& frec = s.symbols.at(mr.fieldSym); frec.isDeprecated)
+                        reportDeprecatedUse(s, tree, mr.nameNode, mr.fieldName, frec);

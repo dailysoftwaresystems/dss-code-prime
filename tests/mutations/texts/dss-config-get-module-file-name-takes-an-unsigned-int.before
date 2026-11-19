@@ -1,1 +1,1 @@
-    { "name": "GetModuleFileNameA", "signature": "fn(ptr<void>, ptr<char>, u32 \"unsigned long\") -> u32 \"unsigned long\"", "kind": "function", "linkage": "external" },
+    { "name": "GetModuleFileNameA", "signature": "fn(ptr<HINSTANCE__>, ptr<char>, u32 \"unsigned long\") -> u32 \"unsigned long\"", "kind": "function", "linkage": "external" },

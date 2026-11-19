@@ -216,6 +216,46 @@ x87UpWithoutX87FromName(std::string_view s) noexcept {
     return kX87UpWithoutX87Table.fromName(s);
 }
 
+// ★ P69 (lane `cs`, fold f26e -- D-TARGET-WIN64-INT128-RESULT-GOES-THROUGH-A-HIDDEN-POINTER-NOT-XMM0): WHERE A 128-BIT
+// INTEGER RESULT (`__int128`, `unsigned __int128`) COMES BACK -- a fact of the calling convention, which its row states.
+// A 128-bit integer is a by-value class (`isByValueClass`), so with nothing stated its result takes the
+// classification's own answer for a 16-byte value: two INTEGER eightbytes under SysV (RAX:RDX), x0:x1 under AAPCS64,
+// and MEMORY under Win64's by-size rule -- the right answer for a 16-byte STRUCT there and the wrong one for
+// `__int128`. ✔MEASURED (probe-reference-cc runs 20261116-230921-93e15c25 and 20261116-231402-ad98c9bb, -O1 -S):
+// MinGW-w64 gcc 13.2, the mingw cross gcc 13 and 15.2, clang 18.1.3 and Apple clang 21 for x86_64-windows-gnu and
+// x86_64-pc-windows-msvc alike return it in XMM0, the low limb in lane 0, and pass it by reference; cl 19.52 has no
+// `__int128` (C4235). DOCUMENTED: clang's Win64 classifier, "Mingw64 GCC returns i128 in XMM0", for every Windows
+// triple. A `_BitInt(128)` is not this type: its result keeps the aggregate rule (clang returns it through the
+// hidden pointer; a gcc/clang split reported on its own).
+//   * `ByTheAggregateRule` -- the classification's answer (every convention that states nothing);
+//   * `InTheFirstFpr`      -- ONE 16-byte piece in the convention's first floating-point return register.
+// Read for a RESULT only: an argument keeps the classification's answer.
+enum class Integer128Result : std::uint8_t {
+    ByTheAggregateRule = 0,
+    InTheFirstFpr      = 1,
+};
+
+inline constexpr EnumNameTable<Integer128Result, 2> kInteger128ResultTable{{{
+    { Integer128Result::ByTheAggregateRule, "aggregate" },
+    { Integer128Result::InTheFirstFpr,      "first_fpr" },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kInteger128ResultTable);
+
+[[nodiscard]] constexpr std::string_view
+integer128ResultName(Integer128Result k) noexcept {
+    // The `-Werror=switch` backstop -- it owns no spelling. See `dataModelName`.
+    switch (k) {
+        case Integer128Result::ByTheAggregateRule:
+        case Integer128Result::InTheFirstFpr:
+            break;
+    }
+    return kInteger128ResultTable.nameOrEmpty(k);
+}
+[[nodiscard]] constexpr std::optional<Integer128Result>
+integer128ResultFromName(std::string_view s) noexcept {
+    return kInteger128ResultTable.fromName(s);
+}
+
 // ★ P69 (lane `cs`, fold f26c, main's ledger 455): A CALLING CONVENTION'S BY-VALUE AGGREGATE RULES, AS ONE VALUE.
 // The target document's convention row declares them (`TargetCallingConvention::aggregate`), the HIR→MIR lowering
 // takes them WHOLE where the convention is resolved (`MirLoweringConfig::aggregate`, one assignment), and the
@@ -267,6 +307,10 @@ struct AggregateConventionRules {
     // ★ P69 (lane `cs`, fold f26c, main's ledger 454), JSON `x87UpWithoutX87`: what an X87UP eightbyte not
     // preceded by X87 becomes (`X87UpWithoutX87` above). Omitted ⇒ `Memory` (psABI).
     X87UpWithoutX87 x87UpWithoutX87 = X87UpWithoutX87::Memory;
+
+    // ★ P69 (lane `cs`, fold f26e), JSON `integer128Result`: where a 128-bit INTEGER result comes back
+    // (`Integer128Result` above). Omitted ⇒ `ByTheAggregateRule`; `ms_x64` states `first_fpr`.
+    Integer128Result integer128Result = Integer128Result::ByTheAggregateRule;
 };
 
 // FC8 bitfields (D-CSUBSET-BITFIELD / D-CSUBSET-BITFIELD-ABI-EXACT): the per-ABI

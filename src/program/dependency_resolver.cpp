@@ -982,10 +982,8 @@ Resolver::buildNode_(std::size_t index, std::string const& consumerSpec,
     // drains on the way out), and the merged copies are what make
     // `rep.errorCount()` and a caller's inspection see them AT ALL — attributed
     // to the dependency they came from, which the bare rendering cannot say.
-    auto subCfg           = rep_.config();
-    subCfg.maxDiagnostics = std::numeric_limits<std::size_t>::max();
-    subCfg.maxPerCode     = std::numeric_limits<std::size_t>::max();
-    subCfg.dedupWindow    = 0;
+    auto subCfg   = DiagnosticReporter::Config::unbounded();
+    subCfg.policy = rep_.config().policy;
     DiagnosticReporter sub{subCfg};
     int const rc = routesToMultiUnit(sources.size())
                        ? prog.compileUnits(sources, node.config.language,
@@ -994,11 +992,7 @@ Resolver::buildNode_(std::size_t index, std::string const& consumerSpec,
                                            targets, sub);
     std::string const prefix = "[dependency=" + node.outputName + " target="
                              + depSpec + "] ";
-    for (auto const& d : sub.all()) {
-        ParseDiagnostic copy = d;
-        copy.contextPrefix   = prefix;
-        rep_.report(std::move(copy));
-    }
+    rep_.relayFrom(sub, [&prefix](ParseDiagnostic& d) { d.contextPrefix = prefix; });
     if (rc != 0) {
         // 0xD029 and NOT 0xD022, which this site used to reuse
         // (D-DEPS-BUILD-FAILURE-REUSES-THE-DERIVATION-UNRESOLVABLE-CODE).

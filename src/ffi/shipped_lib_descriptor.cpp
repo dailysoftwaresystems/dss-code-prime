@@ -5912,8 +5912,9 @@ readShippedLibConstants(std::filesystem::path const&    path,
     // ★ KEPT PER WHAT ITS DECODE READ (P69 L2b2, ruling 630; the header says why). The key is every
     // input the decode reads, by value (`constantsMemoKey`); what it reads beyond the descriptor's bytes
     // is recorded while it runs (`DecodeReads`) and must all still hold for a kept view to be served;
-    // and only a decode that said nothing is kept, so a decode that reports reports again.
-    std::size_t const saidBefore = reporter.all().size();
+    // and only a decode that said nothing is kept, so a decode that reports reports again. "Said" is
+    // `reportsReceived()`, never `all().size()`: a volume gate stores nothing for a report it drops (D9(c)).
+    std::size_t const saidBefore = reporter.reportsReceived();
     CachedDescriptor* entry = cachedDescriptorEntry(path, reporter);
     if (entry == nullptr) return std::nullopt;
     std::optional<ConstantsMemoKey> const key =
@@ -5944,7 +5945,7 @@ readShippedLibConstants(std::filesystem::path const&    path,
         DecodeReadsRecorder const recording{reads};
         view = decodeConstantsView(entry->doc, path, reporter, activeTarget, activeFormat, pairFacts);
     }
-    if (key.has_value() && !reads.failed && reporter.all().size() == saidBefore) {
+    if (key.has_value() && !reads.failed && reporter.reportsReceived() == saidBefore) {
         // Found again by its parse: a read inside the decode may have replaced the entry.
         if (CachedDescriptor* const same = descriptorEntryOfGeneration(generation)) {
             same->constantsMemo.push_back(ConstantsMemoRow{*key, std::move(reads), view});
@@ -6572,7 +6573,7 @@ shippedSurfaceNamesForFormat(std::filesystem::path const& path,
         }
     }
     ++cacheStats().surfaceHarvests;
-    std::size_t const saidBefore = reporter.all().size();
+    std::size_t const saidBefore = reporter.reportsReceived();   // a report, landed or dropped (D9(c))
     json const&       doc      = entry->doc;
     std::string const pathStr  = core::genericSpelling(path);
 
@@ -6595,7 +6596,7 @@ shippedSurfaceNamesForFormat(std::filesystem::path const& path,
     }
 
     if (reporter.errorCount() != errBefore) return std::nullopt;
-    if (reporter.all().size() == saidBefore)
+    if (reporter.reportsReceived() == saidBefore)
         entry->surfaceByFormat.push_back({fmt, archKey, out});
     return out;
 }
@@ -7250,7 +7251,7 @@ realizeShippedExternSymbols(std::span<std::string const>      names,
             if (refusalBelongsToThisBuild(idx->root / rel, interner, typeReg,
                                           dataModel, activeTarget, activeFormat,
                                           namedTypes, roleResolver, pairFacts)) {
-                for (auto const& d : throwaway.all()) reporter.report(d);
+                reporter.relayFrom(throwaway);
             }
             continue;
         }

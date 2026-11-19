@@ -736,8 +736,10 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // invalid id, the first id past the table. Everything this reader keys by a
     // symbol below is keyed by the record INDEX; an id is made where a value
     // enters the module.
-    link::format::RecordSymbolIds symbolIds{nsyms, reporter, "macho::readRelocatableObject"};
-    if (symbolIds.refused()) return std::nullopt;   // the table reaches a reserved id: refused by name
+    std::optional<link::format::RecordSymbolIds> openedIds =
+        link::format::RecordSymbolIds::open(nsyms, reporter, "macho::readRelocatableObject");
+    if (!openedIds) return std::nullopt;   // the table reaches a reserved id: refused by name
+    link::format::RecordSymbolIds& symbolIds = *openedIds;
     std::vector<Nlist> syms(nsyms);
     for (std::uint32_t i = 0; i < nsyms; ++i) {
         std::size_t const so = static_cast<std::size_t>(*symoff)
@@ -1418,8 +1420,10 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             }
         }
         for (auto const& gap : link::format::unownedByteRangesOfSection(ordinal, sec.size, covered)) {
+            std::optional<SymbolId> const gapId = symbolIds.fresh();
+            if (!gapId) return std::nullopt;   // refused by name at the door
             AssembledData di;
-            di.symbol       = symbolIds.fresh();
+            di.symbol       = *gapId;
             di.section      = *dk;
             di.alignment    = sec.alignment;
             di.inputSection = sliceOf(ordinal, gap.start);
@@ -1860,7 +1864,9 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // an atom is then a reference to its BYTES: one written through a
             // static name of the body, or through its section. The addend is
             // the name's own: the name sits at the atom's start.
-            if (auto const weakName = weakNames.referenceFor(rSymNum, symbolIds)) {
+            auto const weakNameOrRefused = weakNames.referenceFor(rSymNum, symbolIds);
+            if (!weakNameOrRefused) return std::nullopt;   // a fresh id refused by name at the door
+            if (auto const& weakName = *weakNameOrRefused) {
                 if (weakName->fresh) {
                     mod.externImports.push_back(
                         link::format::referenceRowOfAWeakName(*weakName, mod.dataItems));
@@ -2476,8 +2482,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         }
     }
 
-    // A fresh id the table could not hand out was refused by name there; nothing it handed out leaves.
-    if (symbolIds.refused()) return std::nullopt;
+    // A fresh id the table could not hand out refused the read AT its take (P69 f26e, B1): nothing reaches here.
     mod.symbolIdEnd.keepClearOf(symbolIds.end());   // the module carries its table's end
     mod.expectedFuncCount = mod.functions.size();
     return mod;

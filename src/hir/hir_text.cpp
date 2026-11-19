@@ -77,7 +77,8 @@
 //               | arr<T,N> | tuple<T,...> | "type" INT (a `types` entry)
 //               | fn(T,...) -> T [cc NAME] | ext STR (T,...) [N,...] | invalid
 //               (a STANDALONE type text — `parseTypeFromText` — spells a composite
-//               inline instead: struct STR {T,...} | union STR {T,...} | rec INT)
+//               inline instead: struct STR packed? ("aligned" INT)? {T,...} |
+//               union STR packed? ("aligned" INT)? {T,...} | rec INT)
 //
 // Symbols are positional handles (`%1`) bound to a name in the `symbols` preamble;
 // the handle number IS the rebuilt SymbolId.v, so the body and preamble agree by
@@ -1071,16 +1072,10 @@ private:
     // and that is what keeps the output byte-identical.
     void noteSymbol(std::uint32_t sv) {
         if (!symHandle_.contains(sv)) {
+            // An INDEX door, the ABORT form (P69 f26e, B1): the handle IS the rebuilt SymbolId.v, dense by the
+            // reader's contract, so the table ends at the first writer-reserved value -- fatal by name.
+            SymbolId const handle = IndexSymbolIds{symOrder_.size() + 1u}.nextOrAbort("hir_text", "a .dsshir table");
             symOrder_.push_back(sv);
-            // An INDEX door (P69 f26d, N9): the handle IS the rebuilt SymbolId.v, dense by the reader's
-            // contract, so the table ends at the first writer-reserved value (`symbolIdOfIndex`).
-            SymbolId const handle = symbolIdOfIndex(symOrder_.size());
-            if (!handle.valid()) {
-                std::fprintf(stderr, "dss::hir_text fatal: %zu symbols reach the first writer-reserved "
-                                     "SymbolId value -- a .dsshir table cannot number them\n",
-                             symOrder_.size());
-                std::abort();
-            }
             symHandle_.emplace(sv, handle.v);
         }
     }
@@ -4336,9 +4331,9 @@ private:
             return;
         }
         std::size_t const n = entries.size();
-        // P69 (lane `cs`, fold f26d — N9): a handle is an index, so a table ends at the first
-        // writer-reserved SymbolId value (`symbolIdOfIndex`) -- refused by name, before it is sized.
-        if (n != 0 && !symbolIdOfIndex(n).valid()) {
+        // P69 (lane `cs`, fold f26d — N9; f26e B1): a handle is an index, so a table ends at the first
+        // writer-reserved SymbolId value (the index door's `fits`) -- refused by name, before it is sized.
+        if (n != 0 && !IndexSymbolIds::fits(n + 1u)) {
             malformed(std::format("a `.dsshir` symbol table of {} entries reaches the first "
                                   "writer-reserved SymbolId value ({}) -- a table of handles ends there",
                                   n, kFirstWriterReservedSymbolIdValue));
@@ -6008,8 +6003,8 @@ private:
             // declarator spine every consumer of this text reconstructs.
             Aligned,
             Tuple,      // tuple<T, …>
-            Struct,     // struct "name" [packed] { T [@off | ~align] [packed], … }
-            Union,      // union "name" [packed] { T [packed], … }
+            Struct,     // struct "name" [packed] [aligned N] { T [@off | ~align] [packed], … }
+            Union,      // union "name" [packed] [aligned N] { T [packed], … }
             Fn,         // fn(P, …[, ...]) -> R [cc X]
             Ext         // ext "name" (T, …) [s, …]
         } kind;
@@ -6019,6 +6014,9 @@ private:
         // Composite / Ext / Tuple / Fn: the name and the operands read so far.
         std::string         name;
         bool                packed = false;   // Struct / Union: the whole-composite marker
+        // P69 (lane `cs`, fold f26e): Struct / Union: the whole-composite `aligned N`
+        // (0 = none), the module `types` grammar's own marker in its own place.
+        std::uint32_t       explicitAlign = 0;
         // v3: the `rec <H>` marker's handle (0 = not a recursive composite) and the
         // forward id minted for it before the field list was read.
         std::uint64_t       recHandle = 0;
@@ -6364,10 +6362,16 @@ private:
             // forwardComposite + completeComposite in `finishStructType` (the
             // structType convenience overloads don't carry packed).
             bool const packed = acceptKeyword("packed");
+            // P69 (lane `cs`, fold f26e): ` aligned N` after it, the whole-composite
+            // alignment the module `types` grammar spells in the same place
+            // (`"packed"? ("aligned" INT)?`), so a standalone text can state every
+            // composite a shipped header defines (Windows `CONTEXT` is DECLSPEC_ALIGN(16)).
+            std::uint32_t const explicitAlign =
+                acceptKeyword("aligned") ? takeCompositeAlign("aligned") : 0u;
             expect(Tk::LBrace, "'{'");
             TypeParseFrame f{.kind = Kind::Struct, .name = std::move(name),
-                             .packed = packed, .recHandle = recH,
-                             .refusedInModule = refused};
+                             .packed = packed, .explicitAlign = explicitAlign,
+                             .recHandle = recH, .refusedInModule = refused};
             if (recH != 0) f.recForward = openRecComposite(TypeKind::Struct, f.name, recH);
             stack.push_back(std::move(f));
             return false;   // the field list comes next
@@ -6387,10 +6391,12 @@ private:
             std::uint64_t recH = takeRecMarker();
             if (refused) recH = 0;               // v5 — see the struct arm
             bool const packed = acceptKeyword("packed");   // D-CSUBSET-PACKED
+            std::uint32_t const explicitAlign =             // the struct arm's marker
+                acceptKeyword("aligned") ? takeCompositeAlign("aligned") : 0u;
             expect(Tk::LBrace, "'{'");
             TypeParseFrame f{.kind = Kind::Union, .name = std::move(name),
-                             .packed = packed, .recHandle = recH,
-                             .refusedInModule = refused};
+                             .packed = packed, .explicitAlign = explicitAlign,
+                             .recHandle = recH, .refusedInModule = refused};
             if (recH != 0) f.recForward = openRecComposite(TypeKind::Union, f.name, recH);
             stack.push_back(std::move(f));
             return false;   // the member list comes next
@@ -6845,8 +6851,9 @@ private:
         std::span<std::int64_t const> const noWidths{};
         if (interner_.isIncompleteComposite(f.recForward)) {
             interner_.completeComposite(f.recForward, ts, f.packed, noWidths, offs, aligns,
-                                        /*explicitAlign=*/0, /*maxFieldAlign=*/0, fp);
-        } else if (!recCompletionAgrees(f.recForward, ts, f.packed, offs, aligns, fp)) {
+                                        f.explicitAlign, /*maxFieldAlign=*/0, fp);
+        } else if (!recCompletionAgrees(f.recForward, ts, f.packed, offs, aligns, fp)
+                   || interner_.explicitCompositeAlign(f.recForward) != f.explicitAlign) {
             malformed(std::format(
                 "recursion handle {} was spelled twice with DIFFERENT content — a "
                 "handle names one composite per artifact, so the two spellings "
@@ -6889,6 +6896,7 @@ private:
         std::size_t const nWithAlign   = f.nWithAlign;
         std::size_t const nFieldPacked = f.nFieldPacked;
         bool const        packed       = f.packed;
+        std::uint32_t const explicitAlign = f.explicitAlign;   // 0 = none
         out = InvalidType;
         expect(Tk::RBrace, "'}'");
         if (nWithOff != 0 && nWithAlign != 0) {
@@ -6967,12 +6975,15 @@ private:
             // must get DISTINCT forward ids instead of colliding. An empty span
             // leaves the key BYTE-IDENTICAL (zero churn).
             for (std::uint8_t p : fpSpan) key = (key ^ p) * 1099511628211ull;
+            // P69 (lane `cs`, fold f26e): the whole-composite `aligned N` too, guarded so
+            // an unaligned spelling keeps its key byte-identical.
+            if (explicitAlign != 0) key = (key ^ (0xA11A00000000ull | explicitAlign)) * 1099511628211ull;
             key |= (std::uint64_t{1} << 62);
             TypeId const fwd =
                 interner_.forwardComposite(TypeKind::Struct, name, key);
             std::span<std::uint64_t const> const noOffs{};
             interner_.completeComposite(fwd, ts, /*packed=*/true, noWidths,
-                                        noOffs, al, /*explicitAlign=*/0,
+                                        noOffs, al, explicitAlign,
                                         /*maxFieldAlign=*/0, fpSpan);
             return fwd;
         };
@@ -6989,29 +7000,40 @@ private:
             for (TypeId fld : ts) key = (key ^ fld.v) * 1099511628211ull;
             for (std::uint32_t a : al) key = (key ^ a) * 1099511628211ull;
             for (std::uint8_t p : fpSpan) key = (key ^ p) * 1099511628211ull;
+            if (explicitAlign != 0) key = (key ^ (0xA11A00000000ull | explicitAlign)) * 1099511628211ull;
             key |= (std::uint64_t{1} << 61);
             TypeId const fwd =
                 interner_.forwardComposite(TypeKind::Struct, name, key);
             std::span<std::uint64_t const> const noOffs{};
             interner_.completeComposite(fwd, ts, /*packed=*/false, noWidths,
-                                        noOffs, al, /*explicitAlign=*/0,
+                                        noOffs, al, explicitAlign,
                                         /*maxFieldAlign=*/0, fpSpan);
             return fwd;
         };
+        // P69 (lane `cs`, fold f26e): a whole-composite `aligned N` takes the overload that
+        // carries it — the one `structType` the shipped-lib `structs` decoder calls for
+        // the same composite, so the two spellings of one header type are one TypeId.
+        std::span<std::uint64_t const> const noOffsets{};
+        std::span<std::uint32_t const> const noAligns{};
         if (nWithOff == 0 && nWithAlign == 0) {
             if (packed) { out = internPacked({}); return true; }
             if (nFieldPacked != 0) { out = internFieldPacked({}); return true; }
-            out = interner_.structType(name, ts);
+            out = explicitAlign != 0
+                      ? interner_.structType(name, ts, noWidths, noOffsets, noAligns, explicitAlign)
+                      : interner_.structType(name, ts);
             return true;
         }
         if (nWithAlign != 0) {   // count + packed exclusivity checked above
             if (packed) { out = internPacked(aligns); return true; }
             if (nFieldPacked != 0) { out = internFieldPacked(aligns); return true; }
-            std::span<std::uint64_t const> const noOffs{};
-            out = interner_.structType(name, ts, noWidths, noOffs, aligns);
+            out = explicitAlign != 0
+                      ? interner_.structType(name, ts, noWidths, noOffsets, aligns, explicitAlign)
+                      : interner_.structType(name, ts, noWidths, noOffsets, aligns);
             return true;
         }
-        out = interner_.structType(name, ts, noWidths, offs);
+        out = explicitAlign != 0
+                  ? interner_.structType(name, ts, noWidths, offs, noAligns, explicitAlign)
+                  : interner_.structType(name, ts, noWidths, offs);
         return true;
     }
 
@@ -7033,12 +7055,17 @@ private:
                                  std::span<std::uint32_t const>{}, fpSpan, out);
             return true;
         }
-        if (!packed && nFieldPacked == 0) { out = interner_.unionType(name, ts); return true; }
+        std::uint32_t const explicitAlign = f.explicitAlign;   // P69 fold f26e; 0 = none
+        if (!packed && nFieldPacked == 0 && explicitAlign == 0) {
+            out = interner_.unionType(name, ts);
+            return true;
+        }
         std::uint64_t key = 1469598103934665603ull;
         for (char ch : name)
             key = (key ^ static_cast<std::uint8_t>(ch)) * 1099511628211ull;
         for (TypeId fld : ts) key = (key ^ fld.v) * 1099511628211ull;
         for (std::uint8_t p : fpSpan) key = (key ^ p) * 1099511628211ull;
+        if (explicitAlign != 0) key = (key ^ (0xA11A00000000ull | explicitAlign)) * 1099511628211ull;
         // Bit 62 is the whole-composite packed key space; bit 61 the per-field one
         // — a union packed as a whole and a union with one packed member are
         // different layouts and must never collapse onto one forward id.
@@ -7048,7 +7075,7 @@ private:
         std::span<std::uint64_t const> const noO{};
         std::span<std::uint32_t const> const noA{};
         interner_.completeComposite(fwd, ts, packed, noW, noO, noA,
-                                    /*explicitAlign=*/0, /*maxFieldAlign=*/0,
+                                    explicitAlign, /*maxFieldAlign=*/0,
                                     fpSpan);
         out = fwd;
         return true;

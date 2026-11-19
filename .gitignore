@@ -362,10 +362,13 @@ id_ed25519
 !/.worktrees/.gitkeep
 /.orchestrators/*
 !/.orchestrators/.gitkeep
-/.mutations/*
-!/.mutations/.gitkeep
+/.m/*
+!/.m/.gitkeep
 /.legs/*
 !/.legs/.gitkeep
+/.side-tasks/*
+!/.side-tasks/.gitkeep
+/.mutations/
 /.harness-config/sshItems/*
 !/.harness-config/sshItems/.gitkeep
 /.harness-config/wslDistros/*
@@ -374,6 +377,8 @@ id_ed25519
 !/.harness-config/runner/.env/.gitkeep
 /.harness-config/runner/.secrets/*
 !/.harness-config/runner/.secrets/.gitkeep
+/.harness-config/workflows/.env/*
+!/.harness-config/workflows/.env/.gitkeep
 /.harness-config/runner/actions/**/build/
 /.harness-config/runner/actions/**/artifacts/
 # <<< dss-harness managed block <<<

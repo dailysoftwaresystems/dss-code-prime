@@ -62,14 +62,17 @@ std::span<ParseDiagnostic const> DiagnosticReporter::all() const noexcept {
     return std::span<ParseDiagnostic const>{all_.data(), all_.size()};
 }
 
+// Landed + dropped (D9(c); `DroppedTally` in the header says why).
 std::size_t DiagnosticReporter::errorCount() const noexcept {
     return static_cast<std::size_t>(std::ranges::count_if(
-        all_, [](ParseDiagnostic const& d) { return d.severity == DiagnosticSeverity::Error; }));
+               all_, [](ParseDiagnostic const& d) { return d.severity == DiagnosticSeverity::Error; }))
+         + droppedTotal_.errors;
 }
 
 std::size_t DiagnosticReporter::warningCount() const noexcept {
     return static_cast<std::size_t>(std::ranges::count_if(
-        all_, [](ParseDiagnostic const& d) { return d.severity == DiagnosticSeverity::Warning; }));
+               all_, [](ParseDiagnostic const& d) { return d.severity == DiagnosticSeverity::Warning; }))
+         + droppedTotal_.warnings;
 }
 
 DiagnosticReporter::Snapshot DiagnosticReporter::snapshotForRollback() const {
@@ -87,6 +90,9 @@ DiagnosticReporter::Snapshot DiagnosticReporter::snapshotForRollback() const {
     // the next elision on that code would rewrite whatever now sits at that
     // index — or run off the end.
     s.elided         = elided_;
+    s.dropped        = dropped_;
+    s.droppedTotal   = droppedTotal_;
+    s.received       = received_;
     return s;
 }
 
@@ -112,6 +118,9 @@ void DiagnosticReporter::truncateTo(Snapshot const& snap) {
     droppedByCap_   = snap.droppedByCap;
     capMarkerIndex_ = snap.capMarkerIndex;
     elided_         = snap.elided;
+    dropped_        = snap.dropped;
+    droppedTotal_   = snap.droppedTotal;
+    received_       = snap.received;
 
     // ★★★ AND THE MARKERS' PROSE, WHICH A SIZE RESTORE CANNOT REACH.
     //
@@ -345,8 +354,9 @@ std::uint64_t hashKey(ParseDiagnostic const& d) noexcept {
 }
 } // namespace
 
-void DiagnosticReporter::noteCapDrop_() {
+void DiagnosticReporter::noteCapDrop_(ParseDiagnostic const& dropped) {
     ++droppedByCap_;
+    noteDropped_(dropped.code, dropped.severity, 1);
     rewriteCapMarker_();
 }
 
@@ -479,6 +489,7 @@ void DiagnosticReporter::rewriteElisionMarker_(DiagnosticCode code) {
 void DiagnosticReporter::noteElision_(ParseDiagnostic const& d,
                                       ElisionKind kind) {
     const DiagnosticCode code = d.code;
+    noteDropped_(code, d.severity, 1);
     auto [it, minted] = elided_.try_emplace(code);
     ElisionLedger& led = it->second;
     if (kind == ElisionKind::PerCodeCap) {
@@ -522,12 +533,8 @@ bool DiagnosticReporter::isRecentDuplicate(ParseDiagnostic const& d) const noexc
 }
 
 void DiagnosticReporter::report(ParseDiagnostic d) {
-    // An Error whose code the operator asked to suppress is reported anyway
-    // (`effectiveSeverity`), and the refused request is SAID, once per code.
-    if (d.severity == DiagnosticSeverity::Error && !isUnsuppressable(d.code)
-        && cfg_.policy.suppress.contains(d.code)) {
-        announceRefusedErrorSuppression_(d.code);
-    }
+    ++received_;
+    announceIfSuppressingAnError_(d.code, d.severity);
     // Policy first so the unsuppressable check below sees the post-
     // policy code. See `applyPolicy` above for the canonical
     // silencing-vs-elevation contract.
@@ -553,7 +560,7 @@ void DiagnosticReporter::report(ParseDiagnostic d) {
         // information is lost forever, so it is the one path that has to
         // leave a number behind. One increment plus an in-place rewrite on
         // a path that was already throwing the diagnostic away.
-        noteCapDrop_();
+        noteCapDrop_(*filtered);
         return;
     }
 
@@ -614,7 +621,7 @@ void DiagnosticReporter::report(ParseDiagnostic d) {
         // The diagnostic that TRIPPED the cap is dropped too — the marker
         // stands in its place, it is not stored alongside it — so it is the
         // first thing the count counts.
-        noteCapDrop_();
+        noteCapDrop_(*filtered);
         return;
     }
 
@@ -625,6 +632,122 @@ void DiagnosticReporter::report(ParseDiagnostic d) {
         recent_.pop_front();
     }
     all_.push_back(std::move(*filtered));
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// D9(c): the dropped tally and the one relay
+// ─────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+constexpr DiagnosticSeverity kEverySeverity[] = {
+    DiagnosticSeverity::Hint, DiagnosticSeverity::Info,
+    DiagnosticSeverity::Warning, DiagnosticSeverity::Error};
+
+// House-style fail-loud sinks (see `capMarkerFatal`): each names the broken
+// contract, so a future edit that breaks it aborts with its name on it.
+[[noreturn]] void severityFatal(DiagnosticSeverity severity) {
+    std::fprintf(stderr,
+                 "dss::DiagnosticReporter fatal: severity value %u is no "
+                 "DiagnosticSeverity enumerator (a compiler bug, not a source error)\n",
+                 static_cast<unsigned>(severity));
+    std::abort();
+}
+
+[[noreturn]] void relayFatal(char const* what) {
+    std::fprintf(stderr, "dss::DiagnosticReporter fatal: %s (a compiler bug, not a source error)\n",
+                 what);
+    std::abort();
+}
+
+} // namespace
+
+std::size_t DiagnosticReporter::DroppedTally::of(DiagnosticSeverity severity) const noexcept {
+    switch (severity) {
+        case DiagnosticSeverity::Hint:    return hints;
+        case DiagnosticSeverity::Info:    return infos;
+        case DiagnosticSeverity::Warning: return warnings;
+        case DiagnosticSeverity::Error:   return errors;
+    }
+    severityFatal(severity);
+}
+
+void DiagnosticReporter::DroppedTally::add(DiagnosticSeverity severity, std::size_t n) noexcept {
+    switch (severity) {
+        case DiagnosticSeverity::Hint:    hints    += n; return;
+        case DiagnosticSeverity::Info:    infos    += n; return;
+        case DiagnosticSeverity::Warning: warnings += n; return;
+        case DiagnosticSeverity::Error:   errors   += n; return;
+    }
+    severityFatal(severity);
+}
+
+DiagnosticReporter::DroppedTally
+DiagnosticReporter::droppedFor(DiagnosticCode code) const noexcept {
+    auto const it = dropped_.find(code);
+    return it == dropped_.end() ? DroppedTally{} : it->second;
+}
+
+std::vector<DiagnosticCode> DiagnosticReporter::droppedCodes() const {
+    std::vector<DiagnosticCode> codes;
+    codes.reserve(dropped_.size());
+    for (auto const& entry : dropped_) codes.push_back(entry.first);
+    std::ranges::sort(codes);
+    return codes;
+}
+
+void DiagnosticReporter::noteDropped_(DiagnosticCode code, DiagnosticSeverity severity,
+                                      std::size_t n) {
+    dropped_[code].add(severity, n);
+    droppedTotal_.add(severity, n);
+}
+
+// An Error whose code the operator asked to suppress is reported anyway
+// (`effectiveSeverity`), and the refused request is SAID, once per code.
+void DiagnosticReporter::announceIfSuppressingAnError_(DiagnosticCode code,
+                                                       DiagnosticSeverity severity) {
+    if (severity == DiagnosticSeverity::Error && !isUnsuppressable(code)
+        && cfg_.policy.suppress.contains(code)) {
+        announceRefusedErrorSuppression_(code);
+    }
+}
+
+void DiagnosticReporter::relayFrom(DiagnosticReporter const& src) {
+    relayFrom(src, [](ParseDiagnostic&) {});
+}
+
+// The dropped half of a relay. Each (code, severity) cell of `src`'s tally is
+// what `report` would have done with that many diagnostics of that code and
+// severity, minus the storing: THIS reporter's policy decides the severity it
+// counts at (or suppresses it), and the refused-suppression notice fires for an
+// Error exactly as a report would fire it. The cells are walked in CODE order
+// (`droppedCodes()`), not hash order, because the notice lands in `all_` and the
+// stream must not depend on an unordered_map's iteration.
+void DiagnosticReporter::takeDroppedFrom_(DiagnosticReporter const& src) {
+    for (DiagnosticCode const code : src.droppedCodes()) {
+        DroppedTally const tally = src.dropped_.at(code);
+        for (DiagnosticSeverity const severity : kEverySeverity) {
+            std::size_t const n = tally.of(severity);
+            if (n == 0) continue;
+            received_ += n;
+            announceIfSuppressingAnError_(code, severity);
+            std::optional<DiagnosticSeverity> const counted = effectiveSeverity(code, severity);
+            if (!counted.has_value()) continue;
+            noteDropped_(code, *counted, n);
+        }
+    }
+}
+
+void DiagnosticReporter::requireNotSelf_(DiagnosticReporter const& src) const {
+    if (&src == this) relayFatal("a reporter was relayed into itself");
+}
+
+void DiagnosticReporter::requireDropsNothing_(DiagnosticReporter const& src) {
+    if (!src.cfg_.dropsNothing()) {
+        relayFatal("relaySelectedFrom's source has a volume gate, so a diagnostic its "
+                   "filter must judge may already be gone; build the source from "
+                   "DiagnosticReporter::Config::unbounded()");
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────

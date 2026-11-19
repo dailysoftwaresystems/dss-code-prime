@@ -173,7 +173,7 @@ TEST(PcRelativeImportAddress, APeUnitThatTakesAnImportsAddressByDisplacementBind
     std::vector<AssembledModule> const units{a, b};
     std::vector<AssembledModule> out;
     DiagnosticReporter rep;
-    ASSERT_FALSE(linker::bindPcRelativeImportAddressUnits(units, out, *t, *f, rep)) << "changed";
+    ASSERT_EQ(linker::bindPcRelativeImportAddressUnits(units, out, *t, *f, rep), linker::LinkPassOutcome::Rewritten) << "changed";
     ASSERT_FALSE(rep.hasErrors()) << errorText(rep);
     ASSERT_EQ(out.size(), 2u);
     AssembledModule const& ua = out[0];
@@ -213,7 +213,7 @@ TEST(PcRelativeImportAddress, ABranchToTheImportChangesNothing) {
     std::vector<AssembledModule> const units{u};
     std::vector<AssembledModule> out;
     DiagnosticReporter rep;
-    EXPECT_TRUE(linker::bindPcRelativeImportAddressUnits(units, out, *t, *f, rep));
+    EXPECT_EQ(linker::bindPcRelativeImportAddressUnits(units, out, *t, *f, rep), linker::LinkPassOutcome::Unchanged);
     EXPECT_FALSE(rep.hasErrors());
     EXPECT_TRUE(out.empty());
 }
@@ -234,7 +234,7 @@ TEST(PcRelativeImportAddress, ASharedObjectRefusesTheUnitByName) {
     std::vector<AssembledModule> const units{u};
     std::vector<AssembledModule> out;
     DiagnosticReporter rep;
-    EXPECT_FALSE(linker::bindPcRelativeImportAddressUnits(units, out, *t, *f, rep));
+    EXPECT_EQ(linker::bindPcRelativeImportAddressUnits(units, out, *t, *f, rep), linker::LinkPassOutcome::Refused);
     ASSERT_EQ(rep.errorCount(), 1u) << "one unit, one import: one refusal\n" << errorText(rep);
     std::string const text = errorText(rep);
     EXPECT_NE(text.find("'take_puts'"), std::string::npos) << text;
@@ -261,7 +261,7 @@ TEST(PcRelativeImportAddress, AMachOImageRefusesAnAdrpPairToo) {
     std::vector<AssembledModule> const units{u};
     std::vector<AssembledModule> out;
     DiagnosticReporter rep;
-    EXPECT_FALSE(linker::bindPcRelativeImportAddressUnits(units, out, *t, *f, rep));
+    EXPECT_EQ(linker::bindPcRelativeImportAddressUnits(units, out, *t, *f, rep), linker::LinkPassOutcome::Refused);
     EXPECT_EQ(rep.errorCount(), 1u) << errorText(rep);
 }
 
@@ -295,7 +295,7 @@ TEST(PcRelativeImportAddress, ADatumAPendingRowAndASlotReadImportAreNotThisRules
         std::vector<AssembledModule> const units{u};
         std::vector<AssembledModule> out;
         DiagnosticReporter rep;
-        EXPECT_TRUE(linker::bindPcRelativeImportAddressUnits(units, out, *t, *f, rep));
+        EXPECT_EQ(linker::bindPcRelativeImportAddressUnits(units, out, *t, *f, rep), linker::LinkPassOutcome::Unchanged);
         EXPECT_FALSE(rep.hasErrors()) << errorText(rep);
         EXPECT_TRUE(out.empty());
     }
@@ -306,7 +306,7 @@ TEST(PcRelativeImportAddress, ADatumAPendingRowAndASlotReadImportAreNotThisRules
     std::vector<AssembledModule> const units{u};
     std::vector<AssembledModule> out;
     DiagnosticReporter rep;
-    EXPECT_FALSE(linker::bindPcRelativeImportAddressUnits(units, out, *t, *f, rep));
+    EXPECT_EQ(linker::bindPcRelativeImportAddressUnits(units, out, *t, *f, rep), linker::LinkPassOutcome::Refused);
     ASSERT_EQ(rep.errorCount(), 1u) << errorText(rep);
     EXPECT_NE(errorText(rep).find("function '_puts'"), std::string::npos) << errorText(rep);
 }
@@ -332,7 +332,7 @@ TEST(PcRelativeImportAddress, ANameALinkedUnitDefinesIsNoImport) {
     std::vector<AssembledModule> const units{u, d};
     std::vector<AssembledModule> out;
     DiagnosticReporter rep;
-    EXPECT_TRUE(linker::bindPcRelativeImportAddressUnits(units, out, *t, *f, rep));
+    EXPECT_EQ(linker::bindPcRelativeImportAddressUnits(units, out, *t, *f, rep), linker::LinkPassOutcome::Unchanged);
     EXPECT_FALSE(rep.hasErrors()) << errorText(rep);
 }
 
@@ -351,7 +351,7 @@ TEST(PcRelativeImportAddress, AnExecutableWhoseStubIsCanonicalDecidesNothing) {
         std::vector<AssembledModule> const units{u};
         std::vector<AssembledModule> out;
         DiagnosticReporter rep;
-        EXPECT_TRUE(linker::bindPcRelativeImportAddressUnits(units, out, *t, *f, rep));
+        EXPECT_EQ(linker::bindPcRelativeImportAddressUnits(units, out, *t, *f, rep), linker::LinkPassOutcome::Unchanged);
         EXPECT_FALSE(rep.hasErrors());
     }
 }

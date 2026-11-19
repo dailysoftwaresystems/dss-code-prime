@@ -39,6 +39,7 @@
 #include <nlohmann/json.hpp>   // the placement universe reads each row's keys
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>     // P69: std::isinf (a folded +inf literal)
 #include <cstdlib>
@@ -46,6 +47,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <set>
@@ -184,7 +186,12 @@ struct Lowered {
                                    // P69 fold f26c: applied to the MIR config AFTER the
                                    // convention's copy — the one way a cell lowers under a
                                    // configuration no shipped document states (a refusal's pin).
-                                   std::function<void(MirLoweringConfig&)> const& adjustConfig = {}) {
+                                   std::function<void(MirLoweringConfig&)> const& adjustConfig = {},
+                                   // P69 fold f26e: TRUE analyses with the TARGET'S layout, as the pipeline does
+                                   // (`target_format_analysis.cpp`'s `analyzeLayout`) -- the one way a cell sees what
+                                   // the semantic tier decides from a layout (a variably modified type's alignment
+                                   // skin). FALSE (the default) is what every pre-existing fixture here got.
+                                   bool analyzeWithTheTargetsLayout = false) {
     auto const schema = staticInitializersMustFold ? dss::test_support::shippedSchemaOrThrow("c")
                                                    : cWithoutStaticInitializerRule();
     UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
@@ -285,8 +292,12 @@ struct Lowered {
         throw std::runtime_error("format '" + formatName
                                  + "' resolved no object-format kind");
     }
+    std::optional<AggregateLayoutParams> const analysisLayout =
+        analyzeWithTheTargetsLayout && loadedTarget->aggregateLayoutLoaded()
+            ? std::optional<AggregateLayoutParams>{loadedTarget->aggregateLayout()}
+            : std::nullopt;
     auto model = analyze(cu, DiagnosticBudget::libraryDefault(),
-                         dataModel, std::nullopt, vaStrategy, selectableFormat,
+                         dataModel, analysisLayout, vaStrategy, selectableFormat,
                          std::nullopt, ldf, targetSchema.get());
     DiagnosticReporter hirReporter;
     ModelLoweredToHir lowered = lowerModelToHir(model, *formatSchema, hirReporter);   // the pipeline's gates
@@ -9817,6 +9828,8 @@ constexpr OtherKey kNotAssignmentKeys[] = {
     {"derivesFrom", "the row's base, whose own keys are read here as the base's"},
     {"returnGprs", "where a RESULT returns"},
     {"returnFprs", "where a RESULT returns"},
+    {"integer128Result", "where a 128-bit integer RESULT returns: AggregateAbiWin64's classifier cell and the "
+                         "reference-link witness's check 62"},
     {"callerSaved", "what a call preserves"},
     {"calleeSaved", "what a call preserves"},
     {"calleeSavedPreservedBits", "what a call preserves"},
@@ -14592,6 +14605,50 @@ TEST(MirLoweringC, AVlaTypeNamesSizeReadsTheFrozenSizeAndItsAlignmentFolds) {
                                        << c.src;
         else
             EXPECT_EQ(frozenReads, 0u) << "an alignment is static; nothing is read: " << c.src;
+    }
+}
+
+// P69 (lane `cs`, fold f26e) — A VLA OBJECT IS PLACED AT ITS TYPE'S ALIGNMENT, a level's own `aligned`
+// included: the run-time alloca states (payload2) what `typeAlignment` answers for the OBJECT's whole type, never
+// only its base element's. Probe vm2 (p4, p9: gcc 15.2.0, clang 21.1.8, Apple clang 21, MinGW-w64 gcc 13.2.0)
+// places every such object on its request's boundary behind run-time-sized neighbours; a LOWER request (p10)
+// answers 1 and the element's own alignment stays the control.
+TEST(MirLoweringC, AVlaObjectIsPlacedAtItsTypesAlignment) {
+    struct Case {
+        char const*   src;
+        std::uint32_t align;
+    };
+    for (Case const& c : {
+             Case{"int f(int n) { typedef int T[n] __attribute__((aligned(64))); T a; a[0] = 0; return a[0]; }\n", 64u},
+             Case{"int f(int n) { typedef __attribute__((aligned(32))) int T[n]; T a; a[0] = 0; return a[0]; }\n", 32u},
+             Case{"int f(int n) { int (__attribute__((aligned(64))) a)[n]; a[0] = 0; return a[0]; }\n", 64u},
+             Case{"int f(int n) { typedef int T[n] __attribute__((aligned(1))); T a; a[0] = 0; return a[0]; }\n", 1u},
+             Case{"int f(int n) { int a[n]; a[0] = 0; return a[0]; }\n", 4u},
+             Case{"int f(int n) { double a[n][3]; a[0][0] = 0; return (int)a[0][0]; }\n", 8u},
+         }) {
+        auto L = lowerC(c.src, "x86_64", "sysv_amd64", DataModel::Lp64, LongDoubleFormat::None, {},
+                        /*staticInitializersMustFold=*/true, {}, /*analyzeWithTheTargetsLayout=*/true);
+        ASSERT_FALSE(L.model.hasErrors()) << c.src;
+        ASSERT_TRUE(L.hir->ok) << c.src;
+        ASSERT_TRUE(L.mir.ok)
+            << c.src << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        ASSERT_EQ(m.moduleFuncCount(), 1u) << c.src;
+        MirFuncId const fn = m.funcAt(0);
+        // The run-time alloca: an Alloca whose primary payload is 0 (runtime-sized) and whose one operand is
+        // its byte count.
+        std::vector<std::uint32_t> stated;
+        for (std::uint32_t b = 0; b < m.funcBlockCount(fn); ++b) {
+            MirBlockId const blk = m.funcBlockAt(fn, b);
+            for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+                MirInstId const id = m.blockInstAt(blk, i);
+                if (m.instOpcode(id) == MirOpcode::Alloca && m.instPayload(id) == 0u
+                    && m.instOperands(id).size() == 1u)
+                    stated.push_back(m.instPayload2(id));
+            }
+        }
+        ASSERT_EQ(stated.size(), 1u) << "one run-time alloca: " << c.src;
+        EXPECT_EQ(stated[0], c.align) << "the VLA's alloca must state its type's alignment: " << c.src;
     }
 }
 
@@ -20171,4 +20228,58 @@ TEST(MirLoweringC, AnIdTheModuleMintsIsNoSymbolTheUnitsBodiesDeclare) {
         EXPECT_EQ(bodySymbols.count(s.v), 0u) << "a minted id is no symbol the unit's bodies declare: " << s.v;
     }
     EXPECT_GE(minted, 1u) << "CONTROL: the string literal is a global the module mints";
+}
+
+// ★ P69 (lane `cs`, fold f26e — B1, the home audit's §6, D-MIR-SYNTHESIZED-SYMBOL-MINTED-INSIDE-THE-NAME-TABLE):
+// THE REFUSAL CONTRACT AT THE HIR->MIR TIER. A unit whose lowering must synthesize a symbol, lowered into a space
+// stated to end at the LAST id (whose first take therefore refuses), is refused by the door's own code and by
+// nothing else: no later tier's code, no misnamed fold refusal (the static initializer's resolver answered "not
+// resolvable", and the evaluator said H_StaticInitializerNotFolded), no engine stop. Each cell's CONTROL lowers the
+// same unit with its own name table and finds a symbol minted past that table, so the cell reaches the minter.
+TEST(MirLoweringC, AnExhaustedSymbolIdSpaceRefusesTheUnitByTheDoorsCodeAlone) {
+    struct Cell {
+        char const* what;
+        char const* source;
+    };
+    std::array<Cell, 3> const cells{{
+        {"a float's truth compares it with a zero constant",
+         "float f;\nint main(void) { return !f; }\n"},
+        {"a real made a complex takes its parts as constants",
+         "double x = 1.5;\nint main(void) { double _Complex z = x; return (int)((double const *)&z)[0] - 1; }\n"},
+        {"a static pointer to a string literal resolves the literal's object",
+         "static const char *p = \"s\";\nint main(void) { return p[0] != 's'; }\n"},
+    }};
+    for (auto const& cell : cells) {
+        SCOPED_TRACE(cell.what);
+        {
+            Lowered const L = lowerC(cell.source);
+            ASSERT_FALSE(L.model.hasErrors())
+                << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+            ASSERT_TRUE(L.hir->ok) << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+            ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+            auto const tableEnd = static_cast<std::uint32_t>(L.model.symbols().size());
+            Mir const& m = L.mir.mir;
+            std::size_t minted = 0;
+            for (std::uint32_t gi = 0; gi < m.moduleGlobalCount(); ++gi)
+                if (m.globalSymbol(m.globalAt(gi)).v >= tableEnd) ++minted;
+            ASSERT_GE(minted, 1u) << "CONTROL: the unit's lowering mints a symbol past its name table";
+        }
+        Lowered const L = lowerC(cell.source, "x86_64", "sysv_amd64", DataModel::Lp64, LongDoubleFormat::None, {},
+                                 /*staticInitializersMustFold=*/true, [](MirLoweringConfig& cfg) {
+                                     cfg.symbolIdSpace = MirSymbolIdSpace::endingAt(
+                                         std::numeric_limits<std::uint32_t>::max());
+                                 });
+        ASSERT_FALSE(L.model.hasErrors());
+        ASSERT_TRUE(L.hir->ok) << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+        EXPECT_FALSE(L.mir.ok) << "a unit whose symbol was refused is no module";
+        EXPECT_GE(dss::test_support::countCode(L.mirReporter, DiagnosticCode::H_SymbolIdSpaceExhausted), 1u)
+            << "the refusal is said by the door's own code";
+        for (auto const& d : L.mirReporter.all()) {
+            if (d.severity != DiagnosticSeverity::Error) continue;
+            EXPECT_EQ(d.code, DiagnosticCode::H_SymbolIdSpaceExhausted)
+                << "an Error other than the door's own followed its refusal: " << d.actual;
+        }
+        EXPECT_EQ(dss::test_support::countCode(L.mirReporter, DiagnosticCode::H_StaticInitializerNotFolded), 0u)
+            << "the refusal is never renamed a fold that did not happen";
+    }
 }

@@ -4407,6 +4407,20 @@ TEST(GrammarSchema, AttributeSpellingsBlockIsClosedAndEveryRowCanIdentifyASpecif
                                 { "introducer": "DsKw", "qualifier": "ds" } ],)"),
          DiagnosticCode::C_InvalidSemantics,
          "the qualifier 'ds' is already an earlier 'spellings' row's"},
+        // ★ P69 (lane `cs`, fold f26e): the implied clause -- a plain name, beside no qualifier, naming a row.
+        {"an implied clause that is no attribute name",
+         with(R"("spellings": [ { "introducer": "DsKw", "impliedClause": "__fallthrough__" } ],)"),
+         DiagnosticCode::C_InvalidSemantics, "'impliedClause' must be an attribute name"},
+        {"an implied clause that is not a string",
+         with(R"("spellings": [ { "introducer": "DsKw", "impliedClause": 4 } ],)"),
+         DiagnosticCode::C_InvalidSemantics, "'impliedClause' must be an attribute name"},
+        {"an implied clause beside a qualifier",
+         with(R"("spellings": [ { "introducer": "DsKw", "qualifier": "ds",
+                                  "impliedClause": "fallthrough" } ],)"),
+         DiagnosticCode::C_InvalidSemantics, "stands beside neither 'qualifier' nor"},
+        {"an implied clause naming no row",
+         with(R"("spellings": [ { "introducer": "DsKw", "impliedClause": "nosuch" } ],)"),
+         DiagnosticCode::C_InvalidSemantics, "implies the clause 'nosuch'"},
         {"an introducer the specifier shape does not hold",
          with(R"("spellings": [ { "introducer": "ParenOpen" },
                                 { "introducer": "BracketOpen", "qualifier": "b" } ],)"),
@@ -4422,6 +4436,14 @@ TEST(GrammarSchema, AttributeSpellingsBlockIsClosedAndEveryRowCanIdentifyASpecif
     ASSERT_EQ((*ok)->semantics().attributeSpellings.size(), 2u);
     EXPECT_FALSE((*ok)->semantics().attributeSpellings[0]
                      .afterCompositeBodyIsTheDeclarations);
+    // CONTROL (fold f26e): a spelling whose introducer alone is the clause the effects row names loads.
+    auto implied = GrammarSchema::loadFromText(with(
+        R"("spellings": [ { "introducer": "ParenOpen" },
+                          { "introducer": "DsKw", "impliedClause": "fallthrough" } ],)"));
+    ASSERT_TRUE(implied.has_value()) << errorDiags(implied.error());
+    ASSERT_EQ((*implied)->semantics().attributeSpellings.size(), 2u);
+    EXPECT_EQ((*implied)->semantics().attributeSpellings[1].impliedClause, "fallthrough");
+    EXPECT_TRUE((*implied)->semantics().attributeSpellings[0].impliedClause.empty());
 }
 
 // A TABLE KEY WITH A PARENTHESIS IS A QUALIFIED NAME OR IT IS REFUSED — in the
@@ -8576,8 +8598,21 @@ TEST(GrammarSchema, ShippedCDeclaresTheDeclspecSpellingAndItsQualifiedRows) {
     ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
     auto const& sem = (*r)->semantics();
 
-    ASSERT_EQ(sem.attributeSpellings.size(), 2u);
+    // Four spellings (P69 fold f26e, lane `cs`: the two calling-convention keywords are spellings whose introducer
+    // alone is one clause -- `impliedClause`).
+    ASSERT_EQ(sem.attributeSpellings.size(), 4u);
     EXPECT_EQ(sem.attributeSpellings[0].introducerName, "AttributeKeyword");
+    EXPECT_TRUE(sem.attributeSpellings[0].impliedClause.empty());
+    EXPECT_TRUE(sem.attributeSpellings[1].impliedClause.empty());
+    for (std::size_t i : {std::size_t{2}, std::size_t{3}}) {
+        AttributeSpelling const& kw = sem.attributeSpellings[i];
+        EXPECT_EQ(kw.introducerName, i == 2 ? "VectorcallKeyword" : "RegcallKeyword");
+        EXPECT_EQ(kw.impliedClause, i == 2 ? "vectorcall" : "regcall");
+        EXPECT_TRUE(kw.qualifier.empty()) << kw.introducerName;
+        EXPECT_TRUE(kw.standardNamespaces.empty()) << kw.introducerName;
+        EXPECT_TRUE(kw.availableFor(std::nullopt)) << kw.introducerName << ": no format restricts a keyword";
+        EXPECT_FALSE(kw.afterCompositeBodyIsTheDeclarations) << kw.introducerName;
+    }
     EXPECT_TRUE(sem.attributeSpellings[0].qualifier.empty());
     EXPECT_TRUE(sem.attributeSpellings[0].availableFor(std::nullopt));
     EXPECT_FALSE(sem.attributeSpellings[0].afterCompositeBodyIsTheDeclarations);
@@ -9835,7 +9870,10 @@ TEST(GrammarSchema, NotFollowedByIsAdmittedOnlyWhereAProbeEvaluatesIt) {
 //     that alt skips (its tail is nullable, in a rule that is not the root) before it could replay
 //     — so C's attribute run among type specifiers could not be declared at all;
 //   * it called a speculative alt inside a NON-speculative optional "probed", though the optional
-//     enters its rules directly — a predicate there would have been skipped in silence.
+//     entered its rules directly — a predicate there would have been skipped in silence. ★ P69
+//     fold f26e: the optional no longer does — it routes the cursor TO the speculative alt, which
+//     probes its candidates where it stands (`GrammarSchema::nestedSpeculativeChoice`), so that
+//     alt is a cursor position and the predicate is honoured there: ACCEPTED below.
 // RED-ON-DISABLE: judge every speculative alt position again (drop the cursor filter) → the first
 // accepted shape is refused and the nested one loads; let a predicate name a shape whose FIRST set
 // is empty → the empty shape's cell is not refused for it.
@@ -9879,6 +9917,22 @@ TEST(GrammarSchema, AFollowerPredicateIsJudgedAtTheAltTheParserStandsAt) {
                        R"("speculative": true, "lookahead": 4 }] }, )" + run + " }");
         ASSERT_TRUE(ok.has_value()) << ok.error()[0].message;
     }
+    // ACCEPTED (P69 fold f26e): a speculative alt inside a NON-speculative optional, and inside a
+    // NON-speculative alt. The outer position routes the cursor TO the speculative alt, which probes
+    // `run` and `triple` where it stands; both were refused while the outer one entered `run`
+    // directly. RED-ON-DISABLE: drop the loader's closure over those routes → both are refused.
+    for (std::string const& nested :
+         {std::string{R"({ "root": { "sequence": ["list", "CKind"] }, )"
+                      R"("list": { "sequence": ["XKind", { "optional": { "alt": ["run", "triple"], )"
+                      R"("speculative": true, "lookahead": 4 } }] }, )"} + run + ", " + triple + " }",
+          std::string{R"({ "root": { "sequence": ["list", "CKind"] }, )"
+                      R"("list": { "alt": ["XKind", { "alt": ["run", "triple"], "speculative": true, )"
+                      R"("lookahead": 4 }] }, )"} + run + ", " + triple + " }"}) {
+        auto ok = load(nested);
+        ASSERT_TRUE(ok.has_value())
+            << "a speculative alt a non-speculative one routes the cursor to is a cursor position: "
+            << ok.error()[0].message;
+    }
     struct Bad { char const* why; std::string shapes; char const* needle; };
     Bad const bads[] = {
         // The SAME trailing repeat in the ROOT rule: a root position that skips could abandon a
@@ -9887,19 +9941,6 @@ TEST(GrammarSchema, AFollowerPredicateIsJudgedAtTheAltTheParserStandsAt) {
          R"({ "root": { "sequence": ["XKind", )" + loop + "] }, "
              + R"("run": { "sequence": ["AKind", "BKind"], "followedByFirstOf": "root" } })",
          "FALLBACK reading"},
-        // A speculative alt INSIDE a non-speculative optional: the optional is where the parser
-        // stands, and it enters `run` directly.
-        {"a speculative alt inside a NON-speculative optional",
-         R"({ "root": { "sequence": ["list", "CKind"] }, )"
-             R"("list": { "sequence": ["XKind", { "optional": { "alt": ["run", "triple"], )"
-             R"("speculative": true, "lookahead": 4 } }] }, )" + run + ", " + triple + " }",
-         "outside a speculative alt's candidate list"},
-        // …and inside a non-speculative alt.
-        {"a speculative alt inside a NON-speculative alt",
-         R"({ "root": { "sequence": ["list", "CKind"] }, )"
-             R"("list": { "alt": ["XKind", { "alt": ["run", "triple"], "speculative": true, )"
-             R"("lookahead": 4 }] }, )" + run + ", " + triple + " }",
-         "outside a speculative alt's candidate list"},
         // A shape with no FIRST set can never follow anything.
         {"a named shape that does not exist",
          R"({ "root": { "sequence": ["list", "CKind"] }, )"

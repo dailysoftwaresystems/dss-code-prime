@@ -19,6 +19,9 @@ add_library(core OBJECT
     types/scope_kind.cpp
     types/parse_diagnostic.cpp
     types/diagnostic_reporter.cpp
+    # The ONE home of a fresh SymbolId: its door types' emitters and the REPORTED
+    # door's settle check (P69 fold f26e, review-csf26d B1).
+    types/symbol_id_cursor.cpp
     # The ONE rendering of source text inside a diagnostic — one line, cut past the
     # configuration's limit (D-DIAG-A-DIAGNOSTIC-QUOTES-ITS-OPERAND-WHOLE).
     types/diagnostic_quote.cpp

@@ -62,12 +62,20 @@ constexpr std::string_view kLanguageConfigSuffix = ".lang.json";
                 // those rule-leaves belong to the enclosing sequence tail.
                 // Excluding it makes a peek that matches only the continuation
                 // yield candidates=[] so the parser's nullable skip fires and
-                // the tail parses non-speculatively. Gated to the walk ROOT so
-                // an ENCLOSING non-speculative optional still reaches those
-                // rules through its own (deeper) traversal — the non-
-                // speculative `altRuleBranches` route stays byte-identical.
+                // the tail parses non-speculatively. Gated to the walk ROOT: an
+                // enclosing SPECULATIVE choice probes those rules as its own; an
+                // enclosing NON-speculative one never reaches them, because it
+                // stops at the speculative choice itself (below).
                 if (posId == startPos && p.speculative() && p.hasSkipBranch()
                     && bid == p.skipBranch()) {
+                    continue;
+                }
+                // ★ P69 (lane `cs`, fold f26e): a nested SPECULATIVE choice under a
+                // NON-speculative root is not this root's to enumerate — the parser
+                // routes its cursor there and decides it in place
+                // (`detail::enumerationEnters`, `GrammarSchema::nestedSpeculativeChoice`).
+                if (bid < positions.size()
+                    && !detail::enumerationEnters(positions[startPos], positions[bid])) {
                     continue;
                 }
                 self(self, bid);
@@ -703,6 +711,38 @@ std::span<RuleId const> GrammarSchema::altRuleBranches(SchemaCursor cur) const n
     auto const* p = lookupPos(ruleRow(cur.rule().v), cur);
     if (p == nullptr) return {};
     return p->altBranchRules();
+}
+
+SchemaCursor GrammarSchema::nestedSpeculativeChoice(SchemaCursor cur,
+                                                    SchemaTokenId tok) const noexcept {
+    auto const* r = ruleRow(cur.rule().v);
+    auto const* root = lookupPos(r, cur);
+    if (root == nullptr || root->slotKind() != SlotKind::AltChoice || root->speculative()) {
+        return SchemaCursor{};
+    }
+    auto const& positions = r->positions;
+    // Each step goes one AltChoice deeper along the branch `tok` selects. The position graph
+    // has no AltChoice-to-AltChoice cycle that consumes nothing (`advance` walks the same
+    // edges unbounded); the bound only keeps a malformed graph from looping.
+    detail::Position const* at = root;
+    for (std::size_t steps = 0; steps < positions.size(); ++steps) {
+        std::uint32_t next = 0;
+        bool found = false;
+        for (auto const bid : at->branches()) {
+            if (bid < positions.size()
+                && detail::tokenBitsContain(positions[bid].expectedBits(), tok.v)) {
+                next  = bid;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return SchemaCursor{};
+        detail::Position const& q = positions[next];
+        if (q.slotKind() != SlotKind::AltChoice) return SchemaCursor{};
+        if (!detail::enumerationEnters(*root, q)) return SchemaCursor{cur.rule(), next};
+        at = &q;
+    }
+    return SchemaCursor{};
 }
 
 SchemaCursor GrammarSchema::advance(SchemaCursor cur, SchemaTokenId tok) const noexcept {

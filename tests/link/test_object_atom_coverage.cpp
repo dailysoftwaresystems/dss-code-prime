@@ -111,6 +111,18 @@ struct Loaded {
     return sink;
 }
 
+// A record table a test reads, OPENED as a reader opens one (P69 f26e, B1); never refused here.
+[[nodiscard]] dss::link::format::RecordSymbolIds openRecordIds(std::size_t records) {
+    return dss::link::format::RecordSymbolIds::open(records, recordIdsSink(), "test::reader").value();
+}
+
+// What `referenceFor` answers for a record, its fresh id never refused here (test_fresh_symbol_ids.cpp pins the
+// refusals): the reference, or nullopt where the record keeps no name.
+template <class Refs>
+[[nodiscard]] auto referenceOf(Refs& refs, std::uint32_t record, dss::link::format::RecordSymbolIds& ids) {
+    return refs.referenceFor(record, ids).value();
+}
+
 [[nodiscard]] bool sawCode(DiagnosticReporter const& rep, DiagnosticCode code) {
     for (auto const& d : rep.all()) if (d.code == code) return true;
     return false;
@@ -265,7 +277,7 @@ std::vector<std::uint8_t> encodeElf(AssembledModule const& m, TargetSchema const
 }
 std::vector<std::uint8_t> encodePe(AssembledModule const& m, TargetSchema const& t,
                                    ObjectFormatSchema const& f, DiagnosticReporter& r) {
-    return pe::encode(m, t, f, r);
+    return pe::encode(m, t, f, r).value_or(std::vector<std::uint8_t>{});
 }
 std::vector<std::uint8_t> encodeMacho(AssembledModule const& m, TargetSchema const& t,
                                       ObjectFormatSchema const& f, DiagnosticReporter& r) {
@@ -419,7 +431,7 @@ TEST(ObjectAtomCoverage, CoffLocalFunctionIsItsOwnAtomWithInternalLinkage) {
 
     DiagnosticReporter wrep;
     auto obj = pe::encode(subjectModule(/*withLocalHelper=*/true), *loaded.target,
-                          *loaded.format, wrep);
+                          *loaded.format, wrep).value();
     ASSERT_EQ(wrep.errorCount(), 0u) << "the WRITER accepts this module -- the "
                                         "object is well formed; the reader was "
                                         "the half that could not represent it";
@@ -1227,11 +1239,11 @@ TEST(ObjectAtomCoverage, AReferenceThroughAWeakNameFollowsTheNameWhateverElseNam
         std::vector<std::uint32_t> owner;
         DiagnosticReporter         rep;
         ASSERT_TRUE(resolveEqualOffsetAtomAliases(c, owner, "test::reader", rep));
-        RecordSymbolIds    ids{100, recordIdsSink(), "test::reader"};
+        RecordSymbolIds    ids = openRecordIds(100);
         WeakNameReferences refs;
         refs.decideFrom(c, owner, ids);
         for (auto const& n : names) {
-            EXPECT_EQ(refs.referenceFor(n.record, ids).has_value(), n.kept) << "'" << n.name << "'";
+            EXPECT_EQ(referenceOf(refs, n.record, ids).has_value(), n.kept) << "'" << n.name << "'";
         }
 
         // THE ROWS SAY SO (`ModuleSymbol::referencedByName`). Filed as a reader
@@ -1262,21 +1274,21 @@ TEST(ObjectAtomCoverage, AReferenceThroughAWeakNameFollowsTheNameWhateverElseNam
         std::vector<std::uint32_t> owner;
         DiagnosticReporter         rep;
         ASSERT_TRUE(resolveEqualOffsetAtomAliases(c, owner, "test::reader", rep));
-        RecordSymbolIds    ids{100, recordIdsSink(), "test::reader"};
+        RecordSymbolIds    ids = openRecordIds(100);
         WeakNameReferences refs;
         refs.decideFrom(c, owner, ids);
-        EXPECT_FALSE(refs.referenceFor(1, ids).has_value());
-        EXPECT_FALSE(refs.referenceFor(2, ids).has_value());
+        EXPECT_FALSE(referenceOf(refs, 1, ids).has_value());
+        EXPECT_FALSE(referenceOf(refs, 2, ids).has_value());
     }
 
     // An object with no symbol at all: nothing kept, and nothing to state.
     {
-        RecordSymbolIds           ids{0, recordIdsSink(), "test::reader"};
+        RecordSymbolIds           ids = openRecordIds(0);
         WeakNameReferences        refs;
         std::vector<ModuleSymbol> rows;
         refs.decideFrom({}, {}, ids);
         refs.stateOn(rows);
-        EXPECT_FALSE(refs.referenceFor(0, ids).has_value());
+        EXPECT_FALSE(referenceOf(refs, 0, ids).has_value());
         EXPECT_TRUE(rows.empty());
     }
 }
@@ -1301,7 +1313,7 @@ TEST(ObjectAtomCoverage, AKeptWeakNameGetsOneReferenceRowUnderAnIdNoBodyHolds) {
 
     // A table of 100 records, none of these the first: each one's id is its
     // index, and the ids no record holds start at 101 (`RecordSymbolIds`).
-    RecordSymbolIds    ids{100, recordIdsSink(), "test::reader"};
+    RecordSymbolIds    ids = openRecordIds(100);
     WeakNameReferences refs;
     refs.decideFrom(c, owner, ids);
     // The next id `ids` would hand out, read off a copy so the counter stays put.
@@ -1309,18 +1321,18 @@ TEST(ObjectAtomCoverage, AKeptWeakNameGetsOneReferenceRowUnderAnIdNoBodyHolds) {
         RecordSymbolIds peek = ids;
         return peek.fresh();
     };
-    EXPECT_FALSE(refs.referenceFor(5, ids).has_value()) << "a strong name keeps the alias remap";
-    EXPECT_FALSE(refs.referenceFor(44, ids).has_value()) << "a symbol that starts no atom";
+    EXPECT_FALSE(referenceOf(refs, 5, ids).has_value()) << "a strong name keeps the alias remap";
+    EXPECT_FALSE(referenceOf(refs, 44, ids).has_value()) << "a symbol that starts no atom";
 
     // A weak name the alias rule took the atom FROM: its own id is free, so the
     // row takes it, and the counter of fresh ids does not move.
-    auto const shared = refs.referenceFor(9, ids);
+    auto const shared = referenceOf(refs, 9, ids);
     ASSERT_TRUE(shared.has_value());
     EXPECT_EQ(shared->id, SymbolId{9});
     EXPECT_TRUE(shared->fresh) << "the first relocation through the name states the row";
     EXPECT_EQ(shared->name, "shared");
     EXPECT_EQ(shared->atom, SymbolId{5});
-    auto const sharedAgain = refs.referenceFor(9, ids);
+    auto const sharedAgain = referenceOf(refs, 9, ids);
     ASSERT_TRUE(sharedAgain.has_value());
     EXPECT_FALSE(sharedAgain->fresh) << "ONE row per name, however many relocations name it";
     EXPECT_EQ(sharedAgain->id, SymbolId{9});
@@ -1328,16 +1340,16 @@ TEST(ObjectAtomCoverage, AKeptWeakNameGetsOneReferenceRowUnderAnIdNoBodyHolds) {
 
     // A weak name that OWNS the atom: its id IS the body's, so the row takes
     // the next id no symbol holds. The other weak name of that body keeps its own.
-    auto const w1 = refs.referenceFor(2, ids);
+    auto const w1 = referenceOf(refs, 2, ids);
     ASSERT_TRUE(w1.has_value());
     EXPECT_EQ(w1->id, SymbolId{101});
     EXPECT_EQ(w1->atom, SymbolId{2});
     EXPECT_EQ(nextFresh(), SymbolId{102});
-    auto const w1Again = refs.referenceFor(2, ids);
+    auto const w1Again = referenceOf(refs, 2, ids);
     ASSERT_TRUE(w1Again.has_value());
     EXPECT_EQ(w1Again->id, SymbolId{101});
     EXPECT_EQ(nextFresh(), SymbolId{102}) << "the fresh id is minted once";
-    auto const w2 = refs.referenceFor(3, ids);
+    auto const w2 = referenceOf(refs, 3, ids);
     ASSERT_TRUE(w2.has_value());
     EXPECT_EQ(w2->id, SymbolId{3});
     EXPECT_EQ(w2->atom, SymbolId{2});
@@ -1348,14 +1360,14 @@ TEST(ObjectAtomCoverage, AKeptWeakNameGetsOneReferenceRowUnderAnIdNoBodyHolds) {
     // -- so a relocation the object wrote through the section, or through a
     // static name of that body, can name the BYTES apart from the name (P69
     // fold 2: until then such a name stated no row, and nothing could).
-    auto const lone = refs.referenceFor(7, ids);
+    auto const lone = referenceOf(refs, 7, ids);
     ASSERT_TRUE(lone.has_value());
     EXPECT_TRUE(lone->fresh);
     EXPECT_EQ(lone->id, SymbolId{102});
     EXPECT_EQ(lone->atom, SymbolId{7});
     EXPECT_EQ(lone->name, "lone");
     EXPECT_EQ(nextFresh(), SymbolId{103});
-    auto const loneAgain = refs.referenceFor(7, ids);
+    auto const loneAgain = referenceOf(refs, 7, ids);
     ASSERT_TRUE(loneAgain.has_value());
     EXPECT_FALSE(loneAgain->fresh) << "ONE row per name";
     EXPECT_EQ(loneAgain->id, SymbolId{102});
@@ -1433,7 +1445,7 @@ TEST(ObjectAtomCoverage, EveryReadModuleCarriesItsRecordTablesEnd) {
 TEST(ObjectAtomCoverage, ARecordsIdIsItsIndexAndRecordZeroTakesTheFirstIdPastTheTable) {
     using dss::link::format::RecordSymbolIds;
 
-    RecordSymbolIds ids{7, recordIdsSink(), "test::reader"};
+    RecordSymbolIds ids = openRecordIds(7);
     EXPECT_EQ(ids.of(0), SymbolId{7}) << "record 0's index is the INVALID id: it takes the record count";
     std::vector<std::uint32_t> seen;
     for (std::uint32_t i = 0; i < 7; ++i) {
@@ -1444,7 +1456,7 @@ TEST(ObjectAtomCoverage, ARecordsIdIsItsIndexAndRecordZeroTakesTheFirstIdPastThe
     }
     // The ids no record holds come after every record's, from one counter.
     for (std::uint32_t expected : {8u, 9u, 10u}) {
-        SymbolId const fresh = ids.fresh();
+        SymbolId const fresh = ids.fresh().value();
         EXPECT_EQ(fresh, SymbolId{expected});
         EXPECT_EQ(std::count(seen.begin(), seen.end(), fresh.v), 0) << "a fresh id is no record's";
     }
@@ -1452,11 +1464,11 @@ TEST(ObjectAtomCoverage, ARecordsIdIsItsIndexAndRecordZeroTakesTheFirstIdPastThe
 
     // The smallest tables: one record, and none (an object with no symbol can
     // still be given rows, and their ids must be valid).
-    RecordSymbolIds one{1, recordIdsSink(), "test::reader"};
+    RecordSymbolIds one = openRecordIds(1);
     EXPECT_EQ(one.of(0), SymbolId{1});
     EXPECT_EQ(one.fresh(), SymbolId{2});
-    RecordSymbolIds none{0, recordIdsSink(), "test::reader"};
-    EXPECT_TRUE(none.fresh().valid());
+    RecordSymbolIds none = openRecordIds(0);
+    EXPECT_TRUE(none.fresh().has_value());
 }
 
 TEST(ObjectAtomCoverage, AWeakNameBesideOrAtRecordZeroIsStatedInIdsNotInRecordIndices) {
@@ -1478,11 +1490,11 @@ TEST(ObjectAtomCoverage, AWeakNameBesideOrAtRecordZeroIsStatedInIdsNotInRecordIn
         DiagnosticReporter         rep;
         ASSERT_TRUE(resolveEqualOffsetAtomAliases(c, owner, "test::reader", rep));
         ASSERT_EQ(owner, (std::vector<std::uint32_t>{0u, 0u}));
-        RecordSymbolIds    ids{6, recordIdsSink(), "test::reader"};
+        RecordSymbolIds    ids = openRecordIds(6);
         WeakNameReferences refs;
         refs.decideFrom(c, owner, ids);
-        EXPECT_FALSE(refs.referenceFor(0, ids).has_value()) << "the strong name at record 0 keeps the alias remap";
-        auto const ref = refs.referenceFor(4, ids);
+        EXPECT_FALSE(referenceOf(refs, 0, ids).has_value()) << "the strong name at record 0 keeps the alias remap";
+        auto const ref = referenceOf(refs, 4, ids);
         ASSERT_TRUE(ref.has_value());
         EXPECT_EQ(ref->id, SymbolId{4});
         EXPECT_EQ(ref->atom, SymbolId{6}) << "the body is record 0's: its ID, never its index";
@@ -1508,10 +1520,10 @@ TEST(ObjectAtomCoverage, AWeakNameBesideOrAtRecordZeroIsStatedInIdsNotInRecordIn
         DiagnosticReporter         rep;
         ASSERT_TRUE(resolveEqualOffsetAtomAliases(c, owner, "test::reader", rep));
         ASSERT_EQ(owner, (std::vector<std::uint32_t>{3u, 3u}));
-        RecordSymbolIds    ids{6, recordIdsSink(), "test::reader"};
+        RecordSymbolIds    ids = openRecordIds(6);
         WeakNameReferences refs;
         refs.decideFrom(c, owner, ids);
-        auto const ref = refs.referenceFor(0, ids);
+        auto const ref = referenceOf(refs, 0, ids);
         ASSERT_TRUE(ref.has_value());
         EXPECT_EQ(ref->id, SymbolId{6}) << "record 0's own id";
         EXPECT_TRUE(ref->id.valid()) << "a row under the invalid id names nothing";
@@ -1535,14 +1547,14 @@ TEST(ObjectAtomCoverage, AWeakNameBesideOrAtRecordZeroIsStatedInIdsNotInRecordIn
         DiagnosticReporter         rep;
         ASSERT_TRUE(resolveEqualOffsetAtomAliases(c, owner, "test::reader", rep));
         ASSERT_EQ(owner, (std::vector<std::uint32_t>{0u, 0u}));
-        RecordSymbolIds    ids{6, recordIdsSink(), "test::reader"};
+        RecordSymbolIds    ids = openRecordIds(6);
         WeakNameReferences refs;
         refs.decideFrom(c, owner, ids);
-        auto const w0 = refs.referenceFor(0, ids);
+        auto const w0 = referenceOf(refs, 0, ids);
         ASSERT_TRUE(w0.has_value());
         EXPECT_EQ(w0->id, SymbolId{7}) << "the owner's id is the body's: its row takes a fresh one";
         EXPECT_EQ(w0->atom, SymbolId{6});
-        auto const w2 = refs.referenceFor(2, ids);
+        auto const w2 = referenceOf(refs, 2, ids);
         ASSERT_TRUE(w2.has_value());
         EXPECT_EQ(w2->id, SymbolId{2});
         EXPECT_EQ(w2->atom, SymbolId{6});

@@ -99,18 +99,6 @@
 
 namespace dss {
 
-void copyDiagnostics(DiagnosticReporter const& src,
-                     DiagnosticReporter&       dst) {
-    // The retained source buffers move WITH the diagnostics — same rule, same
-    // reason, as `mergeWithTargetContext`: a diagnostic naming a buffer only
-    // `src` holds renders `--> <unknown-buffer:N>` at `dst`. Any tier that
-    // parses text the compilation units do not own (an embedded assembly
-    // template today) registers its fragment buffer on the reporter it was
-    // handed, so every reporter→reporter copy owes the pairing.
-    dst.sourceBuffers().addAll(src.sourceBuffers());
-    for (auto const& d : src.all()) dst.report(d);
-}
-
 namespace {
 
 // Snapshot-vs-current `errorCount` gate. Each tier shares `reporter`,
@@ -1126,8 +1114,8 @@ static std::optional<CuHirModule> buildCuHirImpl(
     //    error (e.g. S_UndeclaredIdentifier) silently aborts the
     //    pipeline with no diagnostic surfacing. (code-reviewer F1
     //    fold + post-fold-1 architect: routed through the hoisted
-    //    `copyDiagnostics` helper to eliminate the inline-drain
-    //    duplicate.)
+    //    relay -- now `DiagnosticReporter::relayFrom`, the ONE relay,
+    //    which also carries what the model's gates dropped (D9(c)).)
     auto const semEntry = reporter.errorCount();
     // c97: sequential per-phase scoping via optional emplace — emplace
     // destroys the prior Scope (closing its accumulation window) BEFORE
@@ -1152,7 +1140,7 @@ static std::optional<CuHirModule> buildCuHirImpl(
         target.callingConvention(callingConventionIndex));
     phase.reset();
     SemanticModel& model = analysis.model;
-    copyDiagnostics(model.diagnostics(), reporter);
+    reporter.relayFrom(model.diagnostics());
     if (model.hasErrors() || !tierClean(reporter, semEntry)) {
         return std::nullopt;
     }
@@ -2261,6 +2249,13 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     if (commons.states && !stateTentativeDefinitionsAsCommons(mir, assembled, commons, reporter)) {
         return std::nullopt;
     }
+
+    // ★ THE COMPILED MODULE CARRIES ITS ID SPACE'S END (P69 f26e, B1 A7): MIR→LIR's continuation began at the MIR
+    // module's end (past its name table, every symbol it defines and every id minted for it) and ended past every
+    // id the lowering minted beyond it; the assembled module carries that end, so a link-tier door opened on it
+    // (`linker::ModuleSymbolIds`) continues the space and never hands out an id of the table the module does not
+    // hold.
+    assembled.symbolIdEnd.keepClearOf(lir.symbolIdEnd);
 
     // Assembly complete — return the per-CU module; linking + writing is the shared
     // `linkAndWrite` phase below, so N CUs can each assemble before one merged link.
@@ -4466,7 +4461,7 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
         auto const probed = readArchiveMemberModule(memberBytes, target, format, memberFormat,
                                                     archivePaths[ai], member.name, probeReporter);
         if (!probed) {
-            for (auto const& d : probeReporter.all()) reporter.report(d);
+            reporter.relayFrom(probeReporter);
             ParseDiagnostic d;
             d.code     = DiagnosticCode::K_NoMatchingObjectFormat;
             d.severity = DiagnosticSeverity::Error;
@@ -6182,7 +6177,7 @@ bool runThinLtoImportStage(std::span<CuMirModule>     cuMirs,
         substrate::namingSilentUnits(
             reporter, "the thin-LTO import install", [](std::size_t i) { return "module #" + std::to_string(i); },
             [&](std::size_t i) {
-                copyDiagnostics(scratch[i], reporter);
+                reporter.relayFrom(scratch[i]);
                 // The import fixpoint's bound is an INVARIANT, never a truncation (`importBoundReached`, beside the
                 // stage rule): a unit that reached it fails the stage, whatever its report became.
                 if (importBoundReached(i, outcomes[i].demandLeftAtBound, reporter)) return false;

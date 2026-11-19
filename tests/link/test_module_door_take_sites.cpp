@@ -18,7 +18,7 @@
 // LK10EntrySliceC.SymbolIdSpaceExhaustionFailsLoud (tests/link/test_lk10_entry_slice_c.cpp), which pins too that
 // the refusal says no K_SymbolUndefined.
 //
-// THE MERGE'S NUMBERING (`NewSpaceSymbolIds`, "linker: the merged module") is the one row the table does not drive:
+// THE MERGE'S NUMBERING (`ReportedSymbolIds`, "linker: the merged module") is the one row the table does not drive:
 // its space starts at 1, and crossing its edge needs 2^32 - 2 merged symbols, one row each -- hundreds of GiB of
 // input (MEASURED by reading: no fixture can hold it, and a start the test could set would be a parameter of the
 // public link no real caller passes, which main refused as a test hook). Its door is pinned by
@@ -243,9 +243,10 @@ void driveResidue(std::uint32_t room, Drive& out) {
     m.imageEntryOverride = std::size_t{0};   // a writer pin: the image's entry is the module's function
     atRoom(m, room);
     out.heldBefore = test::digestOf(m);
+    // `nullopt` is the walker's refusal (fold f26e, B1): no image is returned.
     auto const image = pe::encode(m, *s.target, *s.format, out.rep, kRequest);
-    out.succeeded  = !image.empty();
-    out.returned   = !image.empty();
+    out.succeeded  = image.has_value() && !image->empty();
+    out.returned   = image.has_value() && !image->empty();
     out.heldAfter  = test::digestOf(m);
 }
 

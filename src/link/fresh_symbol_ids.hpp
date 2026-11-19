@@ -12,9 +12,12 @@
 #include <string_view>
 #include <vector>
 
-// ★★ THE LINK TIER'S DOORS OF A FRESH SymbolId (P69, lane `cs`, fold f26d -- review-csf26c2 N9). Every id a link-tier
-// pass mints comes through one of the two doors below, and each takes it from the one rule of a fresh id
-// (core/types/symbol_id_cursor.hpp): no link-tier source adds to an id (tests/core/test_symbol_id_mints_guard.cpp).
+// ★★ THE LINK TIER'S DOORS OF A FRESH SymbolId (P69, lane `cs`, fold f26d -- review-csf26c2 N9; f26e -- B1). Every id
+// a link-tier pass mints comes through a door of the one home of a fresh id (core/types/symbol_id_cursor.hpp): a pass
+// on a module through `ModuleSymbolIds` below (the home's OPTIONAL door over the module's end), the link merge's new
+// numbering through the home's REPORTED door (`ReportedSymbolIds`, linker.cpp), an object reader's table through
+// `RecordSymbolIds` (link/format/record_symbol_ids.hpp). No link-tier source adds to an id
+// (tests/core/test_symbol_id_mints_guard.cpp), and every refusal is the home's one sentence under K_.
 //
 // ★ AN ASSEMBLED MODULE IS A COUNTING SPACE, AND IT CARRIES ITS END (`AssembledModule::symbolIdEnd`), GROW-ONLY.
 // A pass that mints on a module -- the entry trampoline, the branch veneers, the import-slot materializations, the
@@ -151,12 +154,9 @@ inline constexpr ModuleSymbolIdHolder kModuleSymbolIdHolders[] = {
     return highest;
 }
 
-// The refusal of an exhausted id space, by name: `who` names the space and what was being minted.
-inline void reportSymbolIdSpaceExhausted(DiagnosticReporter& reporter, std::string_view who, std::uint32_t end) {
-    report(reporter, DiagnosticCode::K_SymbolIdSpaceExhausted, DiagnosticSeverity::Error,
-           std::format("{}: the SymbolId space is exhausted (its end is {}) -- no fresh symbol can be minted, and a "
-                       "wrapped id would be 0, the invalid id, or one a symbol already holds",
-                       who, end));
+// Where the link tier's doors state a refusal: the reporter, under K_ (the home's one emitter writes the sentence).
+[[nodiscard]] inline SymbolIdRefusalSink linkRefusalSink(DiagnosticReporter& reporter) noexcept {
+    return SymbolIdRefusalSink{&reporter, DiagnosticCode::K_SymbolIdSpaceExhausted};
 }
 
 // THE MODULE DOOR. Opened ON a module: the module's carried end is raised past every id its holders hold (the end is
@@ -176,32 +176,17 @@ public:
     ModuleSymbolIds(ModuleSymbolIds const&)            = delete;
     ModuleSymbolIds& operator=(ModuleSymbolIds const&) = delete;
 
-    // The module's next id; or, the space exhausted, nullopt -- the refusal REPORTED here, naming `who`.
+    // The module's next id; or, the space exhausted, nullopt -- the refusal REPORTED by the home's OPTIONAL door,
+    // naming `who`, and nothing written.
     [[nodiscard]] std::optional<SymbolId> take(DiagnosticReporter& reporter, std::string_view who) {
-        SymbolIdEnd trial = end_;
-        SymbolId const id = trial.take();
-        if (!id.valid()) { reportSymbolIdSpaceExhausted(reporter, who, trial.value()); return std::nullopt; }
-        end_ = trial;
-        return id;
+        return OptionalSymbolIds{end_, linkRefusalSink(reporter)}.take(who);
     }
 
     // The module's next `count` ids, ALL OR NONE: the space too short for every one of them, nullopt -- the refusal
-    // REPORTED here, once, naming `who`, and nothing written.
+    // REPORTED once, naming `who`, and nothing written.
     [[nodiscard]] std::optional<std::vector<SymbolId>> take(std::size_t count, DiagnosticReporter& reporter,
                                                             std::string_view who) {
-        SymbolIdEnd trial = end_;
-        std::vector<SymbolId> ids;
-        ids.reserve(count);
-        while (ids.size() < count) {
-            SymbolId const id = trial.take();
-            if (!id.valid()) {
-                reportSymbolIdSpaceExhausted(reporter, who, trial.value());
-                return std::nullopt;
-            }
-            ids.push_back(id);
-        }
-        end_ = trial;
-        return ids;
+        return OptionalSymbolIds{end_, linkRefusalSink(reporter)}.take(count, who);
     }
 
 private:
@@ -209,32 +194,10 @@ private:
 };
 
 // THE DOOR OF A NEW SPACE WHOSE IDS PASS THROUGH MANY HANDS BEFORE THEY REACH A MODULE -- the link merge's numbering
-// of the merged module. Its OWNER refuses its whole output once it is exhausted: the take reports the refusal here,
-// once, by name, and hands out the invalid id from then on, which no output of the owner carries (the merge's caller
-// refuses a merge that reported an error). The space starts at `start` -- the merge's, past nothing (1). The merged
-// module carries no end of it: every id the merge handed out that anything names is held by the merged module (its
-// one output), so the module's scan is that end, and a door opened on it continues the space.
-class NewSpaceSymbolIds {
-public:
-    NewSpaceSymbolIds(SymbolIdEnd start, DiagnosticReporter& reporter, std::string_view who) noexcept
-        : reporter_(&reporter), who_(who), end_(start) {}
-
-    [[nodiscard]] SymbolId take() {
-        if (refused_) return SymbolId{};
-        SymbolId const id = end_.take();
-        if (!id.valid()) {
-            refused_ = true;
-            reportSymbolIdSpaceExhausted(*reporter_, who_, end_.value());
-        }
-        return id;
-    }
-    [[nodiscard]] bool refused() const noexcept { return refused_; }
-
-private:
-    DiagnosticReporter* reporter_;
-    std::string_view    who_;
-    SymbolIdEnd         end_;
-    bool                refused_ = false;
-};
+// of the merged module -- is the home's REPORTED door (`ReportedSymbolIds`): the refusal reported once, by name, the
+// invalid id from then on, and the merged module leaves `mergeModules` ONLY through the door's `seal` (nullopt once
+// refused) or `withhold` (P69 f26e, B1). The merged module carries no end of the space: every id the merge handed out
+// that anything names is held by the merged module (its one output), so the module's scan is that end, and a door
+// opened on it continues the space.
 
 }  // namespace dss::linker

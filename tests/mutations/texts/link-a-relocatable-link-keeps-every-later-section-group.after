@@ -1,1 +1,1 @@
-        if (objectFormatSchema.isImageFlavor() && !discardLaterSectionGroups(judged, stated, objectFormatSchema, groupBoundStorage, reporter)) {
+        switch (!objectFormatSchema.isImageFlavor() ? LinkPassOutcome::Unchanged : discardLaterSectionGroups(judged, stated, objectFormatSchema, groupBoundStorage, reporter)) {

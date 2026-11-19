@@ -14,10 +14,18 @@
 //   (a) a member call `take(` -- through `.` or `->` -- of two arguments or more: the module door's
 //       `take(reporter, who)` and `take(count, reporter, who)`. Its label is the first string literal of its LAST
 //       argument (adjacent literals joined; a `std::format` string as spelled, its holes `{}`). A `take()` of no
-//       argument is a space's own step (`SymbolIdEnd::take`, `NewSpaceSymbolIds::take`), which names nobody;
-//   (b) the construction of a new space's door -- `NewSpaceSymbolIds name{...}`, `NewSpaceSymbolIds{...}`, or either
-//       with parentheses -- whose every take answers to the label its last argument states. The class's own body
-//       (its constructor and copy operations) states no site, and neither does a use of the name as a type.
+//       argument is a space's own step (`ReportedSymbolIds::take`), which names nobody;
+//   (b) the construction of a new space's door -- `ReportedSymbolIds name{...}`, `ReportedSymbolIds{...}`, or either
+//       with parentheses -- whose every take answers to the label its last argument states. A use of the name as a
+//       type states no site, and neither does a member's own name (the destructor's, an out-of-line constructor's).
+// ★ A DOOR'S OWN CODE STATES NO SITE (P69, lane `cs`, fold f26e). A DOOR is a class whose body declares a member
+// `take` -- the module door `ModuleSymbolIds`, the home's doors of core/types/symbol_id_cursor.hpp -- and the new
+// space's door by its name. Its code -- its class body, and each member defined out of line (`Door::member(...) {...}`,
+// a constructor's initializer list with it) -- is where a door hands its CALLER's label on to the next door
+// (`ModuleSymbolIds::take(count, reporter, who)` asks `OptionalSymbolIds::take(count, who)`), never a site. The doors
+// are read from every source of src/ before any site is judged, so a door a header declares covers its members a .cpp
+// defines. A class that only CALLS `take` is no door, and a call of a door's static member (`IndexSymbolIds::fits(n)`)
+// is no definition.
 // SCOPE: every *.cpp and *.hpp under src/, its CODE only (`codeOnly` blanks comments and literals and keeps every
 // offset), the label read from the raw text at the same offsets.
 // NOT JUDGED HERE: that a pass needing several ids on its caller's module takes them at once. The table's drive
@@ -161,15 +169,154 @@ struct Arguments {
     return Site{file, lineAt(code, word), firstLiteral(raw, a.lastBegin, close), oneLine(raw, word, close + 1)};
 }
 
-constexpr std::string_view kNewSpace = "NewSpaceSymbolIds";
+constexpr std::string_view kNewSpace = "ReportedSymbolIds";
 
-// Every take site one source states, in source order.
-[[nodiscard]] std::vector<Site> sitesIn(std::string const& file, std::string const& raw) {
-    std::string const code = dss::test::codeOnly(raw);
-    std::vector<std::pair<std::size_t, Site>> found;
-    // (a) `.take(` / `->take(` of two arguments or more.
-    for (std::size_t q = code.find("take"); q != std::string::npos; q = code.find("take", q + 1)) {
+// A span of a source's code, both ends included.
+struct Span {
+    std::size_t begin = 0;
+    std::size_t end   = 0;
+};
+
+[[nodiscard]] bool inAny(std::vector<Span> const& spans, std::size_t at) {
+    return std::ranges::any_of(spans, [&](Span const& s) { return at >= s.begin && at <= s.end; });
+}
+
+// Every class body a source's code opens -- `class|struct NAME [final] [: bases] {` -- with its name. A forward
+// declaration, an elaborated type, a `friend class` and a template parameter (`template <class Out>`) open none.
+[[nodiscard]] std::vector<std::pair<std::string, Span>> classBodiesIn(std::string const& code) {
+    std::vector<std::pair<std::string, Span>> out;
+    for (std::string_view const key : {std::string_view{"class"}, std::string_view{"struct"}}) {
+        for (std::size_t q = code.find(key); q != std::string::npos; q = code.find(key, q + 1)) {
+            if (!wordAt(code, q, key)) continue;
+            std::size_t const name    = skipSpace(code, q + key.size());
+            std::size_t const nameEnd = dss::test::identEnd(code, name);
+            if (nameEnd == name) continue;
+            std::size_t k = skipSpace(code, nameEnd);
+            if (wordAt(code, k, "final")) k = skipSpace(code, k + 5);
+            if (k < code.size() && code[k] == ':' && code.compare(k, 2, "::") != 0)
+                k = code.find_first_of("{;()", k);   // a base clause holds no `(`, `)` or `;`
+            if (k >= code.size() || code[k] != '{') continue;
+            std::size_t const close = closingOf(code, k);
+            if (close == std::string::npos) continue;
+            out.emplace_back(code.substr(name, nameEnd - name), Span{k, close});
+        }
+    }
+    return out;
+}
+
+// Whether a class body declares a member `take`: the word `take` before a `(`, and no member call (`.take(`,
+// `->take(`).
+[[nodiscard]] bool declaresTake(std::string const& code, Span const& body) {
+    for (std::size_t q = code.find("take", body.begin); q != std::string::npos && q < body.end;
+         q = code.find("take", q + 1)) {
         if (!wordAt(code, q, "take")) continue;
+        std::size_t b = q;
+        while (b > body.begin && isSpace(code[b - 1])) --b;
+        if (code[b - 1] == '.' || code.compare(b - 2, 2, "->") == 0) continue;
+        std::size_t const open = skipSpace(code, q + 4);
+        if (open < code.size() && code[open] == '(') return true;
+    }
+    return false;
+}
+
+// The DOORS a source declares: each class whose body declares a member `take`, and the new space's door by its name.
+[[nodiscard]] std::set<std::string> doorsIn(std::string const& raw) {
+    std::string const     code = dss::test::codeOnly(raw);
+    std::set<std::string> out{std::string{kNewSpace}};
+    for (auto const& [name, body] : classBodiesIn(code))
+        if (declaresTake(code, body)) out.insert(name);
+    return out;
+}
+
+// After a parameter list closing at `close`: the index of the definition's body -- its `{` -- or npos when what
+// follows is no body (a call, a declaration, `= default`). It reads past the qualifiers a definition carries
+// (`const`, `noexcept[(...)]`, `override`, `final`), a trailing return type, and a constructor's initializer list
+// (`: name{...}, Base<T>(...) {`).
+[[nodiscard]] std::size_t bodyAfter(std::string const& code, std::size_t close) {
+    constexpr std::string_view kQualifiers[] = {"const", "noexcept", "override", "final", "volatile"};
+    std::size_t k = skipSpace(code, close + 1);
+    while (k < code.size() && code[k] != '{') {
+        if (code.compare(k, 2, "->") == 0) {
+            k = code.find_first_of("{;", k + 2);
+            if (k == std::string::npos || code[k] == ';') return std::string::npos;
+            break;
+        }
+        if (code[k] == ':' && code.compare(k, 2, "::") != 0) {
+            k = skipSpace(code, k + 1);
+            for (;;) {   // each initializer: a name (qualified, templated), then its ( ) or { }
+                std::size_t j     = k;
+                int         angle = 0;
+                while (j < code.size()) {
+                    char const c = code[j];
+                    if (c == '<') ++angle;
+                    else if (c == '>') --angle;
+                    else if (angle == 0 && !isWordChar(c) && c != ':') break;
+                    if (angle < 0) return std::string::npos;
+                    ++j;
+                }
+                if (j == k) return std::string::npos;
+                j = skipSpace(code, j);
+                if (j >= code.size() || (code[j] != '(' && code[j] != '{')) return std::string::npos;
+                std::size_t const init = closingOf(code, j);
+                if (init == std::string::npos) return std::string::npos;
+                k = skipSpace(code, init + 1);
+                if (k < code.size() && code[k] == ',') {
+                    k = skipSpace(code, k + 1);
+                    continue;
+                }
+                return k < code.size() && code[k] == '{' ? k : std::string::npos;
+            }
+        }
+        std::size_t const end = dss::test::identEnd(code, k);
+        std::string_view const word{code.data() + k, end - k};
+        if (end == k || std::ranges::find(kQualifiers, word) == std::end(kQualifiers)) return std::string::npos;
+        k = skipSpace(code, end);
+        if (word == "noexcept" && k < code.size() && code[k] == '(') {
+            std::size_t const c = closingOf(code, k);
+            if (c == std::string::npos) return std::string::npos;
+            k = skipSpace(code, c + 1);
+        }
+    }
+    return k < code.size() && code[k] == '{' ? k : std::string::npos;
+}
+
+// The spans of a source's code that are a DOOR's own: each door's class body, and each member of a door defined out
+// of line, from its qualified name to its body's end.
+[[nodiscard]] std::vector<Span> doorCodeIn(std::string const& code, std::set<std::string> const& doors) {
+    std::vector<Span> out;
+    for (auto const& [name, body] : classBodiesIn(code))
+        if (doors.contains(name)) out.push_back(body);
+    for (std::string const& door : doors) {
+        for (std::size_t q = code.find(door); q != std::string::npos; q = code.find(door, q + 1)) {
+            if (!wordAt(code, q, door)) continue;
+            std::size_t k = skipSpace(code, q + door.size());
+            if (code.compare(k, 2, "::") != 0) continue;
+            k = skipSpace(code, k + 2);
+            if (k < code.size() && code[k] == '~') k = skipSpace(code, k + 1);
+            std::size_t const nameEnd = dss::test::identEnd(code, k);
+            if (nameEnd == k) continue;
+            std::size_t const open = skipSpace(code, nameEnd);
+            if (open >= code.size() || code[open] != '(') continue;
+            std::size_t const close = closingOf(code, open);
+            if (close == std::string::npos) continue;
+            std::size_t const body = bodyAfter(code, close);
+            if (body == std::string::npos) continue;   // a call (`IndexSymbolIds::fits(n)`), a declaration, `= default`
+            std::size_t const end = closingOf(code, body);
+            if (end != std::string::npos) out.push_back(Span{q, end});
+        }
+    }
+    return out;
+}
+
+// Every take site one source states, in source order; `doors` are read from every source first (`doorsIn`).
+[[nodiscard]] std::vector<Site> sitesIn(std::string const& file, std::string const& raw,
+                                        std::set<std::string> const& doors) {
+    std::string const       code     = dss::test::codeOnly(raw);
+    std::vector<Span> const doorCode = doorCodeIn(code, doors);
+    std::vector<std::pair<std::size_t, Site>> found;
+    // (a) `.take(` / `->take(` of two arguments or more, outside a door's own code.
+    for (std::size_t q = code.find("take"); q != std::string::npos; q = code.find("take", q + 1)) {
+        if (!wordAt(code, q, "take") || inAny(doorCode, q)) continue;
         std::size_t b = q;
         while (b > 0 && isSpace(code[b - 1])) --b;
         bool const member = (b >= 1 && code[b - 1] == '.') || (b >= 2 && code.compare(b - 2, 2, "->") == 0);
@@ -182,32 +329,26 @@ constexpr std::string_view kNewSpace = "NewSpaceSymbolIds";
         if (a.count < 2) continue;
         found.emplace_back(q, siteAt(file, raw, code, q, close, a));
     }
-    // (b) a new space's door, constructed -- outside the class's own body.
-    std::vector<std::pair<std::size_t, std::size_t>> classBodies;
-    std::vector<std::size_t>                         uses;
+    // (b) a new space's door, constructed -- outside a door's own code; neither a type nor a member's own name.
     for (std::size_t q = code.find(kNewSpace); q != std::string::npos; q = code.find(kNewSpace, q + 1)) {
-        if (!wordAt(code, q, kNewSpace)) continue;
+        if (!wordAt(code, q, kNewSpace) || inAny(doorCode, q)) continue;
         std::size_t b = q;
         while (b > 0 && isSpace(code[b - 1])) --b;
+        if (b >= 1 && code[b - 1] == '~') continue;   // a destructor's name
+        if (b >= 2 && code.compare(b - 2, 2, "::") == 0) {
+            std::size_t c = b - 2;
+            while (c > 0 && isSpace(code[c - 1])) --c;
+            if (c >= kNewSpace.size() && wordAt(code, c - kNewSpace.size(), kNewSpace)) continue;   // `D::D(` -- its name
+        }
         std::size_t a = b;
         while (a > 0 && isWordChar(code[a - 1])) --a;
         std::string_view const before{code.data() + a, b - a};
-        if (before == "class" || before == "struct") {
-            std::size_t const brace = skipSpace(code, q + kNewSpace.size());
-            if (brace < code.size() && code[brace] == '{') classBodies.emplace_back(brace, closingOf(code, brace));
-            continue;
-        }
-        uses.push_back(q);
-    }
-    for (std::size_t const q : uses) {
-        bool const inBody = std::any_of(classBodies.begin(), classBodies.end(),
-                                        [&](auto const& body) { return q > body.first && q < body.second; });
-        if (inBody) continue;
+        if (before == "class" || before == "struct") continue;   // its declaration
         std::size_t open = skipSpace(code, q + kNewSpace.size());
         if (open < code.size() && isIdentStart(code[open])) {
             std::size_t name = open;
             while (name < code.size() && isWordChar(code[name])) ++name;
-            if (std::string_view{code.data() + open, name - open} == "const") continue;   // `NewSpaceSymbolIds const&`
+            if (std::string_view{code.data() + open, name - open} == "const") continue;   // `ReportedSymbolIds const&`
             open = skipSpace(code, name);
         }
         if (open >= code.size() || (code[open] != '{' && code[open] != '(')) continue;   // a type, not a construction
@@ -274,21 +415,27 @@ constexpr std::string_view kNewSpace = "NewSpaceSymbolIds";
 
 // THE UNIVERSE: every take site src/ states is a row of the table, and every row a site.
 TEST(ModuleDoorTakeSitesGuard, EveryTakeSiteOfSrcIsARowAndEveryRowASite) {
-    auto const        root = dss::test::repoRoot();
-    std::vector<Site> sites;
-    std::size_t       read = 0;
+    auto const                                       root = dss::test::repoRoot();
+    std::vector<std::pair<std::string, std::string>> sources;   // (from the repository root, the raw text)
     auto const walk = dss::core::walkTree(root / "src", [&](dss::core::TreeEntry const& entry) {
         if (entry.kind != dss::core::EntryKind::File) return dss::core::WalkStep::Continue;
-        std::string const relative = "src/" + entry.relative.generic();
-        if (relative.ends_with(".cpp") || relative.ends_with(".hpp")) {
-            ++read;
-            for (Site& s : sitesIn(relative, readAll(entry.at))) sites.push_back(std::move(s));
-        }
+        std::string relative = "src/" + entry.relative.generic();
+        if (relative.ends_with(".cpp") || relative.ends_with(".hpp"))
+            sources.emplace_back(std::move(relative), readAll(entry.at));
         return dss::core::WalkStep::Continue;
     });
     ASSERT_FALSE(walk.error) << "the walk of src/ stopped at " << walk.where.spelling().generic() << ": "
                              << walk.error.message();
-    EXPECT_GE(read, 400u) << "the guard read only " << read << " sources";
+    EXPECT_GE(sources.size(), 400u) << "the guard read only " << sources.size() << " sources";
+    // The doors first, from every source: a door a header declares covers its members a .cpp defines.
+    std::set<std::string> doors;
+    for (auto const& [relative, raw] : sources) doors.merge(doorsIn(raw));
+    std::string named;
+    for (std::string const& d : doors) named += " " + d;
+    EXPECT_TRUE(doors.contains("ModuleSymbolIds")) << "the scan read no module door; its doors:" << named;
+    std::vector<Site> sites;
+    for (auto const& [relative, raw] : sources)
+        for (Site& s : sitesIn(relative, raw, doors)) sites.push_back(std::move(s));
     auto const refused = refusals(sites, dss::test::kLinkTakeSites);
     EXPECT_TRUE(refused.empty()) << refused.size() << " take site(s) and row(s) out of the universe:" << listed(refused);
 }
@@ -296,7 +443,10 @@ TEST(ModuleDoorTakeSitesGuard, EveryTakeSiteOfSrcIsARowAndEveryRowASite) {
 // THE SCAN ITSELF, on synthetic sources: every site form once -- a literal, a format string split over adjacent
 // literals and lines, a label no literal states, a call through a pointer, a new space's door named and temporary --
 // and the forms it must not read: the words in a comment and a string, a `take()` of no argument, a free `take`, the
-// door's own class body, and the class name used as a type.
+// door's own class body, and the class name used as a type. A DOOR's own code (P69 f26e): a class declaring a member
+// `take` that hands its caller's label on, a door's members defined out of line (a destructor, a constructor with its
+// initializer list, a defaulted one) -- against the forms that stay sites: a class that only calls `take`, a site
+// after a call of a door's static member, a template's body.
 TEST(ModuleDoorTakeSitesGuard, TheScanFindsEverySiteFormAndNothingElse) {
     std::string const src =
         "// ids.take(reporter, \"x: in a comment\") is no site\n"                             // 1
@@ -308,20 +458,41 @@ TEST(ModuleDoorTakeSitesGuard, TheScanFindsEverySiteFormAndNothingElse) {
         "  auto c = ids.take(reporter, who);\n"                                               // 7  site, no literal
         "  auto d = end.take();\n"                                                            // 8
         "  auto e = p->take(reporter, /* the label */ \"x: through a pointer\");\n"           // 9  site
-        "  NewSpaceSymbolIds fresh{SymbolIdEnd{}, reporter, \"x: a new space\"};\n"           // 10 site
-        "  use(NewSpaceSymbolIds(SymbolIdEnd{}, reporter, \"x: a temporary\"));\n"            // 11 site
+        "  ReportedSymbolIds fresh{SymbolIdEnd{}, reporter, \"x: a new space\"};\n"           // 10 site
+        "  use(ReportedSymbolIds(SymbolIdEnd{}, reporter, \"x: a temporary\"));\n"            // 11 site
         "  take(reporter, \"x: a free function\");\n"                                         // 12
         "}\n"                                                                                 // 13
-        "class NewSpaceSymbolIds {\n"                                                         // 14
-        "    NewSpaceSymbolIds(SymbolIdEnd start, DiagnosticReporter& reporter, std::string_view who) noexcept;\n"
-        "    NewSpaceSymbolIds(NewSpaceSymbolIds const&) = delete;\n"                         // 16
+        "class ReportedSymbolIds {\n"                                                         // 14
+        "    ReportedSymbolIds(SymbolIdEnd start, DiagnosticReporter& reporter, std::string_view who) noexcept;\n"
+        "    ReportedSymbolIds(ReportedSymbolIds const&) = delete;\n"                         // 16
         "};\n"                                                                                // 17
-        "void g(NewSpaceSymbolIds& ids, NewSpaceSymbolIds const& other);\n";                  // 18
+        "void g(ReportedSymbolIds& ids, ReportedSymbolIds const& other);\n"                   // 18
+        "class ModuleSymbolIds {\n"                                                           // 19 a door
+        "    std::optional<SymbolId> take(std::size_t n, DiagnosticReporter& r, std::string_view who) {\n"
+        "        return OptionalSymbolIds{end_, sink(r)}.take(n, who);\n"                     // 21 its own code
+        "    }\n"                                                                             // 22
+        "};\n"                                                                                // 23
+        "ReportedSymbolIds::~ReportedSymbolIds() { use(ReportedSymbolIds(e, r, \"x: in a member of a door\")); }\n"
+        "ReportedSymbolIds::ReportedSymbolIds(SymbolIdEnd s, std::string_view who) noexcept\n"   // 25
+        "    : end_{s}, who_(who) { end_.take(1, \"x: in the constructor of a door\"); }\n"  // 26
+        "ReportedSymbolIds::ReportedSymbolIds(ReportedSymbolIds&&) noexcept = default;\n"     // 27
+        "struct Pass final : public Base<int> {\n"                                            // 28 no door
+        "    void run() { auto f = ids.take(reporter, \"x: in a class that is no door\"); }\n"  // 29 site
+        "};\n"                                                                                // 30
+        "void h(std::size_t n) {\n"                                                           // 31
+        "  if (!ModuleSymbolIds::fits(n)) { auto s = ids.take(reporter, \"x: after a static call\"); }\n"  // 32 site
+        "}\n"                                                                                 // 33
+        "template <class Out> void seal(Out& o) { o.take(1, \"x: in a template\"); }\n";     // 34 site
     std::string got;
-    for (Site const& s : sitesIn("src/x/a.cpp", src))
+    for (Site const& s : sitesIn("src/x/a.cpp", src, doorsIn(src)))
         got += " " + std::to_string(s.line) + "=" + (s.label.has_value() ? *s.label : std::string{"<none>"});
     EXPECT_EQ(got, " 4=x: a literal 5=x: the {} id(s) of a pair 7=<none> 9=x: through a pointer 10=x: a new space "
-                   "11=x: a temporary");
+                   "11=x: a temporary 29=x: in a class that is no door 32=x: after a static call 34=x: in a template");
+    // The doors the synthetic source declares: the one declaring a member `take`, and the new space's by its name --
+    // never the class that only calls it.
+    std::string doors;
+    for (std::string const& d : doorsIn(src)) doors += " " + d;
+    EXPECT_EQ(doors, " ModuleSymbolIds ReportedSymbolIds");
 }
 
 // THE JUDGEMENT, both ways, on a synthetic universe: a site the table lacks, a row no site states, a label no literal

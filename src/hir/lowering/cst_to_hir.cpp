@@ -1855,6 +1855,15 @@ struct Lowerer {
         return false;
     }
 
+    // ONE emitter for a leading packing attribute, whatever form leads (P69 f26e, review-csf26d A2): the sentence
+    // names no spelling and no keyword -- the packing attribute's names and where the language honours it are the
+    // language document's (`packedAttributeNames`), never words compiled into this tier.
+    void reportLeadingPackingUnhonoured(NodeId n) {
+        emitH(DiagnosticCode::H_UnknownLinkageSpecifier, n,
+              "a packing attribute is not honoured where it leads a declaration: it takes effect only after the "
+              "record type's member list");
+    }
+
     // TF-C73 (D-CSUBSET-GNU-ATTRIBUTE — closing that row's pinned
     // "after-declarator honoring" follow-up, which TF-C62 deferred by shipping
     // the position as parse-and-ignore): every CST subtree
@@ -2208,12 +2217,7 @@ struct Lowerer {
                     // spelling; every other ignorable attribute (`[[deprecated]]`,
                     // `[[nodiscard]]`) stays silently ignored (the standard-attribute
                     // contract). Source-agnostic: the packed names are per-language config.
-                    if (subtreeNamesPacked(n)) {
-                        emitH(DiagnosticCode::H_UnknownLinkageSpecifier, n,
-                              "'packed' is not honored as a leading attribute here — "
-                              "place __attribute__((packed)) / [[gnu::packed]] AFTER "
-                              "the struct/union body");
-                    }
+                    if (subtreeNamesPacked(n)) reportLeadingPackingUnhonoured(n);
                     continue;
                 }
                 // ★★ P69 (lane `cs`, fold f26d — review-csf26c2 N5): A SPECIFIER OF THE STANDARD FORM
@@ -2229,12 +2233,7 @@ struct Lowerer {
                 // A leading `packed` keeps the one report above, the claimed `packed` being a name the
                 // fold skips by name.
                 if (isStandardAttributeSpecifier(sem, tree(), n)) {
-                    if (subtreeNamesPacked(n)) {
-                        emitH(DiagnosticCode::H_UnknownLinkageSpecifier, n,
-                              "'packed' is not honored as a leading attribute here — "
-                              "place __attribute__((packed)) / [[gnu::packed]] AFTER "
-                              "the struct/union body");
-                    }
+                    if (subtreeNamesPacked(n)) reportLeadingPackingUnhonoured(n);
                     auto const items = visible(n);
                     for (auto it = items.rbegin(); it != items.rend(); ++it) {
                         StandardItemClause const item = standardItemClause(sem, tree(), *it);
@@ -2391,7 +2390,22 @@ struct Lowerer {
             std::string_view const rawText  = tree().text(n);
             bool const inAttrName =
                 i < fromAttrName.size() && fromAttrName[i] != 0;
-            std::string key{inAttrName ? stripDunder(rawText) : rawText};
+            // ★ P69 (lane `cs`, fold f26e): THE INTRODUCER OF A SPELLING WHOSE INTRODUCER ALONE IS ITS ONE
+            // CLAUSE (`impliedClause`: c's `__vectorcall`) is named as that clause, by the one helper every
+            // tier that looks a clause up asks (`attributeClauseLookupName`) -- so `void __vectorcall f(void);`
+            // is the clause `vectorcall` here exactly as `__attribute__((vectorcall))` is, and the keyword
+            // written as a GNU clause NAME (`__attribute__((__vectorcall))`) stays a keyword-spelled unknown
+            // name below. Its token KIND is no structural syntax of a prefix: a kind skipped wholesale would
+            // be skipped inside a GNU clause list too.
+            AttributeSpelling const* const introducedSpelling = [&]() -> AttributeSpelling const* {
+                if (!inAttrName) return nullptr;
+                AttributeSpelling const* const sp = enclosingAttributeSpelling(sem, tree(), n);
+                return sp != nullptr && !sp->impliedClause.empty() && kind.v == sp->introducer.v ? sp : nullptr;
+            }();
+            std::string key{introducedSpelling != nullptr
+                                ? std::string{attributeClauseLookupName(introducedSpelling, rawText)}
+                                : inAttrName ? std::string{stripDunder(rawText)}
+                                             : std::string{rawText}};
             // ⚠ THE KEYWORD TEST ASKS ABOUT THE **DERIVED** NAME, NOT THE RAW
             // SPELLING, AND THAT IS THE WHOLE POINT — asking about the raw text
             // is the version of this guard that does NOT work, and it was BUILT
@@ -10660,6 +10674,16 @@ struct Lowerer {
     foldLayoutQuery(NodeId node, RuleId valueRule, bool alignment) {
         auto const& params = model.aggregateLayout();
         if (!params.has_value()) return std::nullopt;
+        // P69 (lane `cs`, fold f26e) [[D-CSUBSET-ALIGNOF-VALUE-OVERALIGNED-OBJECT]]: a value
+        // operand designating a declaration answers that declaration's alignment, as the
+        // semantic tier decided it once and recorded it on the value form
+        // (`declaredAlignmentOfDesignation`).
+        if (alignment) {
+            LayoutQueryOperand const q = layoutQueryOperand(node, valueRule);
+            if (q.valueForm) {
+                if (auto const declared = model.foldedConstantAt(q.scan)) return *declared;
+            }
+        }
         TypeId const queried = layoutQueryOperand(node, valueRule).type;
         if (!queried.valid()) return std::nullopt;
         // P69 (lane `cs`): `sizeof` of an array of unknown size is what the language
@@ -10668,8 +10692,14 @@ struct Lowerer {
         if (!alignment && sem.sizeofIncompleteArraySize.has_value()
             && interner.isIncompleteArray(queried))
             return *sem.sizeofIncompleteArraySize;
-        if (interner.isVlaArray(queried) || interner.typeContainsVla(queried))
-            return std::nullopt;
+        if (interner.isVlaArray(queried) || interner.typeContainsVla(queried)) {
+            // P69 (lane `cs`, fold f26e): a run-time length leaves the SIZE a run-time value,
+            // never the alignment (C23 6.5.4.4p3) -- the answer `typeAlignment` gives.
+            if (!alignment) return std::nullopt;
+            auto const vm = typeAlignment(queried, interner, *params, dataModel_);
+            if (!vm.has_value()) return std::nullopt;
+            return std::uint64_t{vm->bytes()};
+        }
         auto const layout = operandLayout(queried, interner, *params, dataModel_,
                                           sem.nonObjectTypeSizes);
         if (!layout.has_value()) return std::nullopt;
@@ -10843,38 +10873,6 @@ struct Lowerer {
         return SymbolId{};
     }
 
-    // P68 round 12 (lane `cs`): `t` with every VARIABLE-LENGTH level's length replaced by one — the `_Alignof`
-    // operand of a type whose layout a runtime length would otherwise deny (see `lowerAlignof`). ITERATIVE over
-    // the array spine (no recursion proportional to the declarator's depth): each level's qualifier skin and
-    // type-level alignment are read off the level itself and re-applied to the rebuilt level, fixed lengths are
-    // kept, and the element under the last array level is kept as it is. An INCOMPLETE level (no length at all)
-    // returns `t` unchanged: that type has no alignment to give, and the MIR fold keeps refusing it loudly.
-    [[nodiscard]] TypeId withEveryRuntimeLengthOne(TypeId const original) {
-        struct Level {
-            std::int64_t  length;
-            std::int64_t  skinBits;
-            std::uint32_t skinAlign;
-        };
-        std::vector<Level> levels;
-        TypeId t = original;
-        while (t.valid() && interner.kind(t) == TypeKind::Array) {
-            auto const sc  = interner.scalars(t);
-            auto const ops = interner.operands(t);
-            if (sc.empty() || ops.empty()) return original;
-            bool const runtime = interner.isVlaArray(t);
-            if (!runtime && sc[0] < 0) return original;
-            levels.push_back(Level{runtime ? std::int64_t{1} : sc[0],
-                                   interner.qualifierBits(t), interner.typeAlignOverride(t)});
-            t = ops[0];
-        }
-        for (std::size_t i = levels.size(); i-- > 0;) {
-            t = interner.array(t, levels[i].length);
-            if (levels[i].skinBits != 0 || levels[i].skinAlign != 0)
-                t = interner.qualified(t, levels[i].skinBits, levels[i].skinAlign);
-        }
-        return t;
-    }
-
     // C11/C23 6.5.3.4: `_Alignof ( type-name )` | `_Alignof unary-expression` →
     // core `HirKind::AlignOf`, result type size_t (U64). An ADDITIVE mirror of
     // `lowerSizeof` reading ALIGNMENT instead of size — including WHICH READ each
@@ -10911,6 +10909,18 @@ struct Lowerer {
     // are what make a missing type impossible to mistake for a small one.
     [[nodiscard]] E lowerAlignof(NodeId node) {
         LayoutQueryOperand const operand = layoutQueryOperand(node, sem.alignofValueRule);
+        // P69 (lane `cs`, fold f26e) [[D-CSUBSET-ALIGNOF-VALUE-OVERALIGNED-OBJECT]]: the answer the
+        // semantic tier recorded for an operand designating a declaration (`foldLayoutQuery`'s
+        // first read too), as a `size_t` constant (C 6.5.3.4p5).
+        if (operand.valueForm) {
+            if (auto const declared = model.foldedConstantAt(operand.scan)) {
+                TypeId const u64 = synthesizedType(sem.alignofResultType, TypeKind::U64);
+                HirLiteralValue lit;
+                lit.core  = interner.kind(u64);
+                lit.value = *declared;
+                return {track(builder.makeLiteral(u64, literals.add(std::move(lit))), node), u64};
+            }
+        }
         TypeId sized = operand.type;
         if (!sized.valid()) {
             return exprError(node, operand.valueForm
@@ -10921,15 +10931,24 @@ struct Lowerer {
         }
         // P68 round 12 (lane `cs`): the alignment of a type holding a VARIABLE-LENGTH array level. C 6.5.3.4p3 gives
         // an array type its element type's alignment and does not evaluate the operand, so the answer is static
-        // even where the length is not — but the MIR fold reads it through a LAYOUT, and a runtime-sized level has
-        // none. An array's alignment never depends on its length, so the operand that reaches MIR is the same type
-        // with every runtime length replaced by one: every level, qualifier skin and type-level alignment (a
-        // typedef's `aligned`) kept, so the layout answers exactly what the variable-length type would.
-        // ✔MEASURED 2026-09-24 (lane `cs`'s `.temp/probe/vt` vt15 / vt16): gcc 13.3.0 and clang 18.1.3, at
-        // -std=c17 -pedantic-errors and -std=c2x, give `_Alignof(int)` for `_Alignof(int[n])` and for a VLA
-        // typedef's name; DSS refused both ("_Alignof of an incomplete or un-alignable type").
-        if (interner.isVlaArray(sized) || interner.typeContainsVla(sized))
-            sized = withEveryRuntimeLengthOne(sized);
+        // even where the length is not. ✔MEASURED 2026-09-24 (lane `cs`'s `.temp/probe/vt` vt15 / vt16): gcc
+        // 13.3.0 and clang 18.1.3, at -std=c17 -pedantic-errors and -std=c2x, give `_Alignof(int)` for
+        // `_Alignof(int[n])` and for a VLA typedef's name; DSS refused both. P69 (lane `cs`, fold f26e): the answer
+        // is `typeAlignment`'s -- the one the constant fold and the frame slot read -- lowered as the `size_t`
+        // constant it is (it replaces a length-one twin of the type, a second derivation of the same fact).
+        // A model analysed with no layout leaves the fold to MIR, whose `AlignOf` reads the same home under its
+        // target's layout: either tier answers, and both answer `typeAlignment`'s.
+        if (auto const& params = model.aggregateLayout();
+            params.has_value() && (interner.isVlaArray(sized) || interner.typeContainsVla(sized))) {
+            auto const vm = typeAlignment(sized, interner, *params, dataModel_);
+            if (!vm.has_value())
+                return exprError(node, "_Alignof of a variably modified type found no alignment for it");
+            TypeId const u64 = synthesizedType(sem.alignofResultType, TypeKind::U64);
+            HirLiteralValue lit;
+            lit.core  = interner.kind(u64);
+            lit.value = std::uint64_t{vm->bytes()};
+            return {track(builder.makeLiteral(u64, literals.add(std::move(lit))), node), u64};
+        }
         HirNodeId const tref = track(builder.makeTypeRef(sized), node);
         // `size_t`, the same declared entry `lowerSizeof` mints (C 6.5.3.4p5).
         TypeId const u64 = synthesizedType(sem.alignofResultType, TypeKind::U64);
@@ -12944,13 +12963,8 @@ struct Lowerer {
     // re-seeded to the table's end and handed those ids out again. Reconciled with the MIR space by
     // `keepSymbolIdEndClearOfUnitSymbols` (hir_to_mir).
     [[nodiscard]] SymbolId freshSymbol() {
-        SymbolId const id = syntheticSymbols_.take();
-        if (!id.valid()) {
-            std::fprintf(stderr, "dss::cst_to_hir fatal: the unit's SymbolId space is exhausted (its end is %u) -- "
-                                 "no synthesized symbol can be minted\n", syntheticSymbols_.value());
-            std::abort();
-        }
-        return id;
+        // The home's ABORT door (P69 f26e, B1).
+        return AbortingSymbolIds{syntheticSymbols_, "the unit"}.take("cst_to_hir");
     }
     SymbolIdEnd syntheticSymbols_ = [this] {
         SymbolIdEnd end;   // past every id the model's table holds (its slot 0 is the invalid id)

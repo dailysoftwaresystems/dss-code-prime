@@ -63,12 +63,8 @@ public:
     // Mint the next free id.
     [[nodiscard]] SymbolId mint() {
         while (true) {   // the claimed values are asked again, inside the door
-            SymbolId const id = next_.take();
-            if (!id.valid()) {
-                std::fprintf(stderr, "dss::mergeCuMirs fatal: the merged module's SymbolId space is "
-                                     "exhausted -- no fresh symbol can be minted\n");
-                std::abort();
-            }
+            // The home's ABORT door (P69 f26e, B1).
+            SymbolId const id = AbortingSymbolIds{next_, "the merged module"}.take("mergeCuMirs");
             if (!used_.insert(id.v).second) continue;
             handedOut_(id.v);
             return id;

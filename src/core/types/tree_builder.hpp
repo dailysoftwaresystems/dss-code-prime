@@ -236,8 +236,10 @@ public:
     // buffer/span/scope, unlike reportDiagnostic which stamps the builder's
     // current scope stack. Call before finish() so the finished Tree owns
     // lexer + parser diagnostics in one stream. Reported through the normal
-    // cap/dedup path. See 08-compilation-unit-plan §2.6 C2-L1.
-    void ingestDiagnostics(std::span<ParseDiagnostic const> diags);
+    // cap/dedup path. See 08-compilation-unit-plan §2.6 C2-L1. Takes the
+    // REPORTER, not its `all()`: what its gates dropped is counted here too
+    // (`DiagnosticReporter::relayFrom`, D9(c)).
+    void ingestDiagnostics(DiagnosticReporter const& from);
 
     // ── scope stack (validated against schema in pushToken) ──
     void pushScope(ScopeKind kind);

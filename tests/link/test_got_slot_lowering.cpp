@@ -474,7 +474,7 @@ TEST(GotSlotLowering, X86KeepsTheAddendOnTheReferenceAndSharesOneSlot) {
                                      Relocation{13, SymbolId{2}, gotx, -5}});
     AssembledModule out;
     DiagnosticReporter rep;
-    ASSERT_FALSE(linker::lowerGotSlotReferences(in, out, *t, *f, rep)) << "lowered";
+    ASSERT_EQ(linker::lowerGotSlotReferences(in, out, *t, *f, rep), linker::LinkPassOutcome::Rewritten) << "lowered";
     ASSERT_FALSE(rep.hasErrors()) << errorText(rep);
     ASSERT_EQ(out.dataItems.size(), 2u) << "the datum and ONE slot";
     auto const& r0 = out.functions[0].relocations[0];
@@ -510,7 +510,7 @@ TEST(GotSlotLowering, Aarch64MovesTheAddendIntoTheSlotAndMakesItsOwnSlot) {
                                      Relocation{12, SymbolId{2}, lo12, 4}});
     AssembledModule out;
     DiagnosticReporter rep;
-    ASSERT_FALSE(linker::lowerGotSlotReferences(in, out, *t, *f, rep));
+    ASSERT_EQ(linker::lowerGotSlotReferences(in, out, *t, *f, rep), linker::LinkPassOutcome::Rewritten);
     ASSERT_FALSE(rep.hasErrors()) << errorText(rep);
     auto const& rs = out.functions[0].relocations;
     EXPECT_EQ(rs[0].target, rs[1].target) << "the pair names ONE slot";
@@ -536,7 +536,7 @@ TEST(GotSlotLowering, ARelocatableFormatKeepsItsGotRelocations) {
                                      Relocation{4, SymbolId{2}, kindNamed(*t, "ld64_got_lo12"), 0}});
     AssembledModule out;
     DiagnosticReporter rep;
-    EXPECT_TRUE(linker::lowerGotSlotReferences(in, out, *t, *f, rep)) << "nothing to do";
+    EXPECT_EQ(linker::lowerGotSlotReferences(in, out, *t, *f, rep), linker::LinkPassOutcome::Unchanged) << "nothing to do";
     EXPECT_FALSE(rep.hasErrors());
     EXPECT_TRUE(out.functions.empty() && out.dataItems.empty()) << "out untouched";
 }
@@ -552,7 +552,7 @@ TEST(GotSlotLowering, AWeakSymbolResolvedToNothingGetsASlotHoldingZero) {
     std::vector<SymbolId> const nothing{SymbolId{2}};
     AssembledModule out;
     DiagnosticReporter rep;
-    ASSERT_FALSE(linker::lowerGotSlotReferences(in, out, *t, *f, rep, nothing));
+    ASSERT_EQ(linker::lowerGotSlotReferences(in, out, *t, *f, rep, nothing), linker::LinkPassOutcome::Rewritten);
     ASSERT_FALSE(rep.hasErrors()) << errorText(rep);
     auto const* slot = itemNamed(out, out.functions[0].relocations[0].target);
     ASSERT_NE(slot, nullptr);
@@ -568,7 +568,7 @@ TEST(GotSlotLowering, AWeakSymbolResolvedToNothingGetsASlotHoldingZero) {
     AssembledModule ina = moduleWith({Relocation{0, SymbolId{2}, kindNamed(*ta, "adr_got_page"), 8}});
     AssembledModule outa;
     DiagnosticReporter repa;
-    (void)linker::lowerGotSlotReferences(ina, outa, *ta, *fa, repa, nothing);
+    EXPECT_EQ(linker::lowerGotSlotReferences(ina, outa, *ta, *fa, repa, nothing), linker::LinkPassOutcome::Refused);
     EXPECT_TRUE(repa.hasErrors()) << "a nothing-plus-addend slot is refused";
 }
 
@@ -670,7 +670,7 @@ TEST(GotSlotLowering, TwoRowsWithOneArithmeticAreNeverAChoice) {
         AssembledModule in = moduleWith({Relocation{3, SymbolId{2}, RelocationKind{11}, -1}});
         AssembledModule out;
         DiagnosticReporter rep;
-        ASSERT_FALSE(linker::lowerGotSlotReferences(in, out, **t, *f, rep)) << errorText(rep);
+        ASSERT_EQ(linker::lowerGotSlotReferences(in, out, **t, *f, rep), linker::LinkPassOutcome::Rewritten) << errorText(rep);
         ASSERT_FALSE(rep.hasErrors()) << errorText(rep);
         auto const& r = out.functions[0].relocations[0];
         EXPECT_EQ(r.kind, (*t)->relocationByName(twin)->kind)
@@ -718,7 +718,7 @@ TEST(GotSlotLowering, AFreshSlotIdNeverCollidesWithAnImportsAddressSlot) {
         << "the address slot's id is TAKEN";
     AssembledModule out;
     DiagnosticReporter rep;
-    ASSERT_FALSE(linker::lowerGotSlotReferences(in, out, *t, *f, rep));
+    ASSERT_EQ(linker::lowerGotSlotReferences(in, out, *t, *f, rep), linker::LinkPassOutcome::Rewritten);
     ASSERT_FALSE(rep.hasErrors()) << errorText(rep);
     EXPECT_GT(out.functions[0].relocations[0].target.v, 40u)
         << "the slot is minted PAST every taken id, the address slot's included";
@@ -737,7 +737,7 @@ TEST(GotSlotLowering, AGotRelocationInADataItemIsRefused) {
     in.dataItems.push_back(d);
     AssembledModule out;
     DiagnosticReporter rep;
-    (void)linker::lowerGotSlotReferences(in, out, *t, *f, rep);
+    EXPECT_EQ(linker::lowerGotSlotReferences(in, out, *t, *f, rep), linker::LinkPassOutcome::Refused);
     EXPECT_TRUE(rep.hasErrors()) << "an instruction-field relocation in a data item";
 }
 
@@ -1096,7 +1096,7 @@ TEST(GotSlotLowering, APeObjectCarriesOnePointerPerSymbolForEveryGotLoad) {
     addImport(4, "maybe", "ucrtbase.dll", SymbolBinding::Weak);
     AssembledModule out;
     DiagnosticReporter rep;
-    ASSERT_FALSE(linker::lowerGotSlotReferences(in, out, *t, *f, rep)) << "lowered";
+    ASSERT_EQ(linker::lowerGotSlotReferences(in, out, *t, *f, rep), linker::LinkPassOutcome::Rewritten) << "lowered";
     ASSERT_FALSE(rep.hasErrors()) << errorText(rep);
     RelocationKind const direct = kindNamed(*t, "riprel32");
     auto const& rs = out.functions[0].relocations;
@@ -1141,7 +1141,7 @@ TEST(GotSlotLowering, ARelocatableFormatKeepsEveryGotLoadItCanSpell) {
                                     /*datumIsAnImport=*/true);
     AssembledModule out;
     DiagnosticReporter rep;
-    EXPECT_TRUE(linker::lowerGotSlotReferences(in, out, *t, *f, rep)) << "nothing to do";
+    EXPECT_EQ(linker::lowerGotSlotReferences(in, out, *t, *f, rep), linker::LinkPassOutcome::Unchanged) << "nothing to do";
     EXPECT_FALSE(rep.hasErrors());
 }
 
@@ -1163,7 +1163,7 @@ TEST(GotSlotLowering, ARelocatableFormatLowersOnlyTheGotKindItCannotSpell) {
                                     /*datumIsAnImport=*/true);
     AssembledModule out;
     DiagnosticReporter rep;
-    ASSERT_FALSE(linker::lowerGotSlotReferences(in, out, *t, *f, rep)) << "lowered";
+    ASSERT_EQ(linker::lowerGotSlotReferences(in, out, *t, *f, rep), linker::LinkPassOutcome::Rewritten) << "lowered";
     ASSERT_FALSE(rep.hasErrors()) << errorText(rep);
     auto const& rs = out.functions[0].relocations;
     ASSERT_EQ(rs.size(), 2u);

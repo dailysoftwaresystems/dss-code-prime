@@ -18,7 +18,12 @@
     // The wait is 480 minutes, not the tool's 60: four lanes' whole-suite runs each hold a slot for hours, so a
     // 60-minute wait ended a queued leg `not-admitted` and its relaunch went to the back of the queue again
     // (MEASURED, cycle P69 round 1: a lane's run sat seven legs back and an earlier one ended not-admitted).
-    "admission": { "heavyLegs": 2, "maxMemoryPercent": 76, "maxWaitMinutes": 480 }
+    // ★ A LEG SHORT OF ROOM FIRST REMOVES THIS REPOSITORY'S OTHER TREES' IDLE BUILDS on that filesystem (DssHarness
+    // 0.6.21, 'help admission'; P69, 2026-11-18): the least recently built first, only as many as it lacks, never one
+    // a run or sweep holds, never its own tree's or a sweep's workers. ✔MEASURED P69 (ledger 750): the arm64 VPS
+    // (47.4 GiB, which cannot grow) holds two ~16 GiB debug builds, and a leg stopped at the 2 GiB floor while two
+    // lanes' finished arm64 builds sat idle; every lane cleaned its arm64 legs by hand since. This retires that rule.
+    "admission": { "heavyLegs": 2, "maxMemoryPercent": 76, "maxWaitMinutes": 480, "reclaimIdleBuilds": true }
   },
   "toolchains": {
     // EVERY toolchain NAMES its compiler (`env` CC/CXX) and HOLDS the build to it (`compilerId`,
@@ -194,14 +199,13 @@
     }
   ],
   "hosts": {
-    // THIS PC TAKES THREE HEAVY LEGS, two elsewhere (P69, 2026-11-17). ✔MEASURED that day after its RAM grew: 125.7 GiB
-    // physical, a 154.7 GiB commit limit (29 GiB page file), 91.4 GiB committed (59.1%) with the operator's own IDEs
-    // open, 32 logical CPUs. Three legs at buildCores 6 use 18 of the 32. maxMemoryPercent 76 (117.6 GiB) still gates
-    // each start, so a third leg waits whenever two big builds hold the commit. The linux-x86_64 legs left this PC for
-    // the Ubuntu host the same day, so its slots now carry only the Windows legs, WSL's and the mutation sweeps.
-    // ⓘ Where trees that declare different counts share this PC, a leg starts only within the LOWEST count in front of
-    // it ('help admission'), so a lane's tree runs on three only once a refresh has carried this line into it.
-    "local": { "admission": { "heavyLegs": 3 } },
+    // ★ A MACHINE'S HEAVY-LEG COUNT IS THE MACHINE'S, NOT THIS TREE'S (P69, 2026-11-18): each user's machine declares
+    // it in its OWN settings file, `<user data>/dssharness/settings-<machine id>.json` (`dssharness legs` prints the
+    // path), which wins over every tree's config.json (DssHarness 0.6.21, 'help admission'). It was `hosts.local` here
+    // (2026-11-17: the operator's PC takes three, ✔MEASURED 125.7 GiB RAM, a 154.7 GiB commit limit, 32 CPUs), but a
+    // tracked line speaks for whichever machine runs the tree, and a stale worktree's copy held that PC at two. The
+    // operator's PC now declares `{ "admission": { "heavyLegs": 3 } }` in its own file; every other machine takes
+    // defaults.admission above unless its own file says otherwise.
     // ★ THE ONE WSL DISTRIBUTION THIS TREE DECLARES (2026-11-17). No DssHarness leg runs in WSL any more (the
     // linux-x86_64 legs moved to the `ubuntu` ssh host), but a Windows-driven sqlite corpus still launches its Linux
     // legs, and runs its POSIX half, inside WSL: the sqlite resolver (harness_legs.py `wsl_distribution_of`) reads
@@ -213,6 +217,10 @@
         "repositoryPath": "~/src/dss-code-prime"
       }
     },
+    // ★ EACH HOST'S `repositoryPath` IS ONLY THE DEFAULT A FRESH CLONE USES (operator, 2026-11-18: "each user can use
+    // different build remote machines"): a user's own copy directory is `REPOSITORY_PATH=` in that host item's `.env`
+    // (`.harness-config/sshItems/<name>/.env`, `.harness-config/wslDistros/<name>/.env`), which wins over this file
+    // (DssHarness 0.6.21; `dssharness legs` names each host's copy and what set it).
     "ssh": {
       // ★ THE MAC SLEEPS BETWEEN COMMANDS (DssHarness report #11, P68 r12): a command that met it in a dark wake
       // resolved no address and skipped its legs, so a gate "passed" having run nothing on them. DssHarness 0.5.12:

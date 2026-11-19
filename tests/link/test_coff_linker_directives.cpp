@@ -560,7 +560,7 @@ TEST(CoffLinkerDirectives, AHiddenDefinitionIsWrittenAsADirectiveAndReadBackHidd
     for (bool const alias : {false, true}) {
         SCOPED_TRACE(alias ? "with a hidden alias" : "canonical only");
         DiagnosticReporter rep;
-        auto const obj = pe::encode(hiddenHelperModule(SymbolVisibility::Hidden, alias), *l.target, *l.format, rep);
+        auto const obj = pe::encode(hiddenHelperModule(SymbolVisibility::Hidden, alias), *l.target, *l.format, rep).value();
         ASSERT_FALSE(obj.empty()) << diagnosticsOf(rep);
         auto const sections = coffSections(obj);
         ASSERT_FALSE(sections.empty());
@@ -594,7 +594,7 @@ TEST(CoffLinkerDirectives, EveryHiddenShapeIsWrittenAsADirectiveAndReadBackHidde
     auto const l = loadPe("pe64-x86_64-windows");
     ASSERT_TRUE(l.target && l.format);
     DiagnosticReporter rep;
-    auto const obj = pe::encode(everyHiddenShapeModule(), *l.target, *l.format, rep);
+    auto const obj = pe::encode(everyHiddenShapeModule(), *l.target, *l.format, rep).value();
     ASSERT_FALSE(obj.empty()) << diagnosticsOf(rep);
     auto const d = sectionNamed(obj, ".drectve");
     ASSERT_TRUE(d.has_value());
@@ -632,7 +632,7 @@ TEST(CoffLinkerDirectives, AnInternalDefinitionIsHiddenTooAndAProtectedOneIsNot)
     ASSERT_TRUE(l.target && l.format);
     {
         DiagnosticReporter rep;
-        auto const obj = pe::encode(hiddenHelperModule(SymbolVisibility::Internal, false), *l.target, *l.format, rep);
+        auto const obj = pe::encode(hiddenHelperModule(SymbolVisibility::Internal, false), *l.target, *l.format, rep).value();
         ASSERT_FALSE(obj.empty()) << diagnosticsOf(rep);
         auto const d = sectionNamed(obj, ".drectve");
         ASSERT_TRUE(d.has_value()) << "internal visibility keeps a definition out of the exports as hidden does";
@@ -640,7 +640,7 @@ TEST(CoffLinkerDirectives, AnInternalDefinitionIsHiddenTooAndAProtectedOneIsNot)
     {
         // `protected` is still exported (isExternallyVisible): no directive, and no section at all.
         DiagnosticReporter rep;
-        auto const obj = pe::encode(hiddenHelperModule(SymbolVisibility::Protected, false), *l.target, *l.format, rep);
+        auto const obj = pe::encode(hiddenHelperModule(SymbolVisibility::Protected, false), *l.target, *l.format, rep).value();
         ASSERT_FALSE(obj.empty()) << diagnosticsOf(rep);
         EXPECT_FALSE(sectionNamed(obj, ".drectve").has_value());
     }
@@ -650,7 +650,7 @@ TEST(CoffLinkerDirectives, AModuleWithNoHiddenDefinitionWritesNoDirectiveSection
     auto const l = loadPe("pe64-x86_64-windows");
     ASSERT_TRUE(l.target && l.format);
     DiagnosticReporter rep;
-    auto const obj = pe::encode(hiddenHelperModule(SymbolVisibility::Default, false), *l.target, *l.format, rep);
+    auto const obj = pe::encode(hiddenHelperModule(SymbolVisibility::Default, false), *l.target, *l.format, rep).value();
     ASSERT_FALSE(obj.empty()) << diagnosticsOf(rep);
     EXPECT_FALSE(sectionNamed(obj, ".drectve").has_value()) << "every other object is byte-identical";
 }
@@ -667,7 +667,7 @@ TEST(CoffLinkerDirectives, TheWriterQuotesEachLibraryAndTheReaderReadsEachOnce) 
     AssembledModule m = hiddenHelperModule(SymbolVisibility::Default, false);
     m.linkerRequests.dependentLibraries = {"dss one", "dss_two", "C:\\dss libs\\"};
     DiagnosticReporter rep;
-    auto const obj = pe::encode(m, *l.target, *l.format, rep);
+    auto const obj = pe::encode(m, *l.target, *l.format, rep).value();
     ASSERT_FALSE(obj.empty()) << diagnosticsOf(rep);
     auto const d = sectionNamed(obj, ".drectve");
     ASSERT_TRUE(d.has_value()) << "the object names no library";
@@ -706,7 +706,7 @@ TEST(CoffLinkerDirectives, TheWriterRefusesAUnitOptionNoVocabularyApplied) {
     m.linkerRequests.linkerOptions = {{"/STACK:0x200000"}};
     {
         DiagnosticReporter rep;
-        EXPECT_TRUE(pe::encode(m, *l.target, *l.format, rep).empty());
+        EXPECT_FALSE(pe::encode(m, *l.target, *l.format, rep).has_value());
         bool named = false;
         for (auto const& d : rep.all()) {
             named = named || (d.code == DiagnosticCode::K_NoMatchingObjectFormat
@@ -717,7 +717,7 @@ TEST(CoffLinkerDirectives, TheWriterRefusesAUnitOptionNoVocabularyApplied) {
     DiagnosticReporter rep;
     ASSERT_TRUE(pe::applyUnitLinkerDirectives(m, *l.format, rep)) << diagnosticsOf(rep);
     EXPECT_TRUE(m.linkerRequests.linkerOptions.empty());
-    auto const obj = pe::encode(m, *l.target, *l.format, rep);
+    auto const obj = pe::encode(m, *l.target, *l.format, rep).value();
     ASSERT_FALSE(obj.empty()) << diagnosticsOf(rep);
     auto const d = sectionNamed(obj, ".drectve");
     ASSERT_TRUE(d.has_value());
@@ -733,7 +733,7 @@ TEST(CoffLinkerDirectives, TheReaderHandsAnUndeclaredDirectiveAndAForeignNameToT
     auto const l = loadPe("pe64-x86_64-windows");
     ASSERT_TRUE(l.target && l.format);
     DiagnosticReporter rep;
-    auto const obj = pe::encode(hiddenHelperModule(SymbolVisibility::Hidden, false), *l.target, *l.format, rep);
+    auto const obj = pe::encode(hiddenHelperModule(SymbolVisibility::Hidden, false), *l.target, *l.format, rep).value();
     ASSERT_FALSE(obj.empty()) << diagnosticsOf(rep);
     auto const d = sectionNamed(obj, ".drectve");
     ASSERT_TRUE(d.has_value());

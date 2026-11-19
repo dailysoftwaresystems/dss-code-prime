@@ -1139,6 +1139,27 @@ target_link_libraries(dss_link_test_pe_foreign_import_address
 # instruction with, and the load-time fix-up runner a PE image synthesizes for the slots its loader cannot bind.
 dss_add_test(NAME link/test_pc_relative_import_address
              SOURCES test_pc_relative_import_address.cpp)
+# P69 f26e, B1 A4 (lane `cs`): A DISCARDED `LinkPassOutcome` DOES NOT COMPILE. A link pass answers
+# Unchanged / Rewritten / Refused as a `[[nodiscard]]` value (src/link/link_pass_outcome.hpp), and the root
+# CMakeLists makes a discarded `[[nodiscard]]` value an ERROR on every compiler -- so a caller that drops the
+# answer, the refusal with it, is refused at build time. The pin is a unit built twice:
+#   * `dss_link_kept_link_pass_outcome` (in ALL) keeps the answer: the unit and its include compile, so the
+#     twin below can only fail for the discard;
+#   * `dss_link_discarded_link_pass_outcome` (EXCLUDE_FROM_ALL) drops it, and the test builds it and passes
+#     only on the compiler's own ERROR for the discard -- gcc `[-Werror=unused-result]`, clang
+#     `[-Werror,-Wunused-value]` (its group for a `[[nodiscard]]` TYPE; `-Wunused-result` for a function's),
+#     MSVC `error C4834`. A WARNING (the flag lost) prints no such text, and the
+#     build then succeeds: the test fails either way.
+add_library(dss_link_kept_link_pass_outcome OBJECT discarded_link_pass_outcome.cpp)
+target_include_directories(dss_link_kept_link_pass_outcome PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_library(dss_link_discarded_link_pass_outcome OBJECT EXCLUDE_FROM_ALL discarded_link_pass_outcome.cpp)
+target_include_directories(dss_link_discarded_link_pass_outcome PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_definitions(dss_link_discarded_link_pass_outcome PRIVATE DSS_DISCARD_THE_LINK_PASS_OUTCOME)
+add_test(NAME link/a_discarded_link_pass_outcome_does_not_compile
+         COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}
+                 --target dss_link_discarded_link_pass_outcome --config $<CONFIG>)
+set_tests_properties(link/a_discarded_link_pass_outcome_does_not_compile PROPERTIES
+    PASS_REGULAR_EXPRESSION "-Werror[=,]-?W?unused-(result|value)|error C4834")
 
 # P69 review M4 (D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB) — DSS's RELOCATABLE GOT-load encoding as the
 # REFERENCE linkers consume it. Tier 1 (every host): the four relocatable formats' objects read back, every address of

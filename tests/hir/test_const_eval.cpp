@@ -2594,7 +2594,7 @@ EvalEnvironment addressEnv(TypeInterner& in) {
         if (s.v == kSymW) return AddressableSymbol{true};
         return std::nullopt;   // kSymLocal: an automatic object has no link-time address
     };
-    env.resolveStringLiteralSymbol = [](HirNodeId) -> std::optional<SymbolId> {
+    env.resolveStringLiteralSymbol = [](HirNodeId) -> std::expected<std::optional<SymbolId>, SymbolIdsRefused> {
         return SymbolId{kSymStr};
     };
     env.resolveElementStride = [&in](TypeId t) -> std::optional<std::uint64_t> {
@@ -2908,6 +2908,38 @@ TEST(ConstEvalAddress, AStringLiteralIsItsInternedObject) {
     HirNodeId const e = r.binary(HirOpKind::Add, decayed, r.litInt(1, r.i64T()),
                                  r.interner.pointer(r.charT()));
     expectAddress(evalAddr(r, e, {}), kSymStr, 1);
+}
+
+// P69 f26e (B1, the refusal contract): a resolver whose symbol was REFUSED at its door (which reported it by name)
+// answers SymbolIdsRefused, and the fold fails with exactly that -- never NotAConstantExpression, the answer the
+// caller would turn into an H_StaticInitializerNotFolded of its own; the control, an object the resolver does not
+// have, stays "not a constant". RED-ON-DISABLE: arm hir-the-evaluator-folds-a-refused-symbol-into-not-a-constant
+// (the literal's refusal failing as NotAConstantExpression).
+TEST(ConstEvalAddress, ARefusedSymbolIsTheFoldsAnswerNeverNotAConstant) {
+    for (bool const refused : {true, false}) {
+        SCOPED_TRACE(refused ? "the door refused the literal's symbol" : "CONTROL: no such object");
+        AddrRig r;
+        HirLiteralValue s;
+        s.value = std::string{"x*"};
+        s.core  = TypeKind::Char;
+        HirNodeId const lit = r.builder.makeLiteral(r.arrT(r.charT(), 3), r.literals.add(s));
+        HirNodeId const decayed = r.cast(lit, r.interner.pointer(r.charT()));
+        Hir hir = r.finishWith(decayed);
+        EvalOptions opts;
+        opts.charIsUnsigned       = false;
+        opts.foldAddressConstants = true;
+        EvalEnvironment env = addressEnv(r.interner);
+        env.resolveStringLiteralSymbol =
+            [refused](HirNodeId) -> std::expected<std::optional<SymbolId>, SymbolIdsRefused> {
+            if (refused) return std::unexpected(SymbolIdsRefused{});
+            return std::nullopt;
+        };
+        ConstEvalResult const res = evaluateConstant(hir, r.interner, r.literals, decayed, env, opts);
+        EXPECT_FALSE(res.value.has_value());
+        EXPECT_EQ(res.failure,
+                  refused ? ConstEvalFailure::SymbolIdsRefused : ConstEvalFailure::NotAConstantExpression)
+            << "failure " << static_cast<int>(res.failure);
+    }
 }
 
 // A SEQUENCE: its value alone (`({ 42; })`) needs no form; discarding an operand (`(1, 42)`)

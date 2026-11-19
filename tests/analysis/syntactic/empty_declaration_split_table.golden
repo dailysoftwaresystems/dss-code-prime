@@ -200,7 +200,6 @@ UNIT alignas_on_bitfield.c
 UNIT alignas_on_function.c
 UNIT alignas_on_typedef.c
 UNIT asm_label_invalid.c
-  parse P_UnexpectedToken E @1258:1263 actual='__asm' scopes=[]
 UNIT attr_aligned_unfoldable_const_expr.c
 UNIT attr_arg_malformed_operator_expr.c
   parse P_NoAlternativeMatched E @508:509 actual=')' scopes=[3,3,3,]
@@ -297,6 +296,8 @@ UNIT static_initializer_object_read.c
 UNIT static_initializer_parameter.c
 UNIT static_initializer_volatile_array_element.c
 UNIT static_initializer_volatile_compound_literal_element.c
+UNIT std_attribute_item_without_its_name.c
+  parse P_UnexpectedToken E @395:396 actual=']' scopes=[4,4,]
 UNIT thread_local_invalid_combination.c
 UNIT thread_local_on_function.c
 UNIT thread_local_redeclaration_mismatch.c
@@ -319,4 +320,4 @@ UNIT vla_nullptr_length.c
 UNIT vla_param_star_in_function_definition.c
 UNIT vla_static_storage.c
 UNIT vla_struct_member.c
-END rows=48 units=115
+END rows=48 units=116

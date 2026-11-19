@@ -2813,6 +2813,22 @@ enum class DiagnosticCode : std::uint16_t {
     // suppressible, names what two of the three refuse.
     S_PrototypeIncompatibleWithADeclarationWithoutOne = 0xE0A0,
 
+    // P69 (lane `cs`, fold f26e) [[D-C-A-C23-SEQUENCE-AFTER-A-WIDTH-OR-AFTER-A-GNU-RUN-IS-ACCEPTED-OTHERWISE-THAN-THE-REFERENCES]]:
+    // an asm label written where the language takes none -- after a run the declarators block
+    // names in `asmLabelLeadingFunctionOnlyRules` on any declarator but the FIRST of a
+    // declaration that declares a function, or on a function DEFINITION when
+    // `asmLabelRefusedOnDefinition`. ✔MEASURED (probes n5o, n5t): gcc, clang, Apple clang and
+    // MinGW-w64 gcc refuse both, and clang alone takes the run on a leading function
+    // declarator, which is why that place is admitted. An ERROR, unsuppressable for
+    // S_AsmLabelInvalid's reason: a refused label leaves the C name in its place.
+    S_AsmLabelMisplaced = 0xE0A1,
+
+    // P69 (lane `cs`, fold f26e, WARNING): an asm label on a TYPEDEF declarator. A typedef name
+    // declares a type, which has no assembler symbol to rename; gcc and clang accept the label
+    // and ignore it in silence (probes n5t, n5u), so it is accepted and IGNORED -- and said, as
+    // S_AsmLabelOnAutomaticVariable says it of an automatic object. Suppressible, as that is.
+    S_AsmLabelOnTypedef = 0xE0A2,
+
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
     // The 0xD block is shared with future driver codes (e.g. the artifact-
@@ -4218,6 +4234,13 @@ enum class DiagnosticCode : std::uint16_t {
     //   supported in this configuration; ignored" [-Wattributes]. `.actual` names the
     //   declaration, the visibility it states, the one written, and the format.
     H_VisibilityWrittenAsAnother  = 0xF01F,
+    // H_SymbolIdSpaceExhausted (P69 fold f26e, lane `cs`, review-csf26d B1) — ERROR. HIR→MIR's id space -- the
+    //   module the lowering builds -- has no fresh SymbolId left for a symbol the lowering synthesizes (a promoted
+    //   float constant, a string literal's datum, an unnamed static object, a label's block symbol). Refused at the
+    //   take by the module's door (`MirBuilder::mintSymbol`, through the home's one emitter), rather than handing
+    //   out the invalid id for a caller to drop. The HIR→MIR member of the K_/L_/H_ trio. UNSUPPRESSABLE
+    //   (`kWhySymbolIdSpace`): silenced, two symbols alias one address in a green build.
+    H_SymbolIdSpaceExhausted      = 0xF020,
 
     // ── I0xxx — MIR verifier (plan 12 ML3; the 0xA high nibble renders as "I"
     // for the IR-gen / mid-level layer). Each code names a structural-,
@@ -5741,8 +5764,10 @@ enum class DiagnosticCode : std::uint16_t {
     //   record count reaches the first value a format writer reserves (a record's id is its index, and an
     //   index space ends there). Refused by the space's door (`link/fresh_symbol_ids.hpp`,
     //   `link/format/record_symbol_ids.hpp`), naming what was being minted, rather than wrapping onto 0, the
-    //   invalid id, or onto an id a symbol already holds. Always an Error, so the unsuppressable table needs no
-    //   entry for it (its rule: an Error is never silenced).
+    //   invalid id, or onto an id a symbol already holds. UNSUPPRESSABLE, under `kWhySymbolIdSpace` as its
+    //   L_ and H_ siblings (P69 fold f26e, review-csf26d A1): an Error is never silenced, but only a member is
+    //   delivered past the reporter's volume gates too, and the refusal is the ONLY statement that the output
+    //   was refused. Stated by the home's one emitter (core/types/symbol_id_cursor.hpp).
     K_SymbolIdSpaceExhausted       = 0x8033,
     // K-NEXT-SLOT: 0x8034 — grep this marker before adding a K_* code.
 

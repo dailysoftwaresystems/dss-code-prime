@@ -440,25 +440,14 @@ void emitStoppedBeforeCuBuild(DiagnosticReporter& rep,
 void mergeWithTargetContext(DiagnosticReporter const& src,
                             std::string const&        targetSpec,
                             DiagnosticReporter&       dst) {
-    // ★★ THE BUFFERS TRAVEL WITH THE DIAGNOSTICS, AND FIRST. A diagnostic
-    // whose `BufferId` names a buffer only `src` retains renders as
-    // `--> <unknown-buffer:N>:offset K` at `dst` — the whole failure mode the
-    // reporter-side retention exists to end (see
-    // `DiagnosticReporter::sourceBuffers()`). Every mid-compile fragment
-    // buffer — today an embedded assembly template, tomorrow any other tier
-    // that parses text the CUs do not own — is registered on THIS scratch
-    // reporter, so a merge that carried only `all()` would move the
-    // diagnostics out of reach of their own source.
-    // ⚠ Ordered before the diagnostic loop so a `dst` that is already capped
-    // still gains the buffers: the cap drops diagnostics, not sources, and a
-    // partial render must not also lose its context.
-    dst.sourceBuffers().addAll(src.sourceBuffers());
+    // ★★ THE BUFFERS TRAVEL WITH THE DIAGNOSTICS, AND FIRST -- and so does the
+    // count of what `src`'s gates dropped (D9(c)). Both are `relayFrom`'s: a
+    // diagnostic whose `BufferId` names a buffer only `src` retains renders as
+    // `--> <unknown-buffer:N>:offset K` at `dst` (see
+    // `DiagnosticReporter::sourceBuffers()`), and an Error `src` elided that
+    // `dst` never counts is a failed target that reads as a clean one.
     auto const prefix = "[target=" + targetSpec + "] ";
-    for (auto const& d : src.all()) {
-        ParseDiagnostic copy = d;
-        copy.contextPrefix = prefix;
-        dst.report(std::move(copy));
-    }
+    dst.relayFrom(src, [&prefix](ParseDiagnostic& d) { d.contextPrefix = prefix; });
 }
 
 // Map a `TargetSpec::parse` failure kind to a remediation-distinct
@@ -2138,7 +2127,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         bool const allBuilt = substrate::runEveryUnit(
             cus.size(), substrate::namingSilentUnits(reporter, "a per-CU build (buildCuMir)", silentUnitName,
                                                      [&](std::size_t i) {
-                                                         copyDiagnostics(cuScratch[i], reporter);
+                                                         reporter.relayFrom(cuScratch[i]);
                                                          return cuMirSlots[i].has_value();
                                                      }));
         if (!allBuilt) return std::nullopt;  // ≥1 front-half tier failure — every unit's diagnostics reported
@@ -5345,7 +5334,7 @@ int runCusToTargets(
             auto const errorsBefore = rep.errorCount();
             // The unit's own streams, and its own verdict, through their one home.
             bool failed = cu.forEachOwnDiagnosticStream(
-                [&rep](DiagnosticReporter const& stream) { copyDiagnostics(stream, rep); });
+                [&rep](DiagnosticReporter const& stream) { rep.relayFrom(stream); });
             for (auto const& tree : cu.trees()) {
                 // Defense-in-depth: a driver-produced tree always has a non-null
                 // source, but `BufferRegistry::add` THROWS on null — guard so a

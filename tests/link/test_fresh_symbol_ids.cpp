@@ -281,51 +281,58 @@ TEST(FreshSymbolIds, ANewSpaceIsNumberedFromOneAndRefusesOnceWhenExhausted) {
     DiagnosticReporter::Config noWindow;
     noWindow.dedupWindow = 0;
     DiagnosticReporter rep{noWindow};
-    linker::NewSpaceSymbolIds fresh{SymbolIdEnd{}, rep, "the new-space cell"};
+    // The merge's numbering is the home's REPORTED door (P69 f26e, B1): its owner's output leaves through the seal.
+    SymbolIdRefusalSink const sink = linker::linkRefusalSink(rep);
+    ReportedSymbolIds fresh{SymbolIdEnd{}, sink, "the new-space cell"};
     EXPECT_EQ(fresh.take().v, 1u);
     EXPECT_EQ(fresh.take().v, 2u);
+    EXPECT_EQ(fresh.seal(std::string{"merged"}), std::optional<std::string>{"merged"})
+        << "CONTROL: an unrefused space's output is sealed whole";
 
     SymbolIdEnd nearReserved;
     nearReserved.keepClearOfHighest(kTlsIndexReservedSymbolIdValue - 1u);
-    linker::NewSpaceSymbolIds past{nearReserved, rep, "the reserved cell"};
+    ReportedSymbolIds past{nearReserved, sink, "the reserved cell"};
     EXPECT_EQ(past.take().v, kTlsIndexReservedSymbolIdValue + 1u) << "the value a writer reserves is no merged id";
+    EXPECT_TRUE(past.seal(1).has_value());
 
     SymbolIdEnd edge;
     edge.keepClearOfHighest(kLast - 2u);
-    linker::NewSpaceSymbolIds last{edge, rep, "the edge cell"};
+    ReportedSymbolIds last{edge, sink, "the edge cell"};
     EXPECT_EQ(last.take().v, kLast - 1u);
-    EXPECT_FALSE(last.refused());
     EXPECT_FALSE(last.take().valid());
     EXPECT_FALSE(last.take().valid());
-    EXPECT_TRUE(last.refused());
+    EXPECT_FALSE(last.seal(std::string{"merged"}).has_value()) << "a refused space's output was sealed";
     EXPECT_EQ(countOf(rep, DiagnosticCode::K_SymbolIdSpaceExhausted), 1u) << "reported once, not per take";
 }
 
 // AN OBJECT'S RECORD TABLE: an index space that ends below the first reserved value (a table that reaches it is
-// refused at the read), and a counting space past it that steps over the reserved values and refuses the last.
+// refused when it is OPENED), and a counting space past it -- the home's OPTIONAL door -- that steps over the
+// reserved values and refuses the last, at every take, writing nothing (P69 f26e, B1).
 TEST(FreshSymbolIds, ARecordTableEndsBelowTheReservedValuesAndRefusesItsExhaustion) {
     {
         DiagnosticReporter rep;
-        link::format::RecordSymbolIds const ids{kFirstWriterReservedSymbolIdValue, rep, "the reader cell"};
-        EXPECT_TRUE(ids.refused()) << "record 0 would take the first reserved value as its id";
+        EXPECT_FALSE(link::format::RecordSymbolIds::open(kFirstWriterReservedSymbolIdValue, rep, "the reader cell"))
+            << "record 0 would take the first reserved value as its id";
         EXPECT_EQ(countOf(rep, DiagnosticCode::K_SymbolIdSpaceExhausted), 1u);
     }
     DiagnosticReporter rep;
-    link::format::RecordSymbolIds ids{kFirstWriterReservedSymbolIdValue - 1u, rep, "the reader cell"};
-    ASSERT_FALSE(ids.refused()) << "a table one short of the first reserved value fits";
+    std::optional<link::format::RecordSymbolIds> opened =
+        link::format::RecordSymbolIds::open(kFirstWriterReservedSymbolIdValue - 1u, rep, "the reader cell");
+    ASSERT_TRUE(opened.has_value()) << "a table one short of the first reserved value fits";
+    link::format::RecordSymbolIds& ids = *opened;
     EXPECT_EQ(ids.of(0).v, kFirstWriterReservedSymbolIdValue - 1u) << "record 0 takes the record count";
     std::uint32_t taken = 0;
     std::uint32_t lastId = 0;
-    for (SymbolId id = ids.fresh(); id.valid(); id = ids.fresh()) {
-        EXPECT_FALSE(isWriterReservedSymbolIdValue(id.v)) << "a fresh id is never a reserved value";
-        EXPECT_GT(id.v, lastId);
-        lastId = id.v;
+    for (std::optional<SymbolId> id = ids.fresh(); id.has_value(); id = ids.fresh()) {
+        EXPECT_FALSE(isWriterReservedSymbolIdValue(id->v)) << "a fresh id is never a reserved value";
+        EXPECT_GT(id->v, lastId);
+        lastId = id->v;
         ++taken;
         ASSERT_LT(taken, 1000u) << "the space past the table never ends";
     }
     EXPECT_EQ(lastId, kLast - 1u) << "the last value is never handed out";
-    EXPECT_TRUE(ids.refused());
-    EXPECT_FALSE(ids.fresh().valid()) << "and stays refused";
-    EXPECT_EQ(countOf(rep, DiagnosticCode::K_SymbolIdSpaceExhausted), 1u) << "reported once";
-    EXPECT_EQ(ids.end().value(), kLast) << "the end the reader's module carries";
+    EXPECT_EQ(countOf(rep, DiagnosticCode::K_SymbolIdSpaceExhausted), 1u) << "the refused take, by name";
+    EXPECT_FALSE(ids.fresh().has_value()) << "and stays refused";
+    EXPECT_EQ(countOf(rep, DiagnosticCode::K_SymbolIdSpaceExhausted), 2u) << "every refused take is reported";
+    EXPECT_EQ(ids.end().value(), kLast) << "the end the reader's module carries: a refusal wrote nothing";
 }

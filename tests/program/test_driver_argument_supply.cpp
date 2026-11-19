@@ -1987,6 +1987,163 @@ TEST(DriverArgumentSupply, WindowsModuleAndMemoryQueryDeclarationsAreTheReferenc
         << "the failure must be THIS assertion's, by its own text: " << allDiagnosticText(rep);
 }
 
+// ── THE HANDLE TYPES AND THE x64 CONTEXT OF <windows.h> ────────────────────
+//
+// P69 fold f26e (lane `cs`; the review of f26d C1, and D-FFI-SHIPPED-WINDOWS-H-LACKS-THE-CONTEXT-STRUCTURE): the shipped
+// <windows.h> typed HMODULE, HINSTANCE and FARPROC `void *`, PCONTEXT and the exception structures' pointer
+// typedefs `void *`, and declared no CONTEXT. Every assertion below is a line probe c1 MEASURED IDENTICALLY on
+// MinGW-w64 gcc 13.2 -std=c17 and cl 19.52 /std:c17 (runs 20261119-053323-5ed6b3f8, 20261119-053304-08dfc1d4;
+// generated from their reports, a line where the two part left out and stated in windows.json): the handle
+// types by `_Generic`, CONTEXT member by member (offset, size and type), M128A and XMM_SAVE_AREA32, and the
+// pointer types; then the calls that answer the handle types. The negative proves the assertions are read.
+namespace {
+[[nodiscard]] std::string windowsContextAssertions(char const* extra) {
+    std::string src =
+        "#include <windows.h>\n#include <stddef.h>\n"
+        "#if !defined(STRICT)\n#error \"STRICT is defined by the header\"\n#endif\n"
+        "_Static_assert(_Generic((HANDLE)0, void *: 1, default: 0) == 1, \"HANDLE is void *\");\n"
+        "_Static_assert(_Generic((HLOCAL)0, void *: 1, default: 0) == 1, \"HLOCAL is void *\");\n"
+        "_Static_assert(_Generic((HLOCAL)0, HANDLE: 1, default: 0) == 1, \"HLOCAL is HANDLE\");\n"
+        "_Static_assert(_Generic((HMODULE)0, void *: 1, default: 0) == 0, \"HMODULE is no void *\");\n"
+        "_Static_assert(_Generic((HMODULE)0, struct HINSTANCE__ *: 1, default: 0) == 1, \"HMODULE is struct HINSTANCE__ *\");\n"
+        "_Static_assert(_Generic((HMODULE)0, HINSTANCE: 1, default: 0) == 1, \"HMODULE is HINSTANCE\");\n"
+        "_Static_assert(_Generic((HINSTANCE)0, void *: 1, default: 0) == 0, \"HINSTANCE is no void *\");\n"
+        "_Static_assert(_Generic((HINSTANCE)0, struct HINSTANCE__ *: 1, default: 0) == 1, \"HINSTANCE is struct HINSTANCE__ *\");\n"
+        "_Static_assert(_Generic((LPHANDLE)0, void **: 1, default: 0) == 1, \"LPHANDLE is void **\");\n"
+        "_Static_assert(_Generic((LPHANDLE)0, HANDLE *: 1, default: 0) == 1, \"LPHANDLE is HANDLE *\");\n"
+        "_Static_assert(_Generic((FARPROC)0, void *: 1, default: 0) == 0, \"FARPROC is no void *\");\n"
+        "_Static_assert(_Generic((FARPROC)0, INT_PTR (WINAPI *)(): 1, default: 0) == 1, \"FARPROC is INT_PTR (WINAPI *)()\");\n"
+        "_Static_assert(_Generic((FARPROC)0, long long (WINAPI *)(): 1, default: 0) == 1, \"FARPROC is long long (WINAPI *)()\");\n"
+        "_Static_assert(sizeof(struct HINSTANCE__) == 4, \"struct HINSTANCE__ is 4 bytes\");\n"
+        "_Static_assert(sizeof(FARPROC) == 8, \"FARPROC is 8 bytes\");\n"
+        "_Static_assert(sizeof(CONTEXT) == 1232 && _Alignof(CONTEXT) == 16, \"CONTEXT is 1232 bytes, 16-aligned\");\n"
+        "_Static_assert(sizeof(M128A) == 16 && _Alignof(M128A) == 16, \"M128A is 16 bytes, 16-aligned\");\n"
+        "_Static_assert(offsetof(M128A, Low) == 0 && _Generic(((M128A *)0)->Low, unsigned long long: 1, default: 0), \"M128A.Low at 0\");\n"
+        "_Static_assert(offsetof(M128A, High) == 8 && _Generic(((M128A *)0)->High, long long: 1, default: 0), \"M128A.High at 8\");\n"
+        "_Static_assert(sizeof(XMM_SAVE_AREA32) == 512 && _Alignof(XMM_SAVE_AREA32) == 16, \"XMM_SAVE_AREA32 is 512 bytes, 16-aligned\");\n"
+        "_Static_assert(offsetof(XMM_SAVE_AREA32, ControlWord) == 0 && sizeof(((XMM_SAVE_AREA32 *)0)->ControlWord) == 2 && _Generic(((XMM_SAVE_AREA32 *)0)->ControlWord, unsigned short: 1, default: 0), \"XMM_SAVE_AREA32.ControlWord at 0\");\n"
+        "_Static_assert(offsetof(XMM_SAVE_AREA32, StatusWord) == 2 && sizeof(((XMM_SAVE_AREA32 *)0)->StatusWord) == 2 && _Generic(((XMM_SAVE_AREA32 *)0)->StatusWord, unsigned short: 1, default: 0), \"XMM_SAVE_AREA32.StatusWord at 2\");\n"
+        "_Static_assert(offsetof(XMM_SAVE_AREA32, TagWord) == 4 && sizeof(((XMM_SAVE_AREA32 *)0)->TagWord) == 1 && _Generic(((XMM_SAVE_AREA32 *)0)->TagWord, unsigned char: 1, default: 0), \"XMM_SAVE_AREA32.TagWord at 4\");\n"
+        "_Static_assert(offsetof(XMM_SAVE_AREA32, Reserved1) == 5 && sizeof(((XMM_SAVE_AREA32 *)0)->Reserved1) == 1 && _Generic(((XMM_SAVE_AREA32 *)0)->Reserved1, unsigned char: 1, default: 0), \"XMM_SAVE_AREA32.Reserved1 at 5\");\n"
+        "_Static_assert(offsetof(XMM_SAVE_AREA32, ErrorOpcode) == 6 && sizeof(((XMM_SAVE_AREA32 *)0)->ErrorOpcode) == 2 && _Generic(((XMM_SAVE_AREA32 *)0)->ErrorOpcode, unsigned short: 1, default: 0), \"XMM_SAVE_AREA32.ErrorOpcode at 6\");\n"
+        "_Static_assert(offsetof(XMM_SAVE_AREA32, ErrorOffset) == 8 && sizeof(((XMM_SAVE_AREA32 *)0)->ErrorOffset) == 4 && _Generic(((XMM_SAVE_AREA32 *)0)->ErrorOffset, unsigned long: 1, default: 0), \"XMM_SAVE_AREA32.ErrorOffset at 8\");\n"
+        "_Static_assert(offsetof(XMM_SAVE_AREA32, ErrorSelector) == 12 && sizeof(((XMM_SAVE_AREA32 *)0)->ErrorSelector) == 2 && _Generic(((XMM_SAVE_AREA32 *)0)->ErrorSelector, unsigned short: 1, default: 0), \"XMM_SAVE_AREA32.ErrorSelector at 12\");\n"
+        "_Static_assert(offsetof(XMM_SAVE_AREA32, Reserved2) == 14 && sizeof(((XMM_SAVE_AREA32 *)0)->Reserved2) == 2 && _Generic(((XMM_SAVE_AREA32 *)0)->Reserved2, unsigned short: 1, default: 0), \"XMM_SAVE_AREA32.Reserved2 at 14\");\n"
+        "_Static_assert(offsetof(XMM_SAVE_AREA32, DataOffset) == 16 && sizeof(((XMM_SAVE_AREA32 *)0)->DataOffset) == 4 && _Generic(((XMM_SAVE_AREA32 *)0)->DataOffset, unsigned long: 1, default: 0), \"XMM_SAVE_AREA32.DataOffset at 16\");\n"
+        "_Static_assert(offsetof(XMM_SAVE_AREA32, DataSelector) == 20 && sizeof(((XMM_SAVE_AREA32 *)0)->DataSelector) == 2 && _Generic(((XMM_SAVE_AREA32 *)0)->DataSelector, unsigned short: 1, default: 0), \"XMM_SAVE_AREA32.DataSelector at 20\");\n"
+        "_Static_assert(offsetof(XMM_SAVE_AREA32, Reserved3) == 22 && sizeof(((XMM_SAVE_AREA32 *)0)->Reserved3) == 2 && _Generic(((XMM_SAVE_AREA32 *)0)->Reserved3, unsigned short: 1, default: 0), \"XMM_SAVE_AREA32.Reserved3 at 22\");\n"
+        "_Static_assert(offsetof(XMM_SAVE_AREA32, MxCsr) == 24 && sizeof(((XMM_SAVE_AREA32 *)0)->MxCsr) == 4 && _Generic(((XMM_SAVE_AREA32 *)0)->MxCsr, unsigned long: 1, default: 0), \"XMM_SAVE_AREA32.MxCsr at 24\");\n"
+        "_Static_assert(offsetof(XMM_SAVE_AREA32, MxCsr_Mask) == 28 && sizeof(((XMM_SAVE_AREA32 *)0)->MxCsr_Mask) == 4 && _Generic(((XMM_SAVE_AREA32 *)0)->MxCsr_Mask, unsigned long: 1, default: 0), \"XMM_SAVE_AREA32.MxCsr_Mask at 28\");\n"
+        "_Static_assert(offsetof(XMM_SAVE_AREA32, FloatRegisters) == 32 && sizeof(((XMM_SAVE_AREA32 *)0)->FloatRegisters) == 128, \"XMM_SAVE_AREA32.FloatRegisters at 32\");\n"
+        "_Static_assert(offsetof(XMM_SAVE_AREA32, XmmRegisters) == 160 && sizeof(((XMM_SAVE_AREA32 *)0)->XmmRegisters) == 256, \"XMM_SAVE_AREA32.XmmRegisters at 160\");\n"
+        "_Static_assert(offsetof(XMM_SAVE_AREA32, Reserved4) == 416 && sizeof(((XMM_SAVE_AREA32 *)0)->Reserved4) == 96, \"XMM_SAVE_AREA32.Reserved4 at 416\");\n"
+        "_Static_assert(offsetof(CONTEXT, P1Home) == 0 && sizeof(((CONTEXT *)0)->P1Home) == 8 && _Generic(((CONTEXT *)0)->P1Home, unsigned long long: 1, default: 0), \"CONTEXT.P1Home at 0\");\n"
+        "_Static_assert(offsetof(CONTEXT, P2Home) == 8 && sizeof(((CONTEXT *)0)->P2Home) == 8 && _Generic(((CONTEXT *)0)->P2Home, unsigned long long: 1, default: 0), \"CONTEXT.P2Home at 8\");\n"
+        "_Static_assert(offsetof(CONTEXT, P3Home) == 16 && sizeof(((CONTEXT *)0)->P3Home) == 8 && _Generic(((CONTEXT *)0)->P3Home, unsigned long long: 1, default: 0), \"CONTEXT.P3Home at 16\");\n"
+        "_Static_assert(offsetof(CONTEXT, P4Home) == 24 && sizeof(((CONTEXT *)0)->P4Home) == 8 && _Generic(((CONTEXT *)0)->P4Home, unsigned long long: 1, default: 0), \"CONTEXT.P4Home at 24\");\n"
+        "_Static_assert(offsetof(CONTEXT, P5Home) == 32 && sizeof(((CONTEXT *)0)->P5Home) == 8 && _Generic(((CONTEXT *)0)->P5Home, unsigned long long: 1, default: 0), \"CONTEXT.P5Home at 32\");\n"
+        "_Static_assert(offsetof(CONTEXT, P6Home) == 40 && sizeof(((CONTEXT *)0)->P6Home) == 8 && _Generic(((CONTEXT *)0)->P6Home, unsigned long long: 1, default: 0), \"CONTEXT.P6Home at 40\");\n"
+        "_Static_assert(offsetof(CONTEXT, ContextFlags) == 48 && sizeof(((CONTEXT *)0)->ContextFlags) == 4 && _Generic(((CONTEXT *)0)->ContextFlags, unsigned long: 1, default: 0), \"CONTEXT.ContextFlags at 48\");\n"
+        "_Static_assert(offsetof(CONTEXT, MxCsr) == 52 && sizeof(((CONTEXT *)0)->MxCsr) == 4 && _Generic(((CONTEXT *)0)->MxCsr, unsigned long: 1, default: 0), \"CONTEXT.MxCsr at 52\");\n"
+        "_Static_assert(offsetof(CONTEXT, SegCs) == 56 && sizeof(((CONTEXT *)0)->SegCs) == 2 && _Generic(((CONTEXT *)0)->SegCs, unsigned short: 1, default: 0), \"CONTEXT.SegCs at 56\");\n"
+        "_Static_assert(offsetof(CONTEXT, SegDs) == 58 && sizeof(((CONTEXT *)0)->SegDs) == 2 && _Generic(((CONTEXT *)0)->SegDs, unsigned short: 1, default: 0), \"CONTEXT.SegDs at 58\");\n"
+        "_Static_assert(offsetof(CONTEXT, SegEs) == 60 && sizeof(((CONTEXT *)0)->SegEs) == 2 && _Generic(((CONTEXT *)0)->SegEs, unsigned short: 1, default: 0), \"CONTEXT.SegEs at 60\");\n"
+        "_Static_assert(offsetof(CONTEXT, SegFs) == 62 && sizeof(((CONTEXT *)0)->SegFs) == 2 && _Generic(((CONTEXT *)0)->SegFs, unsigned short: 1, default: 0), \"CONTEXT.SegFs at 62\");\n"
+        "_Static_assert(offsetof(CONTEXT, SegGs) == 64 && sizeof(((CONTEXT *)0)->SegGs) == 2 && _Generic(((CONTEXT *)0)->SegGs, unsigned short: 1, default: 0), \"CONTEXT.SegGs at 64\");\n"
+        "_Static_assert(offsetof(CONTEXT, SegSs) == 66 && sizeof(((CONTEXT *)0)->SegSs) == 2 && _Generic(((CONTEXT *)0)->SegSs, unsigned short: 1, default: 0), \"CONTEXT.SegSs at 66\");\n"
+        "_Static_assert(offsetof(CONTEXT, EFlags) == 68 && sizeof(((CONTEXT *)0)->EFlags) == 4 && _Generic(((CONTEXT *)0)->EFlags, unsigned long: 1, default: 0), \"CONTEXT.EFlags at 68\");\n"
+        "_Static_assert(offsetof(CONTEXT, Dr0) == 72 && sizeof(((CONTEXT *)0)->Dr0) == 8 && _Generic(((CONTEXT *)0)->Dr0, unsigned long long: 1, default: 0), \"CONTEXT.Dr0 at 72\");\n"
+        "_Static_assert(offsetof(CONTEXT, Dr1) == 80 && sizeof(((CONTEXT *)0)->Dr1) == 8 && _Generic(((CONTEXT *)0)->Dr1, unsigned long long: 1, default: 0), \"CONTEXT.Dr1 at 80\");\n"
+        "_Static_assert(offsetof(CONTEXT, Dr2) == 88 && sizeof(((CONTEXT *)0)->Dr2) == 8 && _Generic(((CONTEXT *)0)->Dr2, unsigned long long: 1, default: 0), \"CONTEXT.Dr2 at 88\");\n"
+        "_Static_assert(offsetof(CONTEXT, Dr3) == 96 && sizeof(((CONTEXT *)0)->Dr3) == 8 && _Generic(((CONTEXT *)0)->Dr3, unsigned long long: 1, default: 0), \"CONTEXT.Dr3 at 96\");\n"
+        "_Static_assert(offsetof(CONTEXT, Dr6) == 104 && sizeof(((CONTEXT *)0)->Dr6) == 8 && _Generic(((CONTEXT *)0)->Dr6, unsigned long long: 1, default: 0), \"CONTEXT.Dr6 at 104\");\n"
+        "_Static_assert(offsetof(CONTEXT, Dr7) == 112 && sizeof(((CONTEXT *)0)->Dr7) == 8 && _Generic(((CONTEXT *)0)->Dr7, unsigned long long: 1, default: 0), \"CONTEXT.Dr7 at 112\");\n"
+        "_Static_assert(offsetof(CONTEXT, Rax) == 120 && sizeof(((CONTEXT *)0)->Rax) == 8 && _Generic(((CONTEXT *)0)->Rax, unsigned long long: 1, default: 0), \"CONTEXT.Rax at 120\");\n"
+        "_Static_assert(offsetof(CONTEXT, Rcx) == 128 && sizeof(((CONTEXT *)0)->Rcx) == 8 && _Generic(((CONTEXT *)0)->Rcx, unsigned long long: 1, default: 0), \"CONTEXT.Rcx at 128\");\n"
+        "_Static_assert(offsetof(CONTEXT, Rdx) == 136 && sizeof(((CONTEXT *)0)->Rdx) == 8 && _Generic(((CONTEXT *)0)->Rdx, unsigned long long: 1, default: 0), \"CONTEXT.Rdx at 136\");\n"
+        "_Static_assert(offsetof(CONTEXT, Rbx) == 144 && sizeof(((CONTEXT *)0)->Rbx) == 8 && _Generic(((CONTEXT *)0)->Rbx, unsigned long long: 1, default: 0), \"CONTEXT.Rbx at 144\");\n"
+        "_Static_assert(offsetof(CONTEXT, Rsp) == 152 && sizeof(((CONTEXT *)0)->Rsp) == 8 && _Generic(((CONTEXT *)0)->Rsp, unsigned long long: 1, default: 0), \"CONTEXT.Rsp at 152\");\n"
+        "_Static_assert(offsetof(CONTEXT, Rbp) == 160 && sizeof(((CONTEXT *)0)->Rbp) == 8 && _Generic(((CONTEXT *)0)->Rbp, unsigned long long: 1, default: 0), \"CONTEXT.Rbp at 160\");\n"
+        "_Static_assert(offsetof(CONTEXT, Rsi) == 168 && sizeof(((CONTEXT *)0)->Rsi) == 8 && _Generic(((CONTEXT *)0)->Rsi, unsigned long long: 1, default: 0), \"CONTEXT.Rsi at 168\");\n"
+        "_Static_assert(offsetof(CONTEXT, Rdi) == 176 && sizeof(((CONTEXT *)0)->Rdi) == 8 && _Generic(((CONTEXT *)0)->Rdi, unsigned long long: 1, default: 0), \"CONTEXT.Rdi at 176\");\n"
+        "_Static_assert(offsetof(CONTEXT, R8) == 184 && sizeof(((CONTEXT *)0)->R8) == 8 && _Generic(((CONTEXT *)0)->R8, unsigned long long: 1, default: 0), \"CONTEXT.R8 at 184\");\n"
+        "_Static_assert(offsetof(CONTEXT, R9) == 192 && sizeof(((CONTEXT *)0)->R9) == 8 && _Generic(((CONTEXT *)0)->R9, unsigned long long: 1, default: 0), \"CONTEXT.R9 at 192\");\n"
+        "_Static_assert(offsetof(CONTEXT, R10) == 200 && sizeof(((CONTEXT *)0)->R10) == 8 && _Generic(((CONTEXT *)0)->R10, unsigned long long: 1, default: 0), \"CONTEXT.R10 at 200\");\n"
+        "_Static_assert(offsetof(CONTEXT, R11) == 208 && sizeof(((CONTEXT *)0)->R11) == 8 && _Generic(((CONTEXT *)0)->R11, unsigned long long: 1, default: 0), \"CONTEXT.R11 at 208\");\n"
+        "_Static_assert(offsetof(CONTEXT, R12) == 216 && sizeof(((CONTEXT *)0)->R12) == 8 && _Generic(((CONTEXT *)0)->R12, unsigned long long: 1, default: 0), \"CONTEXT.R12 at 216\");\n"
+        "_Static_assert(offsetof(CONTEXT, R13) == 224 && sizeof(((CONTEXT *)0)->R13) == 8 && _Generic(((CONTEXT *)0)->R13, unsigned long long: 1, default: 0), \"CONTEXT.R13 at 224\");\n"
+        "_Static_assert(offsetof(CONTEXT, R14) == 232 && sizeof(((CONTEXT *)0)->R14) == 8 && _Generic(((CONTEXT *)0)->R14, unsigned long long: 1, default: 0), \"CONTEXT.R14 at 232\");\n"
+        "_Static_assert(offsetof(CONTEXT, R15) == 240 && sizeof(((CONTEXT *)0)->R15) == 8 && _Generic(((CONTEXT *)0)->R15, unsigned long long: 1, default: 0), \"CONTEXT.R15 at 240\");\n"
+        "_Static_assert(offsetof(CONTEXT, Rip) == 248 && sizeof(((CONTEXT *)0)->Rip) == 8 && _Generic(((CONTEXT *)0)->Rip, unsigned long long: 1, default: 0), \"CONTEXT.Rip at 248\");\n"
+        "_Static_assert(offsetof(CONTEXT, FltSave) == 256 && sizeof(((CONTEXT *)0)->FltSave) == 512 && _Generic(((CONTEXT *)0)->FltSave, XMM_SAVE_AREA32: 1, default: 0), \"CONTEXT.FltSave at 256\");\n"
+        "_Static_assert(offsetof(CONTEXT, Header) == 256 && sizeof(((CONTEXT *)0)->Header) == 32, \"CONTEXT.Header at 256\");\n"
+        "_Static_assert(offsetof(CONTEXT, Legacy) == 288 && sizeof(((CONTEXT *)0)->Legacy) == 128, \"CONTEXT.Legacy at 288\");\n"
+        "_Static_assert(offsetof(CONTEXT, Xmm0) == 416 && sizeof(((CONTEXT *)0)->Xmm0) == 16 && _Generic(((CONTEXT *)0)->Xmm0, M128A: 1, default: 0), \"CONTEXT.Xmm0 at 416\");\n"
+        "_Static_assert(offsetof(CONTEXT, Xmm1) == 432 && sizeof(((CONTEXT *)0)->Xmm1) == 16 && _Generic(((CONTEXT *)0)->Xmm1, M128A: 1, default: 0), \"CONTEXT.Xmm1 at 432\");\n"
+        "_Static_assert(offsetof(CONTEXT, Xmm2) == 448 && sizeof(((CONTEXT *)0)->Xmm2) == 16 && _Generic(((CONTEXT *)0)->Xmm2, M128A: 1, default: 0), \"CONTEXT.Xmm2 at 448\");\n"
+        "_Static_assert(offsetof(CONTEXT, Xmm3) == 464 && sizeof(((CONTEXT *)0)->Xmm3) == 16 && _Generic(((CONTEXT *)0)->Xmm3, M128A: 1, default: 0), \"CONTEXT.Xmm3 at 464\");\n"
+        "_Static_assert(offsetof(CONTEXT, Xmm4) == 480 && sizeof(((CONTEXT *)0)->Xmm4) == 16 && _Generic(((CONTEXT *)0)->Xmm4, M128A: 1, default: 0), \"CONTEXT.Xmm4 at 480\");\n"
+        "_Static_assert(offsetof(CONTEXT, Xmm5) == 496 && sizeof(((CONTEXT *)0)->Xmm5) == 16 && _Generic(((CONTEXT *)0)->Xmm5, M128A: 1, default: 0), \"CONTEXT.Xmm5 at 496\");\n"
+        "_Static_assert(offsetof(CONTEXT, Xmm6) == 512 && sizeof(((CONTEXT *)0)->Xmm6) == 16 && _Generic(((CONTEXT *)0)->Xmm6, M128A: 1, default: 0), \"CONTEXT.Xmm6 at 512\");\n"
+        "_Static_assert(offsetof(CONTEXT, Xmm7) == 528 && sizeof(((CONTEXT *)0)->Xmm7) == 16 && _Generic(((CONTEXT *)0)->Xmm7, M128A: 1, default: 0), \"CONTEXT.Xmm7 at 528\");\n"
+        "_Static_assert(offsetof(CONTEXT, Xmm8) == 544 && sizeof(((CONTEXT *)0)->Xmm8) == 16 && _Generic(((CONTEXT *)0)->Xmm8, M128A: 1, default: 0), \"CONTEXT.Xmm8 at 544\");\n"
+        "_Static_assert(offsetof(CONTEXT, Xmm9) == 560 && sizeof(((CONTEXT *)0)->Xmm9) == 16 && _Generic(((CONTEXT *)0)->Xmm9, M128A: 1, default: 0), \"CONTEXT.Xmm9 at 560\");\n"
+        "_Static_assert(offsetof(CONTEXT, Xmm10) == 576 && sizeof(((CONTEXT *)0)->Xmm10) == 16 && _Generic(((CONTEXT *)0)->Xmm10, M128A: 1, default: 0), \"CONTEXT.Xmm10 at 576\");\n"
+        "_Static_assert(offsetof(CONTEXT, Xmm11) == 592 && sizeof(((CONTEXT *)0)->Xmm11) == 16 && _Generic(((CONTEXT *)0)->Xmm11, M128A: 1, default: 0), \"CONTEXT.Xmm11 at 592\");\n"
+        "_Static_assert(offsetof(CONTEXT, Xmm12) == 608 && sizeof(((CONTEXT *)0)->Xmm12) == 16 && _Generic(((CONTEXT *)0)->Xmm12, M128A: 1, default: 0), \"CONTEXT.Xmm12 at 608\");\n"
+        "_Static_assert(offsetof(CONTEXT, Xmm13) == 624 && sizeof(((CONTEXT *)0)->Xmm13) == 16 && _Generic(((CONTEXT *)0)->Xmm13, M128A: 1, default: 0), \"CONTEXT.Xmm13 at 624\");\n"
+        "_Static_assert(offsetof(CONTEXT, Xmm14) == 640 && sizeof(((CONTEXT *)0)->Xmm14) == 16 && _Generic(((CONTEXT *)0)->Xmm14, M128A: 1, default: 0), \"CONTEXT.Xmm14 at 640\");\n"
+        "_Static_assert(offsetof(CONTEXT, Xmm15) == 656 && sizeof(((CONTEXT *)0)->Xmm15) == 16 && _Generic(((CONTEXT *)0)->Xmm15, M128A: 1, default: 0), \"CONTEXT.Xmm15 at 656\");\n"
+        "_Static_assert(offsetof(CONTEXT, VectorRegister) == 768 && sizeof(((CONTEXT *)0)->VectorRegister) == 416, \"CONTEXT.VectorRegister at 768\");\n"
+        "_Static_assert(offsetof(CONTEXT, VectorControl) == 1184 && sizeof(((CONTEXT *)0)->VectorControl) == 8 && _Generic(((CONTEXT *)0)->VectorControl, unsigned long long: 1, default: 0), \"CONTEXT.VectorControl at 1184\");\n"
+        "_Static_assert(offsetof(CONTEXT, DebugControl) == 1192 && sizeof(((CONTEXT *)0)->DebugControl) == 8 && _Generic(((CONTEXT *)0)->DebugControl, unsigned long long: 1, default: 0), \"CONTEXT.DebugControl at 1192\");\n"
+        "_Static_assert(offsetof(CONTEXT, LastBranchToRip) == 1200 && sizeof(((CONTEXT *)0)->LastBranchToRip) == 8 && _Generic(((CONTEXT *)0)->LastBranchToRip, unsigned long long: 1, default: 0), \"CONTEXT.LastBranchToRip at 1200\");\n"
+        "_Static_assert(offsetof(CONTEXT, LastBranchFromRip) == 1208 && sizeof(((CONTEXT *)0)->LastBranchFromRip) == 8 && _Generic(((CONTEXT *)0)->LastBranchFromRip, unsigned long long: 1, default: 0), \"CONTEXT.LastBranchFromRip at 1208\");\n"
+        "_Static_assert(offsetof(CONTEXT, LastExceptionToRip) == 1216 && sizeof(((CONTEXT *)0)->LastExceptionToRip) == 8 && _Generic(((CONTEXT *)0)->LastExceptionToRip, unsigned long long: 1, default: 0), \"CONTEXT.LastExceptionToRip at 1216\");\n"
+        "_Static_assert(offsetof(CONTEXT, LastExceptionFromRip) == 1224 && sizeof(((CONTEXT *)0)->LastExceptionFromRip) == 8 && _Generic(((CONTEXT *)0)->LastExceptionFromRip, unsigned long long: 1, default: 0), \"CONTEXT.LastExceptionFromRip at 1224\");\n"
+        "_Static_assert(_Generic((PCONTEXT)0, CONTEXT *: 1, default: 0), \"PCONTEXT is CONTEXT *\");\n"
+        "_Static_assert(_Generic((struct _CONTEXT *)0, PCONTEXT: 1, default: 0), \"struct _CONTEXT * is PCONTEXT\");\n"
+        "_Static_assert(_Generic((struct _M128A *)0, M128A *: 1, default: 0), \"struct _M128A * is M128A *\");\n"
+        "_Static_assert(_Generic((LPCONTEXT)0, PCONTEXT: 1, default: 0), \"LPCONTEXT is PCONTEXT\");\n"
+        "_Static_assert(_Generic((PEXCEPTION_RECORD)0, EXCEPTION_RECORD *: 1, default: 0), \"PEXCEPTION_RECORD is EXCEPTION_RECORD *\");\n"
+        "_Static_assert(_Generic((PEXCEPTION_POINTERS)0, EXCEPTION_POINTERS *: 1, default: 0), \"PEXCEPTION_POINTERS is EXCEPTION_POINTERS *\");\n"
+        "_Static_assert(_Generic((LPEXCEPTION_POINTERS)0, EXCEPTION_POINTERS *: 1, default: 0), \"LPEXCEPTION_POINTERS is EXCEPTION_POINTERS *\");\n"
+        "_Static_assert(_Generic(((EXCEPTION_POINTERS *)0)->ContextRecord, PCONTEXT: 1, default: 0), \"EXCEPTION_POINTERS.ContextRecord is PCONTEXT\");\n"
+        "_Static_assert(_Generic(((EXCEPTION_POINTERS *)0)->ExceptionRecord, PEXCEPTION_RECORD: 1, default: 0), \"EXCEPTION_POINTERS.ExceptionRecord is PEXCEPTION_RECORD\");\n"
+        "_Static_assert(_Generic(((DISPATCHER_CONTEXT *)0)->ContextRecord, PCONTEXT: 1, default: 0), \"DISPATCHER_CONTEXT.ContextRecord is PCONTEXT\");\n"
+        "_Static_assert(_Generic(GetProcAddress((HMODULE)0, \"\"), FARPROC: 1, default: 0), \"GetProcAddress answers FARPROC\");\n"
+        "_Static_assert(_Generic(GetModuleHandleW((LPCWSTR)0), HMODULE: 1, default: 0), \"GetModuleHandleW answers HMODULE\");\n"
+        "_Static_assert(_Generic(LoadLibraryA((LPCSTR)0), HMODULE: 1, default: 0), \"LoadLibraryA answers HMODULE\");\n"
+        ;
+    src += extra;
+    src += "int windows_constants_unit(void) { return 0; }\n";
+    return src;
+}
+} // namespace
+
+TEST(DriverArgumentSupply, WindowsHandleTypesAndTheContextStructureAreTheReferences) {
+    {
+        ScratchDir scratch{Location::InsideRepo, "driver-arg-windows-context"};
+        scratch.useAsCwd();
+        DiagnosticReporter rep;
+        EXPECT_EQ(buildMergedPair(scratch, "wc_a.c", windowsContextAssertions(""), "wc_b.c",
+                                  kWindowsConstantsMain, kPeExecSpec, scratch.path() / "wc_out", rep), 0)
+            << "a handle type or the CONTEXT of the shipped <windows.h> is not what both references give:\n"
+            << allDiagnosticText(rep);
+    }
+    ScratchDir scratch{Location::InsideRepo, "driver-arg-windows-context-negative"};
+    scratch.useAsCwd();
+    DiagnosticReporter rep;
+    EXPECT_NE(buildMergedPair(scratch, "wc_a.c",
+                              windowsContextAssertions(
+                                  "_Static_assert(offsetof(CONTEXT, Rip) == 240, \"CONTEXT.Rip at 240\");\n"),
+                              "wc_b.c", kWindowsConstantsMain, kPeExecSpec, scratch.path() / "wc_out", rep),
+              0)
+        << "a false assertion must fail the build";
+    EXPECT_NE(allDiagnosticText(rep).find("CONTEXT.Rip at 240"), std::string::npos)
+        << "the failure must be THIS assertion's, by its own text: " << allDiagnosticText(rep);
+}
+
 // ── A `sysconf` NAME IS ITS PLATFORM'S OWN NUMBER ──────────────────────────
 //
 // `_SC_NPROCESSORS_ONLN` is declared by the <unistd.h> of every POSIX platform

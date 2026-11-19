@@ -831,7 +831,7 @@ TEST(CoffDirectiveImageRequests, AnObjectsDirectivesReachTheLinkThroughTheReader
     UnitLinkerRequests written;
     written.handOn = {"/STACK:0x10000000,0x20000", "/SUBSYSTEM:WINDOWS", "/EXPORT:dss_renamed=dss_internal"};
     DiagnosticReporter rep;
-    auto const bytes = pe::encode(requestingUnit(2, written), *obj.target, *obj.format, rep);
+    auto const bytes = pe::encode(requestingUnit(2, written), *obj.target, *obj.format, rep).value();
     ASSERT_FALSE(bytes.empty()) << diagnosticsOf(rep);
     auto read = pe::readRelocatableObject(bytes, *obj.target, *obj.format, rep, CompilationUnitId{2});
     ASSERT_TRUE(read.has_value()) << diagnosticsOf(rep);
@@ -855,7 +855,7 @@ TEST(CoffDirectiveImageRequests, TheTlsCallbackIdiomIsRefusedNamingItsTable) {
     UnitLinkerRequests written;
     written.handOn = {"/INCLUDE:_tls_used"};
     DiagnosticReporter rep;
-    auto const bytes = pe::encode(requestingUnit(2, written), *obj.target, *obj.format, rep);
+    auto const bytes = pe::encode(requestingUnit(2, written), *obj.target, *obj.format, rep).value();
     ASSERT_FALSE(bytes.empty()) << diagnosticsOf(rep);
     DiagnosticReporter readRep;
     auto const read = pe::readRelocatableObject(bytes, *obj.target, *obj.format, readRep, CompilationUnitId{2});
@@ -866,7 +866,7 @@ TEST(CoffDirectiveImageRequests, TheTlsCallbackIdiomIsRefusedNamingItsTable) {
     // CONTROL: an include of a name the object DEFINES needs nothing more, and one of an ordinary name is a required
     // reference, as before.
     written.handOn = {"/INCLUDE:dss_internal", "/INCLUDE:puts"};
-    auto const ok = pe::encode(requestingUnit(2, written), *obj.target, *obj.format, rep);
+    auto const ok = pe::encode(requestingUnit(2, written), *obj.target, *obj.format, rep).value();
     DiagnosticReporter okRep;
     auto const okRead = pe::readRelocatableObject(ok, *obj.target, *obj.format, okRep, CompilationUnitId{2});
     ASSERT_TRUE(okRead.has_value()) << diagnosticsOf(okRep);
@@ -1256,7 +1256,7 @@ TEST(CoffDirectiveImageRequests, AnIncludeOfTheObjectsOwnDefinitionIsHandedOn) {
     UnitLinkerRequests written;
     written.handOn = {"/INCLUDE:dss_internal", "/INCLUDE:puts"};
     DiagnosticReporter rep;
-    auto const bytes = pe::encode(requestingUnit(2, written), *obj.target, *obj.format, rep);
+    auto const bytes = pe::encode(requestingUnit(2, written), *obj.target, *obj.format, rep).value();
     ASSERT_FALSE(bytes.empty()) << diagnosticsOf(rep);
     auto read = pe::readRelocatableObject(bytes, *obj.target, *obj.format, rep, CompilationUnitId{2});
     ASSERT_TRUE(read.has_value()) << diagnosticsOf(rep);

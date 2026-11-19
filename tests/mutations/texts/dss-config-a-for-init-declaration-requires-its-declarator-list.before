@@ -1,1 +1,1 @@
-        { "sequence": [ "kwDeclHead", { "optional": "initDeclaratorList" } ] }
+        { "sequence": [ "kwDeclHead", "declAttrRun", { "optional": "initDeclaratorList" } ] }

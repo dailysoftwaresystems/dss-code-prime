@@ -207,8 +207,35 @@ TEST(IncompatiblePointerConversion, ASameRepresentationIntegerPointeeKeepsItsOwn
 }
 
 // ── an integer and a pointer, either direction, not a null pointer constant ─
+// EVERY POSITION the assignment constraint reaches, both directions (P69 fold f26e,
+// lane `cs`: the positions the P68 round 9 cases left unpinned are an assignment
+// from a literal and from a non-constant integer, a return of an integer from a
+// pointer-returning function, an argument literal, and an `int` from a pointer).
+// ✔MEASURED 2026-11-17 (lane `cs` probe ip5, object mode, the seven positions and
+// the two controls below as separate units): gcc 15.2, clang and Apple clang REFUSE
+// every position at their default, `-std=c17` and `-std=c2x` (-Wint-conversion is an
+// error since gcc 14 / clang 16; their escape flag makes it a warning); mingw-w64
+// gcc 13.2 WARNS at all three dialects and MSVC 19.52 warns C4047 — both build every
+// one. So the union ACCEPTS, and every reference SAYS something at every position:
+// DSS owes the warning at each, and silence on `int *p = 0;` and `(int *)5`.
 TEST(IncompatiblePointerConversion, AnIntegerAndAPointerConvertWithAWarning) {
     expectAdmittedWith({
+        {"an assignment from a NON-ZERO literal (`p = 5;`)",
+         "int main(void) { int x = 42; int *p = &x; p = 5; return p ? 42 : 0; }\n", kInt, 1},
+        {"an assignment from a non-constant integer (`p = argc;`)",
+         "int main(int argc, char **argv) { (void)argv; int x = 42; int *p = &x; p = argc;\n"
+         "  return p ? 42 : 0; }\n", kInt, 1},
+        {"a return: a NON-ZERO literal from a pointer-returning function",
+         "static int *f(void) { return 5; }\nint main(void) { return f() ? 42 : 0; }\n", kInt, 1},
+        {"an argument: a NON-ZERO literal for `int *`",
+         "static int g(int *q) { return q ? 42 : 0; }\nint main(void) { return g(5); }\n", kInt, 1},
+        {"an `int` object from `int *`",
+         "int main(void) { int x = 42; int *p = &x; int i = p; return i ? 42 : 0; }\n", kInt, 1},
+        {"a return: an `int` from a pointer",
+         "static int *gp;\nstatic int f(void) { return gp; }\nint main(void) { return f() ? 0 : 42; }\n",
+         kInt, 1},
+        {"the control `int *p = (int *)5;` (a cast)",
+         "int main(void) { int *p = (int *)5; return p ? 42 : 0; }\n", kInt, 0},
         {"`int *` from an integer object",
          "int main(void) { int x = 42; long v = (long)&x; int *p = v; return *p; }\n", kInt, 1},
         {"an integer object from `int *`",

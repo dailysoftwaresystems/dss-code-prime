@@ -1,2 +1,2 @@
                             preStampLiteralLeaves(s, *cfg, tree, opnd);
-                            queried = subtreeType(s, tree, opnd, fromScope);
+                            // P69 (lane `cs`, fold f26e): a declaration's own request first

@@ -13,5 +13,10 @@
     "source": "test_support/driver_diagnostics_listener.cpp",
     "site": "CMakeLists.txt",
     "reason": "NOT a gtest suite. It is the one source of add_library(dss_test_driver_diagnostics OBJECT ...) in the tests-root CMakeLists.txt, which dss_add_test links into EVERY test binary and the examples runner links too: its static initializer registers the observer that fails a test whose unit was finished with a driver Error the test did not ask for. Its own pin is test_support/test_driver_diagnostics_listener.cpp, registered with dss_add_test; registering this file the same way would make the observer a test of its own, which it is not."
+  },
+  {
+    "source": "link/discarded_link_pass_outcome.cpp",
+    "site": "link/CMakeLists.txt",
+    "reason": "NOT a gtest suite. It is a negative-compile unit, compiled twice and never run: add_library(dss_link_kept_link_pass_outcome OBJECT ...) in link/CMakeLists.txt compiles it keeping a link pass's `[[nodiscard]]` LinkPassOutcome (the control, in ALL), and add_library(dss_link_discarded_link_pass_outcome OBJECT EXCLUDE_FROM_ALL ...) compiles it with DSS_DISCARD_THE_LINK_PASS_OUTCOME, which drops one; the ctest entry link/a_discarded_link_pass_outcome_does_not_compile builds that target and passes only on the compiler's own error for the discard. It holds no TEST, so dss_add_test would make a gtest binary of nothing, and its discarding twin cannot stand in ALL."
   }
 ]

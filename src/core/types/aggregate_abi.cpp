@@ -160,6 +160,21 @@ classifyAggregate(AggregateConventionRules const& rules,
     if (!lay.has_value()) return std::nullopt;   // un-sizeable → fail loud
     std::uint64_t const size = lay->size;
 
+    // ★ P69 (lane `cs`, fold f26e -- D-TARGET-WIN64-INT128-RESULT-GOES-THROUGH-A-HIDDEN-POINTER-NOT-XMM0): a
+    // 128-bit INTEGER result comes back where the convention STATES (`integer128Result`), before any
+    // strategy's size rule: Win64 returns `__int128` in XMM0 (every reference that has the type), where its
+    // by-size rule sends a 16-byte value through the hidden pointer. One 16-byte FP piece: the piece's
+    // register is the convention's first FP return register, its 16 bytes the value's (the low limb first).
+    // An argument, and every other type, takes the strategy's answer below.
+    if (position == AggregatePosition::Result
+        && rules.integer128Result == Integer128Result::InTheFirstFpr
+        && (in.kind(aggTy) == TypeKind::I128 || in.kind(aggTy) == TypeKind::U128)) {
+        AbiPassing iout;
+        iout.kind = AbiPassing::Kind::InRegisters;
+        iout.pieces.push_back(AbiPiece{AbiPieceClass::Fpr, 0, static_cast<std::uint32_t>(size)});
+        return iout;
+    }
+
     if (strategy == AggregateClassKind::Win64BySize) {
         // MS x64: a struct/union is passed/returned in ONE GPR iff its size is a
         // power of two ≤ maxRegBytes (1/2/4/8 bytes); every other size — 3/5/6/7,

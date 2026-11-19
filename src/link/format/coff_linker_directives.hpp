@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/types/extern_import.hpp"         // ExternImport -- the rows a unit's directives complete
+#include "core/types/symbol_id_cursor.hpp"      // SymbolIdsRefused -- a refused fresh id, carried as a value
 #include "core/types/unit_linker_requests.hpp"   // UnitImageRequest, UnitExportRequest
 #include "link/object_format_schema.hpp"         // PeLinkerDirectives, LinkerDirectiveMeaning
 #include "link/standing_fallback.hpp"             // standingFallback -- which of a name's fallbacks stands
@@ -20,6 +21,7 @@
 #include <system_error>
 #include <unordered_map>
 #include <unordered_set>
+#include <variant>
 #include <vector>
 
 // ── A COFF OBJECT'S LINKER DIRECTIVES, BOTH DIRECTIONS ─────────────────────
@@ -1035,16 +1037,21 @@ struct CoffDirectiveRowsOf {
     std::function<bool(std::string const&)> definesExternally;
     // Was the name's hide answered by the unit's own definition (read back, or stated, Hidden)?
     std::function<bool(std::string const&)> hideAnswered;
-    // The unit's reference rows, and a fresh id for a row no record of the unit owns (the unit's id space's door).
-    std::vector<ExternImport>*              rows = nullptr;
-    std::function<SymbolId()>               freshId;
+    // The unit's reference rows, and a fresh id for a row no record of the unit owns (the unit's id space's door):
+    // nullopt when that door REFUSED the id -- reported there, by name -- which refuses the completion (P69 f26e, B1).
+    std::vector<ExternImport>*                        rows = nullptr;
+    std::function<std::optional<SymbolId>()>          freshId;
 };
+
+// The completion's refusal: its text, for the caller to report; or `SymbolIdsRefused`, a fresh row's id the unit's
+// door refused, which the door has reported by name -- the caller refuses its output and says nothing more.
+using CoffDirectivesRefusal = std::variant<std::string, SymbolIdsRefused>;
 
 // The folded requests applied against what the unit defines: the alternate names, the includes, the exports'
 // internal names, the hides of another unit's definitions. `requests` is the unit's (its exports are read, its
 // hides and hand-on tokens grow); `reporter` hears a directive a weak external's own default stands over. The error
-// is the refusal's text.
-[[nodiscard]] inline std::expected<void, std::string>
+// is the refusal (`CoffDirectivesRefusal`).
+[[nodiscard]] inline std::expected<void, CoffDirectivesRefusal>
 completeCoffLinkerDirectives(CoffUnitDirectives const& d, CoffDirectiveRowsOf const& unit, UnitLinkerRequests& requests,
                              PeLinkerDirectives const& vocab, std::string_view who, DiagnosticReporter& reporter) {
     std::vector<ExternImport>& rows = *unit.rows;
@@ -1054,15 +1061,18 @@ completeCoffLinkerDirectives(CoffUnitDirectives const& d, CoffDirectiveRowsOf co
         }
         return std::nullopt;
     };
-    auto const freshRow = [&](std::string const& name) -> ExternImport& {
+    // nullptr: the fresh id was REFUSED (reported by name at the door); the completion is refused.
+    auto const freshRow = [&](std::string const& name) -> ExternImport* {
+        std::optional<SymbolId> const id = unit.freshId();
+        if (!id) return nullptr;
         ExternImport row;
-        row.symbol      = unit.freshId();
+        row.symbol      = *id;
         row.mangledName = name;
         // A directive states no code-vs-data kind; the definition the link finds decides it (the `__imp_X` fold's
         // rule, `ExternKindOrigin`).
         row.kindOrigin  = ExternKindOrigin::Pending;
         rows.push_back(std::move(row));
-        return rows.back();
+        return &rows.back();
     };
 
     // `/alternatename:A=B` (`LinkerDirectiveMeaning::AlternateName`), judged as the reference linkers judge it --
@@ -1095,10 +1105,12 @@ completeCoffLinkerDirectives(CoffUnitDirectives const& d, CoffDirectiveRowsOf co
             }
             named.fallbackName = alt.fallback;
         } else {
-            freshRow(alt.name).fallbackName = alt.fallback;
+            ExternImport* const fresh = freshRow(alt.name);
+            if (fresh == nullptr) return std::unexpected(SymbolIdsRefused{});   // refused by name at the door
+            fresh->fallbackName = alt.fallback;
         }
         if (!unit.definesExternally(alt.fallback) && !rowNamed(alt.fallback).has_value()) {
-            (void)freshRow(alt.fallback);
+            if (freshRow(alt.fallback) == nullptr) return std::unexpected(SymbolIdsRefused{});   // refused at the door
         }
     }
 
@@ -1141,7 +1153,9 @@ completeCoffLinkerDirectives(CoffUnitDirectives const& d, CoffDirectiveRowsOf co
         if (auto const row = rowNamed(name); row.has_value()) {
             rows[*row].requiredByDirective = true;
         } else {
-            freshRow(name).requiredByDirective = true;
+            ExternImport* const fresh = freshRow(name);
+            if (fresh == nullptr) return std::unexpected(SymbolIdsRefused{});   // refused by name at the door
+            fresh->requiredByDirective = true;
         }
     }
 
@@ -1155,7 +1169,9 @@ completeCoffLinkerDirectives(CoffUnitDirectives const& d, CoffDirectiveRowsOf co
         if (auto const row = rowNamed(e.internalName); row.has_value()) {
             rows[*row].requiredByDirective = true;
         } else {
-            freshRow(e.internalName).requiredByDirective = true;
+            ExternImport* const fresh = freshRow(e.internalName);
+            if (fresh == nullptr) return std::unexpected(SymbolIdsRefused{});   // refused by name at the door
+            fresh->requiredByDirective = true;
         }
     }
 

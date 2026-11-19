@@ -1,0 +1,2 @@
+    if (!dc.asmLabelLeadingFunctionOnlyRules.empty()
+        && !(site.declaresFunction && site.leadsItsDeclaration) && false) {

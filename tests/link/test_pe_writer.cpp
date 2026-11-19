@@ -194,7 +194,7 @@ TEST(PeWriter, FileHeaderMatchesPECoffSpec) {
     auto loaded = loadShipped();
     AssembledModule mod = makeTrivialModule({0xC3}, 42);
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_GE(bytes.size(), 20u);
     EXPECT_EQ(rep.errorCount(), 0u);
 
@@ -216,7 +216,7 @@ TEST(PeWriter, TextSectionCharacteristicsMatchesMsvcConvention) {
     auto loaded = loadShipped();
     AssembledModule mod = makeTrivialModule({0xC3}, 42);
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_GE(bytes.size(), 60u);
     EXPECT_EQ(rep.errorCount(), 0u);
 
@@ -252,7 +252,7 @@ TEST(PeWriter, SymbolRecordsAre18BytesPackedNoPadding) {
     auto loaded = loadShipped();
     AssembledModule mod = makeTrivialModule({0xC3}, 7);
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep).value();
     EXPECT_EQ(rep.errorCount(), 0u);
 
     // PointerToSymbolTable lives at IMAGE_FILE_HEADER + 8.
@@ -311,7 +311,7 @@ TEST(PeWriter, ObjectSymtabCarriesRealNameForExternalDefButStaticStaysInternal) 
                                        SymbolVisibility::Default});
 
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u);
 
     std::uint32_t const symPtr  = readU32LE(bytes, 8);
@@ -536,7 +536,7 @@ TEST(PeWriter, ObjectWeakDefinedFunctionEmitsOwnComdatSelectAnySection) {
 
     AssembledModule mod = strongPlusWeakFunctionModule();
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
     ASSERT_FALSE(bytes.empty());
 
@@ -648,7 +648,7 @@ TEST(PeWriter, ComdatSectionSymbolIsTheFirstRecordNamingItsSection) {
 
     AssembledModule mod = weakFunctionWithInteriorBlockLabelModule();
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
     ASSERT_FALSE(bytes.empty());
 
@@ -716,7 +716,7 @@ TEST(PeWriter, ObjectWeakDefinitionRoundTripsBackToWeakThroughDssReader) {
 
     AssembledModule mod = strongPlusWeakFunctionModule();
     DiagnosticReporter wrep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, wrep);
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, wrep).value();
     ASSERT_EQ(wrep.errorCount(), 0u) << diagSummary(wrep);
 
     DiagnosticReporter rrep;
@@ -783,7 +783,7 @@ TEST(PeWriter, WeakDefinitionAndUndefinedReferenceEmitDifferentCoffShapes) {
     mod.externImports.push_back(std::move(ext));
 
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
 
     std::uint32_t const numSyms = readU32LE(bytes, 12);
@@ -857,7 +857,7 @@ TEST(PeWriter, WeakDefinitionBodyRelocationsGoToItsOwnComdatRelocTable) {
                                        SymbolVisibility::Default});
 
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
     ASSERT_EQ(readU16LE(bytes, 2), 2u);
 
@@ -908,7 +908,7 @@ TEST(PeWriter, RelocationToAWeakDefinitionResolvesPastTheAuxSlot) {
                    /*kind=*/RelocationKind{1}, /*addend=*/0});
 
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
 
     // `.text` (ordinal 1) owns the relocation.
@@ -967,7 +967,7 @@ TEST(PeWriter, ObjectSymtabCarriesEveryAliasNameAndRelocKeepsTheCanonical) {
                                        SymbolVisibility::Default});
 
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
 
     std::uint32_t const numSyms = readU32LE(bytes, 12);
@@ -1087,7 +1087,7 @@ TEST(PeWriter, ObjWeakDefinitionEncodesWhenTheFormatDeclaresComdat) {
 
     AssembledModule mod = strongPlusWeakFunctionModule();
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, **target, **fmt, rep);
+    auto bytes = pe::encode(mod, **target, **fmt, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
     ASSERT_FALSE(bytes.empty());
     // The declaration was honoured, not merely accepted: the weak body still
@@ -1108,7 +1108,7 @@ TEST(PeWriter, ObjWeakDefinitionRefusedWhenTheFormatDeclaresNoDialect) {
     AssembledModule mod = strongPlusWeakFunctionModule();
     DiagnosticReporter rep;
     auto bytes = pe::encode(mod, **target, **fmt, rep);
-    EXPECT_TRUE(bytes.empty())
+    EXPECT_FALSE(bytes.has_value())
         << "an unanswered schema must produce NO object — emitting the body "
            "under an assumed spelling is the silent path this refusal replaces";
     EXPECT_EQ(::dss::test_support::countCode(
@@ -1175,7 +1175,7 @@ TEST(PeWriter, ObjWithoutAWeakDefinitionNeedsNoDialectDeclaration) {
                                        SymbolBinding::Global,
                                        SymbolVisibility::Default});
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, **target, **fmt, rep);
+    auto bytes = pe::encode(mod, **target, **fmt, rep).value();
     EXPECT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
     EXPECT_FALSE(bytes.empty());
     EXPECT_EQ(::dss::test_support::countCode(
@@ -1221,7 +1221,7 @@ TEST(PeWriter, WeakAliasOfAStrongDefinitionEmitsAWeakExternalRecord) {
                                        SymbolVisibility::Default});
 
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_FALSE(bytes.empty()) << diagSummary(rep);
     EXPECT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
 
@@ -1319,7 +1319,7 @@ TEST(PeWriter, AnAliasOfAnotherBindingIsALabelOfItsBodyUnlessAWeakNameMeetsAPriv
         AssembledModule const mod = twoNames(SymbolBinding::Weak, WeakDefinitionKind::SelectAny, "weakcano",
                                            SymbolBinding::Global, std::nullopt, "strongal");
         DiagnosticReporter rep;
-        auto const bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+        auto const bytes = pe::encode(mod, *loaded.target, *loaded.format, rep).value();
         ASSERT_FALSE(bytes.empty()) << diagSummary(rep);
         EXPECT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
         std::optional<std::uint32_t> canon;
@@ -1351,7 +1351,7 @@ TEST(PeWriter, AnAliasOfAnotherBindingIsALabelOfItsBodyUnlessAWeakNameMeetsAPriv
                                            SymbolBinding::Weak, WeakDefinitionKind::SelectAny, "weakalia");
         DiagnosticReporter rep;
         auto const bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
-        EXPECT_TRUE(bytes.empty())
+        EXPECT_FALSE(bytes.has_value())
             << "an unrepresentable alias binding must emit NO bytes, never an alias silently "
                "carrying the body's binding";
         EXPECT_EQ(rep.errorCount(), 1u) << diagSummary(rep);
@@ -1398,7 +1398,7 @@ TEST(PeWriter, WeakAliasRoundTripsThroughDssOwnReader) {
                                        SymbolVisibility::Default});
 
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_FALSE(bytes.empty()) << diagSummary(rep);
 
     DiagnosticReporter rrep;
@@ -1457,7 +1457,7 @@ TEST(PeWriter, AliasedObjectSurvivesReadThenReEmitThroughTheRealReader) {
                                        SymbolVisibility::Default});
 
     DiagnosticReporter rep1;
-    auto first = pe::encode(mod, *loaded.target, *loaded.format, rep1);
+    auto first = pe::encode(mod, *loaded.target, *loaded.format, rep1).value();
     ASSERT_EQ(rep1.errorCount(), 0u) << diagSummary(rep1);
 
     DiagnosticReporter rrep;
@@ -1475,7 +1475,7 @@ TEST(PeWriter, AliasedObjectSurvivesReadThenReEmitThroughTheRealReader) {
     EXPECT_EQ(named, 2) << "both names must come back off the wire";
 
     DiagnosticReporter rep2;
-    auto second = pe::encode(*read, *loaded.target, *loaded.format, rep2);
+    auto second = pe::encode(*read, *loaded.target, *loaded.format, rep2).value();
     ASSERT_EQ(rep2.errorCount(), 0u) << diagSummary(rep2);
     std::uint32_t const numSyms = readU32LE(second, 12);
     std::optional<std::uint32_t> a;
@@ -1499,7 +1499,7 @@ TEST(PeWriter, StringTableHasSizePrefixAndIncludesItself) {
     auto loaded = loadShipped();
     AssembledModule mod = makeTrivialModule({0xC3}, 42);
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep).value();
     EXPECT_EQ(rep.errorCount(), 0u);
 
     // String table immediately follows the symbol table.
@@ -1536,7 +1536,7 @@ TEST(PeWriter, RelocationsArePackedTenBytesAndCarryNoAddend) {
     mod.functions.push_back(std::move(caller));
 
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep).value();
     EXPECT_EQ(rep.errorCount(), 0u);
 
     // PointerToRelocations lives in IMAGE_SECTION_HEADER @ +24 from
@@ -1574,7 +1574,7 @@ TEST(PeWriter, LongSymbolNamesUseStringTableOffsetForm) {
     mod.functions.push_back(std::move(caller));
 
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep).value();
     EXPECT_EQ(rep.errorCount(), 0u);
     std::uint32_t const symPtr = readU32LE(bytes, 8);
     ASSERT_LE(symPtr + 18u, bytes.size());
@@ -1612,7 +1612,7 @@ TEST(PeWriter, NonPeFormatKindEmitsK_NoMatchingObjectFormat) {
 
     DiagnosticReporter rep;
     auto bytes = pe::encode(mod, *loaded.target, elf, rep);
-    EXPECT_TRUE(bytes.empty());
+    EXPECT_FALSE(bytes.has_value());
     bool sawCode = false;
     for (auto const& d : rep.all()) {
         if (d.code == DiagnosticCode::K_NoMatchingObjectFormat) sawCode = true;
@@ -1730,7 +1730,7 @@ TEST(PeWriter, NonZeroAddendIsWrittenIntoThePatchedField) {
     mod.externImports = {ExternImport{SymbolId{2}, "callee", "", /*isData=*/false}};
 
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_FALSE(bytes.empty());
     EXPECT_EQ(rep.errorCount(), 0u);
     std::vector<std::uint8_t> const stamped{0xE8, 0xFC, 0xFF, 0xFF, 0xFF};
@@ -1818,7 +1818,7 @@ TEST(PeWriter, ObjRodataItemEmitsRdataSectionAndDataSymbol) {
                                        SymbolVisibility::Default});
 
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
 
@@ -1895,7 +1895,7 @@ TEST(PeWriter, ObjectStaticDataItemIsClassStaticNotExternal) {
                                        SymbolVisibility::Default});
 
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
 
@@ -1970,7 +1970,7 @@ TEST(PeWriter, ObjectWeakDefinedDataEmitsOwnComdatAndRoundTrips) {
                                        SymbolVisibility::Default});
 
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
     ASSERT_FALSE(bytes.empty());
 
@@ -2052,7 +2052,7 @@ TEST(PeWriter, ObjRelRoFnPtrSlotEmitsAddr64RelocAndInSlotAddend) {
     mod.dataItems.push_back(std::move(tab));
 
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
 
@@ -2128,7 +2128,7 @@ TEST(PeWriter, ObjJumpTableBlockSymbolIsStaticLocalDefinedNotUndefExtern) {
     mod.dataItems.push_back(std::move(tab));
 
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u)
         << "a jump-table slot targeting a block symbol must encode";
 
@@ -2204,7 +2204,7 @@ TEST(PeWriter, ObjBssItemCarriesSizeOfRawDataWithNoFilePointer) {
     mod.dataItems.push_back(std::move(g));
 
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
 
@@ -2234,7 +2234,7 @@ TEST(PeWriter, ObjDataFreeModuleKeepsSingleSectionLayoutByteIdentical) {
     auto loaded = loadShipped();
     AssembledModule mod = makeTrivialModule({0xC3}, 42);
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u);
     // 20 header + 40 section header + 1 text + 18 symbol + 4 strtab.
     ASSERT_EQ(bytes.size(), 83u);
@@ -2337,7 +2337,7 @@ TEST(PeWriter, ObjRodataItemWithRelocationFailsLoud) {
 
     DiagnosticReporter rep;
     auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
-    EXPECT_TRUE(bytes.empty());
+    EXPECT_FALSE(bytes.has_value());
     EXPECT_GT(rep.errorCount(), 0u);
 }
 
@@ -2362,7 +2362,7 @@ TEST(PeWriter, ObjThreadLocalItemFailsLoud) {
 
     DiagnosticReporter rep;
     auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
-    EXPECT_TRUE(bytes.empty());
+    EXPECT_FALSE(bytes.has_value());
     bool saw = false;
     for (auto const& d : rep.all()) {
         if (d.code == DiagnosticCode::K_FormatLacksThreadLocalSupport)
@@ -2402,7 +2402,7 @@ TEST(PeWriter, ObjExternCallEmitsUndefinedRealNameNotSymId) {
     mod.externImports.push_back(std::move(ext));
 
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u)
         << "a .obj with an extern-call import must encode";
 
@@ -2451,7 +2451,7 @@ TEST(PeWriter, ObjDataRelocOnlyExternGetsUndefinedSymbol) {
     mod.externImports.push_back(std::move(ext));
 
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u)
         << "a data-reloc-only extern must be covered by the undefined-"
            "extern scan (the ELF c145 / Mach-O c147 mirror)";
@@ -2486,7 +2486,7 @@ TEST(PeWriter, ObjDuplicateDataSymbolFailsLoud) {
 
     DiagnosticReporter rep;
     auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
-    EXPECT_TRUE(bytes.empty());
+    EXPECT_FALSE(bytes.has_value());
     bool saw = false;
     for (auto const& diag : rep.all()) {
         if (diag.code == DiagnosticCode::K_DuplicateDataSymbol) saw = true;
@@ -2524,7 +2524,7 @@ TEST(PeWriter, ObjAllFourDataSectionsOrderAndOrdinals) {
     addItem(13, DataSectionKind::Bss, {}, 8);
 
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u);
 
     // 5 sections; raw base = 20 + 5*40 = 220.
@@ -2601,7 +2601,7 @@ namespace {
 // chances to miss one. The DLL arm and the .obj arm deliberately do NOT
 // come through here: a dll module carrying an override is itself a
 // fail-loud case (pe.cpp's `isDll` branch), and .obj resolves no entry.
-[[nodiscard]] std::vector<std::uint8_t>
+[[nodiscard]] std::optional<std::vector<std::uint8_t>>
 encodeUntrampolined(AssembledModule           mod,  // by value: stamped copy
                     TargetSchema const&       target,
                     ObjectFormatSchema const& fmt,
@@ -2697,7 +2697,7 @@ TEST(PeExecWriter, AddressTakenImportResolvesToTextThunkNotIdataSlot) {
         ExternImport{SymbolId{99}, "puts", "msvcrt.dll"});
 
     DiagnosticReporter rep;
-    auto img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    auto img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(img.empty());
@@ -2785,7 +2785,7 @@ TEST(PeExecWriter, DataExternBindsToIatSlotInIdataNotTextThunk) {
     mod.externImports.push_back(std::move(dataExt));
 
     DiagnosticReporter rep;
-    auto img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    auto img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     ASSERT_EQ(rep.errorCount(), 0u)
         << "the data-import gate must admit the declared got-indirect "
@@ -2884,7 +2884,7 @@ TEST(PeExecWriter, MixedFunctionAndDataExternsThunkForFunctionSlotForData) {
     mod.externImports.push_back(std::move(dataExt));
 
     DiagnosticReporter rep;
-    auto img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    auto img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(img.empty());
@@ -2983,7 +2983,7 @@ TEST(PeExecWriter, AnExternIdCollisionIsReportedForTheFirstExternOfTheTable) {
     }
     DiagnosticReporter rep;
     auto const img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
-    EXPECT_TRUE(img.empty());
+    EXPECT_FALSE(img.has_value());
     std::vector<std::string> collisions;
     std::string              said;
     for (auto const& d : rep.all()) {
@@ -3050,7 +3050,7 @@ TEST(PeExecWriter, DataExternUnderUndeclaredDataImportBindingFailsLoud) {
     mod.externImports.push_back(std::move(dataExt));
     DiagnosticReporter rep;
     auto img = encodeUntrampolined(mod, **target, **fmt, rep);
-    EXPECT_TRUE(img.empty());
+    EXPECT_FALSE(img.has_value());
     EXPECT_GE(::dss::test_support::countCode(
                   rep, DiagnosticCode::K_FormatLacksImportSupport),
               1u)
@@ -3162,7 +3162,7 @@ TEST(PeExecWriter, FunctionUnwindInfoEmitsPdataXdataAndExceptionDataDir) {
     mod.functions.push_back(std::move(fn));
 
     DiagnosticReporter rep;
-    auto img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    auto img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(img.empty());
@@ -3278,7 +3278,7 @@ TEST(PeExecWriter, VlaFramePointerCaptureEmitsSetFpregSoTheFrameIsDescribable) {
     mod.functions.push_back(std::move(fn));
 
     DiagnosticReporter rep;
-    auto img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    auto img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(img.empty());
@@ -3352,7 +3352,7 @@ TEST(PeExecWriter, FunctionUnwindInfoStackProbePrologueUsesFixedAllocLen) {
     mod.functions.push_back(std::move(fn));
 
     DiagnosticReporter rep;
-    auto img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    auto img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     ASSERT_EQ(rep.errorCount(), 0u);
 
@@ -3456,7 +3456,7 @@ TEST(PeExecWriter, SehScopeTableEmitsEhandlerFlagAndScopeRecord) {
                      /*isData=*/false});
 
     DiagnosticReporter rep;
-    auto img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    auto img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(img.empty());
@@ -3590,7 +3590,7 @@ TEST(PeExecWriter, GuardingFunctionSavingVectorRegistersStatesEachSaveCode) {
 
     {
         DiagnosticReporter rep;
-        auto img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+        auto img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
         for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
         ASSERT_EQ(rep.errorCount(), 0u)
             << "a guarding function that saves a vector register is describable";
@@ -3888,7 +3888,7 @@ TEST(PeExecWriter, NonX64MachineCarryingUnwindInfoFailsLoudButCfiFreeStillEncode
         DiagnosticReporter rep;
         auto img = encodeUntrampolined(makeArm64PeModule(/*withCfi=*/true),
                                        **target, **fmt, rep);
-        EXPECT_TRUE(img.empty())
+        EXPECT_FALSE(img.has_value())
             << "an image whose unwind tables cannot be encoded must emit NO "
                "bytes -- never a silently unwind-less binary";
         EXPECT_GT(rep.errorCount(), 0u)
@@ -3932,7 +3932,7 @@ TEST(PeExecWriter, NonX64MachineCarryingUnwindInfoFailsLoudButCfiFreeStillEncode
     {
         DiagnosticReporter rep;
         auto img = encodeUntrampolined(makeArm64PeModule(/*withCfi=*/false),
-                                       **target, **fmt, rep);
+                                       **target, **fmt, rep).value();
         for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
         EXPECT_EQ(rep.errorCount(), 0u)
             << "a non-x64 PE image that carries NO call-frame information "
@@ -3954,7 +3954,7 @@ TEST(PeExecWriter, DosHeaderMzSignature) {
     auto loaded = loadShippedExec();
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
-    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_GE(bytes.size(), 0x40u);
     EXPECT_EQ(bytes[0], 'M');
@@ -3967,7 +3967,7 @@ TEST(PeExecWriter, PeSignatureAtZero80) {
     auto loaded = loadShippedExec();
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
-    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_GE(bytes.size(), 0x84u);
     EXPECT_EQ(bytes[0x80], 'P');
@@ -3980,7 +3980,7 @@ TEST(PeExecWriter, OptionalHeaderFieldsByteForByte) {
     auto loaded = loadShippedExec();
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
-    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u);
 
     // IMAGE_FILE_HEADER at 0x84:
@@ -4038,7 +4038,7 @@ TEST(PeExecWriter, IntraModuleRel32CallAppliedByteForByte) {
     mod.functions.push_back(std::move(f1));
 
     DiagnosticReporter rep;
-    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u);
 
     // Locate .text file offset from IMAGE_SECTION_HEADER at 0x188
@@ -4086,7 +4086,7 @@ TEST(PeExecWriter, Abs64RodataSlotEmitsDir64BaseRelocation) {
     mod.dataItems.push_back(std::move(slot));
 
     DiagnosticReporter rep;
-    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u);
 
     constexpr std::uint64_t kImageBase = 0x140000000ull;
@@ -4210,7 +4210,7 @@ TEST(PeExecWriter, AnImageRelativeFieldHoldsItsRvaAndTakesNoBaseRelocation) {
     mod.dataItems.push_back(std::move(va));
 
     DiagnosticReporter rep;
-    auto const         bytes = encodeUntrampolined(mod, **t, **f, rep);
+    auto const         bytes = encodeUntrampolined(mod, **t, **f, rep).value();
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     ASSERT_FALSE(bytes.empty()) << "an image-relative field in code is not an unrebased address";
     constexpr std::uint64_t kImageBase = 0x140000000ull;
@@ -4255,7 +4255,7 @@ TEST(PeExecWriter, APcRelativeDataFieldHoldsItsDistanceFromItselfAndTakesNoBaseR
     mod.dataItems.push_back(std::move(table));
 
     DiagnosticReporter rep;
-    auto const         bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    auto const         bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     ASSERT_FALSE(bytes.empty()) << "a pc-relative data field is a field the image writes";
     constexpr std::uint64_t kImageBase = 0x140000000ull;
@@ -4292,7 +4292,7 @@ TEST(PeExecWriter, APcRelativeDataFieldPastTwoGibIsRefusedNotWrapped) {
         mod.dataItems.push_back(std::move(table));
         DiagnosticReporter rep;
         auto const         bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
-        EXPECT_TRUE(bytes.empty()) << "a distance the field cannot hold is refused";
+        EXPECT_FALSE(bytes.has_value()) << "a distance the field cannot hold is refused";
         bool named = false;
         for (auto const& d : rep.all()) {
             named = named
@@ -4332,7 +4332,7 @@ TEST(PeExecWriter, RelRoConstSlotFoldsIntoRdataAndEmitsDir64BaseReloc) {
     mod.dataItems.push_back(std::move(slot));
 
     DiagnosticReporter rep;
-    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u)
         << "a relro item must NOT fail loud in a PE exec image";
 
@@ -4402,7 +4402,7 @@ TEST(PeExecTls, ThreadLocalEmitsTlsDirectorySectionAndIndex) {
     mod.dataItems.push_back(makeTbssItem(43, 4, 4));
 
     DiagnosticReporter rep;
-    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
 
@@ -4493,7 +4493,7 @@ TEST(PeExecTls, SecrelPatchedIntoFunctionRelocIsPositiveTemplateOffset) {
     mod.dataItems.push_back(makeTbssItem(43, 4, 4));             // counter @ 4
 
     DiagnosticReporter rep;
-    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u);
     auto const text = findExecSection(bytes, {'.', 't', 'e', 'x', 't', 0, 0, 0});
     ASSERT_NE(text.first, 0u);
@@ -4529,7 +4529,7 @@ TEST(PeExecTls, DataItemRelocTargetingTlsSymbolFailsLoud) {
 
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
-    EXPECT_TRUE(bytes.empty());
+    EXPECT_FALSE(bytes.has_value());
     bool saw = false;
     for (auto const& diag : rep.all())
         if (diag.code == DiagnosticCode::K_RelocationKindMismatch) saw = true;
@@ -4561,7 +4561,7 @@ TEST(PeExecTls, FunctionTlsKindRelocTargetingNonTlsSymbolFailsLoud) {
 
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
-    EXPECT_TRUE(bytes.empty());
+    EXPECT_FALSE(bytes.has_value());
     bool saw = false;
     for (auto const& diag : rep.all())
         if (diag.code == DiagnosticCode::K_RelocationKindMismatch) saw = true;
@@ -4607,7 +4607,7 @@ TEST(PeExecTls, ThreadLocalPastTheEncodableCeilingFailsLoud) {
 
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
-    EXPECT_TRUE(bytes.empty()) << "no artifact may be written";
+    EXPECT_FALSE(bytes.has_value()) << "no artifact may be written";
     bool saw = false;
     for (auto const& diag : rep.all())
         if (diag.code == DiagnosticCode::K_ThreadLocalOveralignedForFormat)
@@ -4634,7 +4634,7 @@ TEST(PeExecTls, ThreadLocalAtTheEncodableCeilingCompilesClean) {
     mod.dataItems.push_back(makeTdataItem(42, {1, 0, 0, 0}, 8192));
 
     DiagnosticReporter rep;
-    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
     for (auto const& diag : rep.all())
         EXPECT_NE(diag.code, DiagnosticCode::K_ThreadLocalOveralignedForFormat)
             << "8192 IS encodable (IMAGE_SCN_ALIGN_8192BYTES) — the gate is `>`";
@@ -4660,7 +4660,7 @@ TEST(PeExecTls, DirectoryCharacteristicsCarryTheBlockBaseAlignment) {
         mod.functions.push_back(std::move(fn));
         mod.dataItems.push_back(makeTdataItem(42, {7, 0, 0, 0}, align));
         DiagnosticReporter rep;
-        auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+        auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
         EXPECT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
         EXPECT_FALSE(bytes.empty());
         if (bytes.empty()) return 0xFFFFFFFFu;
@@ -4736,7 +4736,7 @@ TEST(PeExecData, StaticObjectPastTheEncodableCeilingFailsLoud) {
 
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
-    EXPECT_TRUE(bytes.empty()) << "no artifact may be written";
+    EXPECT_FALSE(bytes.has_value()) << "no artifact may be written";
     bool saw = false;
     for (auto const& diag : rep.all())
         if (diag.code == DiagnosticCode::K_StaticObjectOveralignedForFormat)
@@ -4766,7 +4766,7 @@ TEST(PeExecData, StaticObjectAtTheEncodableCeilingCompilesClean) {
     mod.dataItems.push_back(std::move(d));
 
     DiagnosticReporter rep;
-    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
     for (auto const& diag : rep.all())
         EXPECT_NE(diag.code, DiagnosticCode::K_StaticObjectOveralignedForFormat)
             << "8192 is encodable — the gate is `>`, and it is not tied to "
@@ -4824,7 +4824,7 @@ TEST(PeExecData, OveralignedStaticsLandOnAlignedVirtualAddresses) {
     mod.dataItems.push_back(dataItem(44, {0xB1, 0xB2, 0xB3, 0xB4}, 8192));
 
     DiagnosticReporter rep;
-    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
     ASSERT_FALSE(bytes.empty());
 
@@ -4890,7 +4890,7 @@ TEST(PeExecTls, SixteenByteAlignedThreadLocalCompilesClean) {
     mod.dataItems.push_back(makeTdataItem(42, {1, 0, 0, 0}, 16));  // _Alignas(16)
 
     DiagnosticReporter rep;
-    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
     EXPECT_EQ(rep.errorCount(), 0u)
         << "16-byte alignment == the PE x64 TLS block-base guarantee — clean";
     // FATAL, not EXPECT: `findExecSection` below indexes the buffer at 0x86
@@ -4917,7 +4917,7 @@ TEST(PeExecWriter, ExternTargetFailsLoudAsUndefined) {
     mod.functions.push_back(std::move(fn));
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
-    EXPECT_TRUE(bytes.empty());
+    EXPECT_FALSE(bytes.has_value());
     bool sawCode = false;
     for (auto const& d : rep.all()) {
         if (d.code == DiagnosticCode::K_SymbolUndefined) sawCode = true;
@@ -5286,7 +5286,7 @@ TEST(PeExecWriter, DllArmEncodesEntrylessImage) {
     ASSERT_TRUE(target.has_value());
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
-    auto bytes = pe::encode(mod, **target, **r, rep);
+    auto bytes = pe::encode(mod, **target, **r, rep).value();
     ASSERT_FALSE(bytes.empty());
     EXPECT_EQ(rep.errorCount(), 0u);
     // IMAGE_FILE_HEADER.Characteristics @ 0x96 carries IMAGE_FILE_DLL.
@@ -5305,7 +5305,7 @@ TEST(PeExecWriter, EmptyTextFailsLoud) {
     mod.functions.push_back(std::move(fn));
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
-    EXPECT_TRUE(bytes.empty());
+    EXPECT_FALSE(bytes.has_value());
     // A PE executable whose one function holds no byte is a program with no
     // instruction to start at: refused under K_ProgramEntryUndefined alone
     // (P69 fold 3d; K_RelocationKindMismatch, "an exec with no instructions
@@ -5337,7 +5337,7 @@ TEST(PeExecWriter, RelocOffsetPastFunctionBytesFailsLoud) {
     mod.functions.push_back(std::move(f1));
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
-    EXPECT_TRUE(bytes.empty());
+    EXPECT_FALSE(bytes.has_value());
     bool sawCode = false;
     for (auto const& d : rep.all()) {
         if (d.code == DiagnosticCode::K_RelocationKindMismatch) sawCode = true;
@@ -5354,7 +5354,7 @@ TEST(PeExecWriter, LoadBearingOptionalHeaderFieldsPinnedByteForByte) {
     auto loaded = loadShippedExec();
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
-    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u);
     // Per PE/COFF §3.4 (PE32+ optional header layout):
     //   [0xD0] SizeOfImage (u32) — must be ≥ secText.RVA + textVS.
@@ -5398,7 +5398,7 @@ TEST(PeExecWriter, DisplacementOverflowFailsLoud) {
     mod.functions.push_back(std::move(fn));
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
-    EXPECT_TRUE(bytes.empty());
+    EXPECT_FALSE(bytes.has_value());
     bool sawCode = false;
     for (auto const& d : rep.all()) {
         if (d.code == DiagnosticCode::K_RelocationKindMismatch) sawCode = true;
@@ -5440,7 +5440,7 @@ TEST(PeExecWriter, ExternImportProducesIDataSectionAndPatchesReloc) {
     AssembledModule mod = makeModuleWithOneExtern(
         {0xE8, 0x00, 0x00, 0x00, 0x00, 0xC3}, 1, 99, 1);
     DiagnosticReporter rep;
-    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
 
@@ -5503,7 +5503,7 @@ TEST(PeExecWriter, IDataContainsExitProcessNameAndKernel32DllName) {
     AssembledModule mod = makeModuleWithOneExtern(
         {0xE8, 0, 0, 0, 0, 0xC3}, 1, 99, 1);
     DiagnosticReporter rep;
-    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u);
     constexpr std::size_t kSecondSecHdr = 0x188 + 40;
     std::uint32_t const idataFileOff =
@@ -5523,7 +5523,7 @@ TEST(PeExecWriter, NoExternImportsEmitsSingleSection) {
     auto loaded = loadShippedExec();
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
-    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u);
     EXPECT_EQ(readU16LE(bytes, 0x86), 1u);
     EXPECT_EQ(readU32LE(bytes, 0x110), 0u);
@@ -5539,7 +5539,7 @@ TEST(PeExecWriter, IltAndIatHoldIdenticalThunksAtFileImageTime) {
     AssembledModule mod = makeModuleWithOneExtern(
         {0xE8, 0, 0, 0, 0, 0xC3}, 1, 99, 1);
     DiagnosticReporter rep;
-    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u);
     // Read ImageImportDescriptor[0] @ idata + 0:
     //   OriginalFirstThunk (ILT RVA) @ +0
@@ -5588,7 +5588,7 @@ TEST(PeExecWriter, MultipleExternsInOneLibraryProduceDistinctIatSlots) {
     mod.externImports.push_back(
         ExternImport{SymbolId{11}, "GetStdHandle", "kernel32.dll"});
     DiagnosticReporter rep;
-    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u);
     EXPECT_EQ(readU16LE(bytes, 0x86), 2u);
     // 1 lib + null terminator descriptor = 2 × 20 = 40
@@ -5632,7 +5632,7 @@ TEST(PeExecWriter, MultipleLibrariesEachWithOneExtern) {
     mod.externImports.push_back(
         ExternImport{SymbolId{11}, "printf",      "msvcrt.dll"});
     DiagnosticReporter rep;
-    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u);
     // 2 libs + null terminator = 3 × 20 = 60
     EXPECT_EQ(readU32LE(bytes, 0x114), 60u);
@@ -5683,7 +5683,7 @@ TEST(PeExecWriter, MixedExternAndIntraModuleCallInOneFunction) {
     mod.externImports.push_back(
         ExternImport{SymbolId{99}, "ExitProcess", "kernel32.dll"});
     DiagnosticReporter rep;
-    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u);
     // Intra-call: from text @ +1 to fn[1] @ +11 (fn[0] is 11 bytes).
     // value = 11 - 1 - 4 = 6.
@@ -5933,7 +5933,7 @@ TEST(PeExecWriter, RodataSectionEmittedWhenDataItemsNonEmpty) {
     d.alignment = Alignment::of<1>();
     mod.dataItems.push_back(std::move(d));
     DiagnosticReporter rep;
-    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u);
     // NumberOfSections at IMAGE_FILE_HEADER offset 0x86: 2 sections
     // (.text + .rdata; no .idata since externImports empty).
@@ -5984,7 +5984,7 @@ TEST(PeExecWriter, RodataAndIdataCoexistInCorrectOrder) {
     d.bytes   = {'x'};
     mod.dataItems.push_back(std::move(d));
     DiagnosticReporter rep;
-    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u);
     // 3 sections.
     EXPECT_EQ(readU16LE(bytes, 0x86), 3u);
@@ -6029,7 +6029,7 @@ TEST(PeExecWriter, MultipleRodataItemsLayWithAlignmentPadding) {
     b.alignment = Alignment::of<8>();
     mod.dataItems.push_back(std::move(b));
     DiagnosticReporter rep;
-    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u);
     constexpr std::size_t kSecHdrTable = 0x188;
     constexpr std::size_t kSecHdrSize  = 40;
@@ -6058,7 +6058,7 @@ TEST(PeExecWriter, NoRodataItemsEmitsNoRdataSection) {
     auto loaded = loadShippedExec();
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
-    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u);
     // Single section (.text only).
     EXPECT_EQ(readU16LE(bytes, 0x86), 1u);
@@ -6193,7 +6193,7 @@ TEST(PeExecWriter, DataSectionEmittedWritable) {
     d.alignment = Alignment::of<4>();
     mod.dataItems.push_back(std::move(d));
     DiagnosticReporter rep;
-    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u)
         << "PE writer must ACCEPT a Data item now that D-LK4-DATA-PRODUCER "
            "closed (it was fail-loud before)";
@@ -6237,7 +6237,7 @@ TEST(PeExecWriter, BssSectionEmittedNobitsWritable) {
     d.alignment    = Alignment::of<4>();
     mod.dataItems.push_back(std::move(d));
     DiagnosticReporter rep;
-    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u)
         << "PE writer must ACCEPT a Bss item now that D-LK4-DATA-PRODUCER closed";
     ASSERT_FALSE(bytes.empty());
@@ -6351,7 +6351,7 @@ TEST(PeExecWriter, AnImageWithImportsRefusesADocumentWithNoDynamicRow) {
     AssembledModule mod = makeModuleWithOneExtern({0xE8, 0, 0, 0, 0, 0xC3}, 1, 99, 1);
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, **target, **fmt, rep);
-    EXPECT_TRUE(bytes.empty());
+    EXPECT_FALSE(bytes.has_value());
     EXPECT_EQ(::dss::test_support::countCode(rep, DiagnosticCode::K_NoMatchingObjectFormat), 1u);
     bool named = false;
     for (auto const& d : rep.all()) {
@@ -6374,7 +6374,7 @@ TEST(PeExecWriter, SizeOfInitializedDataSumsRdataAndIdata) {
     d.bytes   = {'x'};
     mod.dataItems.push_back(std::move(d));
     DiagnosticReporter rep;
-    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u);
     // OH64 starts at file-offset 0x98 (DOS 64 + stub 64 + PE sig 4
     // + file hdr 20 = 152 = 0x98); SizeOfInitializedData is at +8.
@@ -6395,7 +6395,7 @@ TEST(PeExecWriter, SizeOfImageReflectsRdataExtentInRodataOnlyArm) {
     d.bytes   = {'x'};
     mod.dataItems.push_back(std::move(d));
     DiagnosticReporter rep;
-    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u);
     // SizeOfImage field at OH64+56 (per the existing
     // LoadBearingOptionalHeaderFieldsPinnedByteForByte test).
@@ -6456,7 +6456,7 @@ TEST(PeExecWriter, CertTableFileOffsetShiftsPastRdataAndIdata) {
     d.bytes   = {'x'};
     mod.dataItems.push_back(std::move(d));
     DiagnosticReporter rep;
-    auto bytes = encodeUntrampolined(mod, **target, **fmt, rep);
+    auto bytes = encodeUntrampolined(mod, **target, **fmt, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u);
     // Data directory base in OH64: per PE §3.4 the directories
     // sit at offset 112 from OH64 start. Cert is entry 4 → +32.
@@ -6762,7 +6762,7 @@ TEST(PeExecWriter, DllAndObjSchemasRefuseAStackReserveRequest) {
         auto const bytes =
             pe::encode(mod, **target, *fmt, repW,
                        ImageRequest{.stackReserveBytes = kOverrideReserve});
-        EXPECT_TRUE(bytes.empty())
+        EXPECT_FALSE(bytes.has_value())
             << fmt->name() << " -- pe::encode must refuse a request it "
                               "cannot honour, even off the linker path";
         EXPECT_EQ(::dss::test_support::countCode(
@@ -7269,7 +7269,7 @@ TEST(PeObjWriter, ATryRegionCarriesItsScopeTableIntoTheObject) {
         << "the fixture is only meaningful if the declaration actually loaded";
 
     DiagnosticReporter rep;
-    auto obj = pe::encode(makePeObjTryModule(), **target, **fmt, rep);
+    auto obj = pe::encode(makePeObjTryModule(), **target, **fmt, rep).value();
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(obj.empty());
@@ -7326,7 +7326,7 @@ TEST(PeObjWriter, DeclaringAPersonalityWithoutTheRvaRelocationIsRefused) {
         auto obj = pe::encode(makePeObjUnwindModule(/*withCfi=*/true,
                                                     /*withTry=*/false),
                               **target, **fmt, rep);
-        EXPECT_TRUE(obj.empty())
+        EXPECT_FALSE(obj.has_value())
             << "an object whose RUNTIME_FUNCTION fields cannot be relocated "
                "must emit NO bytes -- never a `.pdata` full of raw offsets";
         EXPECT_EQ(::dss::test_support::countCode(
@@ -7362,7 +7362,7 @@ TEST(PeObjWriter, DeclaringAPersonalityWithoutTheRvaRelocationIsRefused) {
         DiagnosticReporter rep;
         auto obj = pe::encode(makePeObjUnwindModule(/*withCfi=*/true,
                                                     /*withTry=*/false),
-                              *loaded.target, *loaded.format, rep);
+                              *loaded.target, *loaded.format, rep).value();
         for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
         EXPECT_EQ(rep.errorCount(), 0u);
         EXPECT_FALSE(obj.empty());
@@ -7390,7 +7390,7 @@ TEST(PeObjWriter, OrdinaryFramesCarryPdataAndXdataShapedLikeGccs) {
     DiagnosticReporter rep;
     auto obj = pe::encode(makePeObjUnwindModule(/*withCfi=*/true,
                                                 /*withTry=*/false),
-                          *loaded.target, *loaded.format, rep);
+                          *loaded.target, *loaded.format, rep).value();
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(obj.empty());
@@ -7473,7 +7473,7 @@ TEST(PeObjWriter, EveryRuntimeFunctionResolvesToItsOwnFunctionUnderSPlusA) {
 
     DiagnosticReporter rep;
     auto obj = pe::encode(makePeObjThreeFrameModule(), *loaded.target,
-                          *loaded.format, rep);
+                          *loaded.format, rep).value();
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(obj.empty());
@@ -7552,7 +7552,7 @@ TEST(PeObjWriter, AScopeTableAtANonZeroOffsetResolvesToItsOwnGuardedRange) {
 
     DiagnosticReporter rep;
     auto obj = pe::encode(makePeObjTryAtANonZeroOffsetModule(), **target,
-                          **fmt, rep);
+                          **fmt, rep).value();
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(obj.empty());
@@ -7634,7 +7634,7 @@ TEST(PeObjWriter, AModuleWithNoFrameInformationGrowsNoUnwindSections) {
     DiagnosticReporter rep;
     auto obj = pe::encode(makePeObjUnwindModule(/*withCfi=*/false,
                                                 /*withTry=*/false),
-                          *loaded.target, *loaded.format, rep);
+                          *loaded.target, *loaded.format, rep).value();
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(obj.empty());
@@ -7668,7 +7668,7 @@ TEST(PeObjWriter, AWeakFunctionsUnwindTablesAreComdatsAssociativeToItsBody) {
 
     DiagnosticReporter rep;
     auto obj = pe::encode(makePeObjWeakUnwindModule(), *loaded.target,
-                          *loaded.format, rep);
+                          *loaded.format, rep).value();
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(obj.empty());

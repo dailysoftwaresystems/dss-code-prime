@@ -1,0 +1,1 @@
+    return !(nested.slotKind() == SlotKind::AltChoice && nested.speculative() && !root.speculative());

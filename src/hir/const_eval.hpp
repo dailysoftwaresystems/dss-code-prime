@@ -3,11 +3,13 @@
 #include "core/export.hpp"
 #include "core/types/constant_form.hpp"   // ConstantForms (EvalOptions::admittedForms)
 #include "core/types/strong_ids.hpp"
+#include "core/types/symbol_id_cursor.hpp"   // SymbolIdsRefused -- a refused fresh id, carried as a value
 #include "core/types/type_lattice/core_type.hpp"
 #include "hir/hir_literal_pool.hpp"
 
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <functional>
 #include <optional>
 #include <span>
@@ -129,6 +131,9 @@ enum class ConstEvalFailure : std::uint8_t {
     LossyFloatConversion,      // refuseOnLossyFloatConversion: int→double widening
                                // didn't round-trip (≥2^53-ish), caller wants strict
                                // (verifier-evolution consumer, plan-09 mapped item)
+    SymbolIdsRefused,          // a symbol the fold needed was REFUSED at its door, which
+                               // reported it by name (P69 f26e, B1): the caller says
+                               // nothing more of it -- never "not a constant"
 };
 
 // Language-blind callback for `Ref`-to-constant-symbol resolution (CE2).
@@ -188,15 +193,17 @@ struct AddressableSymbol {
 };
 using AddressableSymbolResolver =
     std::function<std::optional<AddressableSymbol>(SymbolId)>;
+// P69 f26e (B1): the symbol, nullopt (no such object), or SymbolIdsRefused -- its id refused at the
+// door, reported there by name, which the fold carries as `ConstEvalFailure::SymbolIdsRefused`.
 using StringLiteralSymbolResolver =
-    std::function<std::optional<SymbolId>(HirNodeId)>;
+    std::function<std::expected<std::optional<SymbolId>, SymbolIdsRefused>(HirNodeId)>;
 using FieldOffsetResolver =
     std::function<std::optional<std::uint64_t>(TypeId /*record*/, std::uint32_t /*field*/)>;
 // P69 (D-C-A-COMPOUND-LITERAL-IS-ITS-INITIALIZERS-VALUE-NOT-AN-OBJECT): the symbol a STATIC
 // or THREAD `UnnamedObject` node's object lives in (the static-data producer mints one per
 // node); nullopt for an automatic one, which has no link-time address.
 using UnnamedObjectResolver =
-    std::function<std::optional<SymbolId>(HirNodeId)>;
+    std::function<std::expected<std::optional<SymbolId>, SymbolIdsRefused>(HirNodeId)>;   // as above
 // P69 (lane `cs`, D-C-A-READ-THROUGH-AN-ADDRESS-CONSTANT-IN-A-STATIC-INITIALIZER-IS-REFUSED):
 // the object an address constant's BASE symbol names, when its value may be READ through the
 // address — `*p`, `p[i]`, `p->m` of a pointer whose value is an address constant: its

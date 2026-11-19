@@ -75,6 +75,8 @@
 #include "hir/hir.hpp"
 #include "hir/hir_attrs.hpp"               // HirFfiMap
 #include "hir/hir_node.hpp"
+#include "link/fresh_symbol_ids.hpp"        // maxExistingSymbolIdV (every id a module holds)
+#include "link/linker.hpp"                  // link (two coinciding spaces, linked)
 #include "link/object_format_schema.hpp"
 #include "mir/lowering/hir_to_mir.hpp"     // lowerToMir, MirLoweringConfig, MirSymbolIdSpace
 #include "mir/merge/synth_pe_startup.hpp"
@@ -101,6 +103,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -108,6 +111,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <algorithm>
+#include <span>
 #include <vector>
 
 using namespace dss;
@@ -378,7 +383,7 @@ TEST(SynthSymbolFloor, TheModuleCarriesTheEndOfItsSymbolIdSpace) {
         EXPECT_EQ(handed.symbolIdEnd(), 10u) << "an object the builder is handed";
         addFn(handed, 12);
         EXPECT_EQ(handed.symbolIdEnd(), 13u) << "a function the builder is handed";
-        EXPECT_EQ(handed.mintSymbol().v, 13u);
+        EXPECT_EQ(handed.mintSymbolOrAbort("test").v, 13u);
     }
     {
         // A value a format WRITER defines for itself is never a module's: the door
@@ -387,9 +392,9 @@ TEST(SynthSymbolFloor, TheModuleCarriesTheEndOfItsSymbolIdSpace) {
         MirBuilder reserved;
         reserved.stateDataModel(DataModel::Lp64);
         reserved.stateSymbolIdEnd(kTlsIndexReservedSymbolIdValue - 1u);
-        EXPECT_EQ(reserved.mintSymbol().v, kTlsIndexReservedSymbolIdValue - 1u)
+        EXPECT_EQ(reserved.mintSymbolOrAbort("test").v, kTlsIndexReservedSymbolIdValue - 1u)
             << "CONTROL: the value before the reserved one is an ordinary id";
-        EXPECT_EQ(reserved.mintSymbol().v, kTlsIndexReservedSymbolIdValue + 1u)
+        EXPECT_EQ(reserved.mintSymbolOrAbort("test").v, kTlsIndexReservedSymbolIdValue + 1u)
             << "the reserved value itself is never handed out";
     }
     {
@@ -400,15 +405,23 @@ TEST(SynthSymbolFloor, TheModuleCarriesTheEndOfItsSymbolIdSpace) {
         MirBuilder full;
         full.stateDataModel(DataModel::Lp64);
         full.stateSymbolIdEnd(kLast - 1u);
-        EXPECT_EQ(full.mintSymbol().v, kLast - 1u) << "CONTROL: the last id that can be minted";
-        EXPECT_FALSE(full.mintSymbol().valid());
-        EXPECT_FALSE(full.mintSymbol().valid());
+        // The OPTIONAL door (P69 f26e, B1): refused, REPORTED under the sink's code each time, nothing written.
+        DiagnosticReporter rep;
+        SymbolIdRefusalSink const sink{&rep, DiagnosticCode::H_SymbolIdSpaceExhausted};
+        EXPECT_EQ(full.mintSymbol(sink, "test"), std::optional<SymbolId>{SymbolId{kLast - 1u}})
+            << "CONTROL: the last id that can be minted";
+        EXPECT_FALSE(full.mintSymbol(sink, "test").has_value());
+        EXPECT_FALSE(full.mintSymbol(sink, "test").has_value()) << "and stays refused";
+        EXPECT_EQ(full.symbolIdEnd(), kLast) << "a refused take wrote the end";
         MirBuilder saturated;
         saturated.stateDataModel(DataModel::Lp64);
         saturated.stateSymbolIdEnd(7);
         saturated.keepSymbolIdsClearOf(SymbolId{kLast});
         EXPECT_EQ(saturated.symbolIdEnd(), kLast);
-        EXPECT_FALSE(saturated.mintSymbol().valid());
+        EXPECT_FALSE(saturated.mintSymbol(sink, "test").has_value());
+        std::size_t refusals = 0;
+        for (auto const& d : rep.all()) if (d.code == DiagnosticCode::H_SymbolIdSpaceExhausted) ++refusals;
+        EXPECT_EQ(refusals, 3u) << "the OPTIONAL door reports every refused take, by name";
     }
     MirBuilder mb;
     mb.stateDataModel(DataModel::Lp64);
@@ -420,7 +433,7 @@ TEST(SynthSymbolFloor, TheModuleCarriesTheEndOfItsSymbolIdSpace) {
     EXPECT_EQ(mb.symbolIdEnd(), 30u) << "an id something beside the module holds raises the end past itself";
     mb.keepSymbolIdsClearOf(SymbolId{7});
     EXPECT_EQ(mb.symbolIdEnd(), 30u) << "an id already inside the space changes nothing";
-    EXPECT_EQ(mb.mintSymbol().v, 30u);
+    EXPECT_EQ(mb.mintSymbolOrAbort("test").v, 30u);
     EXPECT_EQ(mb.mintSymbolOrAbort("test").v, 31u);
     Mir const mir = std::move(mb).finish();
     EXPECT_EQ(mir.symbolIdEnd(), 32u) << "the finished module carries the end past every id minted for it";
@@ -430,7 +443,7 @@ TEST(SynthSymbolFloor, TheModuleCarriesTheEndOfItsSymbolIdSpace) {
     MirBuilder direct;
     direct.stateDataModel(DataModel::Lp64);
     direct.continueSymbolIdsOf(mir);
-    EXPECT_EQ(direct.mintSymbol().v, 32u);
+    EXPECT_EQ(direct.mintSymbolOrAbort("test").v, 32u);
     MirBuilder viaHelper;
     viaHelper.stateDataModel(DataModel::Lp64);
     opt::passes::cloneGlobalsVerbatim(mir, viaHelper);
@@ -454,19 +467,10 @@ TEST(SynthSymbolFloor, TheModuleCarriesTheEndOfItsSymbolIdSpace) {
         EXPECT_EQ(copy.symbolIdEnd(), 77u);
     }
 
-    // A tier that lowers the FROZEN module and needs symbols of its own continues
-    // the module's ids too, without a builder (MIR→LIR's block symbols).
-    MirSymbolIdContinuation past{mir};
-    EXPECT_EQ(past.mint().v, 32u) << "the first id past a frozen module is its end";
-    EXPECT_EQ(past.mintOrAbort("test").v, 33u);
-    EXPECT_EQ(past.end(), 34u);
-    past.keepClearOf(SymbolId{12});
-    EXPECT_EQ(past.end(), 34u) << "an id already inside the space changes nothing";
-    past.keepClearOf(SymbolId{40});
-    EXPECT_EQ(past.mint().v, 41u)
-        << "an id something beside the module holds (an import row handed to the lowering) "
-           "raises the end past itself";
-    EXPECT_EQ(mir.symbolIdEnd(), 32u) << "a continuation never writes the module";
+    // A tier that lowers the FROZEN module and needs symbols of its own continues the
+    // module's ids too, without a builder (MIR→LIR's block symbols). Only the lowering
+    // makes that continuation (P69 f26e, main's M1), so it is pinned THROUGH the lowering:
+    // mir/test_mir_text_reader_never_aborts, `LoweringContinuesTheModulesIds`.
 }
 
 // A module assembled from raw arenas — no builder in the loop (a verifier fixture; the
@@ -491,7 +495,6 @@ TEST(SynthSymbolFloor, AModuleMadeWithoutABuilderEndsPastTheSymbolsItDefines) {
                   std::move(instBlock), {}, {}, {}, MirLiteralPool{}, MirAsmDescriptorPool{},
                   MirAliasingMode::Permissive, /*charTypesAliasAll=*/true);
     EXPECT_EQ(mir.symbolIdEnd(), 58u) << "one past the highest symbol either arena defines";
-    EXPECT_EQ(MirSymbolIdContinuation{mir}.end(), 58u) << "and a continuation starts there";
     // …but that end is COUNTED — nobody stated it — so nothing is minted past it until
     // a rebuild that knows what the module was made from says so
     // (`SymbolIdEndIsStatedDeath.AMintPastAnEndThatWasOnlyCountedDies`).
@@ -500,7 +503,8 @@ TEST(SynthSymbolFloor, AModuleMadeWithoutABuilderEndsPastTheSymbolsItDefines) {
     rebuilt.stateDataModel(DataModel::Lp64);
     rebuilt.continueSymbolIdsOf(mir);
     rebuilt.stateSelfContainedSymbolIds();
-    EXPECT_EQ(rebuilt.mintSymbol().v, 58u) << "the first id past it, once its maker's word is given";
+    EXPECT_EQ(rebuilt.mintSymbolOrAbort("test").v, 58u)
+        << "the first id past it, once its maker's word is given";
 }
 
 // A unit with NO name table beside it — hand-built HIR, lowered with no semantic model —
@@ -571,7 +575,7 @@ TEST(SynthSymbolFloor, AUnitLoweredWithNoTableEndsPastItsImports) {
         MirBuilder rebuilt;
         rebuilt.stateDataModel(DataModel::Lp64);
         rebuilt.continueSymbolIdsOf(result.mir);
-        EXPECT_GT(rebuilt.mintSymbol().v, ImportOnlyUnit::kImportSymV)
+        EXPECT_GT(rebuilt.mintSymbolOrAbort("test").v, ImportOnlyUnit::kImportSymV)
             << "the first id minted for the module must not be the import's";
     }
 }
@@ -596,14 +600,11 @@ TEST(SynthSymbolFloorDeath, AUnitLoweredWithNothingSaidOfItsIdSpaceIsRefusedAtIt
         MirBuilder rebuilt;
         rebuilt.stateDataModel(DataModel::Lp64);
         rebuilt.continueSymbolIdsOf(result.mir);
-        (void)rebuilt.mintSymbol();
+        (void)rebuilt.mintSymbolOrAbort("test");
     }, "MirBuilder::mintSymbol fatal: this module's symbol-id space was never stated");
-    EXPECT_DEATH({
-        ImportOnlyUnit unit;
-        auto const result = lowerSayingNothing(unit);
-        MirSymbolIdContinuation past{result.mir};
-        (void)past.mint();
-    }, "MirSymbolIdContinuation::mint fatal: this module's symbol-id space was never stated");
+    // The frozen module's continuation refuses it too -- made only by the lowering (M1),
+    // so that death is pinned through the lowering: mir/test_mir_text_reader_never_aborts,
+    // `LoweringContinuesTheModulesIdsDeathTest`.
 }
 
 // An id counted from the symbols a builder happens to hold is the defect itself, so the
@@ -613,13 +614,15 @@ TEST(SynthSymbolFloorDeath, AMintFromABuilderToldNothingDies) {
     EXPECT_DEATH({
         MirBuilder mb;
         mb.stateDataModel(DataModel::Lp64);
-        (void)mb.mintSymbol();
+        (void)mb.mintSymbolOrAbort("test");
     }, "symbol-id space was never stated");
 }
 
 // A pass over a frozen module has no source position to put a diagnostic on, so at
-// exhaustion it dies by name rather than hand a wrapped id downstream — from a builder
-// and from a frozen module's continuation alike.
+// exhaustion it dies by name rather than hand a wrapped id downstream (the module's
+// ABORT door). The frozen module's continuation has no such form: the lowering that
+// makes it REPORTS the refusal (`L_SymbolIdSpaceExhausted`, pinned by
+// mir/test_mir_text_reader_never_aborts).
 TEST(SynthSymbolFloorDeath, AnExhaustedSpaceKillsTheMinterThatCannotRefuse) {
     EXPECT_DEATH({
         MirBuilder mb;
@@ -627,14 +630,6 @@ TEST(SynthSymbolFloorDeath, AnExhaustedSpaceKillsTheMinterThatCannotRefuse) {
         mb.stateSymbolIdEnd(std::numeric_limits<std::uint32_t>::max());
         (void)mb.mintSymbolOrAbort("thePassThatMints");
     }, "thePassThatMints fatal: the module's SymbolId space is exhausted");
-    EXPECT_DEATH({
-        MirBuilder mb;
-        mb.stateDataModel(DataModel::Lp64);
-        mb.stateSymbolIdEnd(std::numeric_limits<std::uint32_t>::max());
-        Mir const full = std::move(mb).finish();
-        MirSymbolIdContinuation past{full};
-        (void)past.mintOrAbort("theLoweringThatMints");
-    }, "theLoweringThatMints fatal: the module's SymbolId space is exhausted");
 }
 
 // ── A STATED END AGAINST A COUNTED ONE ────────────────────────────────────────
@@ -858,6 +853,98 @@ TEST(SynthSymbolFloor, ASingleUnitPublishesNoNameItsSourceDoesNotDeclare) {
 // of the unit schedule ran, the module still carries its table's end, nothing the
 // optimizer synthesized sits inside the table, and no object shares an id with an
 // import. The debug arm is the control: it mints no zero, and carries the end too.
+// ★ A7 (P69 f26e, B1): the module a unit COMPILES to carries its id space's end -- past every id it holds,
+// including the block symbols MIR→LIR minted past the MIR module's end for a computed goto -- so a link-tier door
+// opened on it continues the space. RED-ON-DISABLE: drop the assembled module's raise and its end stays 1.
+TEST(SynthSymbolFloor, ACompiledModuleCarriesItsSpacesEndPastEveryIdTheLoweringMinted) {
+    std::string const src =
+        "int pick(int n) {\n"
+        "    void *t = n ? &&a : &&b;\n"
+        "    goto *t;\n"
+        "a: return 1;\n"
+        "b: return 2;\n"
+        "}\n"
+        "int main(void) { return pick(1); }\n";
+    auto const tc = loadToolchain("x86_64", "elf64-x86_64-linux");
+    ASSERT_TRUE(tc.has_value());
+    CompilationUnit cu = unitOf(*tc, src, "a7.c");
+    DiagnosticReporter rep;
+    auto const mod = assembleUnit(cu, *tc->grammar, *tc->target, *tc->format, tc->ccIndex, rep,
+                                  optionsFor(CompileConfig::Debug));
+    ASSERT_TRUE(mod.has_value()) << allDiagText(rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << allDiagText(rep);
+    std::size_t blockSymbols = 0;
+    for (auto const& f : mod->functions) {
+        for (auto const& b : f.blockSymbols) {
+            ++blockSymbols;
+            EXPECT_LT(b.symbol.v, mod->symbolIdEnd.value())
+                << "block symbol " << b.symbol.v << " is past the end the module carries";
+        }
+    }
+    ASSERT_GT(blockSymbols, 0u) << "no block symbol was minted: the pin would read nothing";
+    EXPECT_GT(mod->symbolIdEnd.value(), linker::maxExistingSymbolIdV(*mod))
+        << "the compiled module's end is not past every id it holds";
+    // A link-tier door opened on the compiled module continues its space: its first id is past the carried end.
+    AssembledModule onward = *mod;
+    std::uint32_t const carried = onward.symbolIdEnd.value();
+    linker::ModuleSymbolIds ids{onward};
+    std::optional<SymbolId> const next = ids.take(rep, "the test's take past the lowering");
+    ASSERT_TRUE(next.has_value()) << allDiagText(rep);
+    EXPECT_GE(next->v, carried) << "a door opened on the compiled module hands out an id the lowering minted";
+}
+
+// ★ A7's SECOND pin (P69 f26e, B1, home audit v2 section 9): two modules whose spaces COINCIDE id for id -- what two
+// lowerings of ONE Mir hand the link, each continuation minting the same block symbols past the same end -- are two
+// spaces to the link, which maps every id by (module, id). One source compiled twice (only its global's name differs,
+// which moves no id): the precondition is that the two modules' block symbols are the SAME ids; the claim is that
+// both link beside a caller with every function resolved. RED-ON-DISABLE: key every module's id as the first
+// module's and the twin's symbols fold onto the first's.
+TEST(SynthSymbolFloor, TwoModulesWhoseSpacesCoincideLinkAsTwoSpaces) {
+    auto const twin = [](char const* name, int pickArg) {
+        return std::string{"static int pick(int n) {\n"
+                           "    void *t = n ? &&a : &&b;\n"
+                           "    goto *t;\n"
+                           "a: return 1;\n"
+                           "b: return 2;\n"
+                           "}\n"
+                           "int "} + name + "(void) { return pick(" + std::to_string(pickArg) + "); }\n";
+    };
+    // The RELOCATABLE ELF x86-64 format: an exec format refuses a unit that defines no entry, and two of the three
+    // define none; the link of the three resolves every function all the same.
+    auto const tc = loadToolchain("x86_64", "elf64-x86_64-linux");
+    ASSERT_TRUE(tc.has_value());
+    DiagnosticReporter rep;
+    auto const compile = [&](std::string const& src, char const* label, std::uint32_t cu) {
+        CompilationUnit unit = unitOf(*tc, src, label);
+        auto mod = assembleUnit(unit, *tc->grammar, *tc->target, *tc->format, tc->ccIndex, rep,
+                                optionsFor(CompileConfig::Debug));
+        if (mod.has_value()) mod->cuId = CompilationUnitId{cu};
+        return mod;
+    };
+    auto const a = compile(twin("fa", 1), "a7b_a.c", 1);
+    auto const b = compile(twin("fb", 0), "a7b_b.c", 2);
+    auto const m = compile("int fa(void);\nint fb(void);\nint main(void) { return fa() + fb(); }\n", "a7b_m.c", 3);
+    ASSERT_TRUE(a.has_value() && b.has_value() && m.has_value()) << allDiagText(rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << allDiagText(rep);
+    auto const blockIds = [](AssembledModule const& mod) {
+        std::vector<std::uint32_t> ids;
+        for (auto const& f : mod.functions)
+            for (auto const& s : f.blockSymbols) ids.push_back(s.symbol.v);
+        std::sort(ids.begin(), ids.end());
+        return ids;
+    };
+    ASSERT_FALSE(blockIds(*a).empty()) << "no block symbol was minted: the pin would read nothing";
+    ASSERT_EQ(blockIds(*a), blockIds(*b))
+        << "PRECONDITION: the twins' continuations minted the same ids -- the case two lowerings of one Mir give";
+    std::vector<AssembledModule> mods{*a, *b, *m};
+    LinkedImage const img = linker::link(std::span<AssembledModule const>{mods}, *tc->target, *tc->format, rep);
+    ASSERT_TRUE(img.ok()) << allDiagText(rep);
+    EXPECT_EQ(rep.errorCount(), 0u) << allDiagText(rep);
+    EXPECT_EQ(img.resolvedFuncCount, img.expectedFuncCount)
+        << "every function of both spaces is resolved -- two `pick`s, `fa`, `fb` and `main`";
+    EXPECT_EQ(img.expectedFuncCount, 5u);
+}
+
 TEST(SynthSymbolFloor, TheOptimizersConstantIsMintedPastTheSemanticTable) {
     struct Arm {
         char const*           source;

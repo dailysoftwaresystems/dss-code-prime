@@ -1803,4 +1803,24 @@ operandLayout(TypeId id, TypeInterner const& interner,
     return StructLayout{*declared, Alignment{}, {}, false};
 }
 
+std::optional<Alignment>
+typeAlignment(TypeId id, TypeInterner const& interner,
+              AggregateLayoutParams params, DataModel dm) {
+    // Bounded by the interner it walks: one step per level, and a level is a distinct record.
+    TypeId cur = id;
+    for (std::size_t steps = 0; steps <= interner.size(); ++steps) {
+        if (!cur.valid()) return std::nullopt;
+        if (auto const lay = computeLayout(cur, interner, params, dm)) return lay->align;
+        // No layout: only an array of KNOWN extent -- fixed or run-time -- still has an alignment.
+        if (interner.kind(cur) != TypeKind::Array || interner.isIncompleteArray(cur))
+            return std::nullopt;
+        if (std::uint32_t const own = interner.typeAlignOverride(cur); own != 0)
+            return Alignment::fromBytes(own);
+        auto const ops = interner.operands(cur);
+        if (ops.empty()) return std::nullopt;
+        cur = ops[0];
+    }
+    return std::nullopt;
+}
+
 } // namespace dss

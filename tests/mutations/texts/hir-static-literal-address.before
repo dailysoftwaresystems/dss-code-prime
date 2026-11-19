@@ -1,3 +1,6 @@
-            std::optional<SymbolId> const s =
-                env.resolveUnnamedObject ? env.resolveUnnamedObject(n) : std::nullopt;
-            if (!s.has_value() || !s->valid()) {
+                               : std::expected<std::optional<SymbolId>, SymbolIdsRefused>{std::nullopt};
+            if (!s.has_value()) {   // refused by name at the door (P69 f26e, B1): no fold, no other answer
+                result = fail(ConstEvalFailure::SymbolIdsRefused, n);
+                return;
+            }
+            if (!s->has_value() || !(*s)->valid()) {

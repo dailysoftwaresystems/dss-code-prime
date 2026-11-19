@@ -7,8 +7,9 @@
 // copy, a parse or a mapping). So a bare mint -- `SymbolId{++maxV}` at one more link site -- compiles everywhere,
 // and before this guard only a review could refuse it. 28 minting lines across nine id spaces each computed their own
 // next id (`+ 1` seeds that wrap onto 0, a caller's contract against two cursors, exhaustion checked at three of them).
-// They now ask src/core/types/symbol_id_cursor.hpp -- the counting cursor (`SymbolIdEnd`) and the index rule
-// (`symbolIdOfIndex`) -- and this guard makes every other spelling RED.
+// They now ask src/core/types/symbol_id_cursor.hpp -- a counting space's door (`AbortingSymbolIds`,
+// `OptionalSymbolIds`, `ReportedSymbolIds` over a `SymbolIdEnd`) or an index space's (`IndexSymbolIds`) -- and this
+// guard makes every other spelling RED.
 //
 // THE FORMS REFUSED (each derived from the type: the constructor's argument, or a write of `v`), naming the door:
 //   (a) a `SymbolId` construction -- `SymbolId{...}`, `SymbolId(...)`, `SymbolId [const] name{...}` / `name(...)`
@@ -718,7 +719,7 @@ TEST(SymbolIdMintsGuard, EveryFreshSymbolIdIsMadeByTheCursorsFile) {
     std::size_t judged = 0;
     auto const  found  = refusedAcross(sources, &judged);
     EXPECT_TRUE(found.empty()) << found.size() << " fresh SymbolId(s) made outside " << kHome
-                               << " -- take the space's door (SymbolIdEnd::take, symbolIdOfIndex):" << listed(found);
+                               << " -- take the space's door (core/types/symbol_id_cursor.hpp):" << listed(found);
     // The in-place rule REACHES the tree (MEASURED 109 when it landed): a receiver it can no longer see, or a type it
     // no longer reads, would leave (c) judging nothing while the guard stayed green.
     EXPECT_GE(judged, 80u) << "(c) judged only " << judged << " in-place insertion(s) into a SymbolId container";

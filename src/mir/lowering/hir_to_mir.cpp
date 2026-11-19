@@ -680,7 +680,20 @@ struct Lowerer {
     // exhausted (advancing would wrap onto 0, the invalid sentinel). Every caller
     // fails loud on the invalid id — the `SymbolIdSpaceExhaustionFailsLoud`
     // discipline.
-    [[nodiscard]] SymbolId mintSyntheticGlobalSymbol() { return mir.mintSymbol(); }
+    // The module's OPTIONAL door (P69 f26e, B1): a symbol the lowering synthesizes, or -- the module's id space
+    // exhausted -- the refusal reported ONCE at the take, under HIR→MIR's code, by the home's one emitter. The
+    // caller tests the value and states nothing of its own.
+    [[nodiscard]] std::optional<SymbolId> mintSyntheticGlobalSymbol(std::string_view what) {
+        std::optional<SymbolId> id =
+            mir.mintSymbol(SymbolIdRefusalSink{&reporter, DiagnosticCode::H_SymbolIdSpaceExhausted},
+                           std::format("hir_to_mir cannot mint {}", what));
+        if (!id) ++symbolIdRefusals_;
+        return id;
+    }
+    // How many takes the door REFUSED (each reported there, by name): the door's own answer, kept so that a site
+    // refusing an output for a reason of its own first asks whether a refusal fell inside its own work -- and then
+    // says nothing, the door's report being that output's refusal (P69 f26e, B1).
+    std::uint32_t symbolIdRefusals_ = 0;
 
     // Emit an unsupported-construct diagnostic anchored at the HIR node's
     // source span (via the optional source map). The buffer/span both
@@ -3537,8 +3550,9 @@ struct Lowerer {
         TypeKind const ek = interner.kind(elemTy);
         if (ek == TypeKind::F64 || ek == TypeKind::F32
             || ek == TypeKind::F80 || ek == TypeKind::F128) {
-            SymbolId const sym = mintSyntheticGlobalSymbol();
-            if (!sym.valid()) return InvalidMirInst;
+            std::optional<SymbolId> const minted = mintSyntheticGlobalSymbol("a floating element constant's symbol");
+            if (!minted) return InvalidMirInst;   // refused by name at the door
+            SymbolId const sym = *minted;
             MirLiteralValue lit;
             lit.value = value;
             lit.core  = ek;
@@ -4392,15 +4406,10 @@ struct Lowerer {
                         // and the softcall verb realizes the arithmetic. Same
                         // unblock as F80, one axis over.
                         || interner.kind(t) == TypeKind::F128)) {
-                    SymbolId const sym = mintSyntheticGlobalSymbol();
-                    if (!sym.valid()) {
-                        unsupported(node,
-                            "float-literal promotion failed: synthetic "
-                            "SymbolId space exhausted (UINT32_MAX "
-                            "wraparound) — same guard as the string-"
-                            "literal minter.");
-                        return InvalidMirInst;
-                    }
+                    std::optional<SymbolId> const minted =
+                        mintSyntheticGlobalSymbol("a promoted floating literal's symbol");
+                    if (!minted) return InvalidMirInst;   // refused by name at the door
+                    SymbolId const sym = *minted;
                     std::uint32_t const mirLitIdx =
                         mir.literalPoolAdd(toMirLiteral(src));
                     (void)mir.addGlobal(t, sym, mirLitIdx, MirFuncId{},
@@ -4530,12 +4539,18 @@ struct Lowerer {
                 // `operandLayout` synthesizes. No separate alignment rule exists
                 // or is needed.
                 auto const* layout = cachedOperandLayout(queried);
-                if (layout == nullptr) {
+                // P69 (lane `cs`, fold f26e): a VARIABLY MODIFIED type has an alignment though no
+                // layout (C23 6.5.4.4p3) -- `typeAlignment`'s, the home the semantic and HIR tiers read.
+                std::optional<Alignment> const align =
+                    layout != nullptr ? std::optional<Alignment>{layout->align}
+                                      : typeAlignment(queried, interner, config.aggregateLayout,
+                                                      config.dataModel);
+                if (!align.has_value()) {
                     unsupported(node, "_Alignof of an incomplete or un-alignable type");
                     return InvalidMirInst;
                 }
                 MirLiteralValue lit;
-                lit.value = static_cast<std::uint64_t>(layout->align.bytes());
+                lit.value = static_cast<std::uint64_t>(align->bytes());
                 lit.core  = TypeKind::U64;
                 return mir.addConst(std::move(lit), t);
             }
@@ -7642,12 +7657,11 @@ struct Lowerer {
         auto const sz = computeVlaByteSize(sym, ty, anchor, /*freezeLevelSlots=*/true);
         if (!sz.has_value()) return InvalidMirInst;
         MirInstId const bytes = sz->totalBytes;   // = sizeof level 0 = whole-object total
-        TypeId const baseElemTy = sz->baseElemTy;
-        // Effective alignment from the BASE element (the VLA levels have no static
-        // layout) + any `alignas` override on the decl. 0 = "no info". Mirrors the
+        // Effective alignment of the OBJECT's type (`typeAlignment`: the VLA levels have
+        // no static layout, but an alignment -- their element's, or a level's own
+        // `aligned`) + any `alignas` override on the decl. 0 = "no info". Mirrors the
         // fixed path's payload2 channel; the PRIMARY payload stays 0 (runtime-sized).
-        std::uint32_t const effectiveAlign =
-            frameSlotAlignment(baseElemTy, anchor);
+        std::uint32_t const effectiveAlign = frameSlotAlignment(ty, anchor);
         std::array<MirInstId, 1> aops{bytes};
         MirInstId const a =
             mir.addInst(MirOpcode::Alloca, aops, ptrTy, /*payload=*/0,
@@ -7682,10 +7696,10 @@ struct Lowerer {
                                                  TypeId ptrTy, HirNodeId anchor) {
         auto const sz = composeOnTypedefOrigin(a, origin, ty, anchor);
         if (!sz.has_value()) return InvalidMirInst;
-        // Effective alignment from the BASE element (the innermost non-array element)
-        // + any `alignas` override — mirror `vlaAllocaForLocal` (the VLA levels
-        // have no static layout; the PRIMARY payload stays 0 = runtime-sized).
-        std::uint32_t const effectiveAlign = frameSlotAlignment(sz->baseElemTy, anchor);
+        // Effective alignment of the object's type -- the alias's own `aligned` included
+        // -- + any `alignas` override; mirror `vlaAllocaForLocal` (the PRIMARY payload
+        // stays 0 = runtime-sized).
+        std::uint32_t const effectiveAlign = frameSlotAlignment(ty, anchor);
         std::array<MirInstId, 1> aops{sz->totalBytes};
         MirInstId const av =
             mir.addInst(MirOpcode::Alloca, aops, ptrTy, /*payload=*/0,
@@ -8287,9 +8301,9 @@ struct Lowerer {
     // body read and a static-initializer reference of the same function's
     // `__func__` must decay to EQUAL pointers (the code-audit's MEDIUM-1 — two
     // independent minters broke it). Precondition: the literal's pool entry IS a
-    // string (callers check). Invalid on SymbolId exhaustion — each caller keeps
-    // its own failure posture (loud vs classify-fallback).
-    [[nodiscard]] SymbolId internStringLiteralGlobal(HirNodeId litNode) {
+    // string (callers check). nullopt when the door REFUSED the symbol (reported there, by
+    // name: P69 f26e, B1): each caller refuses its output and says nothing more.
+    [[nodiscard]] std::optional<SymbolId> internStringLiteralGlobal(HirNodeId litNode) {
         std::uint32_t const litIdx0 = hir.payload(litNode);
         HirLiteralValue const& src = literals.at(litIdx0);
         auto memoKey = std::pair{hir.typeId(litNode).v,
@@ -8298,8 +8312,9 @@ struct Lowerer {
             it != stringGlobalMemo_.end()) {
             return it->second;
         }
-        SymbolId const sym = mintSyntheticGlobalSymbol();
-        if (!sym.valid()) return sym;
+        std::optional<SymbolId> const minted = mintSyntheticGlobalSymbol("a string literal's symbol");
+        if (!minted) return std::nullopt;   // refused by name at the door
+        SymbolId const sym = *minted;
         std::uint32_t const mirLitIdx = mir.literalPoolAdd(toMirLiteral(src));
         // D-CSUBSET-MUTABLE-CHAR-ARRAY-RODATA: the synthetic string-literal-pool
         // bytes are IMMUTABLE read-only data (a string literal is const however
@@ -8327,14 +8342,9 @@ struct Lowerer {
                 "D-LK4-RODATA-PRODUCER-NONSTRING-ARRAY-LITERAL-DECAY)");
             return InvalidMirInst;
         }
-        SymbolId const sym = internStringLiteralGlobal(litNode);
-        if (!sym.valid()) {
-            unsupported(litNode,
-                "string-literal promotion failed: synthetic SymbolId space "
-                "exhausted (UINT32_MAX wraparound). Anchor: "
-                "D-LK4-RODATA-PRODUCER-STRING space-exhaustion pin.");
-            return InvalidMirInst;
-        }
+        std::optional<SymbolId> const interned = internStringLiteralGlobal(litNode);
+        if (!interned) return InvalidMirInst;   // refused by name at the door (P69 f26e, B1)
+        SymbolId const sym = *interned;
         return mir.addGlobalAddr(sym, ptrTy);
     }
 
@@ -8529,9 +8539,9 @@ struct Lowerer {
                 return InvalidMirInst;
             }
             if (hir.unnamedObjectStorage(node) != HirObjectStorage::Automatic) {
-                SymbolId const sym = unnamedStaticObjectSymbol(node);
-                if (!sym.valid()) return InvalidMirInst;   // reported
-                return mir.addGlobalAddr(sym, interner.pointer(ot));
+                std::optional<SymbolId> const sym = unnamedStaticObjectSymbol(node);
+                if (!sym) return InvalidMirInst;   // refused by name at the door
+                return mir.addGlobalAddr(*sym, interner.pointer(ot));
             }
             MirInstId const slot = freshAggregateTemp(ot);
             if (!slot.valid()) {
@@ -9823,28 +9833,14 @@ struct Lowerer {
         });
     }
 
-    // ── ONE derivation of a VLA object's BASE ELEMENT and its EFFECTIVE ALIGNMENT ──
-    // Peel the array levels (a `vlaArray` is a `TypeKind::Array` carrying the
-    // `kVlaLength` scalar, so one loop covers fixed and runtime levels alike) down
-    // to the innermost non-array element. The VLA levels have no static layout, so
-    // the base element is the only thing that CAN answer "how is this object
-    // aligned"; an `alignas` on the declaration then raises it.
+    // ── ONE derivation of a frame slot's EFFECTIVE ALIGNMENT, a VLA's included ──
     //   ★ FACTORED, NOT ADDED: `vlaAllocaForLocal` and `vlaAllocaFromTypedef` each
     // carried a byte-identical copy of the alignment ladder, and P34 needed a THIRD
     // reader for the zero-fill's chunk width. Three copies of "how wide may I store
     // into this object" is how a fill and an allocation come to disagree; one
-    // function is how they cannot.
-    [[nodiscard]] TypeId vlaBaseElementType(TypeId t) const {
-        TypeId cur = t;
-        // P69 L2 (lane `lm`): bounded by the interner it walks (`WalkSteps`), never 64 levels.
-        for (substrate::WalkSteps steps{interner.size(), "vlaBaseElementType's spine"};
-             cur.valid() && interner.kind(cur) == TypeKind::Array; steps.step()) {
-            auto const ops = interner.operands(cur);
-            if (ops.empty() || !ops[0].valid()) break;
-            cur = ops[0];
-        }
-        return cur;
-    }
+    // function is how they cannot. P69 (lane `cs`, fold f26e): each asks it of the
+    // OBJECT's type, no longer of its base element, so a level's own `aligned`
+    // (`typedef int T[n] __attribute__((aligned(64)))`) is delivered, not dropped.
 
     // ★ P69 (lane `cs`, fold f26c): THE ONE DECISION OF A FRAME SLOT'S EFFECTIVE
     // ALIGNMENT — the Alloca's `payload2` (mir_node.hpp's one statement of it):
@@ -9867,12 +9863,13 @@ struct Lowerer {
     // aggregate conditional's common slot (probe w3: every reference at -O0).
     [[nodiscard]] std::uint32_t frameSlotAlignment(TypeId ty, HirNodeId anchor) {
         std::uint32_t effectiveAlign = 0;   // 0 = "no info"
+        // P69 (lane `cs`, fold f26e): `typeAlignment` -- the layout's alignment, and a
+        // variably modified type's, which has no layout, too.
         if (config.aggregateLayoutLoaded && ty.valid())
-            if (auto const lay = computeLayout(ty, interner,
-                                               config.aggregateLayout,
-                                               config.dataModel);
-                lay.has_value())
-                effectiveAlign = lay->align.bytes();
+            if (auto const al = typeAlignment(ty, interner, config.aggregateLayout,
+                                              config.dataModel);
+                al.has_value())
+                effectiveAlign = al->bytes();
         if (alignmentMap != nullptr && anchor.valid())
             if (auto const* p = alignmentMap->tryGet(anchor);
                 p != nullptr && p->alignmentBytes > effectiveAlign)
@@ -9925,8 +9922,7 @@ struct Lowerer {
         // unaligned access on every target that has an opinion about it. An
         // alignment the layout engine could not compute arrives as 0, which lands
         // in the byte arm — the conservative direction.
-        std::uint32_t const objAlign =
-            frameSlotAlignment(vlaBaseElementType(ty), anchor);
+        std::uint32_t const objAlign = frameSlotAlignment(ty, anchor);
         TypeKind const chunkKind = (objAlign >= 8) ? TypeKind::I64
                                 : (objAlign >= 4) ? TypeKind::I32
                                                   : TypeKind::Char;
@@ -17188,14 +17184,10 @@ struct Lowerer {
         if (auto it = labelExportSymbols_.find(key); it != labelExportSymbols_.end()) {
             blockSym = it->second;   // the SAME label ⇒ the SAME symbol
         } else {
-            blockSym = mintSyntheticGlobalSymbol();
-            if (!blockSym.valid()) {
-                unsupported(n,
-                    "the synthetic SymbolId space is exhausted — cannot mint a "
-                    "block symbol for a label address in a static initializer "
-                    "(D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED)");
-                return std::nullopt;
-            }
+            std::optional<SymbolId> const minted =
+                mintSyntheticGlobalSymbol("the block symbol of a label address in a static initializer");
+            if (!minted) return std::nullopt;   // refused by name at the door
+            blockSym = *minted;
             labelExportSymbols_.emplace(key, blockSym);
             TypeId ptrTy = hir.typeId(n);
             if (!ptrTy.valid())
@@ -18098,13 +18090,13 @@ struct Lowerer {
         // STATIC or THREAD unnamed object IS — one symbol per node, minted on first use and
         // classified from `unnamedStaticQueue_` by this same environment. An automatic one
         // has no link-time address (the semantic tier refuses taking it first).
-        env.resolveUnnamedObject = [this](HirNodeId n) -> std::optional<SymbolId> {
+        env.resolveUnnamedObject = [this](HirNodeId n) -> std::expected<std::optional<SymbolId>, SymbolIdsRefused> {
             if (!n.valid() || hir.kind(n) != HirKind::UnnamedObject
                 || hir.unnamedObjectStorage(n) == HirObjectStorage::Automatic) {
                 return std::nullopt;
             }
-            SymbolId const s = unnamedStaticObjectSymbol(n);
-            if (!s.valid()) return std::nullopt;
+            std::optional<SymbolId> const s = unnamedStaticObjectSymbol(n);
+            if (!s) return std::unexpected(SymbolIdsRefused{});   // refused by name at the door
             return s;
         };
         // P69 (lane `cs`, D-C-A-READ-THROUGH-AN-ADDRESS-CONSTANT-IN-A-STATIC-INITIALIZER-IS-REFUSED):
@@ -18146,9 +18138,9 @@ struct Lowerer {
         };
         // A string literal's array object: the SAME memoized rodata global a body read
         // of it decays to (C99 6.4.2.2 for `__func__`), minted on first use.
-        env.resolveStringLiteralSymbol = [this](HirNodeId lit) -> std::optional<SymbolId> {
-            SymbolId const s = internStringLiteralGlobal(lit);
-            if (!s.valid()) return std::nullopt;
+        env.resolveStringLiteralSymbol = [this](HirNodeId lit) -> std::expected<std::optional<SymbolId>, SymbolIdsRefused> {
+            std::optional<SymbolId> const s = internStringLiteralGlobal(lit);
+            if (!s) return std::unexpected(SymbolIdsRefused{});   // refused by name at the door
             return s;
         };
         env.resolveFieldOffset = [this](TypeId record, std::uint32_t field)
@@ -18253,6 +18245,7 @@ struct Lowerer {
     }
 
     void classifyStaticInitializer(HirNodeId initN, PendingGlobal& pg) {
+        std::uint32_t const refusalsBefore = symbolIdRefusals_;   // the door's count (`mintSyntheticGlobalSymbol`)
         EvalEnvironment const& env  = staticEnv_;
         EvalOptions const&     opts = staticOpts_;
         // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: the TOP-LEVEL
@@ -18314,6 +18307,9 @@ struct Lowerer {
                 // constant; what reaches here is either one it could not prove or a
                 // constant form this compiler does not fold yet, so the code says
                 // exactly that and no more.
+                // ★ Unless the door REFUSED a symbol this initializer's fold asked for (P69 f26e,
+                // B1): the door said so by name, and that is this initializer's refusal.
+                if (symbolIdRefusals_ != refusalsBefore) return;
                 ParseDiagnostic d;
                 d.code     = DiagnosticCode::H_StaticInitializerNotFolded;
                 d.severity = DiagnosticSeverity::Error;
@@ -18349,16 +18345,13 @@ struct Lowerer {
     std::unordered_map<std::uint32_t, SymbolId> unnamedStaticObjects_;   // HirNodeId.v → symbol
     std::vector<HirNodeId>                      unnamedStaticQueue_;
 
-    [[nodiscard]] SymbolId unnamedStaticObjectSymbol(HirNodeId node) {
+    [[nodiscard]] std::optional<SymbolId> unnamedStaticObjectSymbol(HirNodeId node) {   // nullopt: refused at the door
         if (auto it = unnamedStaticObjects_.find(node.v); it != unnamedStaticObjects_.end())
             return it->second;
-        SymbolId const sym = mintSyntheticGlobalSymbol();
-        if (!sym.valid()) {
-            unsupported(node,
-                "an unnamed object of static storage duration needs a symbol, and the "
-                "synthetic SymbolId space is exhausted (UINT32_MAX wraparound)");
-            return SymbolId{};
-        }
+        std::optional<SymbolId> const minted =
+            mintSyntheticGlobalSymbol("the symbol of an unnamed object of static storage duration");
+        if (!minted) return std::nullopt;   // refused by name at the door
+        SymbolId const sym = *minted;
         unnamedStaticObjects_.emplace(node.v, sym);
         unnamedStaticNodeBySymbol_.emplace(sym.v, node);
         globalSymbols.insert(sym.v);
@@ -18837,6 +18830,18 @@ HirToMirResult lowerToMir(Hir const&               hir,
     for (HirSymbolAlias const& alias : symbolAliases)
         lwr.mir.addAlias(alias.alias, alias.target, mirLinkageFrom(alias.linkage));
     HirToMirResult result;
+    // ★ P69 (lane `cs`, fold f26e — B1, D-MIR-SYNTHESIZED-SYMBOL-MINTED-INSIDE-THE-NAME-TABLE): A UNIT WHOSE
+    // SYMBOL WAS REFUSED IS NO MODULE. The door said the refusal once, by its own code
+    // (`mintSyntheticGlobalSymbol`); the lowering went on with the refused value standing for an instruction no
+    // one made (`InvalidMirInst`), and `finish`, which validates a module a later tier reads, stopped the process
+    // on that operand (✔MEASURED, e11u: `double _Complex z = x;` in an exhausted space). Nothing is finished or
+    // handed on from a refused unit: its result is the refusal alone. That every consumer of a door's answer tests
+    // it is the typed carriage of fold f26e4 (home-audit-b1.md §12).
+    if (lwr.symbolIdRefusals_ != 0) {
+        result.externImports = std::move(lwr.externImports);
+        result.ok = false;
+        return result;
+    }
     result.mir = std::move(lwr.mir).finish();
     // Canonical-marker stamping (D-OPT4-1): the creation-time
     // `createBlock(StructCfMarker::X)` stamps above are creation-time

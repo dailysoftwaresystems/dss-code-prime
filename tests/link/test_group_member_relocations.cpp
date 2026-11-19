@@ -1074,7 +1074,7 @@ TEST(OneInstancePerProcess, EveryWriterWhoseDocumentStatesNoBindingForItRefusesT
     {
         SCOPED_TRACE("pe::encode");
         DiagnosticReporter rep;
-        EXPECT_TRUE(pe::encode(*unit, *L.target, **pe, rep).empty()) << "no byte for a one instance it cannot spell";
+        EXPECT_FALSE(pe::encode(*unit, *L.target, **pe, rep).has_value()) << "no byte for a one instance it cannot spell";
         EXPECT_TRUE(refusedNamingCounter(rep, "pe::encode")) << diagnosticsOf(rep);
     }
     {

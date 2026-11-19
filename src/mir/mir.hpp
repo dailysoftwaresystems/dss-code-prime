@@ -5,6 +5,7 @@
 #include "core/substrate/arena_container.hpp"
 #include "core/types/data_model.hpp"   // MirModuleFacts::dataModel
 #include "core/types/strong_ids.hpp"
+#include "core/types/symbol_id_cursor.hpp"   // the one home of a fresh SymbolId: the module's doors
 #include "core/types/type_lattice/type_id.hpp"
 #include "mir/mir_asm_descriptor.hpp"
 #include "mir/mir_literal_pool.hpp"
@@ -18,6 +19,7 @@
 #include <expected>     // joinUnitFacts: the facts joined, or the one that disagrees
 #include <optional>
 #include <span>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -770,18 +772,21 @@ public:
     //     so turned a counted end into a stated one at the first rebuild — see
     //     `Mir::symbolIdEndIsStated`). Every rebuild does (the clone-globals
     //     helpers), and a pass that mints does so before it mints;
-    //   * `mintSymbol()` — the next id; the space grows by one. It ABORTS on a
+    //   * `mintSymbol(sink, who)` — the module's OPTIONAL door (P69 f26e, B1;
+    //     core/types/symbol_id_cursor.hpp): the next id, the space grown by one.
+    //     At exhaustion (the next id would be the last value, and the end could
+    //     not move past it) the refusal is REPORTED under the sink's code —
+    //     HIR→MIR's `H_SymbolIdSpaceExhausted` — nothing is written, and the
+    //     answer is nullopt, which the caller tests at the take. It ABORTS on a
     //     builder whose end nobody stated — no statement made here, and none by
-    //     a module it continues: an id counted from the symbols a
-    //     builder happens to hold is exactly the defect, so no caller is left a
-    //     way to mint without the module's end. It never returns a value a format
-    //     WRITER defines for itself (`isWriterReservedSymbolIdValue`): the end
-    //     steps over it. Returns the invalid `SymbolId{}` when the space is
-    //     exhausted (the next id would be the last value, and the end could not
-    //     move past it); the caller refuses.
-    //   * `mintSymbolOrAbort(who)` — the same id for a caller that has no
-    //     diagnostic to give (a pass over a frozen module cannot position an
-    //     error on source text): at exhaustion it aborts, naming `who`.
+    //     a module it continues: an id counted from the symbols a builder happens
+    //     to hold is exactly the defect, so no caller is left a way to mint
+    //     without the module's end. It never returns a value a format WRITER
+    //     defines for itself (`isWriterReservedSymbolIdValue`): the end steps
+    //     over it.
+    //   * `mintSymbolOrAbort(who)` — the module's ABORT door, for a caller that
+    //     has no diagnostic to give (a pass over a frozen module cannot position
+    //     an error on source text): at exhaustion it is fatal, naming `who`.
     // The statements only RAISE the end, a symbol the builder is handed
     // (`addFunction`, `addGlobal`) raises it past itself, and
     // `keepSymbolIdsClearOf` raises it past an id something BESIDE the module
@@ -794,9 +799,9 @@ public:
     void stateSelfContainedSymbolIds() noexcept;
     void continueSymbolIdsOf(Mir const& rebuilt) noexcept;
     void keepSymbolIdsClearOf(SymbolId taken) noexcept;
-    [[nodiscard]] SymbolId mintSymbol();
-    [[nodiscard]] SymbolId mintSymbolOrAbort(char const* who);
-    [[nodiscard]] std::uint32_t symbolIdEnd() const noexcept { return symbolIdEnd_; }
+    [[nodiscard]] std::optional<SymbolId> mintSymbol(SymbolIdRefusalSink sink, std::string_view who);
+    [[nodiscard]] SymbolId mintSymbolOrAbort(std::string_view who);
+    [[nodiscard]] std::uint32_t symbolIdEnd() const noexcept { return symbolIdEnd_.value(); }
     [[nodiscard]] bool symbolIdEndIsStated() const noexcept { return symbolIdEndStated_; }
 
     // ── THE ONE PLACE a module that REPLACES another copies what the MODULE
@@ -1401,12 +1406,14 @@ private:
     // STATED — here (`stateSymbolIdEnd`, `stateSelfContainedSymbolIds`) or by a
     // module this builder continues (`continueSymbolIdsOf`). `finish` hands both
     // to the module.
-    std::uint32_t               symbolIdEnd_ = 1;
+    SymbolIdEnd                 symbolIdEnd_;
     bool                        symbolIdEndStated_ = false;
     std::vector<MirAlias>       aliases_;   // `addAlias`; handed over by `finish`
     void raiseSymbolIdEndTo_(std::uint32_t end) noexcept {
-        if (end > symbolIdEnd_) symbolIdEnd_ = end;
+        symbolIdEnd_.keepClearOf(SymbolIdEnd::startingAt(end));
     }
+    // The module's end, for a door to take from -- refused BY NAME when nobody stated it (both doors ask here).
+    [[nodiscard]] SymbolIdEnd& statedEnd_();
 
     // Per-phi pending incomings, keyed by the phi instruction's slot (.v),
     // flushed into `phiPool_` (contiguously per phi) at `finish`.
@@ -1438,31 +1445,41 @@ private:
 // it handed out would be one of that table's. Constructing a continuation over
 // such a module is no error; minting from it is.
 //
-// ⚠ ONE continuation per lowering of a module. It does not write back — the
-// module is const — so two continuations of one module hand out the same ids.
+// ⚠ ONE continuation per lowering of a module, and its ids are unique within the
+// OUTPUT it lowers into: the lowering's result carries the continuation's end
+// (`MirToLirResult::symbolIdEnd`) and the module compiled from it carries that end
+// (`lowerMirModuleToAssembly`, P69 f26e, B1 A7), so a pass minting on the output
+// continues past every id this one handed out. It does not write back — the module
+// is const — so two continuations of one module hand out the same ids: two outputs
+// of one `Mir` are two id spaces, which the link's merge maps apart by (module, id).
+// So ONLY the lowering makes one (P69 f26e, main's M1: the constructor is private,
+// and `MirToLirLoweringAccess`, lir/lowering/mir_to_lir.cpp, is its one friend).
 class DSS_EXPORT MirSymbolIdContinuation {
 public:
-    explicit MirSymbolIdContinuation(Mir const& mir) noexcept;
-
     // Raise the end past an id something BESIDE the module already uses for it —
     // an import row handed to the lowering next to a hand-built module (in a
     // module made from a table every import's id is below the end already).
     // It states nothing: a counted end stays counted.
     void keepClearOf(SymbolId taken) noexcept;
-    // The next id, or the invalid `SymbolId{}` when the space is exhausted.
-    // Aborts, by name, over a module whose end was only counted.
-    [[nodiscard]] SymbolId mint() noexcept;
-    // `mint` for a caller with no diagnostic to give: at exhaustion it aborts,
-    // naming `who`.
-    [[nodiscard]] SymbolId mintOrAbort(char const* who);
+    // THE OPTIONAL DOOR past a frozen module (P69 f26e, B1): the next id; at
+    // exhaustion the refusal is REPORTED under the sink's code
+    // (`L_SymbolIdSpaceExhausted`) ONCE per continuation, nothing is written,
+    // and the answer is nullopt from then on — the lowering's error gate then
+    // withholds the module. Aborts, by name, over a module whose end was only
+    // counted.
+    [[nodiscard]] std::optional<SymbolId> mint(SymbolIdRefusalSink sink, std::string_view who);
     // One past the highest id handed out so far.
-    [[nodiscard]] std::uint32_t end() const noexcept { return end_; }
+    [[nodiscard]] std::uint32_t end() const noexcept { return end_.value(); }
     // Whether the module's end was stated (see `Mir::symbolIdEndIsStated`).
     [[nodiscard]] bool endIsStated() const noexcept { return stated_; }
 
 private:
-    std::uint32_t end_;
-    bool          stated_;
+    friend struct MirToLirLoweringAccess;
+    explicit MirSymbolIdContinuation(Mir const& mir) noexcept;
+
+    SymbolIdEnd end_;
+    bool        stated_;
+    bool        refused_ = false;
 };
 
 } // namespace dss

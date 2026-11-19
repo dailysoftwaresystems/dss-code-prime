@@ -88,6 +88,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <initializer_list>
 #include <iterator>
@@ -1341,4 +1342,42 @@ TEST(AttributeSecondSpelling, AnImportAcrossABlockAndAFileScopeDeclarationIsTheE
         << everyDiagnostic(m);
     for (SymbolRecord const* r : symsNamed(m, "x"))
         EXPECT_FALSE(r->isImportedDeclaration) << "the import is ended for the entity";
+}
+
+// ★ P69 (lane `cs`, fold f26e): AN ITEM OF THE STANDARD FORM THAT DOES NOT PARSE. `[[gnu::]]` — a
+// namespace with no name after it — leaves the parser's recovery node INSIDE the item, and
+// `standardItemClause` read every child of an item that is not a token as a rule node: `analyze()`
+// of the recovery tree TERMINATED the process (`Tree::rule on non-Internal node`). ✔MEASURED on
+// lane `cs`'s e11s build through `dsscp --lsp`, at every position below but the cast's type name
+// (which fails to parse before the item). The LSP server and the diagnostic corpus both analyze a
+// tree that did not parse, and an abort is the one outcome neither survives. Each cell runs in a
+// CHILD process, so a regression is a named red here rather than the loss of the binary.
+TEST(AttributeSecondSpelling, AnItemThatDoesNotParseIsAnalyzedWithoutTerminating) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    char const* const cells[] = {
+        "int [[gnu::]] x;\n",
+        "int [[gnu:: 3]] x;\n",
+        "void f(int [[gnu:: 3]] x);\n",
+        "[[gnu::]] int x;\n",
+        "int * [[gnu::]] p;\n",
+        "struct S { int [[gnu::]] m; };\n",
+        "int x [[gnu::]];\n",
+        "int f(void) { [[gnu::]]; return 0; }\n",
+        "struct [[gnu::]] T { int a; };\n",
+        "int main(void) { int [[gnu::]] y = 0; return y; }\n",
+        "int f(void) { return (int [[gnu::]])0; }\n",
+    };
+    for (char const* const src : cells) {
+        EXPECT_EXIT(
+            {
+                auto cu = buildShippedUnit("c", {std::string{src}});
+                bool refused = false;
+                for (auto const& t : cu->trees()) refused = refused || t.diagnostics().hasErrors();
+                SemanticModel const m = analyze(cu, DiagnosticBudget::libraryDefault());
+                (void)m;
+                std::exit(refused ? 0 : 3);
+            },
+            ::testing::ExitedWithCode(0), "")
+            << "`" << src << "`: the recovery tree must be analyzed to the end, the parse refused";
+    }
 }

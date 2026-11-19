@@ -2945,15 +2945,10 @@ private:
     // exactly what makes it a booby trap rather than a bug. The first consumer
     // to write `if (sym.valid())` would silently drop function 0, and nothing
     // in the output would show it. D-ASM-FIRST-FUNCTION-TAKES-SYMBOLID-ZERO.
-    [[nodiscard]] SymbolId mintSymbol() noexcept {
-        // The core's cursor (P69 f26d, N9): from 1, the reserved value stepped over, exhaustion refused by
+    [[nodiscard]] SymbolId mintSymbol() {
+        // The home's ABORT door (P69 f26e, B1): from 1, the reserved value stepped over, exhaustion fatal by
         // name -- it wrapped onto 0, the invalid id.
-        SymbolId const id = symbolIds_.take();
-        if (!id.valid()) {
-            std::fprintf(stderr, "dss::asm_text_to_lir fatal: the text's SymbolId space is exhausted\n");
-            std::abort();
-        }
-        return id;
+        return AbortingSymbolIds{symbolIds_, "the text"}.take("asm_text_to_lir");
     }
 
     // One `ModuleSymbol` per DATA label, so the linker can match it across CUs

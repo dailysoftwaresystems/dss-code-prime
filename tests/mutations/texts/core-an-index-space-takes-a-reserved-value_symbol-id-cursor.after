@@ -1,1 +1,1 @@
-    if (index == 0u) return SymbolId{};
+        return positions <= std::size_t{std::numeric_limits<std::uint32_t>::max()};

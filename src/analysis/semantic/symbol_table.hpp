@@ -3,7 +3,7 @@
 #include "analysis/semantic/semantic_model.hpp"
 #include "core/export.hpp"
 #include "core/types/strong_ids.hpp"
-#include "core/types/symbol_id_cursor.hpp"   // the one rule of a fresh SymbolId (P69 f26d, N9)
+#include "core/types/symbol_id_cursor.hpp"   // IndexSymbolIds -- the one home of a fresh SymbolId
 #include <cstdio>
 #include <cstdlib>
 
@@ -39,16 +39,17 @@ public:
     // SymbolId (via `at()`); the analyzer does this in one go inside
     // Pass 1 so partially-constructed records never leak.
     SymbolId mint(SymbolRecord rec) {
-        // An INDEX door (P69 f26d, N9): the id IS the record's index, so the table ends at the first
-        // writer-reserved value (`symbolIdOfIndex`) -- refused by name, never a wrapped or reserved id.
-        SymbolId const id = symbolIdOfIndex(records_.size());
-        if (!id.valid()) {
-            std::fprintf(stderr, "dss::SymbolTable fatal: the unit's symbol table is full -- %zu records "
-                                 "reach the first writer-reserved SymbolId value\n", records_.size());
-            std::abort();
-        }
+        // An INDEX door, the ABORT form (P69 f26e, B1): the id IS the record's index, so the table ends at the
+        // first writer-reserved value -- fatal by name, never a wrapped or reserved id.
+        SymbolId const id = IndexSymbolIds{records_.size()}.nextOrAbort("SymbolTable::mint", "the unit's table");
         records_.push_back(std::move(rec));
         return id;
+    }
+
+    // The id of record `position` of the table (0 < position <= size()) -- a READ through the index door, so
+    // an enumeration of the table never computes an id itself.
+    [[nodiscard]] SymbolId idAt(std::size_t position) const {
+        return IndexSymbolIds{records_.size()}.idAt(position, "the unit's table");
     }
 
     [[nodiscard]] std::size_t size() const noexcept { return records_.size() - 1; }

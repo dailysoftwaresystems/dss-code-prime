@@ -31,15 +31,15 @@
 namespace dss::substrate {
 
 // Runs `read(inputReporter)` -- the read of the ONE input `input` names -- and passes each diagnostic it reported on
-// to `reporter` with `input` in front. Answers what the read answered.
+// to `reporter` with `input` in front, and the count of what its gates dropped (the one relay). Answers what the read
+// answered.
 template <class Read>
 [[nodiscard]] auto readNamingTheInput(std::string_view input, DiagnosticReporter& reporter, Read&& read) {
     DiagnosticReporter inputReporter{reporter.config()};
     auto result = std::forward<Read>(read)(inputReporter);
-    for (ParseDiagnostic d : inputReporter.all()) {
+    reporter.relayFrom(inputReporter, [input](ParseDiagnostic& d) {
         d.actual = std::format("{}: {}", input, d.actual);
-        reporter.report(std::move(d));
-    }
+    });
     return result;
 }
 

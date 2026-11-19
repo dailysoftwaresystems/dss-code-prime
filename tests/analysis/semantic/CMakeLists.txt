@@ -538,6 +538,17 @@ dss_add_test(NAME analysis/semantic/test_gnu_aligned_three_forms
 target_include_directories(dss_analysis_semantic_test_gnu_aligned_three_forms
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 
+# P69 (lane `cs`, fold f26e): the run after a declarator and the C23 sequence that ends a
+# declaration's specifiers, table-driven over the measured universe (probes n5o, n5t, n5u,
+# n5r): the init-declarator's order, the asm label's place (a leading function declarator,
+# never a definition), the typedef and parameter slots, the end-of-specifiers slot on every
+# headed declaration and the `aligned` it carries, the bit-field width, and the two keys'
+# loader. Shares `semantic_test_fixture.hpp`.
+dss_add_test(NAME analysis/semantic/test_declarator_run_order
+             SOURCES test_declarator_run_order.cpp)
+target_include_directories(dss_analysis_semantic_test_declarator_run_order
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
 # P69 (lane `cs`): an attribute written where a TYPE is written — among a type's
 # specifiers, in a type name, in a pointer layer, at the start of a parenthesized
 # declarator, after a tag that is only referred to. The reference matrix as pins:

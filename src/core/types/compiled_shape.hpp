@@ -289,6 +289,22 @@ private:
     std::uint16_t   lookahead_    = 0;
 };
 
+// ★★ P69 (lane `cs`, fold f26e): A SPECULATIVE CHOICE IS DECIDED WHERE IT STANDS. Whether a
+// walk enumerating the candidates of the AltChoice `root` descends into the AltChoice `nested`
+// that one of its branches reaches inside the same rule. It does, except where `nested` is
+// SPECULATIVE and `root` is not: such a choice is decided at its own position — the cursor is
+// routed to it (`GrammarSchema::nestedSpeculativeChoice`) and dispatched there, with its own
+// lookahead prune, its probes and its skip. Entered rule-first by the enclosing choice, none of
+// them ran: C's `declAttrRun` (a GNU run, then a speculative C23 sequence) read the `[` of
+// `void f(int[3]);` as a sequence's and refused the program. Under a speculative root every
+// nested choice is part of the root's own candidate set — each candidate is probed and rolled
+// back, so nothing is entered unweighed. The ONE rule both readers ask: the schema's
+// precomputed enumeration (`collectAltBranchRules`) and the loader's mirror of where the
+// parser's cursor stands (`validateNotFollowedBy`).
+[[nodiscard]] inline bool enumerationEnters(Position const& root, Position const& nested) noexcept {
+    return !(nested.slotKind() == SlotKind::AltChoice && nested.speculative() && !root.speculative());
+}
+
 struct CompiledRule {
     // Index into `positions` for the rule's entry point. `positions[0]`
     // is reserved as a sentinel so cursor `posId == 0` means "invalid",

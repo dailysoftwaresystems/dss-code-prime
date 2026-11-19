@@ -5252,7 +5252,7 @@ TEST(MirMerge, TheMergedModuleCarriesTheEndOfTheMergesAllocation) {
     MirBuilder rebuilt;
     rebuilt.stateDataModel(DataModel::Lp64);
     rebuilt.continueSymbolIdsOf(mm);
-    SymbolId const fresh = rebuilt.mintSymbol();
+    SymbolId const fresh = rebuilt.mintSymbolOrAbort("test");
     EXPECT_GT(fresh.v, *shimV) << "the first id minted for the merged module";
     auto const named = merged->symbolNames.find(fresh.v);
     EXPECT_TRUE(named == merged->symbolNames.end())

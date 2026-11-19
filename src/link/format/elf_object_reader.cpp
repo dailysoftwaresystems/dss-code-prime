@@ -495,8 +495,10 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // index, as it always was; the rule is asked all the same, so that no reader
     // keeps one of its own.
     std::size_t const numSyms = static_cast<std::size_t>(symtab.size / kSymSz);
-    link::format::RecordSymbolIds symbolIds{numSyms, reporter, "elf::readRelocatableObject"};
-    if (symbolIds.refused()) return std::nullopt;   // the table reaches a reserved id: refused by name
+    std::optional<link::format::RecordSymbolIds> openedIds =
+        link::format::RecordSymbolIds::open(numSyms, reporter, "elf::readRelocatableObject");
+    if (!openedIds) return std::nullopt;   // the table reaches a reserved id: refused by name
+    link::format::RecordSymbolIds& symbolIds = *openedIds;
     std::vector<Sym> syms(numSyms);
     for (std::size_t i = 0; i < numSyms; ++i) {
         std::size_t const so = static_cast<std::size_t>(symtab.offset) + i * kSymSz;
@@ -1317,10 +1319,13 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                     si, iv.start, iv.len});
             }
         }
-        auto emitGap = [&](std::uint64_t gapStart, std::uint64_t gapEnd) {
-            if (gapEnd <= gapStart) return;
+        // false: the gap's fresh id was REFUSED (reported by name at the door); the read is refused.
+        auto emitGap = [&](std::uint64_t gapStart, std::uint64_t gapEnd) -> bool {
+            if (gapEnd <= gapStart) return true;
+            std::optional<SymbolId> const gapId = symbolIds.fresh();
+            if (!gapId) return false;
             AssembledData di;
-            di.symbol    = symbolIds.fresh();
+            di.symbol    = *gapId;
             di.section   = *dk;
             di.alignment = sec.alignment;
             std::size_t const b0 = static_cast<std::size_t>(sec.offset + gapStart);
@@ -1329,6 +1334,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             dataIntervalsBySec[si].push_back(
                 Interval{gapStart, gapEnd - gapStart, mod.dataItems.size()});
             mod.dataItems.push_back(std::move(di));
+            return true;
         };
         // WHICH bytes are unowned is the shared question -- see
         // `unownedByteRangesOfSection`. It used to be a cursor walk written
@@ -1336,7 +1342,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         // one rule that can disagree with itself.
         for (auto const& gap : link::format::unownedByteRangesOfSection(
                  si, sec.size, covered)) {
-            emitGap(gap.start, gap.start + gap.len);
+            if (!emitGap(gap.start, gap.start + gap.len)) return std::nullopt;   // refused by name at the door
         }
     }
 
@@ -1466,8 +1472,10 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                             "elf::readRelocatableObject: data-area section '"
                             + area.name + "' runs past the end of the file.");
                     }
+                    std::optional<SymbolId> const areaId = symbolIds.fresh();
+                    if (!areaId) return std::nullopt;   // refused by name at the door
                     AssembledData di;
-                    di.symbol    = symbolIds.fresh();
+                    di.symbol    = *areaId;
                     di.section   = *dk;
                     di.alignment = area.alignment;
                     std::size_t const b0 = static_cast<std::size_t>(area.offset);
@@ -1746,7 +1754,9 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // an atom is then a reference to its BYTES: one written through a
             // static name of the body, or through its section. The addend is
             // the name's own: the name sits at the atom's start.
-            if (auto const weakName = weakNames.referenceFor(symIdx, symbolIds)) {
+            auto const weakNameOrRefused = weakNames.referenceFor(symIdx, symbolIds);
+            if (!weakNameOrRefused) return std::nullopt;   // a fresh id refused by name at the door
+            if (auto const& weakName = *weakNameOrRefused) {
                 if (weakName->fresh) {
                     mod.externImports.push_back(
                         link::format::referenceRowOfAWeakName(*weakName, mod.dataItems));
@@ -2437,7 +2447,9 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 // draw from it too, and a second counter seeded from the
                 // functions and data items alone gave such a row and the first
                 // padding atom one id.
-                pad.symbol = symbolIds.fresh();
+                std::optional<SymbolId> const padId = symbolIds.fresh();
+                if (!padId) return std::nullopt;   // refused by name at the door
+                pad.symbol = *padId;
                 pad.bytes.assign(bytes.begin() + off,
                                  bytes.begin() + off
                                      + static_cast<std::size_t>(gapLen));
@@ -2496,8 +2508,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             }
         }
     }
-    // A fresh id the table could not hand out was refused by name there; nothing it handed out leaves.
-    if (symbolIds.refused()) return std::nullopt;
+    // A fresh id the table could not hand out refused the read AT its take (P69 f26e, B1): nothing reaches here.
     mod.symbolIdEnd.keepClearOf(symbolIds.end());   // the module carries its table's end
     mod.expectedFuncCount = mod.functions.size();
     return mod;

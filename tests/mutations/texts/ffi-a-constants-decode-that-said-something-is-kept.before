@@ -1,1 +1,1 @@
-    if (key.has_value() && !reads.failed && reporter.all().size() == saidBefore) {
+    if (key.has_value() && !reads.failed && reporter.reportsReceived() == saidBefore) {

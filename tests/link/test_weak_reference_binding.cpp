@@ -301,7 +301,7 @@ TEST(WeakReferenceBinding, CoffUndefinedWeakImportTakesWeakExternalWithAnAbsolut
 
     Fixture f = makeFixture(*kind);
     DiagnosticReporter rep;
-    auto bytes = pe::encode(f.mod, **l.target, **l.format, rep);
+    auto bytes = pe::encode(f.mod, **l.target, **l.format, rep).value();
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
 
@@ -432,7 +432,7 @@ TEST(WeakReferenceBinding, EveryFormatReadsBackTheWeakReferenceItWrote) {
         else if (std::string_view{leg.formatName}.starts_with("macho"))
             bytes = macho::encode(f.mod, **l.target, **l.format, wrep);
         else
-            bytes = pe::encode(f.mod, **l.target, **l.format, wrep);
+            bytes = pe::encode(f.mod, **l.target, **l.format, wrep).value();
         ASSERT_EQ(wrep.errorCount(), 0u);
 
         DiagnosticReporter rrep;

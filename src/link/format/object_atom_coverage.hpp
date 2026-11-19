@@ -8,6 +8,9 @@
 #include "core/types/strong_ids.hpp"    // SymbolId
 #include "core/types/symbol_attrs.hpp"  // SymbolBinding / SymbolVisibility / isExternallyVisible
 #include "link/format/record_symbol_ids.hpp"   // RecordSymbolIds -- the ids a kept weak name is stated in
+#include "core/types/symbol_id_cursor.hpp"     // SymbolIdsRefused -- a refused fresh id, carried as a value
+
+#include <expected>
 
 #include <algorithm>
 #include <cstdint>
@@ -625,15 +628,25 @@ public:
     // takes the alias remap as before. Otherwise the id of the NAME: the
     // symbol's own id, which no body holds once the alias rule gave the atom to
     // another name -- or, when this weak name is the one that OWNS the atom, a
-    // fresh id of `ids`, the object's one counter of ids no record holds.
-    [[nodiscard]] std::optional<Reference> referenceFor(std::uint32_t    recordIndex,
-                                                        RecordSymbolIds& ids) {
+    // fresh id of `ids`, the object's one counter of ids no record holds. That
+    // take can be REFUSED (reported by name at the door, P69 f26e B1): the
+    // refusal is the unexpected value, and the reader refuses its read.
+    [[nodiscard]] std::expected<std::optional<Reference>, SymbolIdsRefused>
+    referenceFor(std::uint32_t recordIndex, RecordSymbolIds& ids) {
         auto const it = kept_.find(recordIndex);
-        if (it == kept_.end()) return std::nullopt;
+        if (it == kept_.end()) return std::optional<Reference>{};
         Kept&      k     = it->second;
         bool const fresh = !k.row.has_value();
-        if (fresh) k.row = k.own.has_value() ? *k.own : ids.fresh();
-        return Reference{*k.row, fresh, k.name, k.atom};
+        if (fresh) {
+            if (k.own.has_value()) {
+                k.row = *k.own;
+            } else {
+                std::optional<SymbolId> const id = ids.fresh();
+                if (!id) return std::unexpected(SymbolIdsRefused{});   // refused by name at the door
+                k.row = *id;
+            }
+        }
+        return std::optional<Reference>{Reference{*k.row, fresh, k.name, k.atom}};
     }
 
 private:

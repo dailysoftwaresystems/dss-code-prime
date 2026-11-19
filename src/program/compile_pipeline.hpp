@@ -136,8 +136,8 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 // so `doc_census_guard` re-derives them on every ctest run and a drift is a RED
 // rather than a discovery. The PATTERN lives in that document, not here — a
 // pattern quoted in prose is prose, and rots exactly like the number did:
-//     <!--census:source:program.exportedDecls-->43 exported declarations
-// — <!--census:source:program.exportedFunctions-->33 exported functions plus
+//     <!--census:source:program.exportedDecls-->42 exported declarations
+// — <!--census:source:program.exportedFunctions-->32 exported functions plus
 // <!--census:source:program.exportedStructs-->10 exported structs (`CuMirModule`,
 // `CuHirModule`, `EntryCandidate`, `ResolvedEntry`, `EntryLinkName`, `ForeignEntryCandidate` -- declared
 // twice, ahead of its first use and where it is defined --, `ResolveLibraryPartition`).
@@ -171,7 +171,7 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 // `linkAndWriteWithStaticArchives`, which is where the pin had to go.
 //
 // ── B. DRIVER-SUPPLIED, WITNESSED ──────────────────────────────────────────
-// `copyDiagnostics` (3 driver calls: the N>1 pooled per-CU scratch drain, plus
+// `DiagnosticReporter::relayFrom` (the driver's drains: the N>1 pooled per-CU scratch drain, plus
 //   the front-half drains of a CU's own diagnostics and of each Tree's) — `dst`
 //   is the RUN-WIDE reporter carrying the CLI's diagnostic policy; `src` is a
 //   SCRATCH, i.e. earlier pipeline state. Several reporters are in scope and all
@@ -493,7 +493,7 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 // ✔MEASURED — the merged route is reachable ONLY through
 // `Program::compileUnits` with ≥2 sources, and
 // <!--census:examples:top.sources-->52 of the
-// <!--census:examples:manifests-->1128 shipped corpus example manifests declare a
+// <!--census:examples:manifests-->1130 shipped corpus example manifests declare a
 // multi-source `sources` array, so the corpus exercises it roughly 3% as often
 // as the single-CU route.
 // ⚠ THE RATIO IS THE ONE FIGURE HERE THAT IS **NOT** MACHINE-CHECKED — a census
@@ -513,26 +513,11 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 // sole-CU path instead.
 // ═══════════════════════════════════════════════════════════════════════════
 
-// Drain every diagnostic from `src` into `dst`. Shared driver-tier
-// helper — used by `program.cpp::compileFiles` (drains CU +
-// per-Tree reporters) AND by `compile_pipeline.cpp::compileSingleUnit`
-// (drains the SemanticModel's reporter after `analyze`). Hoisted
-// out of the program-anon namespace at LK10 cycle 2 post-fold
-// review #1 (silent-failure-hunter F9 — eliminates the inline drain
-// duplicate that risked future divergence).
-//
-// **Policy-aware semantics (D-LK10-7 closed at LK10 cycle 3):**
-// `dst.report(d)` re-traverses `dst`'s `DiagnosticPolicy` (suppress
-// / overrides / warningsAsErrors). With the CLI now wiring
-// `--warnings-as-errors` and `--suppress=<code>` through a
-// `DiagnosticReporter::Config` to `compileFiles`/`compileDirectory`,
-// the policy ALSO applies to per-tier drains coming through
-// `copyDiagnostics`. That's the intended shape — the user's
-// `--suppress` applies uniformly across the front-half and back-half
-// of the pipeline. (D-LK10-7's `copyDiagnosticsRaw` alternative
-// becomes unnecessary; this routing IS the design.)
-DSS_EXPORT void copyDiagnostics(DiagnosticReporter const& src,
-                                 DiagnosticReporter&       dst);
+// A reporter-to-reporter drain is `DiagnosticReporter::relayFrom` -- the ONE
+// relay (D9(c)): buffers, stored diagnostics through the destination's policy
+// and gates (D-LK10-7's policy-aware semantics), and the count of what the
+// source's gates dropped. The driver helper `copyDiagnostics` that preceded it
+// copied `all()` only, and is gone.
 
 // Compile a single CompilationUnit through the full HIR→write
 // pipeline for one (target, format) pair. Returns true iff every

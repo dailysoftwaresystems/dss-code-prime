@@ -373,7 +373,10 @@ constexpr int kComplexX87Checks      = 4;
 // aggregate from a save slot. Checks 43.. (on every GNU arm: the shapes are GNU C, and SysV and Win64 pass them
 // as they always did, so there they are controls): the six composites stacked after one stacked scalar
 // (`take_pX_stk`), the five integer ones and a scalar `__int128` after one long (`take_pX_pair`), the five
-// integer ones through `...` (`take_pX_var`), an exact fit (`take_fit_var`) and a spill (`take_spill_var`).
+// integer ones through `...` (`take_pX_var`), an exact fit (`take_fit_var`) and a spill (`take_spill_var`); and,
+// last, a scalar `__int128` RESULT (`give_i128`; P69 f26e, D-TARGET-WIN64-INT128-RESULT-GOES-THROUGH-A-HIDDEN-POINTER-NOT-XMM0):
+// RAX:RDX under SysV, x0:x1 under AAPCS64, XMM0 under Win64 -- where MinGW-w64 gcc returns it and DSS took the
+// hidden pointer.
 // VALUES only: the placement of these parameter objects is the stacked-alignment universe's question (6-15). The
 // 32-aligned HFA is not passed through `...`: Apple clang 21's `va_arg` rounds it to 32 where its own caller
 // placed it at 8 (probe f14, side 3 against side 4), so no pairing of Apple's agrees with itself there.
@@ -413,7 +416,8 @@ constexpr int kPairChecksBegin = kComplexX87ChecksBegin + kComplexX87Checks;
 constexpr int kPairStackedChecks = static_cast<int>(sizeof kPairShapes / sizeof kPairShapes[0]);
 constexpr int kPairRegisterChecks = pairedShapeCount() + 1;   // the integer composites and the scalar __int128
 constexpr int kPairVariadicChecks = pairedShapeCount();       // the integer composites
-constexpr int kPairChecks = kPairStackedChecks + kPairRegisterChecks + kPairVariadicChecks + 2;
+// + the exact fit, the spill and the scalar `__int128` result
+constexpr int kPairChecks = kPairStackedChecks + kPairRegisterChecks + kPairVariadicChecks + 3;
 constexpr int kReportedChecks = kPairChecksBegin + kPairChecks;
 
 [[nodiscard]] std::string upperTag(char const* tag) {
@@ -453,6 +457,8 @@ constexpr int kReportedChecks = kPairChecksBegin + kPairChecks;
     }
     head("long long take_i128_pair(long long k, __int128 v)",
          "    return k + (long long)v + 2 * (long long)(v >> 64);\n");
+    // a scalar `__int128` RESULT, the low word 4 and the high word 1 for k = 36
+    head("__int128 give_i128(long long k)", "    return ((__int128)(k - 35) << 64) | (k - 32);\n");
     // n in the first register, five more, then a two-register aggregate in exactly the last two
     head("long long take_fit_var(int n, ...)",
          "    va_list ap;\n    va_start(ap, n);\n    long long t = 0;\n"
@@ -489,6 +495,7 @@ constexpr int kReportedChecks = kPairChecksBegin + kPairChecks;
             check(std::string{p.key} + " " + upperTag(p.tag) + " x; " + p.set, "take_p" + std::string{p.tag} + "_var(30, x, 6LL)");
     check("struct PL x = { 5, 1 };", "take_fit_var(20, 1LL, 2LL, 3LL, 4LL, 5LL, x)");
     check("struct PL x = { 4, 1 };", "take_spill_var(10, 1LL, 2LL, 3LL, 4LL, 5LL, 6LL, x, 5LL)");
+    check("__int128 v = give_i128(36);", "36 + (long long)v + 2 * (long long)(v >> 64)");
     return s;
 }
 
@@ -865,13 +872,14 @@ constexpr char const* kChecks =
     "MEMORY) -- 39 take_cld_after_seven (a `long double _Complex` after one stacked eightbyte, 16-aligned), "
     "40 make_scld and 41 take_scld (a struct holding one: MEMORY by size), 42 a `long double _Complex` result "
     "dropped sixteen times, then x87 arithmetic (each side keeps the x87 stack balanced) (39-42: SysV arms); "
-    "43-61 on the GNU arms, a composite of alignment 16 where its convention puts it -- 43-48 take_pX_stk for "
+    "43-62 on the GNU arms, a composite of alignment 16 where its convention puts it -- 43-48 take_pX_stk for "
     "struct { __int128 v; }, struct { _Alignas(16) long long a, b; }, struct __attribute__((aligned(16))) "
     "{ long long a, b; }, struct { _Alignas(32) double a, b, c, d; }, union { __int128 v; long long l; } and "
     "struct { __int128 a[1]; } after one stacked scalar, 49-54 take_pX_pair for the five integer ones and a scalar "
     "__int128 after one long (AAPCS64's even register pair), 55-59 take_pX_var for the five integer ones through "
     "`...`, 60 take_fit_var (an aggregate in exactly the last two registers, read by va_arg) and 61 take_spill_var "
-    "(an aggregate that no longer fits spends the registers left: the scalar after it is read from the stack); "
+    "(an aggregate that no longer fits spends the registers left: the scalar after it is read from the stack), "
+    "and 62 give_i128 (a scalar __int128 RESULT: RAX:RDX under SysV, x0:x1 under AAPCS64, XMM0 under Win64); "
     "every check is made by each caller the driver names";
 
 static_assert(kCommonChecks == 16, "the SysV group's checks begin at 16");
@@ -880,7 +888,8 @@ static_assert(kFrameCheck == 27 && kWalkCheck == 28 && kTailCheck == 29,
               "the frame's, the walk's and the tail's bits are spelled 27, 28 and 29 above");
 static_assert(kComplexChecksBegin == 30 && kComplexX87ChecksBegin == 39 && kPairChecksBegin == 43,
               "the complex checks are spelled 30-38 and the COMPLEX_X87 ones 39-42 above");
-static_assert(kPairChecks == 19 && kReportedChecks == 62, "the composites of alignment 16 are spelled 43-61 above");
+static_assert(kPairChecks == 20 && kReportedChecks == 63,
+              "the composites of alignment 16 and the __int128 result are spelled 43-62 above");
 static_assert(kReportedChecks <= 63, "every check is one bit of a `long long`");
 
 // `x87`: the SysV group; `gnu`: the over-aligned scalar typedefs, whose attribute is GNU's; `refused`: the

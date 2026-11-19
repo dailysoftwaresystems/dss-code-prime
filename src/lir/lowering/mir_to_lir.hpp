@@ -268,6 +268,10 @@ struct DSS_EXPORT MirToLirResult {
     // stack. Consumed by `compile_pipeline.cpp` → `materializeCallingConvention` →
     // `computeFrameLayout`. Empty when no function has either.
     std::vector<FuncLocalAlignment> funcLocalAlignments;
+    // ★ One past every id of the module's space and every id this lowering minted beyond it (P69 f26e, B1 A7): the
+    // continuation's end, which began at `Mir::symbolIdEnd`. The module compiled from this LIR carries it
+    // (`lowerMirModuleToAssembly`), so a link-tier door opened on that module continues the space.
+    SymbolIdEnd            symbolIdEnd;
     bool                   ok = true;
 };
 

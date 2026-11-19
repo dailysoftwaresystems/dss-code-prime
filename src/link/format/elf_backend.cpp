@@ -1134,7 +1134,7 @@ public:
         }
     }
 
-    [[nodiscard]] std::vector<std::uint8_t>
+    [[nodiscard]] std::optional<std::vector<std::uint8_t>>
     encode(AssembledModule const&    module,
            TargetSchema const&       targetSchema,
            ObjectFormatSchema const& objectFormatSchema,

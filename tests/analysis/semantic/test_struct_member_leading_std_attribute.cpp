@@ -99,6 +99,7 @@
 #include <cstddef>
 #include <string>
 #include <utility>
+#include <vector>
 
 using namespace dss;
 using namespace dss::sem_test;
@@ -264,16 +265,61 @@ TEST(StructMemberLeadingStdAttribute, ASequenceBeforeExtensionIsRefused) {
            "`type name requires a specifier or qualifier`";
 }
 
-// ★★ THE END-OF-SPECIFIER-QUALIFIER-LIST SLOT IS A DIFFERENT POSITION AND IS
-// DELIBERATELY NOT OPENED. C23 6.7.2.1p9 makes that sequence appertain to the
-// TYPE denoted by the preceding specifier-qualifiers, and C23 6.7.13.4's
-// Constraints admit `maybe_unused` only on a declaration of a structure, union,
-// typedef name, object, member, function, enumeration, enumerator or label —
-// never on a type. ✔MEASURED: clang `'maybe_unused' attribute cannot be applied
-// to types` rc 1, MSVC C2143/C2059 rc 2, and gcc rc 0 with `attribute ignored`
-// AND the effect measurably gone. A loud refusal is inside the union.
-TEST(StructMemberLeadingStdAttribute, TheEndOfSpecifierListSlotStaysRefused) {
-    EXPECT_TRUE(frontEndRefuses("struct S { int [[maybe_unused]] a; };\n"))
-        << "clang and MSVC refuse this; gcc accepts it and DROPS the "
-           "attribute, so its acceptance buys nothing the union requires";
+// ★★ THE END-OF-SPECIFIER-QUALIFIER-LIST SLOT IS A DIFFERENT POSITION. C23 6.7.2.1p9 makes
+// that sequence appertain to the TYPE denoted by the preceding specifier-qualifiers, and C23
+// 6.7.13.4's Constraints admit `maybe_unused` only on a declaration — never on a type.
+// ~~ It read: 'DELIBERATELY NOT OPENED … A loud refusal is inside the union.' ~~ P69 (lane
+// `cs`, fold f26e) opened it, on measurement (probe n5u): an UNRECOGNISED attribute there is
+// valid C23 (6.7.13.1 ignores it) and gcc 15.2.0, clang 21.1.8, Apple clang and MinGW-w64 gcc
+// all accept `struct S { int [[vnd::p]] x; };`, which this compiler refused — below the union.
+// The slot is read at the TYPE grain, so a STANDARD attribute in it is accepted and said
+// IGNORED, as gcc says it (clang and MSVC refuse it), and never conferred on the member.
+TEST(StructMemberLeadingStdAttribute, TheEndOfSpecifierListSlotIsTakenAtTheTypeGrain) {
+    EXPECT_FALSE(frontEndRefuses("struct S { int [[maybe_unused]] a; };\n"))
+        << "the slot is taken; its standard attribute is ignored, as gcc ignores it";
+    auto m = analyzeWithLayout("struct S { int [[maybe_unused]] a; };\n");
+    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_AttributeIgnoredForDeclarationKind), 1u)
+        << "the drop is SAID, once";
+}
+
+// ★ P69 (lane `cs`, fold f26e): A DEPRECATED MEMBER IS WARNED AT EVERY MEMBER ACCESS. ✔MEASURED (probes n5r and n5s,
+// 2026-11-17: gcc 13.3.0, clang 18.1.3, Apple clang, MinGW-w64 gcc 13.2.0): `s.x`, `p->x`, a write, `&p->x` and
+// `sizeof p->x` each draw "'x' is deprecated: old" from all four, in the C23 and the GNU spelling, on a plain and on a
+// bit-field member; cl 19.52 says C5030 ("attribute [[deprecated]] is not recognized") on a member. DSS warned at none
+// of them: the member's record carried the fact (struct fields are declaration rows, FC17's fold) and no member use
+// asked it. SPLIT AMONG THE REFERENCES, decided: offsetof (gcc and MinGW warn, clang does not) and a designator `.x =`
+// (clang warns, gcc does not) -- DSS warns at neither, each the answer of one reference. RED-ON-DISABLE: the member
+// access's question dropped -> every warned cell reads 0.
+TEST(StructMemberLeadingStdAttribute, ADeprecatedMemberIsWarnedAtEveryMemberAccess) {
+    auto const warnings = [](SemanticModel const& m) {
+        std::vector<std::string> out;
+        for (auto const& d : m.diagnostics().all())
+            if (d.code == DiagnosticCode::S_DeprecatedSymbolUsed) out.push_back(d.actual);
+        return out;
+    };
+    std::string const c23   = "struct S { int x [[deprecated(\"old\")]]; int y; };\n";
+    std::string const gnu   = "struct S { int x __attribute__((deprecated(\"old\"))); int y; };\n";
+    std::string const c23bf = "struct S { int x [[deprecated(\"old\")]] : 3; int y; };\n";
+    std::string const gnubf = "struct S { int x : 3 __attribute__((deprecated(\"old\"))); int y; };\n";
+    std::vector<std::pair<char const*, std::string>> const cells = {
+        {"`.` read", c23 + "int use(struct S s) { return s.x; }\n"},
+        {"`->` read", c23 + "int use(struct S *s) { return s->x; }\n"},
+        {"a write", c23 + "void use(struct S *s) { s->x = 1; }\n"},
+        {"its address", c23 + "int *use(struct S *s) { return &s->x; }\n"},
+        {"sizeof of it", c23 + "unsigned long use(struct S *s) { return sizeof s->x; }\n"},
+        {"the GNU spelling", gnu + "int use(struct S *s) { return s->x; }\n"},
+        {"a bit-field member, the sequence before its width", c23bf + "int use(struct S *s) { return s->x; }\n"},
+        {"a bit-field member, the GNU run after its width", gnubf + "int use(struct S *s) { return s->x; }\n"},
+    };
+    for (auto const& [what, src] : cells) {
+        SCOPED_TRACE(std::string{what} + "\n" + src);
+        auto const model = analyzeShipped("c", {src});
+        EXPECT_FALSE(model.hasErrors());
+        EXPECT_EQ(warnings(model), std::vector<std::string>{"x: old"})
+            << "a deprecated member is warned at its use, once, with its message";
+    }
+    // CONTROL: the member beside it is no deprecated one.
+    auto const control = analyzeShipped("c", {c23 + "int use(struct S *s) { return s->y; }\n"});
+    EXPECT_FALSE(control.hasErrors());
+    EXPECT_TRUE(warnings(control).empty()) << "CONTROL: a use of the other member warns nothing";
 }

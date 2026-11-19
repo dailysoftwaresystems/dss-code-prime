@@ -36,13 +36,13 @@ struct Site {
 
 }  // namespace
 
-bool bindPcRelativeImportAddressUnits(std::span<AssembledModule const> units,
-                                      std::vector<AssembledModule>&    out,
-                                      TargetSchema const&              target,
-                                      ObjectFormatSchema const&        format,
-                                      DiagnosticReporter&              reporter) {
+LinkPassOutcome bindPcRelativeImportAddressUnits(std::span<AssembledModule const> units,
+                                                 std::vector<AssembledModule>&    out,
+                                                 TargetSchema const&              target,
+                                                 ObjectFormatSchema const&        format,
+                                                 DiagnosticReporter&              reporter) {
     auto const meaning = format.pcRelativeImportAddress();
-    if (!meaning.has_value()) return true;
+    if (!meaning.has_value()) return LinkPassOutcome::Unchanged;
 
     // Names a linked unit DEFINES with external linkage: a reference to one of
     // them reaches that definition, never an import.
@@ -101,7 +101,7 @@ bool bindPcRelativeImportAddressUnits(std::span<AssembledModule const> units,
             }
         }
     }
-    if (!any) return true;
+    if (!any) return LinkPassOutcome::Unchanged;
 
     if (*meaning == PcRelativeImportAddress::Refused) {
         for (std::size_t ui = 0; ui < units.size(); ++ui) {
@@ -122,7 +122,7 @@ bool bindPcRelativeImportAddressUnits(std::span<AssembledModule const> units,
                            ext.mangledName, ext.libraryPath, format.name(), ext.mangledName));
             }
         }
-        return false;
+        return LinkPassOutcome::Refused;
     }
 
     // `callEntry`: the unit's address of each such FUNCTION import is its call
@@ -140,7 +140,7 @@ bool bindPcRelativeImportAddressUnits(std::span<AssembledModule const> units,
             ExternImport& ext = u.externImports[row];   // a function: rows are chosen above
             if (!ext.callEntrySymbol.valid()) {
                 auto const s = mint();
-                if (!s.has_value()) return false;
+                if (!s.has_value()) return LinkPassOutcome::Refused;
                 ext.callEntrySymbol = *s;
             }
             entryOf.emplace(ext.symbol.v, ext.callEntrySymbol);
@@ -174,7 +174,7 @@ bool bindPcRelativeImportAddressUnits(std::span<AssembledModule const> units,
             // A coalescable item (a `.refptr.<name>` COMDAT): other units may be
             // bound to whichever copy wins, so this unit reads a private clone.
             auto const s = mint();
-            if (!s.has_value()) return false;
+            if (!s.has_value()) return LinkPassOutcome::Refused;
             AssembledData clone = d;
             clone.symbol = *s;
             clone.inputSection.reset();   // its own placement: no longer a slice of the section
@@ -209,7 +209,7 @@ bool bindPcRelativeImportAddressUnits(std::span<AssembledModule const> units,
             }
         }
     }
-    return false;
+    return LinkPassOutcome::Rewritten;
 }
 
 }  // namespace dss::linker

@@ -549,6 +549,15 @@ namespace {
     return mod;
 }
 
+// P69 f26e (lane `cs`, B1): `pe::encode` answers its refusal as no bytes at all (an empty optional), the
+// ELF and Mach-O writers as an empty buffer; the table below asks each the one question "were any bytes
+// written", so the PE door's answer is read through this.
+[[nodiscard]] std::vector<std::uint8_t> encodePe(AssembledModule const& m, TargetSchema const& t,
+                                                 ObjectFormatSchema const& f, DiagnosticReporter& r,
+                                                 ImageRequest const& q) {
+    return pe::encode(m, t, f, r, q).value_or(std::vector<std::uint8_t>{});
+}
+
 } // namespace
 
 TEST(RunpathWalkers, EachWalkerRefusesAnUnrecordableEntryWhenReachedDirectly) {
@@ -568,7 +577,7 @@ TEST(RunpathWalkers, EachWalkerRefusesAnUnrecordableEntryWhenReachedDirectly) {
     Door const doors[] = {
         {"elf64-x86_64-linux-exec",   x64, &elf::encode},
         {"macho64-arm64-darwin-exec", a64, &macho::encode},
-        {"pe64-x86_64-windows-exec",  x64, &pe::encode},
+        {"pe64-x86_64-windows-exec",  x64, &encodePe},
     };
     for (auto const& d : doors) {
         auto const f = shipped(d.format);

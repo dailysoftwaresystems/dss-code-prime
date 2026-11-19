@@ -118,7 +118,7 @@ INVENTORY = {
     "src/lir/lir_callconv.cpp": 26,
     "src/lir/lir_verifier.cpp": 3,
     "src/lir/lowering/mir_to_lir.cpp": 48,
-    "src/mir/lowering/hir_to_mir.cpp": 77,
+    "src/mir/lowering/hir_to_mir.cpp": 75,
     "src/mir/merge/synth_seh_funclets.cpp": 9,
     "src/program/compile_pipeline.cpp": 19,
     "src/program/cross_validate_target_format.cpp": 2,

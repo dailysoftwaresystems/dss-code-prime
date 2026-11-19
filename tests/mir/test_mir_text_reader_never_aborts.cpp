@@ -804,14 +804,16 @@ void stateIdSpace(MirBuilder& b, std::uint32_t tableEnd) {
 }
 
 // One function `sym` that takes the addresses of TWO of its blocks (two mints)
-// and branches through them. `tableEnd` as `stateIdSpace` reads it.
-Mir blockAddressModule(TypeInterner& ti, std::uint32_t sym, std::uint32_t tableEnd = 0) {
+// and branches through them. `tableEnd` as `stateIdSpace` reads it; `stated` false
+// tells the builder NOTHING of its id space, so the module's end is only COUNTED.
+Mir blockAddressModule(TypeInterner& ti, std::uint32_t sym, std::uint32_t tableEnd = 0,
+                       bool stated = true) {
     TypeId const i32   = ti.primitive(TypeKind::I32);
     TypeId const vptr  = ti.pointer(ti.primitive(TypeKind::Void));
     TypeId const fnSig = ti.fnSig(std::span<TypeId const>{}, i32, CallConv::CcSysV);
     MirBuilder b;
     b.stateDataModel(DataModel::Lp64);
-    stateIdSpace(b, tableEnd);
+    if (stated) stateIdSpace(b, tableEnd);
     b.addFunction(fnSig, SymbolId{sym});
     MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const t1    = b.createBlock(StructCfMarker::Linear);
@@ -1147,6 +1149,51 @@ TEST(MirTextSymbolTable, AModuleReadFromTextStatesItsEndWithOrWithoutASymbolsSec
         ASSERT_FALSE(refs.empty()) << "no block address was lowered: nothing was minted";
         for (std::uint32_t const v : refs) EXPECT_GE(v, 2u);
     }
+}
+
+// ── THE FROZEN MODULE'S CONTINUATION, THROUGH THE LOWERING THAT ALONE MAKES IT ──
+// (P69 f26e, main's M1: `MirSymbolIdContinuation`'s constructor is private to
+// `MirToLirLoweringAccess`, lir/lowering/mir_to_lir.cpp.) Its FIRST id is the
+// module's end exactly and its second the next; an import row handed in beside the
+// module raises it past the row's id; and the module is never written.
+TEST(LoweringContinuesTheModulesIds, TheFirstIdIsTheModulesEndAndAnImportBesideItRaisesIt) {
+    constexpr std::uint32_t kEnd = 32;
+    TypeInterner ti{CompilationUnitId{1}};
+    Mir const m = blockAddressModule(ti, 1, kEnd);
+    ASSERT_EQ(m.symbolIdEnd(), kEnd);
+    {
+        Lowered const low = lowerModule(m, ti);
+        EXPECT_TRUE(low.errors.empty()) << listed(low.errors);
+        std::vector<std::uint32_t> refs = symbolRefs(low.result.lir);
+        std::sort(refs.begin(), refs.end());
+        EXPECT_EQ(refs, (std::vector<std::uint32_t>{kEnd, kEnd + 1u}))
+            << "the two block symbols are the module's end and the id after it";
+    }
+    {
+        ExternImport imp;
+        imp.symbol      = SymbolId{40};
+        imp.mangledName = "g";
+        Lowered const low = lowerModule(m, ti, {}, {imp});
+        EXPECT_TRUE(low.errors.empty()) << listed(low.errors);
+        std::vector<std::uint32_t> refs = symbolRefs(low.result.lir);
+        std::sort(refs.begin(), refs.end());
+        EXPECT_EQ(refs, (std::vector<std::uint32_t>{41u, 42u}))
+            << "an import row beside the module raises the continuation past its id";
+    }
+    EXPECT_EQ(m.symbolIdEnd(), kEnd) << "a lowering never writes the module";
+}
+
+// Over a module whose end nobody stated (only COUNTED from the symbols it defines),
+// the lowering's first mint dies by name: a table beside the module may own the id.
+TEST(LoweringContinuesTheModulesIdsDeathTest, ALoweringOverAnEndThatWasOnlyCountedDies) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    auto const lowerCounted = [] {
+        TypeInterner ti{CompilationUnitId{1}};
+        Mir const m = blockAddressModule(ti, 1, 0, /*stated=*/false);
+        (void)lowerModule(m, ti);
+    };
+    EXPECT_DEATH(lowerCounted(),
+                 "MirSymbolIdContinuation::mint fatal: this module's symbol-id space was never stated");
 }
 
 // A table of nine names, of which the module holds ONE (`1`): every block symbol

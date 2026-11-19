@@ -30,9 +30,15 @@ steps:
   - name: compile
     workingDirectoryRoot: action
     inputs:
+      # ★ REFUSED BEFORE ADMISSION (DssHarness 0.6.21 input `pattern`; P69 pending 45): a value over the program's
+      # MAX_SOURCES_B64 (24000 characters, the one-command-line bound) or outside the base64 alphabets is refused before
+      # the leg is placed or waits for a heavy slot, where it used to be refused only after the wait (✔MEASURED P69: a
+      # 49-minute wait). The SOURCE COUNT (MAX_SOURCES, 32) is inside the encoded value, so no pattern can read it: the
+      # manual `pack` step, which builds nothing and so waits for no slot, checks it before any compile run.
       sources_b64:
         description: "the sources: base64 (standard or URL-safe alphabet, padding optional) of a UTF-8 JSON array of {name, src, ext[, language]}, plain or as a zlib stream; the manual `pack` step writes it from files"
         required: true
+        pattern: '(?=[\s\S]{1,24000}$)\s*[A-Za-z0-9+/_=-]+\s*'
       language:
         description: "the source language, passed to the compiler as --language (a source may name its own)"
         required: true

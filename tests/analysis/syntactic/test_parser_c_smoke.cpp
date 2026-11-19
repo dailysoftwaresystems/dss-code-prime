@@ -835,6 +835,7 @@ TEST(ParserCSmoke, ExternFunctionPrototypeParses) {
         "    rule:typeBaseAllowingStruct\n"
         "      rule:typeSpecifierSeq\n"
         "        tok:\"int\"\n"
+        "  rule:declAttrRun\n"
         "  rule:initDeclaratorList\n"
         "    rule:initDeclarator\n"
         "      rule:declarator\n"
@@ -847,6 +848,7 @@ TEST(ParserCSmoke, ExternFunctionPrototypeParses) {
         "                rule:declHeadForParam\n"
         "                  rule:typeSpecifierSeq\n"
         "                    tok:\"char\"\n"
+        "                rule:declAttrRun\n"
         "                rule:declarator\n"
         "                  rule:directDeclarator\n"
         "                    tok:\"x\"\n"
@@ -950,6 +952,7 @@ TEST(ParserCSmoke, ExternAtFileScopeParsesThroughTheMergedRule) {
         "                rule:declHeadForParam\n"
         "                  rule:typeSpecifierSeq\n"
         "                    tok:\"int\"\n"
+        "                rule:declAttrRun\n"
         "                rule:declarator\n"
         "                  rule:directDeclarator\n"
         "                    tok:\"fmt\"\n"
@@ -1147,6 +1150,7 @@ TEST(ParserCSmoke, ExternTypedefNameTrailingQualifierParses) {
         "      tok:\"LONG\"\n"
         "    rule:headQualifier\n"
         "      tok:\"volatile\"\n"
+        "  rule:declAttrRun\n"
         "  rule:initDeclaratorList\n"
         "    rule:initDeclarator\n"
         "      rule:declarator\n"
@@ -2424,9 +2428,14 @@ TEST(ParserCSmoke, AttributedLocalDeclCommitsVarDeclBranch) {
 // exists to pin is UNCHANGED and is why the split had to be done this way:
 // both runs are still NAMED rules over a lone `{repeat}`, so both still emit a
 // node when empty and `head: 0` / `declaratorList: 2` still cannot shift.
+// ⓘ P69 (lane `cs`, fold f26e): `typedefTrailingAttrRun` is GONE — each declarator's own slot
+// takes the run an init-declarator takes, in the references' order (probe n5t, n5u), and the
+// trailing run had become unreachable for the GNU spelling and wrong for the C23 one (it took a
+// sequence after a GNU run, which every reference refuses). `head: 0` / `declaratorList: 2` do
+// not move: the run was AFTER the list.
 constexpr std::string_view kCanonicalTypedefRoles =
     "rule:typedefDeclSpecifiers/rule:typedefHeadFull/rule:typedefAttrRun/"
-    "rule:typedefDeclaratorList/rule:typedefTrailingAttrRun/tok:EndStatement";
+    "rule:typedefDeclaratorList/tok:EndStatement";
 
 // TRAILING (after the declarator) — the real SDK witness
 // `bsm/audit.h`: `typedef u_int64_t au_asflgs_t __attribute__ ((aligned(8)));`
@@ -2481,11 +2490,9 @@ TEST(ParserCSmoke, TypedefTrailingAttributeParsesIntoTheDeclaratorSlotRun) {
     for (NodeId c : t.children(attributed)) {
         if (!isEmptySpace(t.flags(c))) kids.push_back(c);
     }
-    ASSERT_EQ(kids.size(), 6u);
+    ASSERT_EQ(kids.size(), 5u);
     EXPECT_EQ(visibleChildRoles(t, kids[2]), "")
         << "the pre-declarator run must be EMPTY here (and still emit its node)";
-    EXPECT_EQ(visibleChildRoles(t, kids[4]), "")
-        << "the trailing run is now EMPTY: the declarator's own slot run took it";
     // ...and it is INSIDE the list's slot, which is the half that says WHERE it went
     // rather than merely where it did not go.
     EXPECT_EQ(visibleChildRoles(t, kids[3]), "rule:typedefDeclaratorSlot");
@@ -2562,7 +2569,8 @@ TEST(ParserCSmoke, TypedefMidAttributeParsesIntoTheFirstAttrRun) {
     for (NodeId c : t.children(attributed)) {
         if (!isEmptySpace(t.flags(c))) kids.push_back(c);
     }
-    ASSERT_EQ(kids.size(), 6u);
+    // P69 fold f26e: the typedef's trailing run is gone (the declarator slot holds it).
+    ASSERT_EQ(kids.size(), 5u);
     EXPECT_EQ(visibleChildRoles(t, kids[2]), "rule:attrSpec")
         << "the decoration must land in the pre-declarator run";
     // ★ The structural half of the anti-hijack contract: the head subtree must
@@ -3490,19 +3498,27 @@ TEST(ParserCSmoke, MidPositionAttributeParses) {
 // it is a live Direction-A gap owned by [[D-CSUBSET-ATTRIBUTE-TYPE-POSITION]]
 // and NOT by the P66 mid-run row, and it is said here so the two are not
 // confused.
-TEST(ParserCSmoke, StdAttrStaysRejectedInBothNewSlots) {
-    for (char const* src : {
-             // mode 1 slot — `externSpecifiers`'s repeat, at the block scope
-             // that is now the only place that rule is reachable.
-             "int use(void){ extern [[deprecated]] int dg; return dg; }",
-             "int [[deprecated]] gv;"}) {       // mode 2 slot
+// ⓘ P69 (lane `cs`, fold f26e): THE MODE-2 SLOT IS TAKEN NOW, and the paragraph above is the
+// record of why it was not. Probe n5u measured it with an UNRECOGNISED attribute — valid C23
+// (6.7.13.1) — and gcc 15.2.0, clang 21.1.8, Apple clang and MinGW-w64 gcc all accept `int
+// [[vnd::p]] gv;` (and the slot on a member, a parameter, at block scope), which this parser
+// refused: below the union. The slot reads at the TYPE grain (`declAttrRun`'s
+// `standardSpellingAppertainsTo`), so `int [[deprecated]] gv;` parses and is said ignored, as gcc
+// says it. The MID-RUN mode-1 cell is a different position and stays refused.
+TEST(ParserCSmoke, StdAttrIsRefusedMidRunAndTakenAtTheEndOfTheSpecifiers) {
+    auto const parses = [](char const* src) {
         auto h = loadAndTokenize(src);
         Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
         auto result = std::move(p).parse();
-        EXPECT_TRUE(result.tree.diagnostics().hasErrors())
-            << src << " — real clang rejects this; admitting `stdAttr` into the "
-                      "new slots would make DSS accept C no toolchain does";
-    }
+        return !result.tree.diagnostics().hasErrors();
+    };
+    // mode 1 slot — `externSpecifiers`'s repeat, at the block scope that is now the only
+    // place that rule is reachable: a sequence BETWEEN two specifiers (C23 6.7).
+    EXPECT_FALSE(parses("int use(void){ extern [[deprecated]] int dg; return dg; }"))
+        << "every reference refuses a sequence between two specifiers";
+    // mode 2 slot — the END of the specifiers.
+    EXPECT_TRUE(parses("int [[deprecated]] gv;"));
+    EXPECT_TRUE(parses("int [[vnd::p]] gv;"));
 }
 
 // ★ THE ANTI-HIJACK PIN. `declAttrRun` is a SIBLING of the head, never a child.
@@ -3615,9 +3631,10 @@ TEST(ParserCSmoke, NoreturnKeywordInParameterSpecifiersParses) {
     NodeId const param = findFirstNodeWithRule(t, "param");
     ASSERT_TRUE(param.valid());
     EXPECT_EQ(visibleChildRoles(t, param),
-              "rule:paramDeclSpecifiers/rule:declHeadForParam/rule:declarator")
+              "rule:paramDeclSpecifiers/rule:declHeadForParam/rule:declAttrRun/rule:declarator")
         << "the keyword must ride the stripped specifier prefix, so the row's "
-           "head: 0 / declarator: 1 are byte-identical decorated or not";
+           "head: 0 / declarator: 2 are byte-identical decorated or not (P69 fold f26e: the "
+           "end-of-specifiers run, `declAttrRun`, is the parameter's second role)";
     NodeId const prefix = findFirstNodeWithRule(t, "paramDeclSpecifiers");
     ASSERT_TRUE(prefix.valid());
     EXPECT_EQ(visibleChildRoles(t, prefix), "rule:paramDeclSpecifier")
@@ -3694,4 +3711,64 @@ TEST(ParserCSmoke, NoreturnKeywordStaysRejectedInTheAdjacentPositions) {
         EXPECT_TRUE(t.diagnostics().hasErrors())
             << s.src << " must stay a LOUD refusal: " << s.why;
     }
+}
+
+// ★★ P69 (lane `cs`, fold f26e): AN ABSTRACT PARAMETER DECLARATOR THAT OPENS WITH `[`. A parameter's
+// end of specifiers (`declAttrRun`: a GNU run, then a speculative C23 sequence) is followed by its
+// declarator, and an abstract array declarator opens with the `[` a sequence opens with. The run's
+// first repeat entered the sequence's `stdAttr` rule-first on that `[`, so `void f(int[3]);` was
+// refused ("expected '['"); the sequence is now decided where it stands, by its own lookahead
+// (`GrammarSchema::nestedSpeculativeChoice`). The one other instance of the shape in c is the
+// tagless `enum : T { … }`, whose speculative underlying-type clause its `{opt tag}` entered
+// rule-first. ✔MEASURED, probe apf (lane `cs`): gcc 15.2.0, clang 21.1.8, Apple clang 21 and
+// MinGW-w64 gcc 13.2.0 compile and run every cell; `int [[deprecated]] [3]` is refused by both
+// clangs ("cannot be applied to types") and run by gcc and MinGW, which say the attribute ignored.
+TEST(ParserCSmoke, AnAbstractArrayParameterIsTheDeclaratorsNotAnAttributeSequence) {
+    auto const countRule = [](Tree const& t, std::string_view name) {
+        std::size_t n = 0;
+        for (std::uint32_t i = 1; i < t.nodeCount(); ++i) {
+            NodeId const id{i};
+            if (t.kind(id) == NodeKind::Internal && t.rules().name(t.rule(id)) == name) ++n;
+        }
+        return n;
+    };
+    struct Cell { char const* src; std::size_t arraySuffixes; std::size_t sequences; };
+    Cell const cells[] = {
+        {"void f(int[3]);", 1, 0},
+        {"void f(int[*]);", 1, 0},
+        {"void f(int[]);", 1, 0},
+        {"int g(int, int[3]) { return 42; }", 1, 0},
+        {"int g(int, int[]) { return 42; }", 1, 0},
+        {"void f(int[static 3]);", 1, 0},
+        {"void f(int[const 3]);", 1, 0},
+        {"void f(int[3][4]);", 2, 0},
+        {"void f(int [[deprecated]] [3]);", 1, 1},
+    };
+    for (Cell const& c : cells) {
+        Tree t = parseC(c.src);
+        ASSERT_NE(t.root(), InvalidNode) << c.src;
+        EXPECT_FALSE(t.diagnostics().hasErrors())
+            << "`" << c.src << "`: an abstract array parameter must parse as its declarator: "
+            << firstErrorText(t);
+        EXPECT_EQ(countRule(t, "arrayDeclSuffix") + countRule(t, "arrayStarSuffix"), c.arraySuffixes)
+            << c.src;
+        EXPECT_EQ(countRule(t, "stdAttr"), c.sequences) << c.src;
+    }
+    // ACCEPTED WITH THE WARNING (gcc and MinGW warn the attribute ignored and run the cell; ✔MEASURED on lane
+    // `cs`'s e11u build: S_AttributeIgnoredForDeclarationKind, compiled and run on pe64 and ELF x86-64).
+    {
+        SemanticModel const dm = analyzeC("void f(int [[deprecated]] [3]);\n");
+        std::size_t ignored = 0;
+        bool refused = false;
+        for (auto const& d : dm.diagnostics().all()) {
+            if (d.code == DiagnosticCode::S_AttributeIgnoredForDeclarationKind) ++ignored;
+            if (d.severity == DiagnosticSeverity::Error) refused = true;
+        }
+        EXPECT_FALSE(refused) << "`int [[deprecated]] [3]` is accepted, as gcc and MinGW accept it";
+        EXPECT_EQ(ignored, 1u) << "the type-grain `deprecated` is said ignored, once, as gcc and MinGW say it";
+    }
+    Tree e = parseC("enum : unsigned char { A = 1 };");
+    EXPECT_FALSE(e.diagnostics().hasErrors())
+        << "the tagless enumeration's underlying type must parse: " << firstErrorText(e);
+    EXPECT_EQ(countRule(e, "enumTypeSpecifier"), 1u);
 }

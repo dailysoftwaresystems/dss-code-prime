@@ -815,7 +815,7 @@ isWriterReservedSymbolIdValue(std::uint32_t v) noexcept {
         if (r == v) return true;
     return false;
 }
-// The lowest reserved value: where an index space ends (`symbolIdOfIndex`).
+// The lowest reserved value: where an index space ends (`IndexSymbolIds`, core/types/symbol_id_cursor.hpp).
 inline constexpr std::uint32_t kFirstWriterReservedSymbolIdValue = [] {
     std::uint32_t lowest = kWriterReservedSymbolIdValues[0];
     for (std::uint32_t const r : kWriterReservedSymbolIdValues)

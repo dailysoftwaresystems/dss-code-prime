@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -175,6 +176,27 @@ public:
         std::size_t       maxPerCode     = 50;     // per-code cap; coalesces beyond this
         std::size_t       dedupWindow    = 4;      // identical (code, buffer, span, rule, actual) within this many recent diags is dropped
         DiagnosticPolicy  policy{};
+
+        // A STAGING reporter's volume: no gate at all, so nothing it is told is
+        // dropped. For a reporter whose content is FILTERED before it reaches a
+        // budgeted one (`relaySelectedFrom`) -- a filter can judge only what was
+        // kept, so the budget belongs AFTER it -- and for a sub-build merged into
+        // a reporter that applies the operator's budget itself. The policy is
+        // left empty: it applies at the destination.
+        [[nodiscard]] static Config unbounded() {
+            Config c{};
+            c.maxDiagnostics = std::numeric_limits<std::size_t>::max();
+            c.maxPerCode     = std::numeric_limits<std::size_t>::max();
+            c.dedupWindow    = 0;
+            return c;
+        }
+
+        // True iff no volume gate can drop anything -- `unbounded()`'s volume.
+        [[nodiscard]] bool dropsNothing() const noexcept {
+            return maxDiagnostics == std::numeric_limits<std::size_t>::max()
+                && maxPerCode     == std::numeric_limits<std::size_t>::max()
+                && dedupWindow    == 0;
+        }
     };
 
     DiagnosticReporter() noexcept = default;
@@ -204,6 +226,9 @@ public:
     effectiveSeverity(DiagnosticCode code, DiagnosticSeverity severity) const;
 
     [[nodiscard]] std::span<ParseDiagnostic const> all() const noexcept;
+    // Every Error / Warning the policy let through, LANDED in `all()` OR DROPPED
+    // by a volume gate -- here, or in any source relayed into this reporter.
+    // `DroppedTally` below says why the dropped half is counted.
     [[nodiscard]] std::size_t errorCount()   const noexcept;
     [[nodiscard]] std::size_t warningCount() const noexcept;
     [[nodiscard]] bool        hasErrors()    const noexcept { return errorCount() > 0; }
@@ -246,8 +271,105 @@ public:
     [[nodiscard]] ElisionLedger elisionFor(DiagnosticCode code) const noexcept;
 
     // True iff ANY code's reported count in this reporter is a FLOOR rather
-    // than a total. The one question a census actually wants answered.
-    [[nodiscard]] bool anyCountIsAFloor() const noexcept { return !elided_.empty(); }
+    // than a total -- anything was dropped, by any gate, here or in a source
+    // relayed here. The one question a census actually wants answered.
+    [[nodiscard]] bool anyCountIsAFloor() const noexcept { return droppedTotal_.total() > 0; }
+
+    // ★★★ D9(c) -- WHAT THE VOLUME GATES DROP IS STILL COUNTED, BY SEVERITY.
+    //
+    // ⚠ THE DEFECT THIS ENDS, ✔MEASURED through `Program::compileUnits` before it
+    // (x86_64:elf64-x86_64-linux-exec): under `--max-per-code 0` the build of
+    // `int main(void) { const int c = 1; c = 2; return c; }` was GREEN -- rc 0,
+    // an artifact on disk -- because `errorCount()` counted only what `all()`
+    // STORED and the per-code cap had stored nothing. Four other one-Error
+    // sources failed only under a LATER tier's code (H_TypeUnresolved,
+    // H_VerifierFailure, H_UnsupportedLoweringForKind): the tier whose Error was
+    // elided went on as if it had none, and the next tier refused the broken
+    // model. The gates decide what is SHOWN; they never decided what HAPPENED,
+    // and how many errors there were is what happened.
+    //
+    // So every diagnostic the policy lets through is counted at its post-policy
+    // severity whether it lands or is dropped -- by the dedup window, the
+    // per-code cap or the global cap -- and `errorCount()` / `warningCount()`
+    // answer landed + dropped. Every stage gate in the tree reads those two
+    // (`hasErrors()`, the `errorCount() != before` deltas), so the fix is here.
+    struct DSS_EXPORT DroppedTally {
+        std::size_t hints    = 0;
+        std::size_t infos    = 0;
+        std::size_t warnings = 0;
+        std::size_t errors   = 0;
+
+        [[nodiscard]] std::size_t of(DiagnosticSeverity severity) const noexcept;
+        void add(DiagnosticSeverity severity, std::size_t n) noexcept;
+        [[nodiscard]] std::size_t total() const noexcept {
+            return hints + infos + warnings + errors;
+        }
+        [[nodiscard]] friend bool operator==(DroppedTally const&, DroppedTally const&) noexcept = default;
+    };
+
+    // Everything dropped of `code` on its way to this reporter -- by this
+    // reporter's own gates AND in every source relayed into it -- by severity.
+    // `elisionFor` says which of THIS reporter's gates dropped it (the marker's
+    // prose); this says how many, of what severity, wherever they fell.
+    [[nodiscard]] DroppedTally droppedFor(DiagnosticCode code) const noexcept;
+
+    // The codes `droppedFor` answers non-zero for, in code order: WHICH counts in
+    // this reporter are floors, by name -- `anyCountIsAFloor()` itemised.
+    [[nodiscard]] std::vector<DiagnosticCode> droppedCodes() const;
+
+    // Every diagnostic handed to this reporter -- by `report`, or in a relayed
+    // source's dropped tally -- before the policy or a gate decided anything.
+    // "Did this step say anything?" is a question about this number, never
+    // about `all().size()`, which the gates make a floor.
+    [[nodiscard]] std::size_t reportsReceived() const noexcept { return received_; }
+
+    // ★★★ THE ONE RELAY: `src`'s retained buffers, every diagnostic it STORED
+    // (re-reported here, so THIS reporter's policy and gates apply), and every
+    // diagnostic its gates DROPPED (its tally, through this reporter's policy).
+    //
+    // ⚠ WHY ONE MEMBER. Thirteen relays in `src/` copied `src.all()` and nothing
+    // else (✔MEASURED, a scan of range-for loops over `.all()` that re-report:
+    // the preprocessor x3, the asm template reader, input naming, the C header
+    // reader x2, the shipped-descriptor read, `copyDiagnostics`, the
+    // archive-member probe, the dependency build, `mergeWithTargetContext`, and
+    // the tree builder's lexer ingest) -- so a tier that counted its dropped
+    // Errors would still have lost them at its first relay.
+    //
+    // `edit` rewrites each STORED diagnostic before it is re-reported (a context
+    // prefix, an input name, a new locus). A dropped one has no text left to
+    // edit; only its code and severity travel, and they never change.
+    //
+    // ⓘ Policy-aware by design (D-LK10-7): re-reporting runs THIS reporter's
+    // policy over what a tier reported under none, so the user's `--suppress`
+    // applies across both halves of the pipeline. The dropped tally takes the
+    // same verdict, code by code, severity by severity.
+    void relayFrom(DiagnosticReporter const& src);
+    template <class Edit>
+    void relayFrom(DiagnosticReporter const& src, Edit&& edit) {
+        requireNotSelf_(src);
+        ownBuffers_.addAll(src.ownBuffers_);
+        for (ParseDiagnostic d : src.all_) {
+            edit(d);
+            report(std::move(d));
+        }
+        takeDroppedFrom_(src);
+    }
+
+    // A relay that ADMITS only some of `src`'s diagnostics, judged by what each
+    // one says (`admit` may also edit the one it admits). A dropped diagnostic
+    // has nothing left to judge, so `src` must drop nothing -- a staging
+    // reporter built from `Config::unbounded()` -- and any other source is a
+    // compiler bug, fatal by name. The budget then applies HERE, after the
+    // filter: the only order in which a filter sees every candidate.
+    template <class Admit>
+    void relaySelectedFrom(DiagnosticReporter const& src, Admit&& admit) {
+        requireNotSelf_(src);
+        requireDropsNothing_(src);
+        ownBuffers_.addAll(src.ownBuffers_);
+        for (ParseDiagnostic d : src.all_) {
+            if (admit(d)) report(std::move(d));
+        }
+    }
 
     // Opaque restore token used exclusively by TreeBuilder::Checkpoint.
     // `recent_` is a sliding window with pop_front, so size-only capture
@@ -277,6 +399,12 @@ public:
         // diagnostic that is not its marker, or run off the vector. Whole-map
         // capture is the only sound shape here, same as `recent`.
         std::unordered_map<DiagnosticCode, ElisionLedger> elided;
+        // D9(c): what the gates dropped, by severity, and how many reports
+        // arrived. A speculative branch's reports move all three, so all three
+        // roll back with it -- a rewound branch must not leave an Error counted.
+        std::unordered_map<DiagnosticCode, DroppedTally>  dropped;
+        DroppedTally                                      droppedTotal{};
+        std::size_t                                       received = 0;
     };
     [[nodiscard]] Snapshot snapshotForRollback() const;
     void                   truncateTo(Snapshot const& snap);
@@ -464,7 +592,9 @@ private:
     // already-dropping path" affordable enough to do unconditionally
     // instead of leaving the number to be recovered later (it cannot be:
     // once a diagnostic is dropped there is nothing left to count).
-    void noteCapDrop_();
+    // `dropped` is the diagnostic the cap ate: its code and severity are counted
+    // (D9(c)), its text is gone.
+    void noteCapDrop_(ParseDiagnostic const& dropped);
 
     // The rewrite half of `noteCapDrop_`, on its own so `truncateTo` can
     // re-derive the sentence after a rollback restores `droppedByCap_`. The
@@ -497,6 +627,28 @@ private:
     // overwhelmingly common case, so a build that never saturates pays one
     // empty-map probe per elision-free report and nothing else.
     std::unordered_map<DiagnosticCode, ElisionLedger> elided_;
+
+    // D9(c): count `n` dropped diagnostics of `code` at `severity` -- the ONE
+    // place a drop is counted, whichever gate or relay dropped it.
+    void noteDropped_(DiagnosticCode code, DiagnosticSeverity severity, std::size_t n);
+
+    // `relayFrom`'s dropped half: `src`'s tally through THIS reporter's policy.
+    void takeDroppedFrom_(DiagnosticReporter const& src);
+
+    // An Error whose code the policy asks to suppress is reported anyway, and
+    // the refused request is announced -- for a report AND for a relayed drop.
+    void announceIfSuppressingAnError_(DiagnosticCode code, DiagnosticSeverity severity);
+
+    // A relay into itself would read `all_` while appending to it.
+    void requireNotSelf_(DiagnosticReporter const& src) const;
+    // `relaySelectedFrom`'s precondition (see there).
+    static void requireDropsNothing_(DiagnosticReporter const& src);
+
+    // Absent from the map == nothing of that code dropped. `droppedTotal_` is
+    // the sum over the map, kept so `errorCount()` stays O(stored).
+    std::unordered_map<DiagnosticCode, DroppedTally> dropped_;
+    DroppedTally                                      droppedTotal_{};
+    std::size_t                                       received_ = 0;
 
     Config                                  cfg_{};
     std::vector<ParseDiagnostic>            all_;

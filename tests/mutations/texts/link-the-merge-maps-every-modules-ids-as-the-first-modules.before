@@ -1,0 +1,2 @@
+        if (isWriterReservedSymbolIdValue(old.v)) return old.v;
+        LinkedSymbolKey const key{modules[modIdx].cuId, old};

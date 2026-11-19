@@ -1,5 +1,6 @@
-        mergedStorage = mergeModules(modules, image, targetSchema,
-                                     objectFormatSchema, reporter);
-        if (reporter.errorCount() != errsBeforeMerge) {
-            return image;  // merge fail-loud (ambiguous entry / cross-CU ref pending).
+        std::optional<AssembledModule> merged = mergeModules(modules, image, targetSchema,
+                                                             objectFormatSchema, reporter);
+        if (!merged) {
+            return image;  // merge fail-loud, reported (ambiguous entry / cross-CU ref pending / ids exhausted).
         }
+        mergedStorage = std::move(*merged);

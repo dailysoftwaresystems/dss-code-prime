@@ -1,0 +1,1 @@
+        std::uint32_t const explicitAlign = f.explicitAlign;   // 0 = none

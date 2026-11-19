@@ -1,1 +1,1 @@
-a linkage key qualified by an undeclared qualifier must fail the load
+a linkage key qualified by an undeclared qualifier — expected a diagnostic containing

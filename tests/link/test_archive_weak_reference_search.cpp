@@ -525,7 +525,7 @@ TEST(ArchiveWeakReferenceSearch, ACoffWeakExternalsLibrarySearchIsReadWrittenAnd
     for (bool const searches : {false, true}) {
         AssembledModule m = callerOf(*L.target, {{"hook", SymbolBinding::Weak, searches}});
         DiagnosticReporter rep;
-        auto const obj = pe::encode(m, *L.target, *L.format, rep);
+        auto const obj = pe::encode(m, *L.target, *L.format, rep).value();
         ASSERT_FALSE(obj.empty()) << diagnosticsOf(rep);
         EXPECT_EQ(weakExternalPolicy(obj, "hook"), std::optional<std::uint32_t>{searches ? 2u : 3u})
             << (searches ? "SEARCH_LIBRARY" : "ALIAS");

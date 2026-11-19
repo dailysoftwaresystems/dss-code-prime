@@ -176,7 +176,7 @@ TEST(SymbolIdEndIsStated, ANameTablesEndStatesIt) {
     ASSERT_TRUE(table.symbolIdEndIsStated());
     addFunction(table, in, 3);
     EXPECT_EQ(table.symbolIdEnd(), 20u) << "a symbol below the table's end moves nothing";
-    EXPECT_EQ(table.mintSymbol().v, 20u) << "the first fresh id is the table's end";
+    EXPECT_EQ(table.mintSymbolOrAbort("test").v, 20u) << "the first fresh id is the table's end";
 }
 
 // "This module is its own table" is a STATEMENT: the end is the counted one, said —
@@ -189,7 +189,7 @@ TEST(SymbolIdEndIsStated, SayingAModuleIsItsOwnTableStatesItsEnd) {
     ASSERT_TRUE(self.symbolIdEndIsStated())
         << "a hand-built module said it is its own table, and its end is still only counted";
     EXPECT_EQ(self.symbolIdEnd(), 4u) << "its end is the counted one — stated, not moved";
-    EXPECT_EQ(self.mintSymbol().v, 4u);
+    EXPECT_EQ(self.mintSymbolOrAbort("test").v, 4u);
 }
 
 // `finish` hands the builder's fact to the module it makes — both ways.
@@ -253,7 +253,7 @@ TEST(SymbolIdEndIsStated, ARebuildCopiesTheFactAndNeverMakesIt) {
         MirBuilder rebuilt;
         rebuilt.continueSymbolIdsOf(stated);
         ASSERT_TRUE(rebuilt.symbolIdEndIsStated());
-        EXPECT_EQ(rebuilt.mintSymbol().v, 20u);
+        EXPECT_EQ(rebuilt.mintSymbolOrAbort("test").v, 20u);
     }
 }
 
@@ -275,23 +275,10 @@ TEST(SymbolIdEndIsStated, AMoveCarriesTheFactAndEmptiesItsSource) {
 
 // The continuation a lowering tier mints from takes the fact FROM THE MODULE — never
 // from a count, never by default — and keeping clear of an id beside the module
-// states nothing there either.
-TEST(SymbolIdEndIsStated, AContinuationTakesTheFactFromItsModule) {
-    TypeInterner in{CompilationUnitId{1}};
-    Mir const counted = countedModule(in);
-    Mir const stated  = statedModule(in);
-    ASSERT_FALSE(counted.symbolIdEndIsStated());
-    ASSERT_TRUE(stated.symbolIdEndIsStated());
-    MirSymbolIdContinuation overCounted{counted};
-    EXPECT_FALSE(overCounted.endIsStated())
-        << "a continuation over a counted module believes its end stated";
-    overCounted.keepClearOf(SymbolId{40});
-    EXPECT_FALSE(overCounted.endIsStated()) << "keeping clear of an id states nothing";
-    EXPECT_EQ(overCounted.end(), 41u) << "CONTROL: the end itself was raised";
-    MirSymbolIdContinuation overStated{stated};
-    ASSERT_TRUE(overStated.endIsStated());
-    EXPECT_EQ(overStated.mint().v, 20u);
-}
+// states nothing there either. Only the lowering makes a continuation (P69 f26e,
+// main's M1), so those facts are pinned THROUGH the lowering:
+// mir/test_mir_text_reader_never_aborts, `LoweringContinuesTheModulesIds` and its
+// death test.
 
 namespace {
 
@@ -607,21 +594,11 @@ TEST(SymbolIdEndIsStatedDeath, AMintPastAnEndThatWasOnlyCountedDies) {
         Mir const counted = countedModule(in);
         MirBuilder rebuilt;
         rebuilt.continueSymbolIdsOf(counted);
-        (void)rebuilt.mintSymbol();
+        (void)rebuilt.mintSymbolOrAbort("test");
     }, "MirBuilder::mintSymbol fatal: this module's symbol-id space was never stated");
-    EXPECT_DEATH({
-        TypeInterner in{CompilationUnitId{1}};
-        Mir const counted = countedModule(in);
-        MirSymbolIdContinuation past{counted};
-        (void)past.mint();
-    }, "MirSymbolIdContinuation::mint fatal: this module's symbol-id space was never stated");
-    EXPECT_DEATH({
-        TypeInterner in{CompilationUnitId{1}};
-        Mir const counted = countedModule(in);
-        MirSymbolIdContinuation past{counted};
-        past.keepClearOf(SymbolId{40});   // raises the end; states nothing
-        (void)past.mintOrAbort("theLoweringThatMints");
-    }, "MirSymbolIdContinuation::mint fatal: this module's symbol-id space was never stated");
+    // The frozen module's continuation, over the same end: through the lowering that alone
+    // makes it (M1) -- mir/test_mir_text_reader_never_aborts,
+    // `LoweringContinuesTheModulesIdsDeathTest.ALoweringOverAnEndThatWasOnlyCountedDies`.
     // Through a real pass: the <threads.h> shim synthesis over a module whose builder
     // said nothing. A function of its own: a death statement is a macro argument, and
     // a brace list's commas would split it.

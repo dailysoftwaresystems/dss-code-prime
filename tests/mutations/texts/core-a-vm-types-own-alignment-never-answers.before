@@ -1,0 +1,2 @@
+        if (std::uint32_t const own = interner.typeAlignOverride(cur); own != 0)
+            return Alignment::fromBytes(own);

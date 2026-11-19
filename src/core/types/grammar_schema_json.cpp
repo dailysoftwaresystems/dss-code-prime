@@ -1947,8 +1947,9 @@ void validateTypeNameCommitGuards(GrammarSchemaData& data, Collector& coll) {
 // facet cannot be a knob that lies:
 //   (a) a reference that is not a candidate of a SPECULATIVE alt — a sequence element, a repeat, a
 //       non-speculative alt, an expression's atom (all compile to a RuleLeaf no probe heads) — the
-//       alt being the one the parser's cursor STANDS at: a speculative alt written inside a
-//       non-speculative one is no shelter, the outer alt enters its rules directly;
+//       alt being the one the parser's cursor STANDS at; a speculative alt written inside a
+//       non-speculative one is such an alt (P69 fold f26e: the outer one routes the cursor to it,
+//       `detail::enumerationEnters`), and a non-speculative alt inside a speculative one is not;
 //   (b) being an alt's FALLBACK reading for one of its FIRST tokens: when every probe at a site
 //       fails, the alt replays, non-speculatively, the LAST candidate whose FIRST holds the token
 //       (`lastStructuralCandidate_`), for that candidate's own diagnostics — so a candidate
@@ -2020,15 +2021,17 @@ void validateNotFollowedBy(GrammarSchemaData& data, Collector& coll) {
         // dispatches at. It enters the rule at its entry, leaves a token or rule leaf at that
         // leaf's `nextPos` (`GrammarSchema::advance`, `leaveRule`), and takes a nullable skip to
         // the FIRST nullable-tailed branch of the alt it stands at (`nullableBranch`). An alt
-        // reached only as a BRANCH of another alt is never one of them: the outer alt routes
-        // straight to the leaves (`collectAltBranchRules`, `routeToRuleLeaf`), so whatever the
-        // inner alt declares — `speculative` included — is read off the OUTER position. That is
-        // why a repeat's inline alt hands its `speculative` to the loop entry when the shapes are
-        // compiled, and why this walk reads a candidate list where the parser reads it rather than
-        // where the document wrote it: judged at the inner alt, the trailing `repeat` of an alt
-        // has no skip branch and its last candidate looks like a fallback it never is; and a
-        // speculative alt inside a NON-speculative one would look probed while the outer alt
-        // enters its rules directly.
+        // reached only as a BRANCH of another alt is otherwise never one of them: the outer alt
+        // routes straight to the leaves (`collectAltBranchRules`, `routeToRuleLeaf`), so whatever
+        // the inner alt declares is read off the OUTER position. That is why a repeat's inline alt
+        // hands its `speculative` to the loop entry when the shapes are compiled, and why this
+        // walk reads a candidate list where the parser reads it rather than where the document
+        // wrote it: judged at the inner alt, the trailing `repeat` of an alt has no skip branch
+        // and its last candidate looks like a fallback it never is. ★ P69 (lane `cs`, fold f26e):
+        // the one exception is a SPECULATIVE alt a NON-speculative one reaches — the outer alt
+        // routes the cursor TO it (`GrammarSchema::nestedSpeculativeChoice`), so it is a cursor
+        // position of its own, and the outer alt's walk stops there
+        // (`detail::enumerationEnters`, the rule `collectAltBranchRules` reads).
         std::vector<bool> isCursor(pos.size(), false);
         isCursor[owner.entryPos] = true;
         for (auto const& p : pos) {
@@ -2039,6 +2042,27 @@ void validateNotFollowedBy(GrammarSchemaData& data, Collector& coll) {
             grew = false;
             for (std::uint32_t q = 0; q < pos.size(); ++q) {
                 if (!isCursor[q] || pos[q].slotKind() != SlotKind::AltChoice) continue;
+                // ★ P69 (fold f26e): the nested SPECULATIVE choices a non-speculative alt the
+                // cursor stands at routes it to, through non-speculative alts.
+                std::vector<std::uint32_t> through(pos[q].branches().begin(),
+                                                   pos[q].branches().end());
+                std::vector<bool> met(pos.size(), false);
+                while (!through.empty()) {
+                    std::uint32_t const n = through.back();
+                    through.pop_back();
+                    if (n >= pos.size() || met[n] || pos[n].slotKind() != SlotKind::AltChoice) {
+                        continue;
+                    }
+                    met[n] = true;
+                    if (!detail::enumerationEnters(pos[q], pos[n])) {
+                        if (!isCursor[n]) {
+                            isCursor[n] = true;
+                            grew = true;
+                        }
+                        continue;
+                    }
+                    for (std::uint32_t const b : pos[n].branches()) through.push_back(b);
+                }
                 for (std::uint32_t const b : pos[q].branches()) {
                     if (b >= pos.size() || !pos[b].nullableTail()) continue;
                     if (!isCursor[b]) {
@@ -2091,7 +2115,8 @@ void validateNotFollowedBy(GrammarSchemaData& data, Collector& coll) {
                         return pos[o].ruleId().v == pos[p].ruleId().v;
                     });
                     if (!repeated) order.push_back(p);
-                } else if (pos[p].slotKind() == SlotKind::AltChoice) {
+                } else if (pos[p].slotKind() == SlotKind::AltChoice
+                           && detail::enumerationEnters(pos[a], pos[p])) {
                     pushBranches(p, false);
                 }
             }
@@ -9852,7 +9877,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "'semantics.declarators' must be an object of "
                               "declarator role names");
                 } else {
-                    static constexpr std::array<std::string_view, 26>
+                    static constexpr std::array<std::string_view, 28>
                         kDeclaratorKeys{
                             "declaratorRule",     "pointerLayerRule",
                             "pointerToken",       "directRule",
@@ -9912,7 +9937,12 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             "scopeBeginsAfterDeclarator",
                             // P69 L2b2 (lane `lm`): the OPTIONAL boolean — a declaration
                             // that declares nothing (C 6.7p2) is a warning, not an error.
-                            "emptyDeclarationWarns"};
+                            "emptyDeclarationWarns",
+                            // P69 (lane `cs`, fold f26e): where an asm label may stand -- the
+                            // runs it may follow only on a leading function declarator, and
+                            // whether a function definition may carry one.
+                            "asmLabelLeadingFunctionOnlyRules",
+                            "asmLabelRefusedOnDefinition"};
                     DSS_CHECK_KEY_VOCABULARY(kDeclaratorKeys);
                     bool dOk = true;
                     if (!checkKeysAgainst(dj, kDeclaratorKeys, dPath,
@@ -10112,6 +10142,68 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             dOk = false;
                         } else {
                             dc.emptyDeclarationWarns = v.get<bool>();
+                        }
+                    }
+                    // ★ P69 (lane `cs`, fold f26e): where an asm label may stand (DeclaratorConfig's
+                    // `asmLabelLeadingFunctionOnlyRules` / `asmLabelRefusedOnDefinition`). Both are
+                    // OPTIONAL and both are facts ABOUT the label, so either one without an
+                    // `asmLabelRule` is a loud load failure rather than a rule nobody reads.
+                    if (dj.contains("asmLabelLeadingFunctionOnlyRules")) {
+                        json const& v = dj.at("asmLabelLeadingFunctionOnlyRules");
+                        std::string const at = dPath + "/asmLabelLeadingFunctionOnlyRules";
+                        if (!dc.asmLabelRule.has_value()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, at,
+                                      "'asmLabelLeadingFunctionOnlyRules' names the runs written "
+                                      "before an asm label, but this block declares no "
+                                      "'asmLabelRule'");
+                            dOk = false;
+                        } else if (!v.is_array() || v.empty()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, at,
+                                      "'asmLabelLeadingFunctionOnlyRules' must be a NON-EMPTY "
+                                      "array of rule-name strings: the runs that, written between a "
+                                      "declarator and its asm label, are taken only on the first "
+                                      "declarator of a declaration that declares a function");
+                            dOk = false;
+                        } else {
+                            for (std::size_t i = 0; i < v.size(); ++i) {
+                                std::string const atI = std::format("{}/{}", at, i);
+                                if (!v[i].is_string()) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics, atI,
+                                              "'asmLabelLeadingFunctionOnlyRules' entries are "
+                                              "rule-name strings");
+                                    dOk = false;
+                                    continue;
+                                }
+                                std::string name = v[i].get<std::string>();
+                                if (!data.rules->contains(name)) {
+                                    coll.emit(DiagnosticCode::C_UnknownShape, atI,
+                                              std::format("'declarators."
+                                                          "asmLabelLeadingFunctionOnlyRules' "
+                                                          "references unknown shape '{}'", name));
+                                    dOk = false;
+                                    continue;
+                                }
+                                dc.asmLabelLeadingFunctionOnlyRules.push_back(
+                                    data.rules->find(name));
+                                dc.asmLabelLeadingFunctionOnlyRuleNames.push_back(std::move(name));
+                            }
+                        }
+                    }
+                    if (dj.contains("asmLabelRefusedOnDefinition")) {
+                        json const& v = dj.at("asmLabelRefusedOnDefinition");
+                        std::string const at = dPath + "/asmLabelRefusedOnDefinition";
+                        if (!dc.asmLabelRule.has_value()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, at,
+                                      "'asmLabelRefusedOnDefinition' says where an asm label may "
+                                      "not stand, but this block declares no 'asmLabelRule'");
+                            dOk = false;
+                        } else if (!v.is_boolean()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, at,
+                                      "'asmLabelRefusedOnDefinition' must be a BOOLEAN: whether a "
+                                      "function definition's declarator may not carry an asm label");
+                            dOk = false;
+                        } else {
+                            dc.asmLabelRefusedOnDefinition = v.get<bool>();
                         }
                     }
                     // c26 (D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME): the OPTIONAL
@@ -16304,16 +16396,17 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                       "'spellings' must be a non-empty ARRAY of "
                                       "{ introducer, qualifier?, "
                                       "availableObjectFormats?, afterCompositeBody?, "
-                                      "standardNamespaces? } "
+                                      "standardNamespaces?, impliedClause? } "
                                       "rows, one per frame of 'attrSpecRule' — a "
                                       "language with nothing to say about its "
                                       "attribute specifier's spelling omits the key");
                         } else {
-                            static constexpr std::array<std::string_view, 5>
+                            static constexpr std::array<std::string_view, 6>
                                 kSpellingKeys{"introducer", "qualifier",
                                               "availableObjectFormats",
                                               "afterCompositeBody",
-                                              "standardNamespaces"};
+                                              "standardNamespaces",
+                                              "impliedClause"};
                             DSS_CHECK_KEY_VOCABULARY(kSpellingKeys);
                             for (std::size_t si = 0; si < sp.size(); ++si) {
                                 json const& row = sp[si];
@@ -16494,6 +16587,34 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                             }
                                             out.standardNamespaces.push_back(name);
                                         }
+                                    }
+                                }
+                                // ★ P69 (lane `cs`, fold f26e): AN IMPLIED CLAUSE — the introducer
+                                // alone is one clause, the effects row this names (checked once
+                                // every row is loaded, below). It is a plain name, and a spelling
+                                // whose one clause is fixed has no clause to qualify and claims no
+                                // items of the standard form.
+                                if (row.contains("impliedClause")) {
+                                    json const& ic = row.at("impliedClause");
+                                    std::string const icPath = rowPath + "/impliedClause";
+                                    std::string const name =
+                                        ic.is_string() ? ic.get<std::string>() : std::string{};
+                                    if (name.empty() || stripDunder(name) != name
+                                        || name.find_first_of("():[] ") != std::string::npos) {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics, icPath,
+                                                  "'impliedClause' must be an attribute name: a "
+                                                  "non-empty identifier, written without its dunders");
+                                        rowOk = false;
+                                    } else if (!out.qualifier.empty()
+                                               || !out.standardNamespaces.empty()) {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics, icPath,
+                                                  "a spelling whose introducer alone is its one clause "
+                                                  "has no clause to qualify and claims no items of the "
+                                                  "standard form: 'impliedClause' stands beside neither "
+                                                  "'qualifier' nor 'standardNamespaces'");
+                                        rowOk = false;
+                                    } else {
+                                        out.impliedClause = name;
                                     }
                                 }
                                 if (rowOk)
@@ -19985,6 +20106,26 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 "declares",
                                 key));
                     }
+                }
+                // ★ P69 (lane `cs`, fold f26e): AN IMPLIED CLAUSE NAMES A ROW. A spelling
+                // whose introducer alone is a clause is judged through the effects row
+                // that clause names; one naming no row would be an unknown attribute every
+                // time it is written, which no author means.
+                for (std::size_t si = 0; si < cfg.attributeSpellings.size(); ++si) {
+                    AttributeSpelling const& sp = cfg.attributeSpellings[si];
+                    if (sp.impliedClause.empty()) continue;
+                    bool named = false;
+                    for (AttributeSemanticsRow const& row : cfg.attributeEffects)
+                        for (std::string const& n : row.names)
+                            if (n == sp.impliedClause) named = true;
+                    if (named) continue;
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/attributeSemantics/spellings",
+                              std::format("the spelling opened by '{}' implies the clause '{}', "
+                                          "and no 'semantics.attributeSemantics.effects' row "
+                                          "names it: every specifier of that spelling would be "
+                                          "an unknown attribute",
+                                          sp.introducerName, sp.impliedClause));
                 }
 
                 // ── P69 (lane `cs`): AN `align` ROW'S `leadingDecoratesDefinitionOf`

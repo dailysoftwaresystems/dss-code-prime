@@ -1,1 +1,1 @@
-    : end_{mir.symbolIdEnd()}, stated_{true} {}
+    : end_{SymbolIdEnd::startingAt(mir.symbolIdEnd())}, stated_{true} {}

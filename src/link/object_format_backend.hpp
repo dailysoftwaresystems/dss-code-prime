@@ -483,7 +483,14 @@ public:
     // RUNPATHS do reach every backend (D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH):
     // a backend whose walker records none was reported by the gate's warning,
     // and one that records them does so from the format's declaration.
-    [[nodiscard]] virtual std::vector<std::uint8_t>
+    //
+    // ★ P69 (lane `cs`, fold f26e -- B1, D-MIR-SYNTHESIZED-SYMBOL-MINTED-INSIDE-THE-NAME-TABLE): THE ANSWER
+    // IS THE REFUSAL. `nullopt` = this walker refused the image, every reason already reported; an engaged
+    // value is its bytes. A walker that takes fresh symbol ids (PE: the import-slot residue runner's three)
+    // hands a refused take to the link as that nullopt, never as an empty vector beside an error count. A
+    // walker whose free function still answers bytes (ELF, Mach-O, SPIR-V, wasm: they take no fresh id) is
+    // answered ENGAGED, and its refusals are read by the link's post-walker count, which stays for them.
+    [[nodiscard]] virtual std::optional<std::vector<std::uint8_t>>
     encode(AssembledModule const&    module,
            TargetSchema const&       targetSchema,
            ObjectFormatSchema const& objectFormatSchema,

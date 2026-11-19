@@ -874,3 +874,49 @@ TEST(AggregateAbiWin64AndAapcs64, APositionChangesNoClassOutsideSysV) {
         EXPECT_EQ(aa->pieces.size(), ar->pieces.size());
     }
 }
+
+// ★ P69 (lane `cs`, fold f26e — D-TARGET-WIN64-INT128-RESULT-GOES-THROUGH-A-HIDDEN-POINTER-NOT-XMM0): A 128-BIT
+// INTEGER RESULT COMES BACK WHERE ITS CONVENTION STATES. Under `integer128Result: first_fpr` (Win64's `ms_x64`) an
+// `__int128` / `unsigned __int128` RESULT is ONE 16-byte FPR piece -- XMM0, the low limb in lane 0, where MinGW-w64
+// gcc and clang return it -- before the by-size rule, which sends every other 16-byte value through the hidden
+// pointer. THE UNIVERSE: {I128, U128} x {result, argument} x {first_fpr, the aggregate rule}; against it the types
+// that keep the by-size rule under first_fpr (a `_BitInt(128)`, a 16-byte struct of two longs), and SysV's own
+// answer for the same two types (two GPRs, RAX:RDX) as the control that the rule reads nothing it does not state.
+TEST(AggregateAbiWin64, A128BitIntegerResultComesBackInTheFirstFprWhereTheConventionStatesIt) {
+    auto ti = makeInterner(10);
+    AggregateConventionRules stated{AggregateClassKind::Win64BySize, 8};
+    stated.integer128Result = Integer128Result::InTheFirstFpr;
+    AggregateConventionRules const unstated{AggregateClassKind::Win64BySize, 8};
+    auto const classify = [&](AggregateConventionRules const& rules, TypeId t, AggregatePosition pos) {
+        return classifyAggregate(rules, t, ti, kX86_64Layout, DataModel::Lp64, pos);
+    };
+    for (TypeKind const k : {TypeKind::I128, TypeKind::U128}) {
+        TypeId const t = ti.primitive(k);
+        auto const r = classify(stated, t, AggregatePosition::Result);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_EQ(r->kind, AbiPassing::Kind::InRegisters) << "a 128-bit integer result under first_fpr";
+        ASSERT_EQ(r->pieces.size(), 1u) << "a 128-bit integer result under first_fpr";
+        EXPECT_EQ(r->pieces[0].cls, AbiPieceClass::Fpr);
+        EXPECT_EQ(r->pieces[0].byteOffset, 0u);
+        EXPECT_EQ(r->pieces[0].widthBytes, 16u);
+        auto const arg = classify(stated, t, AggregatePosition::Argument);
+        ASSERT_TRUE(arg.has_value());
+        EXPECT_EQ(arg->kind, AbiPassing::Kind::Memory) << "an argument keeps the by-size rule: Win64 passes it by "
+                                                          "reference";
+        auto const plain = classify(unstated, t, AggregatePosition::Result);
+        ASSERT_TRUE(plain.has_value());
+        EXPECT_EQ(plain->kind, AbiPassing::Kind::Memory) << "unstated, a result takes the by-size rule";
+        auto const sysv = classifySysV(t, ti, AggregatePosition::Result);
+        ASSERT_TRUE(sysv.has_value());
+        EXPECT_EQ(sysv->kind, AbiPassing::Kind::InRegisters);
+        ASSERT_EQ(sysv->pieces.size(), 2u) << "SysV's RAX:RDX, the rule unstated there";
+        EXPECT_EQ(sysv->pieces[0].cls, AbiPieceClass::Gpr);
+        EXPECT_EQ(sysv->pieces[1].cls, AbiPieceClass::Gpr);
+    }
+    TypeId const l = ti.primitive(TypeKind::I64);
+    for (TypeId const t : {ti.bitInt(128, true), structOf(ti, "W2", {l, l})}) {
+        auto const r = classify(stated, t, AggregatePosition::Result);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_EQ(r->kind, AbiPassing::Kind::Memory) << "a type that is no 128-bit integer keeps the by-size rule";
+    }
+}

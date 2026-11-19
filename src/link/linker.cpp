@@ -11,7 +11,7 @@
 #include "link/branch_veneers.hpp"
 #include "link/entry_trampoline.hpp"
 #include "link/extern_reference_gate.hpp"  // the ONE "this module uses that extern" (gate + static pull)
-#include "link/fresh_symbol_ids.hpp"   // ModuleSymbolIds / NewSpaceSymbolIds — the doors of a fresh id
+#include "link/fresh_symbol_ids.hpp"   // ModuleSymbolIds, and the home's doors of a fresh id
 #include "link/got_slots.hpp"          // lowerGotSlotReferences — the image's GOT slots
 #include "link/pc_relative_import_address.hpp"   // bindPcRelativeImportAddressUnits
 #include "link/pointer_reloc.hpp"      // absolutePointerRelocKind — the one pointer-slot predicate
@@ -336,8 +336,8 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
 //         (nothing later binds it) rejects LOUD, naming the symbol (never an
 //         IAT/DT_NEEDED entry with no owning image, which would defer the failure
 //         to the loader or read a null slot).
-//   * UNREFERENCED + NON-EAGER ⇒ DROPPED (bound OR unbound; returns false ⇒ the
-//     caller swaps in `filtered`): gcc's rule that an unused extern declaration
+//   * UNREFERENCED + NON-EAGER ⇒ DROPPED (bound OR unbound; the pass answers
+//     `Rewritten` and the caller swaps in `filtered`): gcc's rule that an unused extern declaration
 //     emits no import. A source `extern int f(int);` never called, or a bare
 //     prototype nobody uses (sqlite3.h declares the whole API; a config-gated
 //     symbol may be defined nowhere), is dead declaration surface. ★ The
@@ -351,9 +351,9 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
 //     IMAGE_IMPORT_DESCRIPTOR name).
 // AGNOSTIC: the drop is UNIFORM across elf/pe/macho — no format-name branch. The
 // only format-keyed decision is the EXEC-vs-later-binder reject, which reads the
-// schema's `allowsUndefinedImports()` (never a format name). Returns true when `m`
-// flowed through untouched (no drops), false when `filtered` holds the dropped-row
-// copy. Rejects (if any) are reported regardless of the return value.
+// schema's `allowsUndefinedImports()` (never a format name). Answers (`LinkPassOutcome`)
+// Unchanged when `m` flows through untouched (no drops), Rewritten when `filtered` holds
+// the dropped-row copy, and Refused when a referenced row was refused by name.
 // ── NAMING AN UNDEFINED SYMBOL ──────────────────────────────────────────────
 // D-DIAG-K-SYMBOLUNDEFINED-NAMES-NO-SYMBOL
 //
@@ -406,7 +406,7 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
            " this module, so it was minted by a producer and never declared)";
 }
 
-[[nodiscard]] bool rejectOrDropUnreferencedExterns(
+LinkPassOutcome rejectOrDropUnreferencedExterns(
     AssembledModule const& m,
     AssembledModule&       filtered,
     bool                   allowUndefinedExterns,
@@ -461,7 +461,7 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
             break;
         }
     }
-    if (!anyCandidate) return true;   // all named imports eager → nothing to gate
+    if (!anyCandidate) return LinkPassOutcome::Unchanged;   // all named imports eager → nothing to gate
     // Reference scan: every relocation target across functions AND data items,
     // read through the ONE statement of "this module uses that extern"
     // (`link/extern_reference_gate.hpp`) — the static-archive pull reads the same
@@ -482,6 +482,7 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
     // rather than each of the decisions below.
     std::unordered_set<std::uint32_t> const relocationTargets = relocationTargetIds(m);
     bool anyDrop = false;
+    bool rejected = false;   // a referenced row refused by name below: the pass answers Refused
     // ★★ D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE: the imports this link
     // resolves to NOTHING. A REFERENCED, UNBOUND, **WEAK** import on an artifact
     // that cannot carry an undefined symbol is not an error — a weak reference
@@ -548,6 +549,7 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
                     // An invariant of the lowering, refused rather than met
                     // wrongly: a slot read would load the header's first bytes
                     // as a pointer.
+                    rejected = true;
                     report(reporter, DiagnosticCode::K_SymbolUndefined,
                            DiagnosticSeverity::Error,
                            std::format(
@@ -619,6 +621,7 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
                     // change, and the darwin dylib refused with the generic
                     // undefined-symbol message instead of linking.
                 } else if (!allowUndefinedExterns && ext.isPreemptionReference) {
+                    rejected = true;
                     report(reporter, DiagnosticCode::K_SymbolUndefined,
                            DiagnosticSeverity::Error,
                            "cannot route the reference to '" + ext.mangledName
@@ -697,6 +700,7 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
                     // library defines is undefined here as well. The C runtime's
                     // own (`_tls_used`) is refused earlier, by the reader, with
                     // what it serves (D-LK-FOREIGN-OBJECT-INITIALIZER-TABLES-NEVER-RUN).
+                    rejected = true;
                     report(reporter, DiagnosticCode::K_SymbolUndefined,
                            DiagnosticSeverity::Error,
                            "undefined symbol '" + ext.mangledName + "' — a linked "
@@ -709,6 +713,7 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
                            "too: link an object or library that defines it "
                            "(`--resolve-library`).");
                 } else if (!allowUndefinedExterns) {
+                    rejected = true;
                     report(reporter, DiagnosticCode::K_SymbolUndefined,
                            DiagnosticSeverity::Error,
                            "undefined symbol '" + ext.mangledName + "' — the symbol "
@@ -728,7 +733,7 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
             anyDrop = true;   // unreferenced + non-eager ⇒ drop below (bound OR unbound)
         }
     }
-    if (!anyDrop) return true;   // rejects (if any) reported; module unchanged
+    if (!anyDrop) return rejected ? LinkPassOutcome::Refused : LinkPassOutcome::Unchanged;
     filtered = m;   // copy, then erase the unreferenced non-eager rows
     // The null-address symbols below are minted on `filtered` through its door, opened HERE, before any row is
     // erased: an erased row's id stays below the module's end (`link/fresh_symbol_ids.hpp`).
@@ -906,7 +911,7 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
     };
     for (auto& fn : filtered.functions) decideAll(fn.relocations, fn.bytes, /*inCode=*/true);
     for (auto& di : filtered.dataItems) decideAll(di.relocations, di.bytes, /*inCode=*/false);
-    if (refusedAny) return false;   // reported; `filtered` is not emission input
+    if (rejected || refusedAny) return LinkPassOutcome::Refused;   // reported; `filtered` is not emission input
     // ── THE NULL IMPORT SLOT ──────────────────────────────────────────────
     //    D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE
     //
@@ -955,7 +960,7 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
         filtered.dataItems.push_back(std::move(slot));
     }
     resolvedToNothing = std::move(nullBound);
-    return false;
+    return LinkPassOutcome::Rewritten;
 }
 
 // ── THE OBJECT-CARRIED DATA-IMPORT SLOT ───────────────────────────────
@@ -1061,7 +1066,7 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
 // relocations and on a target that addresses a slot with an absolute page
 // offset would split the pair (P68 round 9 made it the role — code — as the
 // cross-unit merge has it).
-[[nodiscard]] bool materializeObjectImportSlots(
+LinkPassOutcome materializeObjectImportSlots(
     AssembledModule const&    m,
     AssembledModule&          withSlots,
     ObjectFormatSchema const& fmt,
@@ -1071,7 +1076,7 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
     // The gate is two DECLARED facts and one ENGINE fact, never a format
     // identity: an artifact with no import walker (`!isImageFlavor()`) whose
     // format nonetheless declares that data imports bind through a slot.
-    if (fmt.isImageFlavor()) return true;
+    if (fmt.isImageFlavor()) return LinkPassOutcome::Unchanged;
     // THE THIRD PAIRING RULE (P54,
     // D-LK-PE-OBJECT-WEAK-FUNCTION-ADDR-REL32-TO-AN-ABSOLUTE-TARGET). A
     // RELOCATABLE format that declares `externCallDispatch: "indirect-slot"`
@@ -1098,7 +1103,7 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
                      "address as if it were a pointer. Declare "
                      "'objectImportSlot', or declare 'direct-plt' dispatch. "
                      "D-LK-PE-OBJECT-WEAK-FUNCTION-ADDR-REL32-TO-AN-ABSOLUTE-TARGET.");
-        return false;
+        return LinkPassOutcome::Refused;
     }
     if (fmt.dataImportBinding() != DataImportBinding::GotIndirect) {
         // The other half of the pairing rule: a format that declares the
@@ -1117,9 +1122,9 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
                          "through it. Declare 'dataImportBinding' too, or "
                          "remove the slot block. "
                          "D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET.");
-            return false;
+            return LinkPassOutcome::Refused;
         }
-        return true;
+        return LinkPassOutcome::Unchanged;
     }
     if (!fmt.objectImportSlot().has_value()) {
         report(reporter, DiagnosticCode::K_FormatLacksImportSupport,
@@ -1134,7 +1139,7 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
                      "would leave every extern data reference loading through "
                      "the import's own address. Declare 'objectImportSlot'. "
                      "D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET.");
-        return false;
+        return LinkPassOutcome::Refused;
     }
 
     // WHICH imports need a slot: those whose CODE MIR→LIR read through one —
@@ -1187,14 +1192,14 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
     for (auto const& ext : m.externImports) {
         if (ext.readThroughSlot) slotImports.insert(ext.symbol.v);
     }
-    if (slotImports.empty()) return true;
+    if (slotImports.empty()) return LinkPassOutcome::Unchanged;
     std::unordered_set<std::uint32_t> needSlot;
     for (auto const& fn : m.functions) {
         for (auto const& rel : fn.relocations) {
             if (slotImports.contains(rel.target.v)) needSlot.insert(rel.target.v);
         }
     }
-    if (needSlot.empty()) return true;
+    if (needSlot.empty()) return LinkPassOutcome::Unchanged;
 
     // The slot's own fixup, found by FORMULA (`absolutePointerRelocKind`, the
     // one scan `mergeModules` and the GOT-slot lowering ask too) at the width
@@ -1213,7 +1218,7 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
                            "format '{}' asks for cannot be filled by the final linker. "
                            "A slot with no fixup is a permanent null pointer.",
                            targetSchema.name(), pointerBytes, fmt.name()));
-        return false;
+        return LinkPassOutcome::Refused;
     }
 
     withSlots = m;   // copy, then append the slots and retarget the references
@@ -1231,7 +1236,7 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
         if (!needSlot.contains(ext.symbol.v)) continue;
         std::optional<SymbolId> const minted = ids.take(
             reporter, std::format("linker: the object-carried data-import slot for '{}'", ext.mangledName));
-        if (!minted.has_value()) return false;
+        if (!minted.has_value()) return LinkPassOutcome::Refused;
         SymbolId const slotSym = *minted;
         slotBySymbol.emplace(ext.symbol.v, slotSym);
 
@@ -1293,7 +1298,7 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
             if (it != slotBySymbol.end()) rel.target = it->second;
         }
     }
-    return false;   // caller must switch to `withSlots`
+    return LinkPassOutcome::Rewritten;   // the caller links `withSlots`
 }
 
 // LK11a — the cross-CU symbol merge + resolution, in three steps:
@@ -1951,11 +1956,14 @@ void resolveCrossCuSymbols(std::span<AssembledModule const> modules,
 // hardcoded "abs64" name / kind constant (the standing source/target/format agnosticism
 // veto). If no such row exists, fail loud (K_AbsolutePointerRelocMissing); a thunk slot
 // without its abs64 fixup would be a broken null pointer.
-AssembledModule mergeModules(std::span<AssembledModule const> modules,
-                             LinkedImage const&        image,
-                             TargetSchema const&       targetSchema,
-                             ObjectFormatSchema const& objectFormatSchema,
-                             DiagnosticReporter&       reporter) {
+// The merged module, or nullopt -- the merge refused it (reported): its id space was exhausted, or the merge stated an
+// Error of its own. It leaves ONLY through the merged numbering's REPORTED door (P69 f26e, B1).
+std::optional<AssembledModule> mergeModules(std::span<AssembledModule const> modules,
+                                            LinkedImage const&        image,
+                                            TargetSchema const&       targetSchema,
+                                            ObjectFormatSchema const& objectFormatSchema,
+                                            DiagnosticReporter&       reporter) {
+    std::size_t const errorsAtEntry = reporter.errorCount();
     AssembledModule combined;
 
     // How the REFERENCING code reads each import decides the reference-resolution
@@ -2057,10 +2065,11 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
     // `remap` for the question because `mergedIdFor` memoizes FOLDS into it before the
     // emission walk runs, making a folded key indistinguishable from a pre-assigned one.
     std::unordered_set<LinkedSymbolKey> winningKeys;
-    // The merged module's ids: a NEW counting space from 1, through its door (`link/fresh_symbol_ids.hpp`), which
-    // steps over a writer-reserved value -- the one id `mergedIdFor` keeps through the merge -- and, exhausted,
-    // reports the refusal once by name; the merge's caller refuses a merge that reported an error.
-    NewSpaceSymbolIds mergedIds{SymbolIdEnd{}, reporter, "linker: the merged module"};
+    // The merged module's ids: a NEW counting space from 1, through the home's REPORTED door
+    // (core/types/symbol_id_cursor.hpp), which steps over a writer-reserved value -- the one id `mergedIdFor` keeps
+    // through the merge -- and, exhausted, reports the refusal once by name; the merged module then leaves only
+    // through the door's seal, which refuses it.
+    ReportedSymbolIds mergedIds{SymbolIdEnd{}, linkRefusalSink(reporter), "linker: the merged module"};
     // ★ ONE FRESH id PER KEY, NEVER ONE PER NAME —
     // D-LK-LINKER-MERGE-DROPS-EVERY-ALIAS-ROW.
     // An alias set puts SEVERAL winning names on ONE key. Minting per name burned
@@ -2409,7 +2418,7 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
                std::string{targetSchema.name()} + "' declares no such relocation kind — "
                "the reference would dereference an un-relocated null slot. Add "
                "the absolute-64-bit relocation row to the target's *.target.json.");
-        return combined;  // half-merge aborted; caller's errorCount delta short-circuits emit
+        return mergedIds.withhold();  // half-merge aborted (reported above): the merged module is refused
     }
     for (auto const& ref : image.resolvedCrossCuRefs) {
         auto const dit = cuIdToIdx.find(ref.definition.cuId.v);
@@ -3236,7 +3245,10 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
         }
     }
     // combined.cuId stays default — the merged image is not a single CU.
-    return combined;
+    // THE SEAL: refused whole if the merged numbering was exhausted; withheld if the merge stated an Error of its
+    // own (its count is exact since D9(c): a dropped Error still counts).
+    if (reporter.errorCount() != errorsAtEntry) return mergedIds.withhold();
+    return mergedIds.seal(std::move(combined));
 }
 
 // ★★ A REFERENCE THAT STATED NO KIND, JUDGED ON THE DEFINITION THAT SURVIVES
@@ -3435,7 +3447,7 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
 // followed while each name stays unresolved, and a cycle is refused.
 // Afterwards no row states a fallback. A RELOCATABLE artifact never gets here:
 // its fallbacks are its final linker's, which the writer hands on as
-// directives. Returns TRUE when no row states one (`out` untouched).
+// directives. Answers Unchanged when no row states one (`out` untouched).
 //
 // ★ ONE FALLBACK STANDS PER NAME, BY THE ONE RULE (P69 H6c2, `standingFallback`):
 // a weak external's own default -- a row of WEAK binding, with the undefined
@@ -3443,9 +3455,9 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
 // two of one source, the first in the LINK's order (`linkPositionOf`), never the
 // order `modules` holds them in. A dropped fallback is warned about, and a name
 // whose standing statement is the absolute 0 keeps no fallback at all.
-[[nodiscard]] bool bindFallbackReferences(std::span<AssembledModule const> modules,
-                                          std::vector<AssembledModule>&    out,
-                                          DiagnosticReporter&              reporter) {
+LinkPassOutcome bindFallbackReferences(std::span<AssembledModule const> modules,
+                                       std::vector<AssembledModule>&    out,
+                                       DiagnosticReporter&              reporter) {
     bool anyStated = false;
     std::unordered_map<std::string, FallbackStatement> standingOf;
     for (std::size_t i = 0; i < modules.size(); ++i) {
@@ -3458,7 +3470,7 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
             if (!fresh) standingFallback(e.mangledName, it->second, std::move(*statement), reporter);
         }
     }
-    if (!anyStated) return true;
+    if (!anyStated) return LinkPassOutcome::Unchanged;
     std::unordered_map<std::string, std::string> fallbackOf;
     for (auto const& [name, statement] : standingOf) {
         if (!statement.fallback.empty()) fallbackOf.emplace(name, statement.fallback);
@@ -3517,7 +3529,7 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
                                        "through '{}', and nothing defines any name "
                                        "in it, so none of them can resolve.",
                                        e.mangledName, target));
-                    return false;
+                    return LinkPassOutcome::Refused;
                 }
                 target = next->second;
             }
@@ -3588,7 +3600,7 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
             m.externImports.erase(m.externImports.begin() + static_cast<std::ptrdiff_t>(*it));
         }
     }
-    return false;
+    return LinkPassOutcome::Rewritten;
 }
 
 // ── A RELOCATABLE ARTIFACT'S COMMON OVER THE WEAK DEFINITIONS IT OUTRANKS
@@ -3693,10 +3705,10 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
 // Only where the weak name is the ONLY external name of its body: under a
 // second one a relocation naming the body is that name's, and it stays.
 // An IMAGE needs none of it — nothing re-links one, and the merge's fold is the
-// by-name resolution. Returns TRUE when no unit is restated (`out` untouched).
-[[nodiscard]] bool restateWeakNameReferencesByRow(std::span<AssembledModule const> modules,
-                                                  std::vector<AssembledModule>&     out,
-                                                  DiagnosticReporter&               reporter) {
+// by-name resolution. Answers Unchanged when no unit is restated (`out` untouched).
+LinkPassOutcome restateWeakNameReferencesByRow(std::span<AssembledModule const> modules,
+                                               std::vector<AssembledModule>&     out,
+                                               DiagnosticReporter&               reporter) {
     std::unordered_set<std::string> byRow;
     for (auto const& m : modules) {
         for (auto const& s : m.symbols) {
@@ -3705,7 +3717,7 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
             }
         }
     }
-    if (byRow.empty()) return true;
+    if (byRow.empty()) return LinkPassOutcome::Unchanged;
     auto const isRestated = [&](AssembledModule const& m, std::size_t r) -> bool {
         ModuleSymbol const& row = m.symbols[r];
         if (row.referencedByName || !dss::link::format::referenceFollowsTheName(row.binding, row.name)
@@ -3725,7 +3737,7 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
     for (auto const& m : modules) {
         for (std::size_t r = 0; r < m.symbols.size() && !any; ++r) any = isRestated(m, r);
     }
-    if (!any) return true;
+    if (!any) return LinkPassOutcome::Unchanged;
     out.assign(modules.begin(), modules.end());
     for (auto& m : out) {
         for (std::size_t r = 0; r < m.symbols.size(); ++r) {
@@ -3733,11 +3745,10 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
             SymbolId const    id   = m.symbols[r].symbol;
             std::string const name = m.symbols[r].name;
             m.symbols[r].referencedByName = true;
-            if (!leaveTheIdToTheName(m, id, name, reporter)) return false;   // refused by name: the caller's
-                                                                           // error count tells it from a change
+            if (!leaveTheIdToTheName(m, id, name, reporter)) return LinkPassOutcome::Refused;   // refused by name
         }
     }
-    return false;
+    return LinkPassOutcome::Rewritten;
 }
 
 // ── TWO COPIES OF A SECTION GROUP, JUDGED BY THE KEPT COPY'S RULE (P69 fold 3d;
@@ -4067,13 +4078,13 @@ void unstateCopiesKept(std::vector<AssembledModule>& units, std::span<StatedCopy
 // A compiled unit's select-any definition beside a group of its name is one
 // copy of it too (`stateCompiledSelectAnyCopies`, which states it so before
 // this pass, and says why).
-// Returns TRUE when no unit loses a group (`out` untouched); FALSE with a
-// refusal reported, or with `out` the units without their lost groups.
-[[nodiscard]] bool discardLaterSectionGroups(std::span<AssembledModule const> modules,
-                                             std::span<StatedCopy const>       stated,
-                                             ObjectFormatSchema const&         format,
-                                             std::vector<AssembledModule>&     out,
-                                             DiagnosticReporter&               reporter) {
+// Answers Unchanged when no unit loses a group (`out` untouched), Refused with a
+// refusal reported, and Rewritten with `out` the units without their lost groups.
+LinkPassOutcome discardLaterSectionGroups(std::span<AssembledModule const> modules,
+                                          std::span<StatedCopy const>       stated,
+                                          ObjectFormatSchema const&         format,
+                                          std::vector<AssembledModule>&     out,
+                                          DiagnosticReporter&               reporter) {
     // The carriers of each group, in the order the link holds them; the groups in order of their first carrier,
     // then name.
     std::unordered_map<std::string_view, std::vector<std::size_t>> carriersOf;
@@ -4141,7 +4152,7 @@ void unstateCopiesKept(std::vector<AssembledModule>& units, std::span<StatedCopy
     }
     // The unit whose copy each group keeps.
     std::unordered_map<std::string_view, std::size_t> keeperOf;
-    bool refused = false;
+    bool refused = false;   // a copy refused by name: here, or where a lost copy is cut below
     for (std::string_view const group : groups) {
         std::vector<std::size_t> const& units = carriersOf.at(group);
         std::size_t                     k     = units.front();
@@ -4159,7 +4170,7 @@ void unstateCopiesKept(std::vector<AssembledModule>& units, std::span<StatedCopy
         }
         keeperOf.emplace(group, k);
     }
-    if (refused) return false;
+    if (refused) return LinkPassOutcome::Refused;
     // What each unit loses: every input section of a group another unit's copy of which is kept.
     std::vector<std::unordered_map<std::uint32_t, std::string_view>> lost(modules.size());
     bool any = false;
@@ -4170,7 +4181,7 @@ void unstateCopiesKept(std::vector<AssembledModule>& units, std::span<StatedCopy
         }
         any = any || !lost[i].empty();
     }
-    if (!any) return true;
+    if (!any) return LinkPassOutcome::Unchanged;
     // ── A LOST COPY THAT CARRIES A NAME THE DOCUMENT KEEPS IS THE ELECTION's (P69 fold 3d, the orchestrator's
     //    ruling of ledger 455) ─────────────────────────────────────────────────────────────────────────────────
     // Invariant: a name a lost copy carries is settled by the election alone (`resolveSettlingCarriedNames`, its
@@ -4335,6 +4346,7 @@ void unstateCopiesKept(std::vector<AssembledModule>& units, std::span<StatedCopy
             if (!refusedBytes.insert(id.v).second) return;
             std::string_view const group = lostIds.at(id.v);
             std::string const      name  = nameOf(id);
+            refused = true;
             report(reporter, DiagnosticCode::K_CrossCuMergeUnsupported, DiagnosticSeverity::Error,
                    std::format("linker: a relocation of linked unit #{} names the BYTES of {} — not a name of "
                                "it — and it lies in section group '{}', whose copy the link keeps from linked "
@@ -4356,6 +4368,7 @@ void unstateCopiesKept(std::vector<AssembledModule>& units, std::span<StatedCopy
             if (!id.valid() || !lostIds.contains(id.v)) return;
             std::string_view const group = lostIds.at(id.v);
             std::string const      name  = nameOf(id);
+            refused = true;
             report(reporter, DiagnosticCode::K_CrossCuMergeUnsupported, DiagnosticSeverity::Error,
                    std::format("linker: {} of linked unit #{} names that unit's own definition{} in section "
                                "group '{}', whose copy the link keeps from linked unit #{}. This format's linkers "
@@ -4427,6 +4440,7 @@ void unstateCopiesKept(std::vector<AssembledModule>& units, std::span<StatedCopy
                 ms.weakDefaultName.empty() ? std::string{lostIn->second} : ms.weakDefaultName;
             if (!answered.contains(ms.name) && !answered.contains(fallback)) {
                 // Its default went with the copy (a label of the lost section), and nothing else answers the name.
+                refused = true;
                 report(reporter, DiagnosticCode::K_SymbolUndefined, DiagnosticSeverity::Error,
                        std::format("linker: '{}' of linked unit #{} is a weak name whose default '{}' is a name of its "
                                    "copy in section group '{}', whose copy the link keeps from linked unit #{}: the "
@@ -4442,6 +4456,7 @@ void unstateCopiesKept(std::vector<AssembledModule>& units, std::span<StatedCopy
                 if (own->fallbackName.empty()) {
                     own->fallbackName = fallback;
                 } else if (own->fallbackName != fallback) {
+                    refused = true;
                     // ★ REFUSED, AS BOTH REFERENCE LINKERS REFUSE IT (P69 H6c2, ✔MEASURED 2026-11-16, u9 F3: lane
                     // cs's carried-alias units with b's own `/alternatename:` for the weak name, link.exe LNK1120 and
                     // GNU ld "undefined reference", in BOTH orders). The weak name's own default would stand over the
@@ -4460,7 +4475,7 @@ void unstateCopiesKept(std::vector<AssembledModule>& units, std::span<StatedCopy
             }
             std::optional<SymbolId> const staysId = ids.take(
                 reporter, std::format("linker: the reference row that keeps the weak name '{}'", ms.name));
-            if (!staysId.has_value()) return false;   // refused by name; the caller's error count says so
+            if (!staysId.has_value()) return LinkPassOutcome::Refused;   // refused by name
             ExternImport stays;
             stays.symbol       = *staysId;
             stays.mangledName  = ms.name;
@@ -4478,7 +4493,7 @@ void unstateCopiesKept(std::vector<AssembledModule>& units, std::span<StatedCopy
             m.sectionGroupRuleOf.erase(std::string{group});
         }
     }
-    return false;
+    return refused ? LinkPassOutcome::Refused : LinkPassOutcome::Rewritten;
 }
 
 // ── A COMMON SYMBOL'S STORAGE (P69,
@@ -4519,7 +4534,7 @@ void unstateCopiesKept(std::vector<AssembledModule>& units, std::span<StatedCopy
 // and one object cannot carry a common and a definition of one name, so where a
 // unit of it defines the name one of the two goes: a definition the common
 // yields to still turns each common into a reference, and a WEAK one the common
-// outranks gives the NAME up (`handTheNameToTheCommon`). Returns TRUE when no
+// outranks gives the NAME up (`handTheNameToTheCommon`). Answers Unchanged when no
 // row is a common (`out` untouched).
 //
 // The alignment a definition an object reader cut from a section HAS (P69, the
@@ -4541,10 +4556,10 @@ void unstateCopiesKept(std::vector<AssembledModule>& units, std::span<StatedCopy
     return std::min(ofSection, ofOffset);
 }
 
-[[nodiscard]] bool allocateCommonDefinitions(std::span<AssembledModule const> modules,
-                                             ObjectFormatSchema const&         format,
-                                             std::vector<AssembledModule>&     out,
-                                             DiagnosticReporter&               reporter) {
+LinkPassOutcome allocateCommonDefinitions(std::span<AssembledModule const> modules,
+                                          ObjectFormatSchema const&         format,
+                                          std::vector<AssembledModule>&     out,
+                                          DiagnosticReporter&               reporter) {
     bool const image = format.isImageFlavor();
     struct CommonRow {
         std::size_t module = 0;
@@ -4561,7 +4576,7 @@ void unstateCopiesKept(std::vector<AssembledModule>& units, std::span<StatedCopy
             it->second.push_back(CommonRow{mi, k});
         }
     }
-    if (commonsOf.empty()) return true;
+    if (commonsOf.empty()) return LinkPassOutcome::Unchanged;
     // What each definition answers (`commonYieldsToDefinition`, the ONE answer
     // the archive search asks of a member too): the names a definition replaces
     // the common of — every strong one, a weak one where the link's document
@@ -4677,7 +4692,7 @@ void unstateCopiesKept(std::vector<AssembledModule>& units, std::span<StatedCopy
                                "System V gABI) is format '{}''s 'commonYieldsTo', which "
                                "it does not state -- refusing rather than guess one.",
                                name, format.name()));
-            return false;
+            return LinkPassOutcome::Refused;
         }
         // Otherwise the common outranks every weak definition of the name: ELF's
         // answer, and on every format a weak definition whose own spelling yields
@@ -4686,7 +4701,7 @@ void unstateCopiesKept(std::vector<AssembledModule>& units, std::span<StatedCopy
         if (!image) {
             // The final linker's to allocate: the artifact hands the common on,
             // and each weak definition it outranks gives the name up.
-            if (weakDefinitions.contains(name) && !handTheNameToTheCommon(name, out, reporter)) return false;
+            if (weakDefinitions.contains(name) && !handTheNameToTheCommon(name, out, reporter)) return LinkPassOutcome::Refused;
             continue;
         }
         CommonRow        winner     = rows.front();
@@ -4715,7 +4730,7 @@ void unstateCopiesKept(std::vector<AssembledModule>& units, std::span<StatedCopy
                                "bytes, which is not a power of two in [1, {}]; no storage "
                                "can be allocated for it.",
                                name, alignment, Alignment::kMaxBytes));
-            return false;
+            return LinkPassOutcome::Refused;
         }
         ExternImport const& w = modules[winner.module].externImports[winner.row];
         AssembledModule&    m = out[winner.module];
@@ -4739,7 +4754,7 @@ void unstateCopiesKept(std::vector<AssembledModule>& units, std::span<StatedCopy
                                         + static_cast<std::ptrdiff_t>(*it));
         }
     }
-    return false;
+    return LinkPassOutcome::Rewritten;
 }
 
 } // namespace
@@ -4777,12 +4792,12 @@ gotSlotDirectTwin(TargetSchema const& target, TargetRelocationInfo const& gotRow
     return twin;
 }
 
-bool lowerGotSlotReferences(AssembledModule const&    in,
-                            AssembledModule&          out,
-                            TargetSchema const&       target,
-                            ObjectFormatSchema const& format,
-                            DiagnosticReporter&       reporter,
-                            std::span<SymbolId const> resolvedToNothing) {
+LinkPassOutcome lowerGotSlotReferences(AssembledModule const&    in,
+                                       AssembledModule&          out,
+                                       TargetSchema const&       target,
+                                       ObjectFormatSchema const& format,
+                                       DiagnosticReporter&       reporter,
+                                       std::span<SymbolId const> resolvedToNothing) {
     // A relocatable artifact keeps every GOT relocation its format can SPELL
     // for the final linker — DSS's own ELF and Mach-O objects write them
     // (`externAddrBinding: got`). A GOT reference the format has NO wire type
@@ -4818,7 +4833,7 @@ bool lowerGotSlotReferences(AssembledModule const&    in,
     for (auto const& fn : in.functions) {
         for (auto const& rel : fn.relocations) any = any || lowered(rel);
     }
-    if (relocatable && !any) return true;   // every GOT reference is the final linker's
+    if (relocatable && !any) return LinkPassOutcome::Unchanged;   // every GOT reference is the final linker's
     // A GOT-slot-relative relocation names an INSTRUCTION field; one in a data
     // item has no meaning this lowering could preserve, so it is refused by
     // name rather than left for a writer to misapply.
@@ -4832,10 +4847,10 @@ bool lowerGotSlotReferences(AssembledModule const&    in,
                                "field that loads a pointer from a slot — in a data "
                                "item it has no meaning this link can apply.",
                                di.symbol.v, target.relocationInfo(rel.kind)->name));
-            return false;
+            return LinkPassOutcome::Refused;
         }
     }
-    if (!any) return true;
+    if (!any) return LinkPassOutcome::Unchanged;
 
     // The slot is one POINTER, of the format's declared width, filled through
     // the target's absolute pointer relocation of that width. The width is the
@@ -4851,7 +4866,7 @@ bool lowerGotSlotReferences(AssembledModule const&    in,
                            "format '{}' states no pointer width for its data model, "
                            "so no slot can be sized.",
                            format.name()));
-        return false;
+        return LinkPassOutcome::Refused;
     }
     std::uint64_t const ptrBytes = *ptrWidth;
     auto const absPtrKind =
@@ -4865,7 +4880,7 @@ bool lowerGotSlotReferences(AssembledModule const&    in,
                            "image-relative) to fill one — a slot with no fixup would "
                            "be a permanent null pointer.",
                            target.name(), ptrBytes));
-        return false;
+        return LinkPassOutcome::Refused;
     }
     std::unordered_set<std::uint32_t> const nothing = [&] {
         std::unordered_set<std::uint32_t> s;
@@ -4891,7 +4906,7 @@ bool lowerGotSlotReferences(AssembledModule const&    in,
                 if (twinIt->second == nullptr) {
                     report(reporter, DiagnosticCode::K_RelocationKindMismatch,
                            DiagnosticSeverity::Error, "linker: " + why + ".");
-                    return false;
+                    return LinkPassOutcome::Refused;
                 }
             }
             GotSlotKey const key = gotSlotKeyFor(rel, f);
@@ -4910,10 +4925,10 @@ bool lowerGotSlotReferences(AssembledModule const&    in,
                                "lld refuses the misaligned load), so it is refused "
                                "rather than guessed.",
                                tri->name, key.addend, key.addend));
-                    return false;
+                    return LinkPassOutcome::Refused;
                 }
                 std::optional<SymbolId> const minted = ids.take(reporter, "linker: a GOT slot");
-                if (!minted.has_value()) return false;
+                if (!minted.has_value()) return LinkPassOutcome::Refused;
                 SymbolId const slotSym = *minted;
                 slotIt->second = slotSym;
                 AssembledData slot;
@@ -4945,7 +4960,7 @@ bool lowerGotSlotReferences(AssembledModule const&    in,
             if (f.slotHoldsAddend) rel.addend = 0;   // it lives in the slot now
         }
     }
-    return false;   // caller switches to `out`
+    return LinkPassOutcome::Rewritten;   // the caller links `out`
 }
 
 LinkedImage link(std::span<AssembledModule const> modules,
@@ -5012,18 +5027,19 @@ LinkedImage link(std::span<AssembledModule const> modules,
     // name is judged as the copy its object would be (`stateCompiledSelectAnyCopies`).
     std::vector<AssembledModule> groupBoundStorage;   // populated only when a group is discarded
     {
-        std::size_t const              errsBeforeGroups = reporter.errorCount();
         std::vector<AssembledModule>   statedStorage;   // populated only when a copy is stated
         std::vector<StatedCopy> const  stated = stateCompiledSelectAnyCopies(modules, objectFormatSchema, statedStorage);
         std::span<AssembledModule const> const judged =
             stated.empty() ? modules : std::span<AssembledModule const>{statedStorage};
-        if (!discardLaterSectionGroups(judged, stated, objectFormatSchema, groupBoundStorage, reporter)) {
-            if (reporter.errorCount() != errsBeforeGroups) {
+        switch (discardLaterSectionGroups(judged, stated, objectFormatSchema, groupBoundStorage, reporter)) {
+            case LinkPassOutcome::Unchanged: break;
+            case LinkPassOutcome::Rewritten:
+                unstateCopiesKept(groupBoundStorage, stated);
+                modules = std::span<AssembledModule const>{groupBoundStorage};
+                break;
+            case LinkPassOutcome::Refused:   // a group's copies refused by name
                 image.resolvedFuncCount = 0;
                 return image;
-            }
-            unstateCopiesKept(groupBoundStorage, stated);
-            modules = std::span<AssembledModule const>{groupBoundStorage};
         }
     }
     // P69 (D-LK-OBJECT-READERS-MISREAD-COMMON-SYMBOLS): a COMMON row is a
@@ -5034,14 +5050,12 @@ LinkedImage link(std::span<AssembledModule const> modules,
     // hands on each one no unit of it defines.
     std::vector<AssembledModule> commonBoundStorage;   // populated only when a row is a common
     {
-        std::size_t const errsBeforeCommons = reporter.errorCount();
-        if (!allocateCommonDefinitions(modules, objectFormatSchema, commonBoundStorage,
-                                       reporter)) {
-            if (reporter.errorCount() != errsBeforeCommons) {
+        switch (allocateCommonDefinitions(modules, objectFormatSchema, commonBoundStorage, reporter)) {
+            case LinkPassOutcome::Unchanged: break;
+            case LinkPassOutcome::Rewritten: modules = std::span<AssembledModule const>{commonBoundStorage}; break;
+            case LinkPassOutcome::Refused:   // a common refused by name
                 image.resolvedFuncCount = 0;
                 return image;
-            }
-            modules = std::span<AssembledModule const>{commonBoundStorage};
         }
     }
     // P69 (D-LK-COFF-READER-SKIPPED-EVERY-LINKER-DIRECTIVE): a name a foreign
@@ -5052,13 +5066,12 @@ LinkedImage link(std::span<AssembledModule const> modules,
     // decides it; a relocatable artifact hands it on to its final linker.
     std::vector<AssembledModule> fallbackBoundStorage;   // populated only when a row states one
     if (objectFormatSchema.isImageFlavor()) {
-        std::size_t const errsBeforeFallbacks = reporter.errorCount();
-        if (!bindFallbackReferences(modules, fallbackBoundStorage, reporter)) {
-            if (reporter.errorCount() != errsBeforeFallbacks) {
+        switch (bindFallbackReferences(modules, fallbackBoundStorage, reporter)) {
+            case LinkPassOutcome::Unchanged: break;
+            case LinkPassOutcome::Rewritten: modules = std::span<AssembledModule const>{fallbackBoundStorage}; break;
+            case LinkPassOutcome::Refused:   // a fallback refused by name
                 image.resolvedFuncCount = 0;
                 return image;
-            }
-            modules = std::span<AssembledModule const>{fallbackBoundStorage};
         }
     }
     // P69 review M1 (c) + MINOR 8 (D-LK-PE-IMPORT-ADDRESS-SLOT-RESIDUE): a
@@ -5068,14 +5081,13 @@ LinkedImage link(std::span<AssembledModule const> modules,
     // entry, or the reference is refused). Per UNIT, so before the merge.
     std::vector<AssembledModule> unitBoundStorage;   // populated only when units change
     {
-        std::size_t const errsBeforeUnits = reporter.errorCount();
-        if (!bindPcRelativeImportAddressUnits(modules, unitBoundStorage, targetSchema,
-                                              objectFormatSchema, reporter)) {
-            if (reporter.errorCount() != errsBeforeUnits) {
+        switch (bindPcRelativeImportAddressUnits(modules, unitBoundStorage, targetSchema,
+                                                 objectFormatSchema, reporter)) {
+            case LinkPassOutcome::Unchanged: break;
+            case LinkPassOutcome::Rewritten: modules = std::span<AssembledModule const>{unitBoundStorage}; break;
+            case LinkPassOutcome::Refused:   // a unit's displacement to an import refused by name
                 image.resolvedFuncCount = 0;
                 return image;
-            }
-            modules = std::span<AssembledModule const>{unitBoundStorage};
         }
     }
     // P69 fold 2 (THE WEAK-NAME RULE's second half): a relocatable artifact in
@@ -5085,13 +5097,12 @@ LinkedImage link(std::span<AssembledModule const> modules,
     // (`restateWeakNameReferencesByRow`).
     std::vector<AssembledModule> weakNameBoundStorage;   // populated only when a unit is restated
     if (!objectFormatSchema.isImageFlavor()) {
-        std::size_t const errsBeforeRestating = reporter.errorCount();
-        if (!restateWeakNameReferencesByRow(modules, weakNameBoundStorage, reporter)) {
-            if (reporter.errorCount() != errsBeforeRestating) {
+        switch (restateWeakNameReferencesByRow(modules, weakNameBoundStorage, reporter)) {
+            case LinkPassOutcome::Unchanged: break;
+            case LinkPassOutcome::Rewritten: modules = std::span<AssembledModule const>{weakNameBoundStorage}; break;
+            case LinkPassOutcome::Refused:   // a weak name's restatement refused by name
                 image.resolvedFuncCount = 0;
                 return image;
-            }
-            modules = std::span<AssembledModule const>{weakNameBoundStorage};
         }
     }
     // N>1: cross-CU merge (LK11a resolution + LK11b pre-merge emission). Validate each
@@ -5142,11 +5153,12 @@ LinkedImage link(std::span<AssembledModule const> modules,
         // relocation kind by formula (thunk-slot minting) — never by a hardcoded name;
         // `objectFormatSchema` so the reference-resolution mechanism keys on the format's
         // DECLARED `externCallDispatch` (direct bind vs indirect thunk slot — c154).
-        mergedStorage = mergeModules(modules, image, targetSchema,
-                                     objectFormatSchema, reporter);
-        if (reporter.errorCount() != errsBeforeMerge) {
-            return image;  // merge fail-loud (ambiguous entry / cross-CU ref pending).
+        std::optional<AssembledModule> merged = mergeModules(modules, image, targetSchema,
+                                                             objectFormatSchema, reporter);
+        if (!merged) {
+            return image;  // merge fail-loud, reported (ambiguous entry / cross-CU ref pending / ids exhausted).
         }
+        mergedStorage = std::move(*merged);
         selectedInput = &mergedStorage;
     } else if (codeUnitMemberOrder(modules[0]).has_value()) {
         // ONE unit, not merged, whose reader emitted a code unit's members out of
@@ -5205,26 +5217,24 @@ LinkedImage link(std::span<AssembledModule const> modules,
         return image;
     }
     {
-        std::size_t const errsBeforeUnbound = reporter.errorCount();
         std::uint64_t const ptrBytes = *formatPointerBytes;
         auto const* const fmtBackend = objectFormatSchema.backend();
         // D-LK-WEAK-UNDEFINED-SYMBOL-NAMED-DIRECTLY-IS-NOT-ADDRESS-ZERO (P69): how
         // the INPUT units read each weak name — through a slot, and directly —
         // asked before the merge folds their rows into one per name.
         WeakSlotReaders const weakSlotReaders = weakSlotReadersOf(modules, targetSchema);
-        if (!rejectOrDropUnreferencedExterns(*selectedInput, unboundFilteredStorage,
-                                        objectFormatSchema.allowsUndefinedImports(),
-                                        fmtBackend != nullptr
-                                            && fmtBackend->realizesCoalescingScopeReferences(),
-                                        ptrBytes, targetSchema, objectFormatSchema,
-                                        weakSlotReaders, reporter,
-                                        weakResolvedToNothing)) {
-            selectedInput = &unboundFilteredStorage;
-        }
-        if (reporter.errorCount() != errsBeforeUnbound) {
-            // Undefined symbol(s) reported — not valid emission input.
-            image.resolvedFuncCount = 0;
-            return image;
+        switch (rejectOrDropUnreferencedExterns(*selectedInput, unboundFilteredStorage,
+                                                objectFormatSchema.allowsUndefinedImports(),
+                                                fmtBackend != nullptr
+                                                    && fmtBackend->realizesCoalescingScopeReferences(),
+                                                ptrBytes, targetSchema, objectFormatSchema,
+                                                weakSlotReaders, reporter,
+                                                weakResolvedToNothing)) {
+            case LinkPassOutcome::Unchanged: break;
+            case LinkPassOutcome::Rewritten: selectedInput = &unboundFilteredStorage; break;
+            case LinkPassOutcome::Refused:   // undefined symbol(s) reported by name: not emission input
+                image.resolvedFuncCount = 0;
+                return image;
         }
     }
     // D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET: give a
@@ -5239,15 +5249,14 @@ LinkedImage link(std::span<AssembledModule const> modules,
     // one only when it allows them.
     AssembledModule slotStorage;   // populated only when slots are minted
     {
-        std::size_t const errsBeforeSlots = reporter.errorCount();
-        if (!materializeObjectImportSlots(*selectedInput, slotStorage,
-                                          objectFormatSchema, targetSchema,
-                                          *formatPointerBytes, reporter)) {
-            if (reporter.errorCount() != errsBeforeSlots) {
+        switch (materializeObjectImportSlots(*selectedInput, slotStorage,
+                                             objectFormatSchema, targetSchema,
+                                             *formatPointerBytes, reporter)) {
+            case LinkPassOutcome::Unchanged: break;
+            case LinkPassOutcome::Rewritten: selectedInput = &slotStorage; break;
+            case LinkPassOutcome::Refused:   // an object's data-import slot refused by name
                 image.resolvedFuncCount = 0;
                 return image;
-            }
-            selectedInput = &slotStorage;
         }
     }
     // P68 round 11 (D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS,
@@ -5263,15 +5272,14 @@ LinkedImage link(std::span<AssembledModule const> modules,
     // unifier and the walkers, which then never see a GOT-slot-relative kind.
     AssembledModule gotSlotStorage;   // populated only when slots are minted
     {
-        std::size_t const errsBeforeGot = reporter.errorCount();
-        if (!lowerGotSlotReferences(*selectedInput, gotSlotStorage, targetSchema,
-                                    objectFormatSchema, reporter,
-                                    weakResolvedToNothing)) {
-            if (reporter.errorCount() != errsBeforeGot) {
+        switch (lowerGotSlotReferences(*selectedInput, gotSlotStorage, targetSchema,
+                                       objectFormatSchema, reporter,
+                                       weakResolvedToNothing)) {
+            case LinkPassOutcome::Unchanged: break;
+            case LinkPassOutcome::Rewritten: selectedInput = &gotSlotStorage; break;
+            case LinkPassOutcome::Refused:   // a GOT slot refused by name
                 image.resolvedFuncCount = 0;
                 return image;
-            }
-            selectedInput = &gotSlotStorage;
         }
     }
     // P69 round 4 (D-LK-COFF-READER-SKIPPED-EVERY-LINKER-DIRECTIVE): what the
@@ -5911,6 +5919,7 @@ LinkedImage link(std::span<AssembledModule const> modules,
     // callers in `tests/` still use and which two tests explicitly assert
     // reject a foreign schema — but nothing routed through the linker can
     // trip them. See the note in `src/link/format/elf.cpp`.
+    bool walkerRefused = false;
     if (auto const* backend = objectFormatSchema.backend();
         backend != nullptr) {
         // `request` goes to EVERY backend now. That is safe for exactly the
@@ -5923,8 +5932,11 @@ LinkedImage link(std::span<AssembledModule const> modules,
         // silently dropped" stays unreachable, now by a capability chain
         // instead of by a hand-maintained argument list that had to be
         // remembered.
-        image.bytes = backend->encode(module, targetSchema,
-                                      objectFormatSchema, reporter, effectiveRequest);
+        // P69 f26e (B1): the walker's answer IS its refusal -- `nullopt` (reported); no byte is kept.
+        std::optional<std::vector<std::uint8_t>> encoded =
+            backend->encode(module, targetSchema, objectFormatSchema, reporter, effectiveRequest);
+        if (encoded.has_value()) image.bytes = std::move(*encoded);
+        else                     walkerRefused = true;
     } else {
         report(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
                DiagnosticSeverity::Error,
@@ -5940,7 +5952,10 @@ LinkedImage link(std::span<AssembledModule const> modules,
     // the pre-walker unifier set. Without this gate, `image.ok()`
     // returns true while `image.bytes` is empty — silent contract
     // violation. Same shape as the pre-walker gate above.
-    if (reporter.errorCount() != errorsAtEntry) {
+    // ★ P69 f26e (B1): a walker that answers its refusal as a value (PE) is read by that value; the count
+    // stays for the walkers whose free functions still refuse with no bytes beside an Error (ELF, Mach-O,
+    // SPIR-V, wasm), and it is sound since the reporter counts what its gates drop (D9(c)).
+    if (walkerRefused || reporter.errorCount() != errorsAtEntry) {
         image.resolvedFuncCount = 0;
     } else {
         // Clean conclusion: the walker produced bytes with no new diagnostic.

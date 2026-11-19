@@ -1130,6 +1130,17 @@ public:
     [[nodiscard]] std::span<RuleId const>
     altRuleBranches(SchemaCursor cur) const noexcept;
 
+    // ★ P69 (lane `cs`, fold f26e): THE POSITION THAT DECIDES `tok` WHEN IT IS A NESTED
+    // SPECULATIVE CHOICE. At a NON-speculative AltChoice cursor, follow the branch whose
+    // expected set holds `tok` (first match, the routing `advance` does) through
+    // NON-speculative AltChoice positions of the same rule, and answer the first
+    // SPECULATIVE AltChoice reached (`detail::enumerationEnters`): the parser moves its
+    // cursor there and dispatches the choice in place, with its own lookahead, probes and
+    // skip. Invalid when the route reaches a token or rule slot (the caller's own routes take
+    // those), at a speculative or non-AltChoice cursor, and for an invalid cursor.
+    [[nodiscard]] SchemaCursor nestedSpeculativeChoice(SchemaCursor cur,
+                                                       SchemaTokenId tok) const noexcept;
+
     [[nodiscard]] std::span<SchemaTokenId const> expectedSet(SchemaCursor cur) const noexcept;
 
     // c97 O(1) membership queries (bitset-backed; built once at schema

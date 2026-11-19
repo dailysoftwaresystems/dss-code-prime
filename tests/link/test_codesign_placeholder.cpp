@@ -140,7 +140,7 @@ encodePeUntrampolined(AssembledModule           mod,  // by value: stamped copy
                       ObjectFormatSchema const& fmt,
                       DiagnosticReporter&       reporter) {
     mod.imageEntryOverride = std::size_t{0};
-    return pe::encode(mod, target, fmt, reporter);
+    return pe::encode(mod, target, fmt, reporter).value();
 }
 
 } // namespace

@@ -1,0 +1,1 @@
+            return effect == AttributeEffect::Align;

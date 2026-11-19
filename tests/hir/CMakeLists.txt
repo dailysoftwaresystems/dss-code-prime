@@ -174,3 +174,7 @@ dss_add_test(NAME hir/test_frontend_deep_nesting_costs_heap
 dss_add_test(NAME hir/test_typeof_of_a_vla SOURCES test_typeof_of_a_vla.cpp)
 dss_add_test(NAME hir/test_a_variable_length_operand_is_evaluated
              SOURCES test_a_variable_length_operand_is_evaluated.cpp)
+# P69 (lane `cs`, fold f26e) — D-CSUBSET-ALIGNOF-VALUE-OVERALIGNED-OBJECT: both tiers' answer for `__alignof__` of a
+# declaration, over probe n5w's cells.
+dss_add_test(NAME hir/test_alignof_answers_a_declarations_alignment
+             SOURCES test_alignof_answers_a_declarations_alignment.cpp)

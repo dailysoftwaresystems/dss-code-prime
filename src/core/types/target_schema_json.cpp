@@ -4693,11 +4693,13 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 // instances carry the most `$...Comment` prose keys - which is
                 // exactly why the carve-out lives in `rejectUnknownKeys` as a
                 // PREFIX test rather than a literal `"$comment"` entry.
-                static constexpr std::array<std::string_view, 31> kCallConvKeys{
+                static constexpr std::array<std::string_view, 32> kCallConvKeys{
                     "name",
                     // P69 (lane `cs`, fold f26c, main's ledger 454): the row this one derives
                     // from (above), and what an X87UP eightbyte not preceded by X87 becomes.
                     "derivesFrom", "x87UpWithoutX87",
+                    // P69 (lane `cs`, fold f26e): where a 128-bit integer result comes back.
+                    "integer128Result",
                     "argGprs", "argFprs", "returnGprs", "returnFprs",
                     "callerSaved", "calleeSaved",
                     // D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT:
@@ -5063,6 +5065,32 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                               aggregateClassKindName(cc.aggregate.classification)));
                     } else {
                         cc.aggregate.x87UpWithoutX87 = *k;
+                    }
+                }
+                // ★ P69 (lane `cs`, fold f26e -- D-TARGET-WIN64-INT128-RESULT-GOES-THROUGH-A-HIDDEN-POINTER-NOT-XMM0):
+                // OPTIONAL -- where a 128-bit INTEGER result comes back (`Integer128Result`,
+                // aggregate_layout.hpp): `aggregate` (the classification's own answer) or `first_fpr` (one
+                // 16-byte piece in the first FP return register). Absent ⇒ aggregate. A wrong type or an
+                // unknown spelling is refused, naming the set; a row whose FP return registers are none
+                // cannot state `first_fpr` (it would name a register the row has not got).
+                if (c.contains("integer128Result")) {
+                    json const& v = c.at("integer128Result");
+                    std::optional<Integer128Result> const k =
+                        v.is_string() ? integer128ResultFromName(v.get<std::string>()) : std::nullopt;
+                    if (!k.has_value()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("{}/integer128Result", ccPath),
+                                  std::format("'integer128Result' must name where a 128-bit integer result "
+                                              "comes back -- accepted: {}",
+                                              detail::renderAllowedList(allNames(kInteger128ResultTable),
+                                                                        " / ")));
+                    } else if (*k == Integer128Result::InTheFirstFpr && cc.returnFprs.empty()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("{}/integer128Result", ccPath),
+                                  "'integer128Result' is 'first_fpr', and this row declares no "
+                                  "'returnFprs' to return it in");
+                    } else {
+                        cc.aggregate.integer128Result = *k;
                     }
                 }
                 if (c.contains("aggregateStackExhaustsRegisters")) {

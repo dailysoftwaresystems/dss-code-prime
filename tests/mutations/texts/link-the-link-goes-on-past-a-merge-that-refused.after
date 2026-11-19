@@ -1,2 +1,3 @@
-        mergedStorage = mergeModules(modules, image, targetSchema,
-                                     objectFormatSchema, reporter);
+        std::optional<AssembledModule> merged = mergeModules(modules, image, targetSchema,
+                                                             objectFormatSchema, reporter);
+        mergedStorage = merged.has_value() ? std::move(*merged) : AssembledModule{};

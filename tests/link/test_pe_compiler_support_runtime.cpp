@@ -315,11 +315,10 @@ int main(int argc, char **argv) {
     EXCEPTION_RECORD record = {0};
     record.ExceptionCode  = 0xE0000002u;
     record.ExceptionFlags = unwinding ? EXCEPTION_UNWINDING : 0u;
-    /* A CONTEXT -- x64: 1232 bytes, 16-aligned, Rsp at 0x98 (winnt.h); DSS's windows.h declares its pointer type
-     * alone -- its Rsp a stack address: the context a dispatcher hands is the thread's. */
-    DWORD64        context_words[156] = {0};
-    PCONTEXT const context            = (PCONTEXT)(((ULONG_PTR)context_words + 15u) & ~(ULONG_PTR)15u);
-    ((DWORD64 *)context)[0x98 / 8]    = (DWORD64)establisher;
+    /* A CONTEXT whose Rsp is a stack address: the context a dispatcher hands is the thread's. */
+    CONTEXT        context_record = {0};
+    PCONTEXT const context        = &context_record;
+    context->Rsp                  = (DWORD64)establisher;
     DISPATCHER_CONTEXT dispatch = {0};
     dispatch.ControlPc        = (ULONG_PTR)covered;
     dispatch.ImageBase        = base;

@@ -209,6 +209,10 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_ImplicitDeclarationConflicts";
         case DiagnosticCode::S_PrototypeIncompatibleWithADeclarationWithoutOne:
             return "S_PrototypeIncompatibleWithADeclarationWithoutOne";
+        case DiagnosticCode::S_AsmLabelMisplaced:
+            return "S_AsmLabelMisplaced";
+        case DiagnosticCode::S_AsmLabelOnTypedef:
+            return "S_AsmLabelOnTypedef";
         case DiagnosticCode::H_StaticInitializerNotFolded:
             return "H_StaticInitializerNotFolded";
         case DiagnosticCode::H_NonVoidFunctionEndReachable:
@@ -431,6 +435,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::H_SehLabelAddress:          return "H_SehLabelAddress";
         case DiagnosticCode::H_SehRegionInsideAFilter:   return "H_SehRegionInsideAFilter";
         case DiagnosticCode::H_VisibilityWrittenAsAnother: return "H_VisibilityWrittenAsAnother";
+        case DiagnosticCode::H_SymbolIdSpaceExhausted:   return "H_SymbolIdSpaceExhausted";
         case DiagnosticCode::H_WideCharSurrogateUnsupported: return "H_WideCharSurrogateUnsupported";
         case DiagnosticCode::H_Utf8CharLiteralOutOfRange: return "H_Utf8CharLiteralOutOfRange";
         case DiagnosticCode::H_WideCharValueUnrepresentable: return "H_WideCharValueUnrepresentable";

@@ -249,6 +249,31 @@ elseif(MSVC)
     add_compile_options(/we4062)
 endif()
 
+# ── A DISCARDED [[nodiscard]] RESULT IS AN ERROR (P69 fold f26e, lane `cs`) ──
+# A function that returns a REFUSAL AS A VALUE -- a door of fresh SymbolIds and
+# every hop between it and the output it refuses (`LinkPassOutcome`, the merge's
+# sealed module, a reader's optional, the format writer's bytes) -- is
+# `[[nodiscard]]`, and a caller that drops the value drops the refusal with it.
+# A warning nobody reads is how a dropped refusal ships; so the discard is an
+# ERROR on every compiler. gcc files it under `-Wunused-result` whether the
+# attribute sits on the function or on the returned TYPE; clang files a function's
+# under `-Wunused-result` and a TYPE's (`LinkPassOutcome`, an `enum class`) under
+# `-Wunused-value` -- MEASURED, AppleClang 21 (macos-arm64-debug, host run
+# 20261119-031519-d5a9deb0): with `-Werror=unused-result` alone that discard was a
+# warning and the build went on, which link/a_discarded_link_pass_outcome_does_not_compile
+# read red -- so clang takes both groups. MSVC files it under C4834 -- and under C4858 when the
+# attribute carries a reason string, so both numbers are errors (H6c3's design
+# audit, P69). A discard that is MEANT is written `(void)call();` with its reason
+# beside it. The same placement rule as `-Werror=switch` above: after the
+# FetchContent block, so googletest and nlohmann_json are not gated on it.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
+    add_compile_options(-Werror=unused-result)
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang")
+    add_compile_options(-Werror=unused-result -Werror=unused-value)
+elseif(MSVC)
+    add_compile_options(/we4834 /we4858)
+endif()
+
 # ── Precompiled headers (build-time only — the windows-msvc build-time ceiling) ──
 # The windows-msvc-release CI leg re-parses the same heavy, templated STL
 # headers (<format>, <unordered_map>, <vector>, …) in every one of the ~280

@@ -213,6 +213,21 @@ attributeSpellingOf(SemanticConfig const& cfg, Tree const& tree, NodeId attrNode
     return nullptr;
 }
 
+// ★★ P69 (lane `cs`, fold f26e) — THE NAME A CLAUSE IS LOOKED UP UNDER, from the token that
+// names it (`written`, as the source spells it): the spelling's implied clause when the
+// spelling has one (its introducer alone is the clause: `__vectorcall` is `vectorcall`),
+// else the written name, dunder-normalized. Every tier that looks a clause's row up asks
+// here, so a keyword spelling and the name it implies are one lookup everywhere.
+// ★ A VIEW, and of storage that outlives every clause: the spelling row's own string (the
+// language config's) or a span of `written` (the tree's text). A clause keeps its name as a
+// view (`AttributeClause::name`); a `std::string` returned here dangled the moment it was
+// stored (✔MEASURED, run e3kw: "attribute 'pH_>…'" for `ms_abi`).
+[[nodiscard]] inline std::string_view
+attributeClauseLookupName(AttributeSpelling const* spelling, std::string_view written) {
+    if (spelling != nullptr && !spelling->impliedClause.empty()) return spelling->impliedClause;
+    return stripDunder(written);
+}
+
 // ★★ P69 (lane `cs`, fold f26d — review-csf26c2 N5) — AN ITEM OF THE STANDARD FORM THAT
 // IS A CLAUSE OF A SPELLING. `item` is one item of a specifier of the language's
 // `stdAttrRule` (c: one `stdAttrItem` of `[[a, ns::b(…)]]`). When it is written
@@ -245,6 +260,10 @@ standardItemClause(SemanticConfig const& cfg, Tree const& tree, NodeId item) {
             nameToken = c;
             continue;
         }
+        // ★ P69 (lane `cs`, fold f26e): a recovery tree's `Error` node is neither a token nor a
+        // rule. Read as a rule, it terminated `analyze()` of `int [[gnu::]] x;` — the tree the
+        // LSP server and the diagnostic corpus analyze although it did not parse.
+        if (tree.kind(c) != NodeKind::Internal) continue;
         if (cfg.attributeArgRule.valid() && tree.rule(c).v == cfg.attributeArgRule.v) args = c;
     }
     if (names < 2) return out;   // no namespace: the standard form's own attribute

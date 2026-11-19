@@ -1033,8 +1033,10 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // its aux slots, and the `1 + numAux` walk is what keeps a relocation's
     // symbol index meaning the same record on the way back in as it did on the
     // way out (`PeWriter.RelocationToAWeakDefinitionResolvesPastTheAuxSlot`).
-    link::format::RecordSymbolIds symbolIds{numSymbols, reporter, "pe::readRelocatableObject"};
-    if (symbolIds.refused()) return std::nullopt;   // the table reaches a reserved id: refused by name
+    std::optional<link::format::RecordSymbolIds> openedIds =
+        link::format::RecordSymbolIds::open(numSymbols, reporter, "pe::readRelocatableObject");
+    if (!openedIds) return std::nullopt;   // the table reaches a reserved id: refused by name
+    link::format::RecordSymbolIds& symbolIds = *openedIds;
     std::vector<Sym>  syms(numSymbols);
     std::vector<bool> auxSlot(numSymbols, false);
     // A `std::size_t` cursor (not u32): the `+= 1 + numAux` skip past a
@@ -2121,8 +2123,9 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         if (auto const completed =
                 completeCoffLinkerDirectives(directives, unit, mod.linkerRequests, *vocab, "the object's", reporter);
             !completed.has_value()) {
-            return fail(DiagnosticCode::K_LinkerDirectiveUnhonourable,
-                        "pe::readRelocatableObject: " + completed.error());
+            auto const* const why = std::get_if<std::string>(&completed.error());
+            if (why == nullptr) return std::nullopt;   // a fresh row's id, refused by name at the door (B1)
+            return fail(DiagnosticCode::K_LinkerDirectiveUnhonourable, "pe::readRelocatableObject: " + *why);
         }
     }
 
@@ -2588,7 +2591,9 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 // and NO ModuleSymbol is recorded -- the atom stays
                 // module-private and is never folded cross-CU by name, which is
                 // right for bytes that have no name.
-                di.symbol    = symbolIds.fresh();
+                std::optional<SymbolId> const gapId = symbolIds.fresh();
+                if (!gapId) return std::nullopt;   // refused by name at the door
+                di.symbol    = *gapId;
                 di.section   = *dk;
                 // The gap's bytes belong to the SAME section, so they carry the
                 // same declared alignment as the named atoms around them --
@@ -2888,7 +2893,9 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         // an atom is then a reference to its BYTES: one written through a
         // static name of the body, or through its section. The addend is
         // the name's own: the name sits at the atom's start.
-        if (auto const weakName = weakNames.referenceFor(symIdx, symbolIds)) {
+        auto const weakNameOrRefused = weakNames.referenceFor(symIdx, symbolIds);
+        if (!weakNameOrRefused) return std::nullopt;   // a fresh id refused by name at the door
+        if (auto const& weakName = *weakNameOrRefused) {
             if (weakName->fresh) {
                 mod.externImports.push_back(
                     link::format::referenceRowOfAWeakName(*weakName, mod.dataItems));
@@ -3381,8 +3388,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         }
     }
 
-    // A fresh id the table could not hand out was refused by name there; nothing it handed out leaves.
-    if (symbolIds.refused()) return std::nullopt;
+    // A fresh id the table could not hand out refused the read AT its take (P69 f26e, B1): nothing reaches here.
     mod.symbolIdEnd.keepClearOf(symbolIds.end());   // the module carries its table's end
     mod.expectedFuncCount = mod.functions.size();
     return mod;
@@ -3451,29 +3457,21 @@ bool applyUnitLinkerDirectives(AssembledModule&          module,
         }
         return false;
     };
-    // THE COMPLETION, its fresh rows' ids from the copy's own door, one at a time -- and none asked for past a
-    // refusal, which the door reports each time it is asked.
+    // THE COMPLETION, its fresh rows' ids from the copy's own door, one at a time: the first id the door refuses
+    // (reported there, by name) ends the completion, so none is asked for past it (P69 f26e, B1).
     linker::ModuleSymbolIds ids{unit};
-    bool exhausted = false;
     CoffDirectiveRowsOf const rows{
         definesExternally,
         [&](std::string const& name) { return hideAnswered.contains(name); },
         &unit.externImports,
-        [&] {
-            if (exhausted) return SymbolId{};
-            auto const id = ids.take(reporter, "pe: a reference row a unit's linker directive asks for");
-            if (!id.has_value()) {
-                exhausted = true;
-                return SymbolId{};
-            }
-            return *id;
-        }};
+        [&] { return ids.take(reporter, "pe: a reference row a unit's linker directive asks for"); }};
     if (auto const completed =
             completeCoffLinkerDirectives(directives, rows, unit.linkerRequests, *vocab, "the unit's", reporter);
         !completed.has_value()) {
-        return refuse(completed.error());
+        auto const* const why = std::get_if<std::string>(&completed.error());
+        if (why == nullptr) return false;   // a fresh row's id, refused by name at the door
+        return refuse(*why);
     }
-    if (exhausted) return false;   // the door refused by name
     module = std::move(unit);
     return true;
 }

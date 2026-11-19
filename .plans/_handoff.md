@@ -1126,6 +1126,32 @@ round's close; each checkpoint's commit message says what was and was not run on
     reds on the next one, which names its cause.
   - Fold order now: f26e → H6c3 (with U1) → f26f → 3f2 (xa's send-back of review-xa3f: two home audits, then the
     findings) → 3g → 3h → L2b4 → L2b3 → H6d → H7 → H7b1 → H7b2 → H7c, with f26g (SVE) placed where ready.
+- **Checkpoint 51 (2026-11-19) = the C front end lane's fold f26e** (290 paths, 25 rows: 8 new — 3 born closed, 4
+  disclosed, 1 open — and 17 changed; the tool's base for 11 paths was the lane's old seed, so main settled them on
+  `bc0deac1` first, read every one of the 17 lost cells for a dropped run, row, hash or arm id — none — and ran its
+  own loss test of the arms registry: 0 of main's changes reverted):
+  - ONE decider, `detail::enumerationEnters`, for a speculative choice nested in a non-speculative one of the same
+    rule, which the parser routes to and the grammar loader mirrors; a recovery tree's Error node read as a rule no
+    longer terminates `analyze()`, pinned over EVERY diagnostic-corpus source in a child process each
+    (analysis/test_recovery_trees_are_analyzed); the C23 sequence after a width or a GNU run (the init-declarator
+    run in the references' order, the end-of-specifiers attribute slot on every headed declaration, the asm label's
+    place judged, a typedef's label a warning as gcc, clang, MinGW and Apple accept it silently); the over-aligned
+    `_Alignof` operand and a VM type's alignment at one home each (the row's premise, "the references disagree",
+    REFUTED); the CONTEXT structure (the 111 facts both pe references agree on); the Win64 128-bit result in XMM0; a
+    deprecated member or enumerator warned at its use; B1's door types over the one symbol-id cursor (lowering to
+    MIR answers a refused unit; the link passes answer `LinkPassOutcome`).
+  - The lane's gate: the full suite on four legs (runs 20261119-094328-ce86fafd and 20261119-095601-44c6fd60; the two
+    goldens f26e moved re-read green in 20261119-104204-56e82b02), every red read by name and none the fold's.
+  - NOT yet: its 42 new arms and every arm whose key moved — after the fold ALL 2136 arms read `pending`, because
+    2064 of them name a CMake file f26e changes in `causesMoved` — so the round close's per-leg sweep is the whole
+    registry; main sweeps the 42 first. D-DIAG-A-DIAGNOSTIC-NAMES-A-TYPE-BY-THE-ENGINES-KIND-NAME is REOPENED for
+    f26e2 (B2: one type renderer per audience; its home audit v2 sent back, v3 owed and fully re-audited before
+    f26e2's first edit). The two new speculation rows (the skip side, the entry side) are HEAD's debt, lane `lm`'s
+    to close in L2b4 after its refresh.
+  - Fold order now: H6c3 (with U1) → f26e3 / f26e4 / f26e2 (whichever is ready; f26e2 after its re-audit) → f26f →
+    3f2 (now also the W14 class: a program's own definition of a C name the corpus renames — its link name, one
+    archive member per runtime entry, the runtime reaching its siblings only privately; ledger 834) → 3g → 3h → L2b4
+    → L2b3 → H6d → H7 → H7b1 → H7b2 → H7c, with f26g (SVE) placed where ready.
 - **★ KNOWN DEFECTS ON THIS TREE — each a MERGE BLOCKER of this PR's own making, each in a lane's hands:**
   (1) `orphan_tests_guard` — FIXED by checkpoint 16;
   (2) the valid ELF link refused since checkpoint 12 — LINKS AGAIN since checkpoint 18 (above);

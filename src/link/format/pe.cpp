@@ -1088,7 +1088,7 @@ void writeSectionHeader(std::vector<std::uint8_t>& out,
 // Forward declaration: EXEC arm lives below the Obj body so the
 // .obj path (LK2 cycle 1) keeps its top-of-file position.
 namespace {
-[[nodiscard]] std::vector<std::uint8_t>
+[[nodiscard]] std::optional<std::vector<std::uint8_t>>
 encodeExecWithImportSlotResidue(AssembledModule const&    module,
                                 TargetSchema const&       targetSchema,
                                 ObjectFormatSchema const& fmt,
@@ -1097,7 +1097,7 @@ encodeExecWithImportSlotResidue(AssembledModule const&    module,
                                 ImageRequest const&       request);
 } // namespace
 
-std::vector<std::uint8_t>
+std::optional<std::vector<std::uint8_t>>
 encode(AssembledModule const&    module,
        TargetSchema const&       targetSchema,
        ObjectFormatSchema const& objectFormatSchema,
@@ -4571,7 +4571,7 @@ externIndexBySymbol(AssembledModule const& module) {
     return out;
 }
 
-[[nodiscard]] std::vector<std::uint8_t>
+[[nodiscard]] std::optional<std::vector<std::uint8_t>>
 encodeExec(AssembledModule const&    module,
            TargetSchema const&       targetSchema,
            ObjectFormatSchema const& fmt,
@@ -4594,7 +4594,9 @@ encodeExec(AssembledModule const&    module,
 // gains a `.tls` section holding only the directory, the index and the
 // callback array — the TLS directory is the only place a PE image can name a
 // function the loader runs before every other.
-[[nodiscard]] std::vector<std::uint8_t>
+// ★ P69 (lane `cs`, fold f26e -- B1): each of its three fresh-id takes answers a refusal as `nullopt`,
+// which is the image's answer: no window remains in which an empty byte vector stands for it.
+[[nodiscard]] std::optional<std::vector<std::uint8_t>>
 encodeExecWithImportSlotResidue(AssembledModule const&    module,
                                 TargetSchema const&       targetSchema,
                                 ObjectFormatSchema const& fmt,
@@ -4655,7 +4657,7 @@ encodeExecWithImportSlotResidue(AssembledModule const&    module,
                       templateBase);
 }
 
-[[nodiscard]] std::vector<std::uint8_t>
+[[nodiscard]] std::optional<std::vector<std::uint8_t>>
 encodeExec(AssembledModule const&    module,
            TargetSchema const&       targetSchema,
            ObjectFormatSchema const& fmt,

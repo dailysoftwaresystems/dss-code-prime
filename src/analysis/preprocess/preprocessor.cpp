@@ -225,7 +225,7 @@ std::vector<PPToken> tokenizeToPP(
                 LexerModeId{}, Tokenizer::Phase::PreprocessingTokens};
     auto result = std::move(tk).tokenize();
     if (result.diagnostics) {
-        for (auto const& d : result.diagnostics->all()) rep.report(d);
+        rep.relayFrom(*result.diagnostics);
     }
     std::vector<PPToken> out;
     while (!result.stream.isAtEnd()) {
@@ -9233,7 +9233,9 @@ private:
         recordProductProvenance(productBase,
                                 static_cast<ByteOffset>(productText_.size()));
         auto tiny = SourceBuffer::fromString(std::string{spelling}, "<pp-product>");
-        DiagnosticReporter scratch;
+        // STAGING (`Config::unbounded()`): the relay below admits by code, and a volume gate here would have taken
+        // a diagnostic away before the filter could see it; `rep_`'s budget applies after it (D9(c)).
+        DiagnosticReporter scratch{DiagnosticReporter::Config::unbounded()};
         auto ppToks = tokenizeToPP(tiny, schema_, scratch);
         // ── [[D-PP-PASTE-REJECTS-A-VALID-PREPROCESSING-NUMBER]]: THE RETIMING ──
         //
@@ -9262,13 +9264,12 @@ private:
         // remove, arrived at from the opposite direction. The "is this ONE
         // preprocessing token" question still belongs to the token COUNT below;
         // exactly one judgement moved tiers, and this is it.
-        for (ParseDiagnostic const& d : scratch.all()) {
-            if (d.code != DiagnosticCode::P_MalformedNumber) continue;
-            ParseDiagnostic moved = d;
-            moved.buffer = synth_->id();
-            moved.span   = SourceSpan::empty(mint_.site);
-            rep_.report(std::move(moved));
-        }
+        rep_.relaySelectedFrom(scratch, [&](ParseDiagnostic& d) {
+            if (d.code != DiagnosticCode::P_MalformedNumber) return false;
+            d.buffer = synth_->id();
+            d.span   = SourceSpan::empty(mint_.site);
+            return true;
+        });
         std::vector<Token> out;
         for (PPToken const& pt : ppToks) {
             if (isTrivia(pt.tok) || isNewline(pt.tok)) continue;
@@ -10930,7 +10931,11 @@ PreprocessResult preprocessRun(
     // uninvoked, `#define A 1 $` on a live line, `S($)` stringized, `#define X @`,
     // `#warning an @ sign`, `#warning 0x1g`, `#define Z 0x1g`, `#undef Y don't` and
     // `#if 1`/`#elif 2d` — none of those tokens is ever converted. See the loop.
-    DiagnosticReporter provisionalTokDiags{budget.asConfig()};
+    // ★ STAGING, NOT BUDGETED (D9(c)): the promotion loop FILTERS by span, and a volume gate applied before it dropped
+    // the candidates it had to judge -- with 50 unconverted conversion diagnostics of one code ahead of a converted
+    // one, the converted one was the 51st, elided here and never reported. The operator's budget applies at
+    // `result.diagnostics`, after the filter; `tokenizeToPP`'s tokenizer inherits this volume from the reporter.
+    DiagnosticReporter provisionalTokDiags{DiagnosticReporter::Config::unbounded()};
     auto ppToks = [&] {
         // D-PERF-1-PREPROCESSOR sub-timing: the single tokenize of the synth buffer.
         substrate::PhaseTimers::Scope ppTok{
@@ -11071,12 +11076,10 @@ PreprocessResult preprocessRun(
             return it != pending.end() && *it == b
                 && converted[static_cast<std::size_t>(it - pending.begin())] != 0;
         };
-        for (ParseDiagnostic const& d : provisionalTokDiags.all()) {
-            if (isTokenConversionDiagnostic(d.code) && !isConverted(d.span.start())) {
-                continue;   // a preprocessing token nobody converts is not judged
-            }
-            result.diagnostics->report(d);
-        }
+        result.diagnostics->relaySelectedFrom(provisionalTokDiags, [&](ParseDiagnostic const& d) {
+            // a preprocessing token nobody converts is not judged
+            return !(isTokenConversionDiagnostic(d.code) && !isConverted(d.span.start()));
+        });
     }
 
     // Append the accumulated `#`/`##` product spellings AFTER the prefix, then

@@ -5802,17 +5802,14 @@ parseAsmTemplateText(std::string                          templateText,
     // the success path too. "Nothing is dropped on the floor" was half true, and
     // the half that was false was the half a reader would rely on.
     // ★ `ffi/c_header_parser.cpp` is the precedent that already does this
-    // (`for (auto const& d : model.diagnostics().all()) reporter.report(d);`),
-    // and matching it means the two fragment readers behave the same way.
-    // ⚠ THE `parsed` VERDICT STILL KEYS ON `Error` ALONE — forwarding a warning
-    // must never fail a parse that succeeded.
-    bool parsed = true;
-    for (auto const& d : result.tree.diagnostics().all()) {
-        if (d.severity == DiagnosticSeverity::Error) parsed = false;
-        ParseDiagnostic copy = d;
-        reporter.report(std::move(copy));
-    }
-    if (!parsed) return std::nullopt;
+    // (`reporter.relayFrom(model.diagnostics());`), and matching it means the
+    // two fragment readers behave the same way.
+    // ⚠ THE VERDICT STILL KEYS ON `Error` ALONE — forwarding a warning must never
+    // fail a parse that succeeded — and it is the tree's own `hasErrors()`, never
+    // a walk over `all()`: a volume gate makes `all()` a floor, and an Error it
+    // elided was invisible to the walk this replaced (D9(c)).
+    reporter.relayFrom(result.tree.diagnostics());
+    if (result.tree.diagnostics().hasErrors()) return std::nullopt;
     return std::move(result.tree);
 }
 

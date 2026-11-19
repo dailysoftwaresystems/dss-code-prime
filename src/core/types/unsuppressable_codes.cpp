@@ -819,7 +819,12 @@ constexpr MembershipReason kWhyIncludeReentryRefused{
 // `Arg`s are counted, a stamped call its callee receives otherwise). Written from main's 203 and
 // reconciled on the refresh onto checkpoint 44 with 3e's departure of `S_EntryShapeNotDeclared`
 // (above); a fold landing another member first reconciles the count.
-constexpr std::array<UnsuppressableEntry, 206> kUnsuppressableCodes{{
+// ⓘ EXTENT 206 → 208 (2026-11-17, P69 round 1, fold f26e, lane `cs`, review-csf26d B1/A1):
+// `K_SymbolIdSpaceExhausted` and the new `H_SymbolIdSpaceExhausted` join `L_SymbolIdSpaceExhausted`
+// under `kWhySymbolIdSpace`, prong (1): the K_/L_/H_ trio of the one home's refusal emitter
+// (core/types/symbol_id_cursor.hpp), each the ONLY statement that its tier's output was refused.
+// Written from main's 206; a fold landing another member first reconciles the count.
+constexpr std::array<UnsuppressableEntry, 209> kUnsuppressableCodes{{
     // D_* build-lifecycle band — a `.dss-project.json` pre/post-build hook
     // that could not be spawned, or that ran and failed. PRONG (2), and only
     // prong (2): both already abort the build with or without the diagnostic
@@ -1567,6 +1572,10 @@ constexpr std::array<UnsuppressableEntry, 206> kUnsuppressableCodes{{
     // of block / jump-table / sign-mask symbols refuses instead of wrapping.
     // Created a member, with the code — its own note says why.
     {DiagnosticCode::L_SymbolIdSpaceExhausted, kWhySymbolIdSpace},
+    // K_SymbolIdSpaceExhausted / H_SymbolIdSpaceExhausted (P69 fold f26e, B1): the
+    // link tier's and HIR→MIR's members of the same refusal, from the one emitter.
+    {DiagnosticCode::K_SymbolIdSpaceExhausted, kWhySymbolIdSpace},
+    {DiagnosticCode::H_SymbolIdSpaceExhausted, kWhySymbolIdSpace},
     // L_ArgClassHasNoRegisterPool / L_ArgClassPoolUndeclared
     // (D-LIR-ARG-PASSING-POOL-SELECTION-IS-TWO-WAY-AND-VR-FALLS-INTO-GPR): their own
     // note says "Both UNSUPPRESSABLE: suppressed, each is a wrong-register codegen
@@ -2087,6 +2096,10 @@ constexpr std::array<UnsuppressableEntry, 206> kUnsuppressableCodes{{
     // wrong symbol ships — the S_DeprecatedSymbolUsed posture.
     {DiagnosticCode::S_AsmLabelInvalid, kWhyAsmLabel},
     {DiagnosticCode::S_AsmLabelDuplicate, kWhyAsmLabel},
+    // P69 (lane `cs`, fold f26e): a label written where the language takes none -- the same
+    // rename, refused, so the C name would ship in its place. S_AsmLabelOnTypedef is NOT a
+    // member: a typedef has no symbol, so nothing wrong ships.
+    {DiagnosticCode::S_AsmLabelMisplaced, kWhyAsmLabel},
     // TF-C86 (D-CSUBSET-STDARG-F001A): a `#define`/`#undef` of a
     // conditional-inclusion OPERATOR name (`__has_include` and siblings).
     // Suppressing it does not make the shadowing harmless — it lets the

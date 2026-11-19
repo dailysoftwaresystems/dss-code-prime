@@ -5,6 +5,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/target_schema.hpp"
+#include "link/link_pass_outcome.hpp"           // LinkPassOutcome
 #include "link/object_format_schema.hpp"
 
 #include <cstdint>
@@ -110,11 +111,10 @@ gotSlotDirectTwin(TargetSchema const& target, TargetRelocationInfo const& gotRow
 // states no kind, P69): their slot HOLDS 0 — S is 0 — so it is minted with no
 // relocation, and a nonzero addend (a slot that would hold the bare number A) is
 // refused rather than guessed.
-// Returns TRUE when the module needs no change (`out` untouched); FALSE when
-// `out` holds the lowered module OR an error was reported — the caller tells
-// the two apart by the reporter's error count (the convention
-// `materializeObjectImportSlots` follows).
-[[nodiscard]] DSS_EXPORT bool
+// Answers (`link/link_pass_outcome.hpp`) Unchanged when the module needs no
+// change (`out` untouched), Rewritten when `out` holds the lowered module, and
+// Refused when a reference was refused by name.
+DSS_EXPORT LinkPassOutcome
 lowerGotSlotReferences(AssembledModule const&    in,
                        AssembledModule&          out,
                        TargetSchema const&       target,

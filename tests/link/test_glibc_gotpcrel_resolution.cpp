@@ -448,8 +448,8 @@ TEST(GlibcGotPcRelResolution, AModuleWithNoGotSlotRelocationGetsNoSlot) {
     (void)defineRemainingExterns(*module);
     DiagnosticReporter lowerReporter;
     AssembledModule lowered;
-    EXPECT_TRUE(linker::lowerGotSlotReferences(*module, lowered, *S.target,
-                                               *S.writer, lowerReporter))
+    EXPECT_EQ(linker::lowerGotSlotReferences(*module, lowered, *S.target,
+                                               *S.writer, lowerReporter), linker::LinkPassOutcome::Unchanged)
         << "a module naming no GOT slot must leave the lowering nothing to do — "
            "otherwise test 1's slots say nothing about the relocation, only "
            "about the link";
